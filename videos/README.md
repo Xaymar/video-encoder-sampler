@@ -1,1 +1,0 @@
-Place input video files here.

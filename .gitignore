@@ -8,3 +8,6 @@ videos/*
 output/*
 cache/*
 desktop.ini
+/cache
+/input
+/output

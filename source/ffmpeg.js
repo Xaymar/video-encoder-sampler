@@ -23,10 +23,10 @@ class ffmpeg {
 			if (fs.existsSync(ffmpeg_local)) {
 				this.bin.ffmpeg = ffmpeg_local;
 			}
-			
+
 			let ffprobe_local = path.join((ffpath ? ffpath : process.cwd()), "bin/ffprobe.exe");
-			if (fs.existsSync(ffmpeg_local)) {
-				this.bin.ffmpeg = ffprobe_local;
+			if (fs.existsSync(ffprobe_local)) {
+				this.bin.ffprobe = ffprobe_local;
 			}
 		}
 	}
@@ -87,7 +87,7 @@ class ffmpeg {
 						reject(signal);
 					} else {
 						reject(code);
-					}					
+					}
 				}
 			});
 			proc.on('error', (error) => {
@@ -126,11 +126,11 @@ class ffmpeg {
 		return result;
 	}
 
-	ffmpegSync(params) {
+	ffmpegSync(...params) {
 		return child_process.spawnSync(this.bin.ffmpeg, params);
 	}
 
-	ffmpeg(params) {
+	ffmpeg(...params) {
 		return new Promise((resolve, reject) => {
 			let proc = child_process.spawn(this.bin.ffmpeg, params);
 			let buf_stdout = "";
@@ -153,7 +153,7 @@ class ffmpeg {
 						reject([signal, buf_stdout, buf_stderr]);
 					} else {
 						reject([code, buf_stdout, buf_stderr]);
-					}					
+					}
 				}
 			});
 			proc.on('error', (error) => {

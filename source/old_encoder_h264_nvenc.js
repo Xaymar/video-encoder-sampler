@@ -3,11 +3,14 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 
-let version = 1;
+let version = 2;
 
 class h264_nvenc extends encoder {
 	constructor(ffmpeg, config, settings) {
 		super(ffmpeg, config, settings);
+
+		this.indexes = new Map();
+		this.combinations = new Array();
 	}
 	
 	available() {
@@ -27,24 +30,9 @@ class h264_nvenc extends encoder {
 		return true;
 	}
 
-	available() {
-		if (global.debug) console.time("Checking...");
-		let res = this.ffmpeg.ffmpegSync([
-			"-hide_banner", "-v", "error",
-			"-f", "lavfi",
-			"-i", "color=size=256x256:duration=1:rate=30:color=black",
-			"-c:v", "h264_nvenc",
-			"-f", "null",
-			"-"
-		]);
-		if (global.debug) console.timeEnd("Checking...");
-		if (res.status != 0) {
-			return false;
-		}
-		return true;
-	}
+	load() { // Generate a list of all allowed combinations.
+		if (global.debug) console.time("h264_nvenc.load()");
 
-	load() {
 		let name = function(opts) {
 			let name = "";
 			for (let idx = 0; idx < opts.length; idx += 2) {
@@ -57,7 +45,50 @@ class h264_nvenc extends encoder {
 			return `${name};version=${version}`;
 		}
 
-		if (global.debug) console.time("Generating...");
+		// First, clear both internal storages.
+		this.indexes.clear();
+		this.combinations = new Array();
+
+		// Go through each setting:
+		// 1. -preset
+		// 2. -tune
+		// 3. -rc-lookahead
+		// 4. -no_scenecut
+		// 5. -bf
+		// 6. -b_ref_mode
+		// 7. -b_adapt
+		// 8. -spatial-aq
+		// 9. -aq-strength
+		// 10. -temporal-aq
+		// 11. -multipass
+
+		let stack = new Array();
+		for (let kv of this.settings.options) {
+			console.log(kv);
+		}
+return;
+		for (let preset of this.settings.options["preset"]) {
+			for (let tune of this.settings.options["tune"]) {
+				for (let rcla of this.settings.options["rc-lookahead"]) {
+					for (let scenecut of this.settings.options["scenecut"]) {
+						for (let bf of this.settings.options["bframes"]) {
+							for (let bfrm of this.settings.options["b_ref_mode"]) {
+								for (let badapt of this.settings.options["b_adapt"]) {
+									for (let spatial_aq of this.settings.options["spatial-aq"]) {
+										for (let spatial_aq of this.settings.options["spatial-aq"]) {
+
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+
+
 		this.indexes = {};
 		this.combinations = [];
 		for (let preset of this.settings.presets) {
@@ -127,7 +158,7 @@ class h264_nvenc extends encoder {
 			JSON.stringify(this.indexes, null, '\t'),
 			{encoding: "utf8"}
 		);
-		if (global.debug) console.timeEnd("Generating...");
+		if (global.debug) console.timeEnd("h264_nvenc.load()");
 		if (global.debug) console.log(`Combinations: ${this.combinations.length}`)
 	}
 
