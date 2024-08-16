@@ -41,6 +41,15 @@ class Encoder extends EventTarget {
 	// Functions
 	// ---------------------------------------------------------------------------------------------- //
 
+	/** Parse arguments with ArgParse
+	 *
+	 * @param ArgParse The ArgParse library itself.
+	 * @param Parser The Argument Parser instance.
+	 */
+	parse(ArgParse, Parser) {
+		throw new Error("Not yet implemented.");
+	}
+
 	/** Load the encoder and any configurations.
 	 *
 	 */

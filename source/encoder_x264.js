@@ -1,12 +1,12 @@
-const Encoder = require('./encoder.js');
-const log = require('./log.js');
+const ENCODER = require('./encoder.js');
+const LOG = require('./log.js');
 const CRYPTO = require('crypto');
 const PATH = require('path');
 const FS = require('fs');
 
-let version = [1,0,0,0];
+let version = [1, 0, 0, 0];
 
-class x264Encoder extends Encoder {
+class x264Encoder extends ENCODER {
 	constructor(parent) {
 		super(parent, "x264");
 
@@ -48,6 +48,26 @@ class x264Encoder extends Encoder {
 		this._index = new Map();
 	}
 
+	// ---------------------------------------------------------------------------------------------- //
+	// Accessors
+	// ---------------------------------------------------------------------------------------------- //
+
+	// ---------------------------------------------------------------------------------------------- //
+	// Functions
+	// ---------------------------------------------------------------------------------------------- //
+
+	/** Parse arguments with ArgParse
+	 *
+	 * @param ArgParse The ArgParse library itself.
+	 * @param Parser The Argument Parser instance.
+	 */
+	parse(ArgParse, Parser) {
+
+	}
+
+	/** Load the encoder and any configurations.
+	 *
+	 */
 	load() {
 		{ // Check if the encoder is actually available on this system.
 			let res = this.ffmpeg.ffmpegSync(
@@ -61,8 +81,8 @@ class x264Encoder extends Encoder {
 
 			if (res.status != 0) {
 				this.enabled = false;
-				this.logger.log(log.ELEVEL_DEBUG, res.stdout.toString());
-				this.logger.log(log.ELEVEL_DEBUG, res.stderr.toString());
+				this.logger.log(LOG.ELEVEL_DEBUG, res.stdout.toString());
+				this.logger.log(LOG.ELEVEL_DEBUG, res.stderr.toString());
 				throw new Error("x264 (via FFmpeg) is not available.");
 			}
 		}
@@ -103,7 +123,7 @@ class x264Encoder extends Encoder {
 					version: version,
 					data: data,
 				}, null, '\t'),
-				{encoding: "utf8"}
+				{ encoding: "utf8" }
 			);
 		}
 	}

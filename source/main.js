@@ -13,14 +13,19 @@ const FS = require('fs');
 const UTIL = require('util');
 
 // Our libraries
-const app = require('./app.js');
-const log = require('./log.js');
+const APP = require('./app.js');
+const LOG = require('./log.js');
 
 // Constants
 const E_OK = 0;
 const E_FAIL = 1;
 
-class ves_app extends app {
+// Encoders
+const ENCODERS = [
+	"x264", "x265", "qsv", "nvenc", "amf", "libsvtav1"
+];
+
+class MyApp extends APP {
 	constructor() {
 		super();
 
@@ -59,135 +64,165 @@ class ves_app extends app {
 		this._bitrates = new Set();
 		this._kfintervals = new Set();
 
-		// Set up our argparse instance.
-		class HelpFormatter extends this._libs.argparse.RawDescriptionHelpFormatter {
-			// executes parent _split_lines for each line of the help, then flattens the result
-			_split_lines(text, width) {
-				return [].concat(...text.split('\n').map(line => super._split_lines(line, width)));
+		// Load any defined encoders.
+		for (let encoder of ENCODERS) {
+			try {
+				this._encoders.set(encoder, new (require(`./encoder_${encoder}.js`)));
+			} catch (ex) {
+				this.logger.log(LOG.ELEVEL_ERROR, "Failed to compile encoder '%s' with error: %s", encoder, ex.toString());
 			}
 		}
-		this._ap = new this._libs.argparse.ArgumentParser({
-			description: 'Video Encoding Samples Tool',
-			add_help: true,
-			formatter_class: HelpFormatter,
-		});
 
-		// ArgParse: Core
-		this._ap.add_argument('-v', '--version', {
-			action: 'version',
-			version: `VES Tool v${global.version[0]}.${global.version[1]}.${global.version[2]}.${global.version[3]}`,
-			help: 'Show the version of the tool.',
-		});
-		this._ap.add_argument('--copyright', {
-			help: 'Hide the copyright header when running the tool. This does not change the copyright itself, only hides it.',
-			action: 'store_false'
-		});
-		this._ap.add_argument('--license', {
-			help: 'Hide the license header when running the tool. This does not change the license itself, only hides it.',
-			action: 'store_false'
-		});
+		{ // Argument Parsing
+			class HelpFormatter extends this._libs.argparse.RawDescriptionHelpFormatter {
+				// executes parent _split_lines for each line of the help, then flattens the result
+				_split_lines(text, width) {
+					return [].concat(...text.split('\n').map(line => super._split_lines(line, width)));
+				}
+			}
 
-		// ArgParse: Paths
-		this._ap_paths = this._ap.add_argument_group('Paths');
-		this._ap_paths.add_argument('-cfg', '--config', {
-			help: `The path to the configuration file, with relative paths being relative to the current working directory.\n(Default: %(default)s)`,
-			type: 'str',
-			action: 'store',
-			default: this._paths.config,
-		});
-		this._ap_paths.add_argument('-ff', '--ffmpeg', {
-			help: `The path to where the FFmpeg binaries are located, with relative paths being relative to the current working directory.\n(Default: ${this._paths.ffmpeg})`,
-			type: 'str',
-			action: 'store',
-		});
-		this._ap_paths.add_argument('-i', '--input', {
-			help: `The path to the input videos, with relative paths being relative to the current working directory.\n(Default: ${this._paths.input})`,
-			type: 'str',
-			action: 'store'
-		});
-		this._ap_paths.add_argument('-c', '--cache', {
-			help: `The path for the intermediate cache storage, with relative paths being relative to the current working directory.\nThis should ideally point at a very high speed storage, such as SSDs.\n(Default: ${this._paths.cache})`,
-			type: 'str',
-			action: 'store'
-		});
-		this._ap_paths.add_argument('-o', '--output', {
-			help: `The path at which to store output files, with relative paths being relative to the current working directory.\nThis should ideally point a a very high speed storage, such as SSDs.\n(Default: ${this._paths.output})`,
-			type: 'str',
-			action: 'store'
-		});
+			// Set up our argparse instance.
+			this._ap = new this._libs.argparse.ArgumentParser({
+				description: 'Video Encoding Samples Tool',
+				add_help: true,
+				formatter_class: HelpFormatter,
+			});
 
-		// ArgParse: Colors
-		this._ap_color = this._ap.add_argument_group('Colors');
-		this._ap_color.add_argument('-cf', '--color-format', {
-			help: `Override the detected color format used for transcoding.`,
-			type: 'str',
-			action: 'store',
-		});
-		this._ap_color.add_argument('-cm', '--color-matrix', {
-			help: `Override the detected color matrix used for transcoding.`,
-			type: 'str',
-			action: 'store',
-		});
-		this._ap_color.add_argument('-ct', '--color-tc', '--color-transfer-characteristics', {
-			help: `Override the detected color transfer characteristics used for transcoding.`,
-			type: 'str',
-			action: 'store',
-		});
-		this._ap_color.add_argument('-cp', '--color-primaries', {
-			help: `Override the detected color primaries used for transcoding.`,
-			type: 'str',
-			action: 'store',
-		});
-		this._ap_color.add_argument('-cr', '--color-range', {
-			help: `Override the detected color range used for transcoding.`,
-			type: 'str',
-			action: 'store',
-		});
+			{ // ArgParse: Core
+				this._ap.add_argument('-v', '--version', {
+					action: 'version',
+					version: `VES Tool v${global.version[0]}.${global.version[1]}.${global.version[2]}.${global.version[3]}`,
+					help: 'Show the version of the tool.',
+				});
+				this._ap.add_argument('--copyright', {
+					help: 'Hide the copyright header when running the tool. This does not change the copyright itself, only hides it.',
+					action: 'store_false'
+				});
+				this._ap.add_argument('--license', {
+					help: 'Hide the license header when running the tool. This does not change the license itself, only hides it.',
+					action: 'store_false'
+				});
+				this._ap.add_argument('--loglevel', {
+					help: 'Change which log level will be shown in the output. From most spammy to least spammy.',
+					type: 'str',
+					action: 'store',
+					choices: ['debug', 'verbose', 'info', 'warning', 'error', 'critical'],
+					default: 'info',
+				});
+			}
 
-		// ArgParse: VMAF
-		this._ap_vmaf = this._ap.add_argument_group('VMAF');
-		this._ap_vmaf.add_argument('--vmaf-model', {
-			help: "What model should be used for VMAF processing? Note that different models are not compatible with each other.\n(Default: %(default)s)",
-			type: 'str',
-			action: 'store',
-			default: this._vmaf.model,
-		});
-		this._ap_vmaf.add_argument('--vmaf-threads', {
-			help: "How many threads should be used by each VMAF instance?\n(Default: %(default)i)",
-			type: 'int',
-			action: 'store',
-			default: this._vmaf.threads,
-		});
+			{ // ArgParse: Paths
+				this._ap_paths = this._ap.add_argument_group('Paths');
+				this._ap_paths.add_argument('-cfg', '--config', {
+					help: `The path to the configuration file, with relative paths being relative to the current working directory.\n(Default: %(default)s)`,
+					type: 'str',
+					action: 'store',
+					default: this._paths.config,
+				});
+				this._ap_paths.add_argument('-ff', '--ffmpeg', {
+					help: `The path to where the FFmpeg binaries are located, with relative paths being relative to the current working directory.\n(Default: ${this._paths.ffmpeg})`,
+					type: 'str',
+					action: 'store',
+				});
+				this._ap_paths.add_argument('-i', '--input', {
+					help: `The path to the input videos, with relative paths being relative to the current working directory.\n(Default: ${this._paths.input})`,
+					type: 'str',
+					action: 'store'
+				});
+				this._ap_paths.add_argument('-c', '--cache', {
+					help: `The path for the intermediate cache storage, with relative paths being relative to the current working directory.\nThis should ideally point at a very high speed storage, such as SSDs.\n(Default: ${this._paths.cache})`,
+					type: 'str',
+					action: 'store'
+				});
+				this._ap_paths.add_argument('-o', '--output', {
+					help: `The path at which to store output files, with relative paths being relative to the current working directory.\nThis should ideally point a a very high speed storage, such as SSDs.\n(Default: ${this._paths.output})`,
+					type: 'str',
+					action: 'store'
+				});
+			}
 
-		// ArgParse: Tests
-		this._ap_tests = this._ap.add_argument_group('Tests');
-		this._ap_tests.add_argument('-enc', '--encoder', {
-			help: "Enable an encoder by name.\n(Default: %(default)s)",
-			type: 'str',
-			action: 'append',
-			default: ['x264', 'nvenc', 'amf', 'qsv']
-		});
-		this._ap_tests.add_argument('-cd', '--codec', {
-			help: "Enable a codec by name.\n(Default: %(default)s)",
-			type: 'str',
-			action: 'append',
-			default: ['h264']
-		});
-		this._ap_tests.add_argument('-res', '--resolution', {
-			help: "Add or remove a resolution (WxH) to the tests.\nPrefix with - to remove an entry (-1920x1080 instead of 1920x1080).",
-			type: 'str',
-			action: 'append',
-		});
-		this._ap_tests.add_argument('-br', '--bitrate', {
-			help: "Add or remove a bitrate to the tests.\nPrefix with - to remove an entry (-3000 instead of 3000).",
-			type: 'int',
-			action: 'append',
-		});
-		this._ap_tests.add_argument('-kf', '--kfinterval', {
-			help: "Add or remove a key frame interval (in seconds) to list of tests.\nPrefix with - to remove an entry (-1.0 instead of 1.0).",
-			type: 'float',
-			action: 'append',
-		});
+			{// ArgParse: Colors
+				this._ap_color = this._ap.add_argument_group('Colors');
+				this._ap_color.add_argument('-cf', '--color-format', {
+					help: `Override the detected color format used for transcoding.`,
+					type: 'str',
+					action: 'store',
+				});
+				this._ap_color.add_argument('-cm', '--color-matrix', {
+					help: `Override the detected color matrix used for transcoding.`,
+					type: 'str',
+					action: 'store',
+				});
+				this._ap_color.add_argument('-ct', '--color-tc', '--color-transfer-characteristics', {
+					help: `Override the detected color transfer characteristics used for transcoding.`,
+					type: 'str',
+					action: 'store',
+				});
+				this._ap_color.add_argument('-cp', '--color-primaries', {
+					help: `Override the detected color primaries used for transcoding.`,
+					type: 'str',
+					action: 'store',
+				});
+				this._ap_color.add_argument('-cr', '--color-range', {
+					help: `Override the detected color range used for transcoding.`,
+					type: 'str',
+					action: 'store',
+				});
+			}
+
+			{// ArgParse: VMAF
+				this._ap_vmaf = this._ap.add_argument_group('VMAF');
+				this._ap_vmaf.add_argument('--vmaf-model', {
+					help: "What model should be used for VMAF processing? Note that different models are not compatible with each other.\n(Default: %(default)s)",
+					type: 'str',
+					action: 'store',
+					default: this._vmaf.model,
+				});
+				this._ap_vmaf.add_argument('--vmaf-threads', {
+					help: "How many threads should be used by each VMAF instance?\n(Default: %(default)i)",
+					type: 'int',
+					action: 'store',
+					default: this._vmaf.threads,
+				});
+			}
+
+			{ // ArgParse: Tests
+				this._ap_tests = this._ap.add_argument_group('Tests');
+				this._ap_tests.add_argument('-enc', '--encoder', {
+					help: "Enable an encoder by name.\n(Default: %(default)s)",
+					type: 'str',
+					action: 'append',
+					default: ['x264', 'nvenc', 'amf', 'qsv']
+				});
+				this._ap_tests.add_argument('-cd', '--codec', {
+					help: "Enable a codec by name.\n(Default: %(default)s)",
+					type: 'str',
+					action: 'append',
+					default: ['h264']
+				});
+				this._ap_tests.add_argument('-res', '--resolution', {
+					help: "Add or remove a resolution (WxH) to the tests.\nPrefix with - to remove an entry (-1920x1080 instead of 1920x1080).",
+					type: 'str',
+					action: 'append',
+				});
+				this._ap_tests.add_argument('-br', '--bitrate', {
+					help: "Add or remove a bitrate to the tests.\nPrefix with - to remove an entry (-3000 instead of 3000).",
+					type: 'int',
+					action: 'append',
+				});
+				this._ap_tests.add_argument('-kf', '--kfinterval', {
+					help: "Add or remove a key frame interval (in seconds) to list of tests.\nPrefix with - to remove an entry (-1.0 instead of 1.0).",
+					type: 'float',
+					action: 'append',
+				});
+			}
+
+			// Parse arguments
+			this._args = this._ap.parse_args();
+
+			// Update log level
+			this.logger.level = this._args.loglevel;
+		}
 	}
 
 	// ---------------------------------------------------------------------------------------------- //
@@ -196,7 +231,7 @@ class ves_app extends app {
 	_copyright() {
 		// Log copyright information.
 		if (this._args.copyright) {
-			this.logger.log(log.ELEVEL_INFO, "Copyright 2017-2021 Michael Fabian 'Xaymar' Dirks");
+			this.logger.log(LOG.ELEVEL_INFO, "Copyright 2017-2021 Michael Fabian 'Xaymar' Dirks");
 		}
 	}
 
@@ -210,7 +245,7 @@ class ves_app extends app {
 				"3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.",
 				"THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS \"AS IS\" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE."
 			]) {
-				this.logger.log(log.ELEVEL_INFO, line);
+				this.logger.log(LOG.ELEVEL_INFO, line);
 			}
 		}
 	}
@@ -259,12 +294,12 @@ class ves_app extends app {
 		if (FS.existsSync(this._paths.config)) {
 			try {
 				config = JSON.parse(FS.readFileSync(this._paths.config));
-				this.logger.log(log.ELEVEL_DEBUG, "Loaded configuration file '%s'.", this._paths.config);
+				this.logger.log(LOG.ELEVEL_VERBOSE, "Loaded configuration file '%s'.", this._paths.config);
 			} catch (ex) {
-				this.logger.log(log.ELEVEL_ERROR, "Configuration file '%s' is invalid: %s", this._paths.config, ex.stack);
+				this.logger.log(LOG.ELEVEL_ERROR, "Configuration file '%s' is invalid: %s", this._paths.config, ex.stack);
 			}
 		} else {
-			this.logger.log(log.ELEVEL_WARNING, "Configuration file '%s' is missing.", this._paths.config);
+			this.logger.log(LOG.ELEVEL_WARNING, "Configuration file '%s' is missing.", this._paths.config);
 		}
 
 		// Decipher the paths for common things.
@@ -284,7 +319,7 @@ class ves_app extends app {
 				if (path.length > 0) {
 					this._paths[k] = path;
 				}
-				this.logger.log(log.ELEVEL_DEBUG, "'%s' is located at: '%s'.", k, this._paths[k]);
+				this.logger.log(LOG.ELEVEL_DEBUG, "'%s' is located at: '%s'.", k, this._paths[k]);
 			}
 		}
 
@@ -299,14 +334,14 @@ class ves_app extends app {
 			}
 			if (value.length > 0) {
 				this._color.set(k, value);
-				this.logger.log(log.ELEVEL_INFO, "Overriding color %s with '%s' during transcoding.", k, value);
+				this.logger.log(LOG.ELEVEL_INFO, "Overriding color %s with '%s' during transcoding.", k, value);
 			}
 		}
 
 		{ // VMAF
 			this._vmaf.model = this._args.vmaf_model;
 			this._vmaf.threads = this._args.vmaf_threads;
-			this.logger.log(log.ELEVEL_DEBUG, "VMAF model is '%s' with %d threads.", this._vmaf.model, this._vmaf.threads);
+			this.logger.log(LOG.ELEVEL_DEBUG, "VMAF model is '%s' with %d threads.", this._vmaf.model, this._vmaf.threads);
 		}
 
 		{ // Tests
@@ -410,33 +445,25 @@ class ves_app extends app {
 			}
 
 			{ // Encoders
-				for (let v of this._args.encoder) {
+				for (let name of this._args.encoder) {
 					try {
-						if ((typeof v) != "string") {
-							throw TypeError(`Encoder must be a 'string', is '${typeof v}'.`);
+						if ((typeof name) != "string") {
+							throw TypeError(`Encoder must be a 'string', is '${typeof name}'.`);
 						}
 
 						let target = true;
-						let name = v;
-						if (v.substr(0, 1) == '-') {
+						if (name.substr(0, 1) == '-') {
 							target = false;
-							name = v.substr(1);
+							name = name.substr(1);
 						}
 
 						if (this._encoders.has(name)) {
 							this._encoders.get(name).enabled = target;
 						} else {
-							// Load the encoder if it isn't loaded yet.
-							let file = PATH.resolve(PATH.join(__dirname, `encoder_${name}.js`));
-							if (!FS.existsSync(file)) {
-								throw SyntaxError(`Encoder '${name}' does not exist.`);
-							}
-							let instance = new (require(file))(this);
-							this._encoders.set(name, instance);
-							instance.enabled = target;
+							this.logger.log(LOG.ELEVEL_ERROR, "Specified encoder '%s' does not exist.", name);
 						}
 					} catch (ex) {
-						console.log(`Unexpected error parsing encoder '${v}':`, ex);
+						console.log(`Unexpected error parsing encoder '${name}':`, ex);
 					}
 				}
 			}
@@ -467,6 +494,15 @@ class ves_app extends app {
 	// ---------------------------------------------------------------------------------------------- //
 	loop() {
 		{ // Initialization
+			// Encoder arguments
+			for (let kv of this._encoders.entries()) {
+				try {
+					kv[1].parse(this._libs.argparse, this._ap);
+				} catch (ex) {
+					this.logger.log(LOG.ELEVEL_DEBUG, "Encoder '%s' failed argument parsing with exception: %s", kv[0], ex.toString());
+				}
+			}
+
 			// Parse arguments
 			this._args = this._ap.parse_args();
 
@@ -496,7 +532,7 @@ class ves_app extends app {
 						kv[1].load();
 					}
 				} catch (ex) {
-					this.logger.log(log.ELEVEL_ERROR, "Failed to load encoder '%s': %s", kv[0], ex.toString());
+					this.logger.log(LOG.ELEVEL_ERROR, "Failed to load encoder '%s': %s", kv[0], ex.toString());
 					kv[1].enabled = false;
 				}
 			}
@@ -547,7 +583,7 @@ class ves_app extends app {
 };
 
 { // Main
-	let main = new ves_app();
+	let main = new MyApp();
 	main.run();
 }
 

@@ -11,3 +11,7 @@ desktop.ini
 /cache
 /input
 /output
+
+# Native build
+/build
+third-party/ffmpeg-dev/

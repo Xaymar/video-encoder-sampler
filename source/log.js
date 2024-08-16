@@ -7,9 +7,45 @@ const ELEVEL_DEBUG = -48;
 
 class Logger {
 	constructor() {
+		this._level = ELEVEL_DEBUG;
+	}
+
+	set level(level) {
+		if (typeof (level) == "number") {
+			this._level = parseInt(level, 10);
+		} else if (typeof (level) == "string") {
+			switch (level.toLowerCase()) {
+				case "debug":
+					this._level = ELEVEL_DEBUG;
+					break;
+				case "verbose":
+					this._level = ELEVEL_VERBOSE;
+					break;
+				case "info":
+					this._level = ELEVEL_INFO;
+					break;
+				case "warning":
+					this._level = ELEVEL_WARNING;
+					break;
+				case "error":
+					this._level = ELEVEL_ERROR;
+					break;
+				case "critical":
+					this._level = ELEVEL_CRITICAL;
+					break;
+			}
+		}
+	}
+
+	get level() {
+		return this._level;
 	}
 
 	log(level, message, ...extra) {
+		if (level < this._level) {
+			return;
+		}
+
 		let time = (new Date()).toISOString();
 		switch (level) {
 			case ELEVEL_CRITICAL:
