@@ -1,21 +1,6 @@
 {
-	"paths": {
-		"input": "./input",
-		"output": "./output",
-		"cache": "./cache"
-	},
-	"color": {
-		"format": "",
-		"matrix": "",
-		"tc": "",
-		"primaries": "",
-		"range": ""
-	},
-	"resolutions": [
-		"3840x2160",
-		"2560x1440",
-		"1920x1080",
-		"1280x720"
+	"inputs": [
+		"input"
 	],
 	"bitrates": [
 		16000,
@@ -24,84 +9,36 @@
 		3500
 	],
 	"kfintervals": [
-		10.0,
-		5.0,
-		2.0,
-		1.0
+		2.0
 	],
-	"encoders": {
-		"libx264": {
+	"over_penalty": 0.025,
+	"vmaf": {
+		"model": "version=vmaf_4k_v0.6.1",
+		"threads": 4
+	},
+	"encoders": [
+		{
 			"enabled": true,
-			"pool": "cpu",
-			"cost_scale": 100.0,
-			"threads": 8,
-			"presets": [
-				"veryfast",
-				"faster",
-				"fast",
-				"medium",
-				"slow",
-				"slower",
-				"veryslow"
-			],
-			"tunes": [
-				null,
-				"film",
-				"animation"
-			],
-			"scenecut": [
-				false
-			]
-		},
-		"h264_nvenc": {
-			"enabled": true,
-			"pool": "nvenc",
-			"parallel": 2,
-			"gpu": -1,
+			"encoder": "nvenc",
+			"codec": "h264",
 			"options": {
-				"preset": [
-					"p7"
-				],
-				"tune": [
-					"hq"
-				],
-				"rc-lookahead": [
-					32,
-					16,
-					8,
-					0
-				],
-				"scenecut": [
-					0,
-					1
-				],
-				"bf": [
-					null,
-					0,
-					1,
-					2,
-					3,
-					4
-				],
-				"b_ref_mode": [
-					null,
-					"none",
-					"middle"
-				],
-				"b_adapt": [
-					null,
-					0,
-					1
-				],
-				"spatial-aq": [
-					null,
-					0,
-					1
-				],
-				"aq-strength": [
-
-				]
+				"preset": ["p7"],
+				"tune": ["hq"],
+				"rc-lookahead": [32, 16, 8, 0],
+				"bf": [null, 0, 1, 2, 3, 4],
+				"b_ref_mode": [null, "none", "middle"],
+				"spatial-aq": [null, 0, 1],
+				"aq-strength": []
+			}
+		},
+		{
+			"enabled": true,
+			"encoder": "libx264",
+			"options": {
+				"preset": ["veryfast", "fast", "medium", "slow", "veryslow"],
+				"tune": [null, "film", "animation"],
+				"threads": [8]
 			}
 		}
-	}
+	]
 }

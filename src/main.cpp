@@ -1,36 +1,141 @@
 // Sweep encoder option combinations: for each one, encode in-process, decode back and score every
 // frame with VMAF, then report which configurations are the best in at least 95% of frames.
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <numeric>
+#include <optional>
 #include <sstream>
 #include <string>
+#include <tuple>
 
 #include "encoder.h"
+#include "json.h"
 #include "source.h"
 #include "vmaf.h"
 
-static constexpr double BEST_FRAME_SHARE = 0.95;
+namespace fs = std::filesystem;
 
-struct Run {
-	int64_t bitrate;        // target, kbps
-	std::string label;      // option set
-	double kbps = 0;        // actual
-	std::vector<double> scores; // per frame, display order
-	double penalty = 0;     // VMAF points deducted for exceeding the target bitrate
-	double best_share = 0;  // share of frames where this run is at least as good as every other run of its bitrate group
-};
+static constexpr double BEST_FRAME_SHARE = 0.95;
 
 // Running under a CBR target is the encoder's own loss, so only overshoot is penalized.
 // Default slope: the 3000 -> 6000 kbps sweep gains roughly 2.5 VMAF over +100%, i.e. ~0.025 per percent.
 static double over_penalty = 0.025; // VMAF points per percent over target
+
+struct Axis { // one swept option; a missing value (JSON null) leaves the option unset
+	std::string key;
+	std::vector<std::optional<std::string>> values;
+};
+
+struct Job {
+	std::string encoder, codec = "h264";
+	std::vector<Axis> axes;
+};
+
+struct Config {
+	std::vector<std::string> inputs;
+	std::vector<int64_t> bitrates;   // kbps
+	std::vector<double> kfs{2.0};    // key frame intervals, seconds
+	VmafOptions vo;
+	std::vector<Job> jobs;
+};
+
+struct Run {
+	std::string input, label;
+	int64_t bitrate;        // target, kbps
+	double kf;
+	double kbps = 0;        // actual
+	std::vector<double> scores; // per frame, display order
+	double penalty = 0;     // VMAF points deducted for exceeding the target bitrate
+	double best_share = 0;  // share of frames where this run is at least as good as every other run of its group
+};
 
 static std::vector<std::string> split(const std::string& s) {
 	std::vector<std::string> out;
 	std::stringstream ss(s);
 	for (std::string t; std::getline(ss, t, ',');) out.push_back(t);
 	return out;
+}
+
+static std::vector<Options> expand(const Job& j) {
+	std::vector<Options> combos(1);
+	for (auto& ax : j.axes) {
+		if (ax.values.empty()) continue;
+		std::vector<Options> next;
+		for (auto& c : combos) for (auto& v : ax.values) { Options n = c; if (v) n[ax.key] = *v; next.push_back(n); }
+		combos = std::move(next);
+	}
+	return combos;
+}
+
+static void add_inputs(Config& cfg, const std::string& path) {
+	if (!fs::exists(path)) throw std::runtime_error("input '" + path + "' does not exist");
+	if (!fs::is_directory(path)) { cfg.inputs.push_back(path); return; }
+	std::vector<std::string> found;
+	for (auto& e : fs::directory_iterator(path)) {
+		std::string ext = e.path().extension().string();
+		if (ext == ".mkv" || ext == ".mp4" || ext == ".mov") found.push_back(e.path().string());
+	}
+	std::sort(found.begin(), found.end());
+	cfg.inputs.insert(cfg.inputs.end(), found.begin(), found.end());
+}
+
+static void load_config(const std::string& path, Config& cfg) {
+	std::ifstream f(path);
+	if (!f) throw std::runtime_error("cannot read '" + path + "'");
+	std::stringstream ss; ss << f.rdbuf();
+	Json root = Json::parse(ss.str());
+
+	auto list = [&](const char* k, auto fn) {
+		if (auto* v = root.find(k)) { if (v->type != Json::Arr) throw std::runtime_error(std::string("'") + k + "' must be an array"); for (auto& e : v->a) fn(e); }
+	};
+	list("inputs", [&](const Json& e) { add_inputs(cfg, e.text()); });
+	list("bitrates", [&](const Json& e) { cfg.bitrates.push_back(atoll(e.text().c_str())); });
+	if (root.find("kfintervals")) { cfg.kfs.clear(); list("kfintervals", [&](const Json& e) { cfg.kfs.push_back(atof(e.text().c_str())); }); }
+	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str());
+	if (auto* v = root.find("vmaf")) {
+		if (auto* m = v->find("model")) cfg.vo.model = m->text();
+		if (auto* t = v->find("threads")) cfg.vo.threads = atoi(t->text().c_str());
+	}
+	list("encoders", [&](const Json& e) {
+		if (auto* en = e.find("enabled"); en && en->text() == "0") return;
+		Job j;
+		auto* name = e.find("encoder");
+		if (!name) throw std::runtime_error("encoder entry without 'encoder'");
+		j.encoder = name->text();
+		if (auto* c = e.find("codec")) j.codec = c->text();
+		if (auto* o = e.find("options")) for (auto& [k, v] : o->o) {
+			Axis ax{k, {}};
+			if (v.type == Json::Arr) { for (auto& x : v.a) ax.values.push_back(x.type == Json::Null ? std::nullopt : std::optional(x.text())); }
+			else ax.values.push_back(v.type == Json::Null ? std::nullopt : std::optional(v.text()));
+			j.axes.push_back(std::move(ax));
+		}
+		cfg.jobs.push_back(std::move(j));
+	});
+}
+
+// Legacy one-liner: ves <input> <encoder> <codec> <kbps[,..]> [key=a,b ...]
+static bool parse_cli(int argc, char** argv, Config& cfg) {
+	add_inputs(cfg, argv[1]);
+	Job j;
+	j.encoder = argv[2]; j.codec = argv[3];
+	for (auto& b : split(argv[4])) cfg.bitrates.push_back(atoll(b.c_str()));
+	for (int i = 5; i < argc; i++) {
+		std::string a = argv[i];
+		size_t eq = a.find('=');
+		if (eq == std::string::npos) { fprintf(stderr, "bad option '%s', expected key=value\n", argv[i]); return false; }
+		std::string k = a.substr(0, eq), v = a.substr(eq + 1);
+		if (k == "vmaf.model") cfg.vo.model = v;
+		else if (k == "vmaf.threads") cfg.vo.threads = atoi(v.c_str());
+		else if (k == "over.penalty") over_penalty = atof(v.c_str());
+		else if (k == "kf") { cfg.kfs.clear(); for (auto& x : split(v)) cfg.kfs.push_back(atof(x.c_str())); }
+		else { Axis ax{k, {}}; for (auto& x : split(v)) ax.values.push_back(x); j.axes.push_back(std::move(ax)); }
+	}
+	cfg.jobs.push_back(std::move(j));
+	return true;
 }
 
 static bool codec_id(const std::string& encoder, const std::string& codec, AVCodecID& id) {
@@ -43,12 +148,12 @@ static bool codec_id(const std::string& encoder, const std::string& codec, AVCod
 	return id != AV_CODEC_ID_NONE;
 }
 
-static bool run_one(const std::string& input, const std::string& encoder, AVCodecID id, Params p, const VmafOptions& vo, Run& out) {
+static bool run_one(const std::string& input, const std::string& encoder, AVCodecID id, Params p, double kf, const VmafOptions& vo, Run& out) {
 	Source src;
 	if (!src.open(input)) return false;
 	p.width = src.width; p.height = src.height;
 	p.framerate = src.framerate;
-	p.gop = (int)(av_q2d(p.framerate) * 2);
+	p.gop = std::max(1, (int)std::lround(kf * av_q2d(p.framerate)));
 
 	std::vector<std::vector<uint8_t>> packets;
 	auto enc = make_encoder(encoder);
@@ -73,63 +178,54 @@ static bool run_one(const std::string& input, const std::string& encoder, AVCode
 }
 
 int main(int argc, char** argv) {
-	if (argc < 5) {
-		fprintf(stderr, "usage: ves <input> <encoder> <codec> <bitrate-kbps[,..]> [key=value[,value..] ...]\n"
-		                "  encoder: nvenc | any libavcodec encoder name (codec is ignored for the latter)\n"
-		                "  comma separated values are swept; every combination is tested\n"
-		                "  vmaf.model=<spec> and vmaf.threads=<n> configure scoring, over.penalty=<vmaf points per %% over target>,\n"
-		                "  other keys go to the encoder\n");
-		return 1;
-	}
-	std::string input = argv[1], encoder = argv[2];
-	Params base;
-	VmafOptions vo;
-	base.codec = argv[3];
-	std::vector<std::string> bitrates = split(argv[4]);
-
-	std::vector<Options> combos(1);
-	for (int i = 5; i < argc; i++) {
-		std::string a = argv[i];
-		size_t eq = a.find('=');
-		if (eq == std::string::npos) { fprintf(stderr, "bad option '%s', expected key=value\n", argv[i]); return 1; }
-		std::string k = a.substr(0, eq), v = a.substr(eq + 1);
-		if (k == "vmaf.model") { vo.model = v; continue; }
-		if (k == "vmaf.threads") { vo.threads = atoi(v.c_str()); continue; }
-		if (k == "over.penalty") { over_penalty = atof(v.c_str()); continue; }
-		std::vector<Options> next;
-		for (auto& c : combos) for (auto& val : split(v)) { Options n = c; n[k] = val; next.push_back(n); }
-		combos = std::move(next);
-	}
-	AVCodecID id;
-	if (!codec_id(encoder, base.codec, id)) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", encoder.c_str(), base.codec.c_str()); return 1; }
+	Config cfg;
+	try {
+		if (argc >= 5) { if (!parse_cli(argc, argv, cfg)) return 1; }
+		// (config errors, including missing inputs, throw and are reported below)
+		else if (argc <= 2) load_config(argc == 2 ? argv[1] : "config.json", cfg);
+		else {
+			fprintf(stderr, "usage: ves [config.json]\n"
+			                "       ves <input> <encoder> <codec> <bitrate-kbps[,..]> [key=value[,value..] ...]\n"
+			                "  encoder: nvenc | any libavcodec encoder name (codec is ignored for the latter)\n"
+			                "  comma separated values are swept; every combination is tested\n"
+			                "  kf=<seconds>, vmaf.model=<spec>, vmaf.threads=<n>, over.penalty=<vmaf points per %% over target>;\n"
+			                "  other keys go to the encoder\n");
+			return 1;
+		}
+	} catch (const std::exception& e) { fprintf(stderr, "config: %s\n", e.what()); return 1; }
+	if (cfg.inputs.empty() || cfg.bitrates.empty() || cfg.jobs.empty()) { fprintf(stderr, "config needs inputs, bitrates and at least one enabled encoder\n"); return 1; }
 
 	std::vector<Run> runs;
 	int failed = 0;
-	for (auto& br : bitrates) {
-		for (auto& c : combos) {
+	for (auto& input : cfg.inputs) for (auto& job : cfg.jobs) {
+		AVCodecID id;
+		if (!codec_id(job.encoder, job.codec, id)) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", job.encoder.c_str(), job.codec.c_str()); failed++; continue; }
+		for (int64_t br : cfg.bitrates) for (double kf : cfg.kfs) for (auto& opts : expand(job)) {
 			Run r;
-			r.bitrate = atoll(br.c_str());
-			for (auto& [k, v] : c) r.label += (r.label.empty() ? "" : " ") + k + "=" + v;
-			Params p = base;
-			p.bitrate = r.bitrate * 1000;
-			p.options = c;
-			if (!run_one(input, encoder, id, p, vo, r)) { fprintf(stderr, "[%lld kbps] %s: FAILED\n", (long long)r.bitrate, r.label.c_str()); failed++; continue; }
-			r.penalty = std::max(0.0, r.kbps / r.bitrate - 1) * 100 * over_penalty;
+			r.input = input; r.bitrate = br; r.kf = kf;
+			r.label = job.encoder == "nvenc" ? job.encoder + "/" + job.codec : job.encoder;
+			for (auto& [k, v] : opts) r.label += " " + k + "=" + v;
+			Params p;
+			p.codec = job.codec; p.bitrate = br * 1000; p.options = opts;
+			if (!run_one(input, job.encoder, id, p, kf, cfg.vo, r)) { fprintf(stderr, "[%s %lld kbps kf %.1f] %s: FAILED\n", input.c_str(), (long long)br, kf, r.label.c_str()); failed++; continue; }
+			r.penalty = std::max(0.0, r.kbps / br - 1) * 100 * over_penalty;
 			std::vector<double> s = r.scores;
 			std::sort(s.begin(), s.end());
-			printf("[%lld kbps] %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f\n", (long long)r.bitrate, r.label.c_str(), r.kbps,
+			printf("[%s %lld kbps kf %.1f] %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f\n", input.c_str(), (long long)br, kf, r.label.c_str(), r.kbps,
 			       std::accumulate(s.begin(), s.end(), 0.0) / s.size(), s.front(), s[(size_t)(s.size() * 0.05)]);
 			fflush(stdout);
 			runs.push_back(std::move(r));
 		}
 	}
 
-	// Within each bitrate group, count the frames on which a run is at least as good as all others.
-	std::stable_sort(runs.begin(), runs.end(), [](const Run& a, const Run& b) { return a.bitrate > b.bitrate; });
+	// A group is every run that shares input, bitrate target and key frame interval.
+	auto key = [](const Run& r) { return std::make_tuple(r.input, -r.bitrate, r.kf); };
+	std::stable_sort(runs.begin(), runs.end(), [&](const Run& a, const Run& b) { return key(a) < key(b); });
 	for (size_t g = 0; g < runs.size();) {
 		size_t e = g;
-		while (e < runs.size() && runs[e].bitrate == runs[g].bitrate) e++;
+		while (e < runs.size() && key(runs[e]) == key(runs[g])) e++;
 		size_t frames = runs[g].scores.size();
+		// Count the frames on which a run is at least as good as all others (after the overshoot penalty).
 		for (size_t i = g; i < e; i++) {
 			size_t best = 0;
 			for (size_t f = 0; f < frames; f++) {
@@ -140,7 +236,7 @@ int main(int argc, char** argv) {
 			runs[i].best_share = (double)best / frames;
 		}
 		std::sort(runs.begin() + g, runs.begin() + e, [](const Run& a, const Run& b) { return a.best_share > b.best_share; });
-		printf("\n== %lld kbps: best in >= %.0f%% of frames ==\n", (long long)runs[g].bitrate, BEST_FRAME_SHARE * 100);
+		printf("\n== %s, %lld kbps, kf %.1f: best in >= %.0f%% of frames ==\n", runs[g].input.c_str(), (long long)runs[g].bitrate, runs[g].kf, BEST_FRAME_SHARE * 100);
 		bool any = false;
 		for (size_t i = g; i < e; i++) {
 			bool win = runs[i].best_share >= BEST_FRAME_SHARE;
