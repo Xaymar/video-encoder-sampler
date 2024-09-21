@@ -149,8 +149,8 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 }
 
 static bool codec_id(const std::string& encoder, const std::string& codec, AVCodecID& id) {
-	if (encoder == "x264" || encoder == "x265") {
-		id = encoder == "x264" ? AV_CODEC_ID_H264 : AV_CODEC_ID_HEVC;
+	if (encoder == "x264" || encoder == "x265" || encoder == "svtav1") {
+		id = encoder == "x264" ? AV_CODEC_ID_H264 : encoder == "x265" ? AV_CODEC_ID_HEVC : AV_CODEC_ID_AV1;
 	} else if (is_native_encoder(encoder)) {
 		id = codec == "h264" ? AV_CODEC_ID_H264 : codec == "hevc" ? AV_CODEC_ID_HEVC : codec == "av1" ? AV_CODEC_ID_AV1 : AV_CODEC_ID_NONE;
 	} else {
