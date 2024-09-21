@@ -1,0 +1,99 @@
+// Native x265 backend: drives libx265 directly, no libavcodec in between.
+// Options are x265's own long option names (bframes, rc-lookahead, ctu, ...) applied with
+// param_parse, so everything the x265 CLI accepts can be swept. "preset", "tune" and "profile"
+// are handled up front. Rate control is ABR at the target bitrate unless vbv-maxrate/vbv-bufsize are given.
+#include "encoder.h"
+
+#include <cstdio>
+
+extern "C" {
+#include <x265.h>
+}
+
+namespace {
+
+class X265 : public Encoder {
+	const x265_api* api = nullptr;
+	x265_param* par = nullptr;
+	x265_encoder* h = nullptr;
+	x265_picture *in = nullptr, *out = nullptr;
+	Sink sink;
+
+	void emit(x265_nal* nal, uint32_t n) {
+		size_t bytes = 0;
+		for (uint32_t i = 0; i < n; i++) bytes += nal[i].sizeBytes;
+		stats.packets++; stats.bytes += bytes;
+		// NAL payloads are contiguous, so the first one points at the whole access unit.
+		if (sink) sink(nal[0].payload, bytes, out->pts, IS_X265_TYPE_I(out->sliceType));
+	}
+
+public:
+	~X265() override {
+		if (h) api->encoder_close(h);
+		if (in) api->picture_free(in);
+		if (out) api->picture_free(out);
+		if (par) api->param_free(par);
+	}
+
+	bool open(const Params& p, Sink s) override {
+		sink = std::move(s);
+		api = x265_api_get(8);
+		if (!api) { fprintf(stderr, "x265: no 8-bit encoder available\n"); return false; }
+		Options o = p.options;
+		auto take = [&](const char* k, std::string& v) {
+			auto it = o.find(k);
+			if (it == o.end()) return false;
+			v = it->second; o.erase(it); return true;
+		};
+		std::string preset = "medium", tune, profile;
+		take("preset", preset); take("tune", tune); take("profile", profile);
+
+		par = api->param_alloc();
+		if (api->param_default_preset(par, preset.c_str(), tune.empty() ? nullptr : tune.c_str()) < 0) {
+			fprintf(stderr, "x265: bad preset '%s' or tune '%s'\n", preset.c_str(), tune.c_str());
+			return false;
+		}
+		par->sourceWidth = p.width; par->sourceHeight = p.height;
+		par->internalCsp = X265_CSP_I420;
+		par->fpsNum = p.framerate.num; par->fpsDenom = p.framerate.den;
+		par->keyframeMax = p.gop;
+		par->bRepeatHeaders = 1; // parameter sets in-band so the stream decodes on its own
+		par->rc.rateControlMode = X265_RC_ABR;
+		par->rc.bitrate = (int)(p.bitrate / 1000);
+		par->logLevel = X265_LOG_WARNING;
+		for (auto& [k, v] : o) {
+			if (api->param_parse(par, k.c_str(), v.c_str()) != 0) { fprintf(stderr, "x265: bad option %s=%s\n", k.c_str(), v.c_str()); return false; }
+		}
+		if (!profile.empty() && api->param_apply_profile(par, profile.c_str()) < 0) { fprintf(stderr, "x265: bad profile '%s'\n", profile.c_str()); return false; }
+		if (!(h = api->encoder_open(par))) { fprintf(stderr, "x265: encoder open failed\n"); return false; }
+		in = api->picture_alloc(); out = api->picture_alloc();
+		api->picture_init(par, in); api->picture_init(par, out);
+		return true;
+	}
+
+	bool encode(const AVFrame* fr) override {
+		x265_nal* nal;
+		uint32_t n = 0;
+		if (fr) {
+			if (fr->format != AV_PIX_FMT_YUV420P) { fprintf(stderr, "x265: input must be yuv420p\n"); return false; }
+			in->colorSpace = X265_CSP_I420;
+			in->bitDepth = 8;
+			for (int i = 0; i < 3; i++) { in->planes[i] = fr->data[i]; in->stride[i] = fr->linesize[i]; }
+			in->pts = fr->pts;
+			int r = api->encoder_encode(h, &nal, &n, in, out);
+			if (r < 0) return false;
+			if (r > 0) emit(nal, n);
+			return true;
+		}
+		for (;;) { // flush
+			int r = api->encoder_encode(h, &nal, &n, nullptr, out);
+			if (r < 0) return false;
+			if (r == 0) return true;
+			emit(nal, n);
+		}
+	}
+};
+
+} // namespace
+
+std::unique_ptr<Encoder> make_encoder_x265() { return std::make_unique<X265>(); }
