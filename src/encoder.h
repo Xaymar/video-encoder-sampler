@@ -35,11 +35,13 @@ public:
 	Stats stats;
 };
 
-// "nvenc" selects the native NVENC backend, anything else is a libavcodec encoder name.
-std::unique_ptr<Encoder> make_encoder(const std::string& name);
+// "nvenc" and "amf" select the native backends, anything else is a libavcodec encoder name.
 std::unique_ptr<Encoder> make_encoder_nvenc();
+std::unique_ptr<Encoder> make_encoder_amf();
 std::unique_ptr<Encoder> make_encoder_libav(const std::string& name);
 
+inline bool is_native_encoder(const std::string& name) { return name == "nvenc" || name == "amf"; }
+
 inline std::unique_ptr<Encoder> make_encoder(const std::string& name) {
-	return name == "nvenc" ? make_encoder_nvenc() : make_encoder_libav(name);
+	return name == "nvenc" ? make_encoder_nvenc() : name == "amf" ? make_encoder_amf() : make_encoder_libav(name);
 }

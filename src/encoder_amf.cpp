@@ -1,0 +1,180 @@
+// Native AMD AMF backend: talks to amfrt64.dll directly (loaded at runtime), no libavcodec.
+// Encoder options are raw AMF property names (e.g. QualityPreset, BPicturesPattern for H.264,
+// HevcQualityPreset for HEVC) so every property AMF exposes can be swept. Enums are numeric.
+#include "encoder.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <thread>
+
+#include <d3d11.h>
+#include <dxgi.h>
+#include <wrl/client.h>
+
+#include <components/VideoEncoderAV1.h>
+#include <components/VideoEncoderHEVC.h>
+#include <components/VideoEncoderVCE.h>
+#include <core/Factory.h>
+
+extern "C" {
+#include <libswscale/swscale.h>
+}
+
+using Microsoft::WRL::ComPtr;
+
+namespace {
+
+struct Names { // property names differ per codec
+	const wchar_t *component, *usage, *target, *peak, *size, *rate, *rc, *gop;
+	int64_t usage_transcoding, rc_cbr;
+};
+
+const Names H264 = {AMFVideoEncoderVCE_AVC, AMF_VIDEO_ENCODER_USAGE, AMF_VIDEO_ENCODER_TARGET_BITRATE, AMF_VIDEO_ENCODER_PEAK_BITRATE,
+	AMF_VIDEO_ENCODER_FRAMESIZE, AMF_VIDEO_ENCODER_FRAMERATE, AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD, AMF_VIDEO_ENCODER_IDR_PERIOD,
+	AMF_VIDEO_ENCODER_USAGE_TRANSCODING, AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR};
+const Names HEVC = {AMFVideoEncoder_HEVC, AMF_VIDEO_ENCODER_HEVC_USAGE, AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE,
+	AMF_VIDEO_ENCODER_HEVC_FRAMESIZE, AMF_VIDEO_ENCODER_HEVC_FRAMERATE, AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD, AMF_VIDEO_ENCODER_HEVC_GOP_SIZE,
+	AMF_VIDEO_ENCODER_HEVC_USAGE_TRANSCODING, AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR};
+const Names AV1 = {AMFVideoEncoder_AV1, AMF_VIDEO_ENCODER_AV1_USAGE, AMF_VIDEO_ENCODER_AV1_TARGET_BITRATE, AMF_VIDEO_ENCODER_AV1_PEAK_BITRATE,
+	AMF_VIDEO_ENCODER_AV1_FRAMESIZE, AMF_VIDEO_ENCODER_AV1_FRAMERATE, AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD, AMF_VIDEO_ENCODER_AV1_GOP_SIZE,
+	AMF_VIDEO_ENCODER_AV1_USAGE_TRANSCODING, AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD_CBR};
+
+std::wstring wide(const std::string& s) { return std::wstring(s.begin(), s.end()); } // property names are ASCII
+
+class Amf : public Encoder {
+	HMODULE dll = nullptr;
+	amf::AMFFactory* factory = nullptr;
+	ComPtr<ID3D11Device> device;
+	amf::AMFContextPtr ctx;
+	amf::AMFComponentPtr enc;
+	SwsContext* sws = nullptr;
+	Sink sink;
+	int w = 0, h = 0;
+	bool eof = false;
+
+	bool fail(AMF_RESULT r, const char* what) {
+		fprintf(stderr, "amf: %s failed (result %d)\n", what, (int)r);
+		return false;
+	}
+
+	// Set a property from text, converting by the type AMF reports for it.
+	bool set(const std::string& key, const std::string& val) {
+		std::wstring k = wide(key);
+		const amf::AMFPropertyInfo* info = nullptr;
+		if (enc->GetPropertyInfo(k.c_str(), &info) != AMF_OK || !info) { fprintf(stderr, "amf: unknown property '%s'\n", key.c_str()); return false; }
+		amf::AMFVariant v;
+		switch (info->type) {
+		case amf::AMF_VARIANT_BOOL: v = (val == "1" || val == "true"); break;
+		case amf::AMF_VARIANT_INT64: v = (amf_int64)strtoll(val.c_str(), nullptr, 10); break;
+		case amf::AMF_VARIANT_DOUBLE: v = strtod(val.c_str(), nullptr); break;
+		case amf::AMF_VARIANT_RATE: { unsigned n = 0, d = 1; sscanf(val.c_str(), "%u/%u", &n, &d); v = AMFConstructRate(n, d); break; }
+		case amf::AMF_VARIANT_SIZE: { int a = 0, b = 0; sscanf(val.c_str(), "%dx%d", &a, &b); v = AMFConstructSize(a, b); break; }
+		default: fprintf(stderr, "amf: property '%s' has an unsupported type\n", key.c_str()); return false;
+		}
+		AMF_RESULT r = enc->SetProperty(k.c_str(), v);
+		if (r != AMF_OK) { fprintf(stderr, "amf: cannot set '%s' to '%s' (result %d)\n", key.c_str(), val.c_str(), (int)r); return false; }
+		return true;
+	}
+
+	bool poll() { // collect whatever the encoder has finished
+		for (;;) {
+			amf::AMFDataPtr data;
+			AMF_RESULT r = enc->QueryOutput(&data);
+			if (r == AMF_EOF) { eof = true; return true; }
+			if (r != AMF_OK || !data) return true; // AMF_REPEAT: nothing ready yet
+			amf::AMFBufferPtr buf(data);
+			stats.packets++; stats.bytes += buf->GetSize();
+			if (sink) sink((const uint8_t*)buf->GetNative(), buf->GetSize(), data->GetPts(), false);
+		}
+	}
+
+public:
+	~Amf() override {
+		if (enc) enc->Terminate();
+		enc = nullptr;
+		if (ctx) ctx->Terminate();
+		ctx = nullptr;
+		device.Reset();
+		sws_freeContext(sws);
+		// shortcut: amfrt64.dll stays loaded; unloading it while AMF's worker threads wind down has been unreliable
+	}
+
+	bool open(const Params& p, Sink s) override {
+		sink = std::move(s);
+		w = p.width; h = p.height;
+		const Names* n = p.codec == "h264" ? &H264 : p.codec == "hevc" ? &HEVC : p.codec == "av1" ? &AV1 : nullptr;
+		if (!n) { fprintf(stderr, "amf: unknown codec '%s'\n", p.codec.c_str()); return false; }
+		Options o = p.options;
+		int gpu = 0;
+		if (auto it = o.find("gpu"); it != o.end()) { gpu = atoi(it->second.c_str()); o.erase(it); }
+
+		dll = LoadLibraryW(AMF_DLL_NAME);
+		auto init = dll ? (AMFInit_Fn)GetProcAddress(dll, AMF_INIT_FUNCTION_NAME) : nullptr;
+		if (!init) { fprintf(stderr, "amf: amfrt64.dll not found\n"); return false; }
+		AMF_RESULT r = init(AMF_FULL_VERSION, &factory);
+		if (r != AMF_OK) return fail(r, "AMFInit");
+
+		// AMF needs a D3D11 device on an AMD adapter; with several GPUs installed the default adapter is not necessarily one.
+		ComPtr<IDXGIFactory1> dxgi;
+		CreateDXGIFactory1(IID_PPV_ARGS(&dxgi));
+		ComPtr<IDXGIAdapter1> adapter;
+		int seen = 0;
+		for (UINT i = 0; dxgi && dxgi->EnumAdapters1(i, &adapter) == S_OK; i++, adapter.Reset()) {
+			DXGI_ADAPTER_DESC1 d;
+			adapter->GetDesc1(&d);
+			if (d.VendorId == 0x1002 && seen++ == gpu) break;
+		}
+		if (!adapter) { fprintf(stderr, "amf: no AMD adapter with index %d\n", gpu); return false; }
+		if (FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, nullptr))) {
+			fprintf(stderr, "amf: cannot create D3D11 device on the AMD adapter\n");
+			return false;
+		}
+		if ((r = factory->CreateContext(&ctx)) != AMF_OK) return fail(r, "CreateContext");
+		if ((r = ctx->InitDX11(device.Get())) != AMF_OK) return fail(r, "InitDX11");
+		if ((r = factory->CreateComponent(ctx, n->component, &enc)) != AMF_OK) return fail(r, "CreateComponent");
+
+		enc->SetProperty(n->usage, n->usage_transcoding);
+		enc->SetProperty(n->rc, n->rc_cbr);
+		enc->SetProperty(n->target, (amf_int64)p.bitrate);
+		enc->SetProperty(n->peak, (amf_int64)p.bitrate);
+		enc->SetProperty(n->size, AMFConstructSize(w, h));
+		enc->SetProperty(n->rate, AMFConstructRate(p.framerate.num, p.framerate.den));
+		enc->SetProperty(n->gop, (amf_int64)p.gop);
+		for (auto& [k, v] : o) if (!set(k, v)) return false;
+
+		if ((r = enc->Init(amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init");
+		return true;
+	}
+
+	bool encode(const AVFrame* fr) override {
+		AMF_RESULT r;
+		if (!fr) { // flush
+			if ((r = enc->Drain()) != AMF_OK) return fail(r, "Drain");
+			for (int i = 0; !eof && i < 20000; i++) { poll(); if (!eof) std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+			return eof;
+		}
+		amf::AMFSurfacePtr surf;
+		if ((r = ctx->AllocSurface(amf::AMF_MEMORY_HOST, amf::AMF_SURFACE_NV12, w, h, &surf)) != AMF_OK) return fail(r, "AllocSurface");
+		amf::AMFPlane *y = surf->GetPlaneAt(0), *uv = surf->GetPlaneAt(1);
+		if (!sws) sws = sws_getContext(fr->width, fr->height, (AVPixelFormat)fr->format, w, h, AV_PIX_FMT_NV12, SWS_BICUBIC, nullptr, nullptr, nullptr);
+		uint8_t* dst[4] = {(uint8_t*)y->GetNative(), (uint8_t*)uv->GetNative(), nullptr, nullptr};
+		int stride[4] = {y->GetHPitch(), uv->GetHPitch(), 0, 0};
+		sws_scale(sws, fr->data, fr->linesize, 0, fr->height, dst, stride);
+		surf->SetPts(fr->pts);
+		if ((r = surf->Convert(amf::AMF_MEMORY_DX11)) != AMF_OK) return fail(r, "Convert");
+
+		for (;;) {
+			r = enc->SubmitInput(surf);
+			if (r != AMF_INPUT_FULL) break;
+			poll();
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		if (r != AMF_OK) return fail(r, "SubmitInput");
+		return poll();
+	}
+};
+
+} // namespace
+
+std::unique_ptr<Encoder> make_encoder_amf() { return std::make_unique<Amf>(); }

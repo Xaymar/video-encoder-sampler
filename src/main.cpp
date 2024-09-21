@@ -1,15 +1,19 @@
 // Sweep encoder option combinations: for each one, encode in-process, decode back and score every
 // frame with VMAF, then report which configurations are the best in at least 95% of frames.
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <tuple>
 
 #include "encoder.h"
@@ -32,6 +36,8 @@ struct Axis { // one swept option; a missing value (JSON null) leaves the option
 
 struct Job {
 	std::string encoder, codec = "h264";
+	std::string pool;  // runs in one pool share a device; at most `parallel` of them run at once
+	int parallel = 0;  // 0: default for the pool (NVENC 2, everything else 1 since CPU encoders use every core)
 	std::vector<Axis> axes;
 };
 
@@ -107,6 +113,8 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (!name) throw std::runtime_error("encoder entry without 'encoder'");
 		j.encoder = name->text();
 		if (auto* c = e.find("codec")) j.codec = c->text();
+		if (auto* p = e.find("pool")) j.pool = p->text();
+		if (auto* p = e.find("parallel")) j.parallel = atoi(p->text().c_str());
 		if (auto* o = e.find("options")) for (auto& [k, v] : o->o) {
 			Axis ax{k, {}};
 			if (v.type == Json::Arr) { for (auto& x : v.a) ax.values.push_back(x.type == Json::Null ? std::nullopt : std::optional(x.text())); }
@@ -131,6 +139,8 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 		if (k == "vmaf.model") cfg.vo.model = v;
 		else if (k == "vmaf.threads") cfg.vo.threads = atoi(v.c_str());
 		else if (k == "over.penalty") over_penalty = atof(v.c_str());
+		else if (k == "pool") j.pool = v;
+		else if (k == "parallel") j.parallel = atoi(v.c_str());
 		else if (k == "kf") { cfg.kfs.clear(); for (auto& x : split(v)) cfg.kfs.push_back(atof(x.c_str())); }
 		else { Axis ax{k, {}}; for (auto& x : split(v)) ax.values.push_back(x); j.axes.push_back(std::move(ax)); }
 	}
@@ -139,7 +149,7 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 }
 
 static bool codec_id(const std::string& encoder, const std::string& codec, AVCodecID& id) {
-	if (encoder == "nvenc") {
+	if (is_native_encoder(encoder)) {
 		id = codec == "h264" ? AV_CODEC_ID_H264 : codec == "hevc" ? AV_CODEC_ID_HEVC : codec == "av1" ? AV_CODEC_ID_AV1 : AV_CODEC_ID_NONE;
 	} else {
 		const AVCodec* c = avcodec_find_encoder_by_name(encoder.c_str());
@@ -195,28 +205,62 @@ int main(int argc, char** argv) {
 	} catch (const std::exception& e) { fprintf(stderr, "config: %s\n", e.what()); return 1; }
 	if (cfg.inputs.empty() || cfg.bitrates.empty() || cfg.jobs.empty()) { fprintf(stderr, "config needs inputs, bitrates and at least one enabled encoder\n"); return 1; }
 
-	std::vector<Run> runs;
+	struct Task {
+		Run r;
+		const Job* job;
+		AVCodecID id;
+		Params p;
+		bool ok = false;
+	};
+	struct Pool {
+		std::vector<size_t> tasks;
+		std::atomic<size_t> next{0};
+		int parallel = 1;
+	};
+	std::vector<Task> tasks;
+	std::map<std::string, Pool> pools;
 	int failed = 0;
 	for (auto& input : cfg.inputs) for (auto& job : cfg.jobs) {
 		AVCodecID id;
 		if (!codec_id(job.encoder, job.codec, id)) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", job.encoder.c_str(), job.codec.c_str()); failed++; continue; }
+		std::string pool = job.pool.empty() ? (is_native_encoder(job.encoder) ? job.encoder : "cpu") : job.pool;
+		Pool& pl = pools[pool];
+		pl.parallel = std::max(pl.parallel, job.parallel ? job.parallel : (is_native_encoder(job.encoder) ? 2 : 1));
 		for (int64_t br : cfg.bitrates) for (double kf : cfg.kfs) for (auto& opts : expand(job)) {
-			Run r;
-			r.input = input; r.bitrate = br; r.kf = kf;
-			r.label = job.encoder == "nvenc" ? job.encoder + "/" + job.codec : job.encoder;
-			for (auto& [k, v] : opts) r.label += " " + k + "=" + v;
-			Params p;
-			p.codec = job.codec; p.bitrate = br * 1000; p.options = opts;
-			if (!run_one(input, job.encoder, id, p, kf, cfg.vo, r)) { fprintf(stderr, "[%s %lld kbps kf %.1f] %s: FAILED\n", input.c_str(), (long long)br, kf, r.label.c_str()); failed++; continue; }
-			r.penalty = std::max(0.0, r.kbps / br - 1) * 100 * over_penalty;
-			std::vector<double> s = r.scores;
-			std::sort(s.begin(), s.end());
-			printf("[%s %lld kbps kf %.1f] %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f\n", input.c_str(), (long long)br, kf, r.label.c_str(), r.kbps,
-			       std::accumulate(s.begin(), s.end(), 0.0) / s.size(), s.front(), s[(size_t)(s.size() * 0.05)]);
-			fflush(stdout);
-			runs.push_back(std::move(r));
+			Task t;
+			t.job = &job; t.id = id;
+			t.r.input = input; t.r.bitrate = br; t.r.kf = kf;
+			t.r.label = is_native_encoder(job.encoder) ? job.encoder + "/" + job.codec : job.encoder;
+			for (auto& [k, v] : opts) t.r.label += " " + k + "=" + v;
+			t.p.codec = job.codec; t.p.bitrate = br * 1000; t.p.options = opts;
+			pl.tasks.push_back(tasks.size());
+			tasks.push_back(std::move(t));
 		}
 	}
+
+	// Each pool gets `parallel` workers; pools run side by side. Concurrency only affects speed, never the scores.
+	std::mutex out_mutex;
+	std::vector<std::thread> workers;
+	for (auto& [name, pl] : pools) for (int w = 0; w < pl.parallel; w++) workers.emplace_back([&, pp = &pl] {
+		for (size_t n; (n = pp->next++) < pp->tasks.size();) {
+			Task& t = tasks[pp->tasks[n]];
+			Run& r = t.r;
+			t.ok = run_one(r.input, t.job->encoder, t.id, t.p, r.kf, cfg.vo, r);
+			std::lock_guard lock(out_mutex);
+			if (!t.ok) { fprintf(stderr, "[%s %lld kbps kf %.1f] %s: FAILED\n", r.input.c_str(), (long long)r.bitrate, r.kf, r.label.c_str()); continue; }
+			r.penalty = std::max(0.0, r.kbps / r.bitrate - 1) * 100 * over_penalty;
+			std::vector<double> s = r.scores;
+			std::sort(s.begin(), s.end());
+			printf("[%s %lld kbps kf %.1f] %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f\n", r.input.c_str(), (long long)r.bitrate, r.kf, r.label.c_str(), r.kbps,
+			       std::accumulate(s.begin(), s.end(), 0.0) / s.size(), s.front(), s[(size_t)(s.size() * 0.05)]);
+			fflush(stdout);
+		}
+	});
+	for (auto& w : workers) w.join();
+
+	// Collect in task order so the ranking below does not depend on which run finished first.
+	std::vector<Run> runs;
+	for (auto& t : tasks) { if (t.ok) runs.push_back(std::move(t.r)); else failed++; }
 
 	// A group is every run that shares input, bitrate target and key frame interval.
 	auto key = [](const Run& r) { return std::make_tuple(r.input, -r.bitrate, r.kf); };

@@ -13,9 +13,9 @@ foreach(l ${FF_LIBS})
 	list(APPEND FF_LINK ${FF_${l}})
 endforeach()
 
-add_executable(ves src/main.cpp src/source.cpp src/vmaf.cpp src/encoder_libav.cpp src/encoder_nvenc.cpp)
-target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include")
-target_link_libraries(ves PRIVATE ${FF_LINK})
+add_executable(ves src/main.cpp src/source.cpp src/vmaf.cpp src/encoder_libav.cpp src/encoder_nvenc.cpp src/encoder_amf.cpp)
+target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include" "${CMAKE_SOURCE_DIR}/third-party/amf-include")
+target_link_libraries(ves PRIVATE ${FF_LINK} d3d11 dxgi)
 
 # Runtime DLLs next to the executable.
 add_custom_command(TARGET ves POST_BUILD
