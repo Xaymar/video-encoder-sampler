@@ -149,7 +149,9 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 }
 
 static bool codec_id(const std::string& encoder, const std::string& codec, AVCodecID& id) {
-	if (is_native_encoder(encoder)) {
+	if (encoder == "x264") {
+		id = AV_CODEC_ID_H264;
+	} else if (is_native_encoder(encoder)) {
 		id = codec == "h264" ? AV_CODEC_ID_H264 : codec == "hevc" ? AV_CODEC_ID_HEVC : codec == "av1" ? AV_CODEC_ID_AV1 : AV_CODEC_ID_NONE;
 	} else {
 		const AVCodec* c = avcodec_find_encoder_by_name(encoder.c_str());
@@ -223,14 +225,14 @@ int main(int argc, char** argv) {
 	for (auto& input : cfg.inputs) for (auto& job : cfg.jobs) {
 		AVCodecID id;
 		if (!codec_id(job.encoder, job.codec, id)) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", job.encoder.c_str(), job.codec.c_str()); failed++; continue; }
-		std::string pool = job.pool.empty() ? (is_native_encoder(job.encoder) ? job.encoder : "cpu") : job.pool;
+		std::string pool = job.pool.empty() ? (is_gpu_encoder(job.encoder) ? job.encoder : "cpu") : job.pool;
 		Pool& pl = pools[pool];
-		pl.parallel = std::max(pl.parallel, job.parallel ? job.parallel : (is_native_encoder(job.encoder) ? 2 : 1));
+		pl.parallel = std::max(pl.parallel, job.parallel ? job.parallel : (is_gpu_encoder(job.encoder) ? 2 : 1));
 		for (int64_t br : cfg.bitrates) for (double kf : cfg.kfs) for (auto& opts : expand(job)) {
 			Task t;
 			t.job = &job; t.id = id;
 			t.r.input = input; t.r.bitrate = br; t.r.kf = kf;
-			t.r.label = is_native_encoder(job.encoder) ? job.encoder + "/" + job.codec : job.encoder;
+			t.r.label = is_gpu_encoder(job.encoder) ? job.encoder + "/" + job.codec : job.encoder;
 			for (auto& [k, v] : opts) t.r.label += " " + k + "=" + v;
 			t.p.codec = job.codec; t.p.bitrate = br * 1000; t.p.options = opts;
 			pl.tasks.push_back(tasks.size());

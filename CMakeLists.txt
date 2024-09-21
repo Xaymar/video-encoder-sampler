@@ -13,10 +13,15 @@ foreach(l ${FF_LIBS})
 	list(APPEND FF_LINK ${FF_${l}})
 endforeach()
 
-add_executable(ves src/main.cpp src/source.cpp src/vmaf.cpp src/encoder_libav.cpp src/encoder_nvenc.cpp src/encoder_amf.cpp)
-target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include" "${CMAKE_SOURCE_DIR}/third-party/amf-include")
-target_link_libraries(ves PRIVATE ${FF_LINK} d3d11 dxgi)
+# libx264 (MSYS2 ucrt64 package): headers, import lib and DLL.
+set(X264_DIR "${CMAKE_SOURCE_DIR}/third-party/x264/ucrt64" CACHE PATH "libx264 package root")
+find_library(X264_LIB x264.dll PATHS "${X264_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
+
+add_executable(ves src/main.cpp src/source.cpp src/vmaf.cpp src/encoder_libav.cpp src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_x264.cpp)
+target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include" "${CMAKE_SOURCE_DIR}/third-party/amf-include" "${X264_DIR}/include")
+target_link_libraries(ves PRIVATE ${FF_LINK} ${X264_LIB} d3d11 dxgi)
 
 # Runtime DLLs next to the executable.
 add_custom_command(TARGET ves POST_BUILD
-	COMMAND ${CMAKE_COMMAND} -E copy_directory "${FFMPEG_DIR}/bin" "$<TARGET_FILE_DIR:ves>")
+	COMMAND ${CMAKE_COMMAND} -E copy_directory "${FFMPEG_DIR}/bin" "$<TARGET_FILE_DIR:ves>"
+	COMMAND ${CMAKE_COMMAND} -E copy_directory "${X264_DIR}/bin" "$<TARGET_FILE_DIR:ves>")

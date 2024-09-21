@@ -15,3 +15,4 @@ desktop.ini
 # Native build
 /build
 third-party/ffmpeg-dev/
+third-party/x264/
