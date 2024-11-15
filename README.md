@@ -3,7 +3,7 @@ Video Encoding Samples (VES) is a project to determine the ideal (or even best) 
 
 VES is a native C++ application. It decodes each input once, encodes it in-process with every combination of options you list, decodes the result again and scores every single frame with VMAF. No `ffmpeg` processes are spawned. For each group of runs that share an input, bitrate and key frame interval it then reports which configurations are the best in at least 95% of the frames.
 
-The Node.js implementation in `source/` is the previous version and no longer maintained.
+The previous Node.js implementation was removed; it is still available in the git history before the "Full rebuild" commit.
 
 ## Requirements
 * Windows 10/11 64 bit
