@@ -41,11 +41,19 @@ struct Job {
 	std::vector<Axis> axes;
 };
 
-struct Config {
-	std::vector<std::string> inputs;
+// One sub-sweep: every combination of its lists is tested with every encoder. Several scenarios let a setup
+// say that some combinations only make sense together (e.g. 1080p60 only at high bitrates).
+struct Scenario {
 	std::vector<int64_t> bitrates;   // kbps
 	std::vector<double> kfs{2.0};    // key frame intervals, seconds
+	std::vector<Shape> shapes{Shape{}}; // resolution / frame rate to encode at; zero fields mean "as the source"
+};
+
+struct Config {
+	std::vector<std::string> inputs;
+	std::vector<Scenario> scenarios;
 	VmafOptions vo;
+	ScaleOptions scale;
 	std::vector<Job> jobs;
 };
 
@@ -53,6 +61,7 @@ struct Run {
 	std::string input, label;
 	int64_t bitrate;        // target, kbps
 	double kf;
+	Shape shape;
 	double kbps = 0;        // actual
 	std::vector<double> scores; // per frame, display order
 	double penalty = 0;     // VMAF points deducted for exceeding the target bitrate
@@ -63,6 +72,24 @@ static std::vector<std::string> split(const std::string& s) {
 	std::vector<std::string> out;
 	std::stringstream ss(s);
 	for (std::string t; std::getline(ss, t, ',');) out.push_back(t);
+	return out;
+}
+
+static AVRational parse_fps(const std::string& s) { // "30", "29.97" or "30000/1001"
+	int n, d;
+	if (sscanf(s.c_str(), "%d/%d", &n, &d) == 2) return {n, d};
+	return av_d2q(atof(s.c_str()), 100000);
+}
+
+// Resolutions x frame rates; either list may be empty (= source).
+static std::vector<Shape> make_shapes(const std::vector<std::string>& res, const std::vector<std::string>& fps) {
+	std::vector<Shape> out;
+	for (size_t i = 0; i < std::max<size_t>(res.size(), 1); i++) for (size_t j = 0; j < std::max<size_t>(fps.size(), 1); j++) {
+		Shape s;
+		if (i < res.size() && sscanf(res[i].c_str(), "%dx%d", &s.w, &s.h) != 2) throw std::runtime_error("bad resolution '" + res[i] + "', expected WxH");
+		if (j < fps.size()) s.fps = parse_fps(fps[j]);
+		out.push_back(s);
+	}
 	return out;
 }
 
@@ -99,8 +126,30 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* v = root.find(k)) { if (v->type != Json::Arr) throw std::runtime_error(std::string("'") + k + "' must be an array"); for (auto& e : v->a) fn(e); }
 	};
 	list("inputs", [&](const Json& e) { add_inputs(cfg, e.text()); });
-	list("bitrates", [&](const Json& e) { cfg.bitrates.push_back(atoll(e.text().c_str())); });
-	if (root.find("kfintervals")) { cfg.kfs.clear(); list("kfintervals", [&](const Json& e) { cfg.kfs.push_back(atof(e.text().c_str())); }); }
+	// Either a "scenarios" list, or the top level itself is the one and only scenario.
+	// Key frame intervals set at the top level are the default for scenarios that do not list their own.
+	std::vector<double> default_kfs{2.0};
+	if (auto* v = root.find("kfintervals")) { default_kfs.clear(); for (auto& e : v->a) default_kfs.push_back(atof(e.text().c_str())); }
+	auto scenario = [&](const Json& o) {
+		Scenario sc;
+		sc.kfs = default_kfs;
+		std::vector<std::string> res, fps;
+		auto strs = [&](const char* k, auto fn) {
+			if (auto* v = o.find(k)) { if (v->type != Json::Arr) throw std::runtime_error(std::string("'") + k + "' must be an array"); for (auto& e : v->a) fn(e.text()); }
+		};
+		strs("bitrates", [&](const std::string& t) { sc.bitrates.push_back(atoll(t.c_str())); });
+		if (o.find("kfintervals")) { sc.kfs.clear(); strs("kfintervals", [&](const std::string& t) { sc.kfs.push_back(atof(t.c_str())); }); }
+		strs("resolutions", [&](const std::string& t) { res.push_back(t); });
+		strs("framerates", [&](const std::string& t) { fps.push_back(t); });
+		sc.shapes = make_shapes(res, fps);
+		if (sc.bitrates.empty()) throw std::runtime_error("a scenario needs bitrates");
+		cfg.scenarios.push_back(std::move(sc));
+	};
+	if (auto* v = root.find("scenarios")) { for (auto& e : v->a) scenario(e); } else scenario(root);
+	if (auto* v = root.find("scaling")) {
+		if (auto* u = v->find("upscaler")) cfg.scale.upscaler = u->text();
+		if (auto* d = v->find("downscaler")) cfg.scale.downscaler = d->text();
+	}
 	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str());
 	if (auto* v = root.find("vmaf")) {
 		if (auto* m = v->find("model")) cfg.vo.model = m->text();
@@ -130,7 +179,9 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 	add_inputs(cfg, argv[1]);
 	Job j;
 	j.encoder = argv[2]; j.codec = argv[3];
-	for (auto& b : split(argv[4])) cfg.bitrates.push_back(atoll(b.c_str()));
+	Scenario sc;
+	std::vector<std::string> res, fps;
+	for (auto& b : split(argv[4])) sc.bitrates.push_back(atoll(b.c_str()));
 	for (int i = 5; i < argc; i++) {
 		std::string a = argv[i];
 		size_t eq = a.find('=');
@@ -141,9 +192,13 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 		else if (k == "over.penalty") over_penalty = atof(v.c_str());
 		else if (k == "pool") j.pool = v;
 		else if (k == "parallel") j.parallel = atoi(v.c_str());
-		else if (k == "kf") { cfg.kfs.clear(); for (auto& x : split(v)) cfg.kfs.push_back(atof(x.c_str())); }
+		else if (k == "kf") { sc.kfs.clear(); for (auto& x : split(v)) sc.kfs.push_back(atof(x.c_str())); }
+		else if (k == "res") res = split(v);
+		else if (k == "fps") fps = split(v);
 		else { Axis ax{k, {}}; for (auto& x : split(v)) ax.values.push_back(x); j.axes.push_back(std::move(ax)); }
 	}
+	sc.shapes = make_shapes(res, fps);
+	cfg.scenarios.push_back(std::move(sc));
 	cfg.jobs.push_back(std::move(j));
 	return true;
 }
@@ -160,31 +215,62 @@ static bool codec_id(const std::string& encoder, const std::string& codec, AVCod
 	return id != AV_CODEC_ID_NONE;
 }
 
-static bool run_one(const std::string& input, const std::string& encoder, AVCodecID id, Params p, double kf, const VmafOptions& vo, Run& out) {
+static bool run_one(const std::string& input, const std::string& encoder, AVCodecID id, Params p, double kf, const Shape& want,
+                    const VmafOptions& vo, const ScaleOptions& so, Run& out) {
 	Source src;
 	if (!src.open(input)) return false;
-	p.width = src.width; p.height = src.height;
-	p.framerate = src.framerate;
-	p.gop = std::max(1, (int)std::lround(kf * av_q2d(p.framerate)));
+	Shape enc{want.w ? want.w : src.width, want.h ? want.h : src.height, want.fps.num ? want.fps : src.framerate};
+	if (enc.w > src.width || enc.h > src.height) { fprintf(stderr, "%dx%d is larger than the source (%dx%d)\n", enc.w, enc.h, src.width, src.height); return false; }
+	if (av_cmp_q(enc.fps, src.framerate) > 0) { fprintf(stderr, "frame rate %.3f is higher than the source (%.3f)\n", av_q2d(enc.fps), av_q2d(src.framerate)); return false; }
+	p.width = enc.w; p.height = enc.h;
+	p.framerate = enc.fps;
+	p.gop = std::max(1, (int)std::lround(kf * av_q2d(enc.fps)));
 
 	std::vector<std::vector<uint8_t>> packets;
-	auto enc = make_encoder(encoder);
+	auto codec = make_encoder(encoder);
 	// Packets arrive in coding order, which is also the order the decoder needs them.
-	if (!enc->open(p, [&](const uint8_t* d, size_t n, int64_t, bool) { packets.emplace_back(d, d + n); })) return false;
+	if (!codec->open(p, [&](const uint8_t* d, size_t n, int64_t, bool) { packets.emplace_back(d, d + n); })) return false;
 
+	// Frame rate conversion drops frames before scaling: source frame n belongs to encoded frame floor(n * enc.fps / src.fps)
+	// and only the first source frame of each such index is kept.
+	const int64_t num = (int64_t)enc.fps.num * src.framerate.den, den = (int64_t)enc.fps.den * src.framerate.num;
+	const bool rescale = enc.w != src.width || enc.h != src.height;
+	Scaler scaler;
 	AVFrame* frame = av_frame_alloc();
-	long long frames = 0;
+	AVFrame* scaled = av_frame_alloc();
+	long long frames = 0; // source frames
 	bool ok = true;
 	int r;
-	while (ok && (r = src.next(frame)) == 1) { ok = enc->encode(frame); av_frame_unref(frame); frames++; }
-	ok = ok && r >= 0 && enc->encode(nullptr);
-	av_frame_free(&frame);
+	auto encode_scaled = [&] {
+		int got;
+		while (ok && (got = scaler.pop(scaled)) == 1) { ok = codec->encode(scaled); av_frame_unref(scaled); }
+		ok = ok && got >= 0;
+	};
+	while (ok && (r = src.next(frame)) == 1) {
+		int64_t m = frames * num / den;
+		bool keep = frames == 0 || m != (frames - 1) * num / den;
+		frames++;
+		if (keep) {
+			frame->pts = m;
+			frame->duration = 1; // one tick of the 1/enc.fps time base
+			if (!rescale) ok = codec->encode(frame);
+			else {
+				if (m == 0) ok = scaler.open(frame, av_inv_q(enc.fps), enc.w, enc.h, so);
+				ok = ok && scaler.push(frame);
+				encode_scaled();
+			}
+		}
+		av_frame_unref(frame);
+	}
+	if (ok && rescale) { ok = scaler.push(nullptr); encode_scaled(); }
+	ok = ok && r >= 0 && codec->encode(nullptr);
+	av_frame_free(&frame); av_frame_free(&scaled);
 	if (!ok) return false;
-	out.kbps = enc->stats.bytes * 8 / (frames / av_q2d(p.framerate)) / 1000;
-	enc.reset();
+	out.kbps = codec->stats.bytes * 8 / (frames / av_q2d(src.framerate)) / 1000;
+	codec.reset();
 
 	Source ref;
-	if (!ref.open(input) || !vmaf_score(ref, id, packets, vo, out.scores)) return false;
+	if (!ref.open(input) || !vmaf_score(ref, id, packets, enc, vo, so, out.scores)) return false;
 	if ((long long)out.scores.size() != frames) { fprintf(stderr, "%zu scores for %lld frames\n", out.scores.size(), frames); return false; }
 	return true;
 }
@@ -205,7 +291,7 @@ int main(int argc, char** argv) {
 			return 1;
 		}
 	} catch (const std::exception& e) { fprintf(stderr, "config: %s\n", e.what()); return 1; }
-	if (cfg.inputs.empty() || cfg.bitrates.empty() || cfg.jobs.empty()) { fprintf(stderr, "config needs inputs, bitrates and at least one enabled encoder\n"); return 1; }
+	if (cfg.inputs.empty() || cfg.scenarios.empty() || cfg.jobs.empty()) { fprintf(stderr, "config needs inputs, bitrates and at least one enabled encoder\n"); return 1; }
 
 	struct Task {
 		Run r;
@@ -228,11 +314,13 @@ int main(int argc, char** argv) {
 		std::string pool = job.pool.empty() ? (is_gpu_encoder(job.encoder) ? job.encoder : "cpu") : job.pool;
 		Pool& pl = pools[pool];
 		pl.parallel = std::max(pl.parallel, job.parallel ? job.parallel : (is_gpu_encoder(job.encoder) ? 2 : 1));
-		for (int64_t br : cfg.bitrates) for (double kf : cfg.kfs) for (auto& opts : expand(job)) {
+			for (auto& sc : cfg.scenarios) for (int64_t br : sc.bitrates) for (double kf : sc.kfs) for (auto& shape : sc.shapes) for (auto& opts : expand(job)) {
 			Task t;
 			t.job = &job; t.id = id;
-			t.r.input = input; t.r.bitrate = br; t.r.kf = kf;
-			t.r.label = is_gpu_encoder(job.encoder) ? job.encoder + "/" + job.codec : job.encoder;
+				t.r.input = input; t.r.bitrate = br; t.r.kf = kf; t.r.shape = shape;
+				t.r.label = is_gpu_encoder(job.encoder) ? job.encoder + "/" + job.codec : job.encoder;
+				if (shape.w) t.r.label += " " + std::to_string(shape.w) + "x" + std::to_string(shape.h);
+				if (shape.fps.num) t.r.label += " @" + std::to_string(av_q2d(shape.fps)).substr(0, 6);
 			for (auto& [k, v] : opts) t.r.label += " " + k + "=" + v;
 			t.p.codec = job.codec; t.p.bitrate = br * 1000; t.p.options = opts;
 			pl.tasks.push_back(tasks.size());
@@ -247,7 +335,7 @@ int main(int argc, char** argv) {
 		for (size_t n; (n = pp->next++) < pp->tasks.size();) {
 			Task& t = tasks[pp->tasks[n]];
 			Run& r = t.r;
-			t.ok = run_one(r.input, t.job->encoder, t.id, t.p, r.kf, cfg.vo, r);
+			t.ok = run_one(r.input, t.job->encoder, t.id, t.p, r.kf, r.shape, cfg.vo, cfg.scale, r);
 			std::lock_guard lock(out_mutex);
 			if (!t.ok) { fprintf(stderr, "[%s %lld kbps kf %.1f] %s: FAILED\n", r.input.c_str(), (long long)r.bitrate, r.kf, r.label.c_str()); continue; }
 			r.penalty = std::max(0.0, r.kbps / r.bitrate - 1) * 100 * over_penalty;

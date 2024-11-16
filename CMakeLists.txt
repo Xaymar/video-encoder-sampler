@@ -25,8 +25,9 @@ find_library(X265_LIB x265.dll PATHS "${X265_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
 set(SVTAV1_DIR "${CMAKE_SOURCE_DIR}/third-party/svt-av1/ucrt64" CACHE PATH "SVT-AV1 package root")
 find_library(SVTAV1_LIB SvtAv1Enc.dll PATHS "${SVTAV1_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
 
-add_executable(ves src/main.cpp src/source.cpp src/vmaf.cpp src/encoder_libav.cpp src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
+add_executable(ves src/main.cpp src/source.cpp src/scaler.cpp src/vmaf.cpp src/encoder_libav.cpp src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
 target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include" "${CMAKE_SOURCE_DIR}/third-party/amf-include" "${X264_DIR}/include" "${X265_DIR}/include" "${SVTAV1_DIR}/include")
+target_compile_definitions(ves PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(ves PRIVATE ${FF_LINK} ${X264_LIB} ${X265_LIB} ${SVTAV1_LIB} d3d11 dxgi)
 
 # Runtime DLLs next to the executable.

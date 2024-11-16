@@ -2,15 +2,28 @@
 	"inputs": [
 		"input"
 	],
-	"bitrates": [
-		16000,
-		8000,
-		6000,
-		3500
+	"scenarios": [
+		{
+			"bitrates": [16000, 8000],
+			"resolutions": ["3840x2160", "2560x1440", "1920x1080"],
+			"framerates": [60, 30]
+		},
+		{
+			"bitrates": [6000],
+			"resolutions": ["2560x1440", "1920x1080", "1280x720"],
+			"framerates": [60, 30]
+		},
+		{
+			"bitrates": [3500],
+			"resolutions": ["1920x1080", "1280x720"],
+			"framerates": [30]
+		}
 	],
-	"kfintervals": [
-		2.0
-	],
+	"kfintervals": [2.0],
+	"scaling": {
+		"upscaler": "ewa_lanczos",
+		"downscaler": "ewa_lanczos"
+	},
 	"over_penalty": 0.025,
 	"vmaf": {
 		"model": "version=vmaf_4k_v0.6.1",
@@ -33,11 +46,10 @@
 		},
 		{
 			"enabled": true,
-			"encoder": "libx264",
+			"encoder": "x264",
 			"options": {
 				"preset": ["veryfast", "fast", "medium", "slow", "veryslow"],
-				"tune": [null, "film", "animation"],
-				"threads": [8]
+				"tune": [null, "film", "animation"]
 			}
 		}
 	]
