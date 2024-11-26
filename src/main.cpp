@@ -37,6 +37,7 @@ struct Axis { // one swept option; a missing value (JSON null) leaves the option
 struct Job {
 	std::string encoder, codec = "h264";
 	std::string pool;  // runs in one pool share a device; at most `parallel` of them run at once
+	std::vector<std::string> scenarios; // names of the scenarios this encoder takes part in; empty: all of them
 	int parallel = 0;  // 0: default for the pool (NVENC 2, everything else 1 since CPU encoders use every core)
 	std::vector<Axis> axes;
 };
@@ -44,6 +45,7 @@ struct Job {
 // One sub-sweep: every combination of its lists is tested with every encoder. Several scenarios let a setup
 // say that some combinations only make sense together (e.g. 1080p60 only at high bitrates).
 struct Scenario {
+	std::string name;
 	std::vector<int64_t> bitrates;   // kbps
 	std::vector<double> kfs{2.0};    // key frame intervals, seconds
 	std::vector<Shape> shapes{Shape{}}; // resolution / frame rate to encode at; zero fields mean "as the source"
@@ -133,6 +135,7 @@ static void load_config(const std::string& path, Config& cfg) {
 	auto scenario = [&](const Json& o) {
 		Scenario sc;
 		sc.kfs = default_kfs;
+		if (auto* n = o.find("name")) sc.name = n->text();
 		std::vector<std::string> res, fps;
 		auto strs = [&](const char* k, auto fn) {
 			if (auto* v = o.find(k)) { if (v->type != Json::Arr) throw std::runtime_error(std::string("'") + k + "' must be an array"); for (auto& e : v->a) fn(e.text()); }
@@ -164,6 +167,7 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* c = e.find("codec")) j.codec = c->text();
 		if (auto* p = e.find("pool")) j.pool = p->text();
 		if (auto* p = e.find("parallel")) j.parallel = atoi(p->text().c_str());
+		if (auto* sn = e.find("scenarios")) for (auto& x : sn->a) j.scenarios.push_back(x.text());
 		if (auto* o = e.find("options")) for (auto& [k, v] : o->o) {
 			Axis ax{k, {}};
 			if (v.type == Json::Arr) { for (auto& x : v.a) ax.values.push_back(x.type == Json::Null ? std::nullopt : std::optional(x.text())); }
@@ -308,13 +312,22 @@ int main(int argc, char** argv) {
 	std::vector<Task> tasks;
 	std::map<std::string, Pool> pools;
 	int failed = 0;
+	for (auto& job : cfg.jobs) for (auto& want : job.scenarios) {
+		bool known = false;
+		for (auto& sc : cfg.scenarios) known |= sc.name == want;
+		if (!known) { fprintf(stderr, "config: encoder '%s' lists unknown scenario '%s'\n", job.encoder.c_str(), want.c_str()); return 1; }
+	}
+	auto takes_part = [](const Job& job, const Scenario& sc) {
+		return job.scenarios.empty() || std::find(job.scenarios.begin(), job.scenarios.end(), sc.name) != job.scenarios.end();
+	};
+
 	for (auto& input : cfg.inputs) for (auto& job : cfg.jobs) {
 		AVCodecID id;
 		if (!codec_id(job.encoder, job.codec, id)) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", job.encoder.c_str(), job.codec.c_str()); failed++; continue; }
 		std::string pool = job.pool.empty() ? (is_gpu_encoder(job.encoder) ? job.encoder : "cpu") : job.pool;
 		Pool& pl = pools[pool];
 		pl.parallel = std::max(pl.parallel, job.parallel ? job.parallel : (is_gpu_encoder(job.encoder) ? 2 : 1));
-			for (auto& sc : cfg.scenarios) for (int64_t br : sc.bitrates) for (double kf : sc.kfs) for (auto& shape : sc.shapes) for (auto& opts : expand(job)) {
+			for (auto& sc : cfg.scenarios) if (takes_part(job, sc)) for (int64_t br : sc.bitrates) for (double kf : sc.kfs) for (auto& shape : sc.shapes) for (auto& opts : expand(job)) {
 			Task t;
 			t.job = &job; t.id = id;
 				t.r.input = input; t.r.bitrate = br; t.r.kf = kf; t.r.shape = shape;

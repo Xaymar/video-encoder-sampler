@@ -4,16 +4,19 @@
 	],
 	"scenarios": [
 		{
+			"name": "high",
 			"bitrates": [16000, 8000],
 			"resolutions": ["3840x2160", "2560x1440", "1920x1080"],
 			"framerates": [60, 30]
 		},
 		{
+			"name": "mid",
 			"bitrates": [6000],
 			"resolutions": ["2560x1440", "1920x1080", "1280x720"],
 			"framerates": [60, 30]
 		},
 		{
+			"name": "low",
 			"bitrates": [3500],
 			"resolutions": ["1920x1080", "1280x720"],
 			"framerates": [30]
@@ -47,6 +50,7 @@
 		{
 			"enabled": true,
 			"encoder": "x264",
+			"scenarios": ["mid", "low"],
 			"options": {
 				"preset": ["veryfast", "fast", "medium", "slow", "veryslow"],
 				"tune": [null, "film", "animation"]
