@@ -113,6 +113,8 @@ bool vmaf_score(Source& ref, AVCodecID codec, const std::vector<std::vector<uint
 					fprintf(stderr, "decoded stream is %dx%d fmt %d, expected %dx%d yuv420p\n", d->width, d->height, d->format, enc.w, enc.h);
 					ok = false; break;
 				}
+				// Encoders do not necessarily write the colour description, so restore the source's before scaling.
+				d->color_range = ref.range; d->colorspace = ref.space; d->color_primaries = ref.primaries; d->color_trc = ref.trc;
 				if (!rescale) show(d, m);
 				else {
 					d->pts = m;

@@ -79,6 +79,8 @@ Without arguments VES reads `config.json` from the working directory. The second
 ### Scaling and frame rates
 Resolution changes use the libplacebo filter (GPU, Vulkan) with the `upscaler` / `downscaler` named in `scaling` (default `ewa_lanczos` for both). Frame rate conversion only drops frames, and it happens before scaling so no time is spent on frames that are thrown away. Resolutions or frame rates above the source's are rejected.
 
+Colours are never converted: pixel values go through unchanged and the source's range, matrix, primaries and transfer tags are used for scaling, including full range (`pc`, `yuvj420p`) sources. Encoders are not told the range, since it does not influence what they encode.
+
 Scores are always measured against the original: the decoded video is scaled back to the source resolution and each dropped frame is shown again until the next kept frame, so every run has one VMAF value per original frame and runs with different resolutions or frame rates can be compared directly.
 
 ### Encoders

@@ -18,6 +18,11 @@ class Source {
 public:
 	int width = 0, height = 0;
 	AVRational framerate{30, 1};
+	// Colour description of the stream, as tagged in the file.
+	AVColorRange range = AVCOL_RANGE_UNSPECIFIED;
+	AVColorSpace space = AVCOL_SPC_UNSPECIFIED;
+	AVColorPrimaries primaries = AVCOL_PRI_UNSPECIFIED;
+	AVColorTransferCharacteristic trc = AVCOL_TRC_UNSPECIFIED;
 
 	~Source();
 	bool open(const std::string& path);

@@ -22,13 +22,23 @@ bool Source::open(const std::string& path) {
 	if (avcodec_open2(dec, c, nullptr) < 0) { fprintf(stderr, "decoder open failed\n"); return false; }
 	width = dec->width; height = dec->height;
 	framerate = av_guess_frame_rate(fmt, st, nullptr);
+	range = st->codecpar->color_range;
+	space = st->codecpar->color_space;
+	primaries = st->codecpar->color_primaries;
+	trc = st->codecpar->color_trc;
+	if (dec->pix_fmt == AV_PIX_FMT_YUVJ420P) range = AVCOL_RANGE_JPEG;
 	return true;
 }
 
 int Source::next(AVFrame* out) {
 	for (;;) {
 		int r = avcodec_receive_frame(dec, out);
-		if (r >= 0) { out->pts = n++; out->pict_type = AV_PICTURE_TYPE_NONE; return 1; }
+		if (r >= 0) {
+			// The deprecated "J" format is plain yuv420p with full range; say so with the tag instead, the data is identical.
+			if (out->format == AV_PIX_FMT_YUVJ420P) { out->format = AV_PIX_FMT_YUV420P; out->color_range = AVCOL_RANGE_JPEG; }
+			out->pts = n++; out->pict_type = AV_PICTURE_TYPE_NONE;
+			return 1;
+		}
 		if (r == AVERROR_EOF) return 0;
 		if (r != AVERROR(EAGAIN)) return r;
 		if (flushed) return 0;
