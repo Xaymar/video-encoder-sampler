@@ -100,7 +100,6 @@ Constant bitrate encoders still miss their target, and spending more bits would 
 
 ## Current Limitations
 * 8-bit 4:2:0 input and output only; frames are assumed to arrive at a constant frame rate.
-* Colour overrides from the old `config.json` are not implemented yet.
 * A resolution with a different aspect ratio than the source is stretched, not letterboxed.
 * VMAF is computed through FFmpeg's `libvmaf` filter and read from its JSON log.
 * Input videos should be properly tagged.
