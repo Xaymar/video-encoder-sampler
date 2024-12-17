@@ -2,6 +2,18 @@
 
 #include <cstdio>
 
+// The deprecated "J" formats are plain planar YUV with full range; the range tag says so instead and the data is identical.
+static AVPixelFormat unj(AVPixelFormat f, bool& full) {
+	full = true;
+	switch (f) {
+	case AV_PIX_FMT_YUVJ420P: return AV_PIX_FMT_YUV420P;
+	case AV_PIX_FMT_YUVJ422P: return AV_PIX_FMT_YUV422P;
+	case AV_PIX_FMT_YUVJ444P: return AV_PIX_FMT_YUV444P;
+	case AV_PIX_FMT_YUVJ440P: return AV_PIX_FMT_YUV440P;
+	default: full = false; return f;
+	}
+}
+
 Source::~Source() {
 	avcodec_free_context(&dec);
 	avformat_close_input(&fmt);
@@ -26,7 +38,9 @@ bool Source::open(const std::string& path) {
 	space = st->codecpar->color_space;
 	primaries = st->codecpar->color_primaries;
 	trc = st->codecpar->color_trc;
-	if (dec->pix_fmt == AV_PIX_FMT_YUVJ420P) range = AVCOL_RANGE_JPEG;
+	bool full = false;
+	pix = unj(dec->pix_fmt, full);
+	if (full) range = AVCOL_RANGE_JPEG;
 	return true;
 }
 
@@ -35,7 +49,9 @@ int Source::next(AVFrame* out) {
 		int r = avcodec_receive_frame(dec, out);
 		if (r >= 0) {
 			// The deprecated "J" format is plain yuv420p with full range; say so with the tag instead, the data is identical.
-			if (out->format == AV_PIX_FMT_YUVJ420P) { out->format = AV_PIX_FMT_YUV420P; out->color_range = AVCOL_RANGE_JPEG; }
+			bool full = false;
+			out->format = unj((AVPixelFormat)out->format, full);
+			if (full) out->color_range = AVCOL_RANGE_JPEG;
 			out->pts = n++; out->pict_type = AV_PICTURE_TYPE_NONE;
 			return 1;
 		}

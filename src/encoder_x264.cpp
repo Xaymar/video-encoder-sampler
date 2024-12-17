@@ -8,6 +8,8 @@
 #include <cstring>
 #include <vector>
 
+#include "formats.h"
+
 extern "C" {
 #include <x264.h>
 }
@@ -17,6 +19,8 @@ namespace {
 class X264 : public Encoder {
 	x264_t* h = nullptr;
 	Sink sink;
+	AVPixelFormat pix = AV_PIX_FMT_YUV420P;
+	int csp = X264_CSP_I420;
 
 	bool emit(x264_nal_t* nal, int n, int bytes, const x264_picture_t& out) {
 		if (bytes <= 0) return true;
@@ -50,7 +54,12 @@ public:
 			return false;
 		}
 		par.i_width = p.width; par.i_height = p.height;
-		par.i_csp = X264_CSP_I420;
+		Fmt f;
+		describe_format(p.pix, f);
+		pix = p.pix;
+		csp = (f.chroma == 444 ? X264_CSP_I444 : f.chroma == 422 ? X264_CSP_I422 : X264_CSP_I420) | (f.depth > 8 ? X264_CSP_HIGH_DEPTH : 0);
+		par.i_csp = csp;
+		par.i_bitdepth = f.depth;
 		par.i_fps_num = p.framerate.num; par.i_fps_den = p.framerate.den;
 		par.i_timebase_num = p.framerate.den; par.i_timebase_den = p.framerate.num; // pts is the frame index
 		par.b_vfr_input = 0;
@@ -71,9 +80,9 @@ public:
 		x264_nal_t* nal;
 		int n;
 		if (fr) {
-			if (fr->format != AV_PIX_FMT_YUV420P) { fprintf(stderr, "x264: input must be yuv420p\n"); return false; }
+			if (fr->format != pix) { fprintf(stderr, "x264: input must be %s\n", av_get_pix_fmt_name(pix)); return false; }
 			x264_picture_init(&in);
-			in.img.i_csp = X264_CSP_I420;
+			in.img.i_csp = csp;
 			in.img.i_plane = 3;
 			for (int i = 0; i < 3; i++) { in.img.plane[i] = fr->data[i]; in.img.i_stride[i] = fr->linesize[i]; }
 			in.i_pts = fr->pts;

@@ -13,6 +13,7 @@ struct VmafOptions {
 
 // Decodes the encoded packets, scales them back to the original resolution, holds frames up to the original
 // frame rate and scores them against `ref` (a fresh Source of the original input) with libvmaf, in-process.
-// `enc` is the geometry the packets were encoded at. `scores` receives one VMAF value per original frame.
+// `enc` is the geometry and pixel format the packets were encoded at. Both sides are compared in the planar YUV
+// format `score_fmt`, converting whichever side differs. `scores` receives one VMAF value per original frame.
 bool vmaf_score(Source& ref, AVCodecID codec, const std::vector<std::vector<uint8_t>>& packets, const Shape& enc,
-                const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores);
+                AVPixelFormat score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores);

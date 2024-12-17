@@ -10,7 +10,7 @@ The previous Node.js implementation was removed; it is still available in the gi
 * CMake 3.20 or newer, Ninja, and a C++20 compiler (developed with LLVM clang)
 * The third-party libraries listed below
 * A GPU with Vulkan support when scaling or frame rate conversion is used (libplacebo)
-* Any number of input videos (`.mkv`, `.mp4`, `.mov`; 8-bit 4:2:0)
+* Any number of input videos (`.mkv`, `.mp4`, `.mov`; YUV 4:2:0, 4:2:2, 4:4:4 or RGB, 8 to 12 bit)
 * A lot of time.
 
 ## Third-Party Libraries
@@ -86,6 +86,13 @@ Colours are never converted: pixel values go through unchanged and the source's 
 
 Scores are always measured against the original: the decoded video is scaled back to the source resolution and each dropped frame is shown again until the next kept frame, so every run has one VMAF value per original frame and runs with different resolutions or frame rates can be compared directly.
 
+### Pixel formats and bit depth
+Sources keep their pixel format. Every encoder run can set `chroma` (`420`, `422`, `444`) and `bitdepth` (`8`, `10`, `12`) in its options, and like any option they can be swept (`"bitdepth": [8, 10]`). Without them the encoder gets the source's layout and depth, or the closest one it supports (same layout at a lower depth, then 8-bit 4:2:0). Asking for something the encoder cannot do fails that run. Conversions are done by libplacebo; RGB sources are converted to YUV as BT.709 limited range, 4:4:4.
+
+Quality is measured with both sides in the source's chroma layout at the higher of the source's and the output's bit depth (RGB counts as 4:4:4), so an 8-bit and a 10-bit encode of the same clip are directly comparable.
+
+Formats currently supported by each backend: `x264` 4:2:0, 4:2:2 and 4:4:4 at 8 and 10 bit, libavcodec encoders whatever the encoder lists as planar YUV; `nvenc`, `amf`, `x265` and `svtav1` 8-bit 4:2:0 for now.
+
 ### Encoders
 | `encoder` | Backend | Options |
 |---|---|---|
@@ -104,5 +111,6 @@ For every group (same input, target bitrate and key frame interval), a run count
 Constant bitrate encoders still miss their target, and spending more bits would win frames unfairly. A run that overshoots its target loses `over_penalty` VMAF points per percent of overshoot (default 0.025, taken from the VMAF gain between 3000 and 6000 kbps on a test clip). Undershooting costs nothing.
 
 ## Current Limitations
-* 8-bit 4:2:0 input and output only; frames are assumed to arrive at a constant frame rate.
+* Frames are assumed to arrive at a constant frame rate.
+* 4:1:0, 4:1:1 and 4:4:0 sources are treated as 4:2:0, and 16-bit or gray sources are not supported.
 * Input videos should be properly tagged.

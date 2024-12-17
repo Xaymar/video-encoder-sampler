@@ -7,6 +7,8 @@
 
 extern "C" {
 #include <libavutil/frame.h>
+#include <libavutil/pixdesc.h>
+#include <libavutil/pixfmt.h>
 #include <libavutil/rational.h>
 }
 
@@ -14,6 +16,7 @@ using Options = std::map<std::string, std::string>;
 
 struct Params {
 	int width = 0, height = 0;
+	AVPixelFormat pix = AV_PIX_FMT_YUV420P; // planar YUV format of the frames handed to encode()
 	AVRational framerate{30, 1}; // shortcut: constant frame rate, frame pts == frame index; revisit for VFR sources
 	int64_t bitrate = 0;         // bits per second
 	int gop = 0;                 // frames

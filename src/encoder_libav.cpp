@@ -27,7 +27,7 @@ public:
 		ctx->width = p.width; ctx->height = p.height;
 		ctx->framerate = p.framerate; ctx->time_base = av_inv_q(p.framerate);
 		ctx->bit_rate = p.bitrate; ctx->gop_size = p.gop;
-		ctx->pix_fmt = AV_PIX_FMT_YUV420P; // shortcut: 8-bit 4:2:0 only, no conversion; add swscale when 10-bit tests land
+		ctx->pix_fmt = p.pix;
 		for (auto& [k, v] : p.options) {
 			if (av_opt_set(ctx, k.c_str(), v.c_str(), AV_OPT_SEARCH_CHILDREN) < 0) {
 				fprintf(stderr, "%s: bad option %s=%s\n", name.c_str(), k.c_str(), v.c_str());
@@ -40,7 +40,7 @@ public:
 	}
 
 	bool encode(const AVFrame* f) override {
-		if (f && f->format != ctx->pix_fmt) { fprintf(stderr, "%s: input must be yuv420p\n", name.c_str()); return false; }
+		if (f && f->format != ctx->pix_fmt) { fprintf(stderr, "%s: input must be %s\n", name.c_str(), av_get_pix_fmt_name(ctx->pix_fmt)); return false; }
 		if (avcodec_send_frame(ctx, f) < 0) return false;
 		int r;
 		while ((r = avcodec_receive_packet(ctx, pkt)) >= 0) {

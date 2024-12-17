@@ -75,7 +75,7 @@ public:
 } // namespace
 
 bool vmaf_score(Source& ref, AVCodecID codec, const std::vector<std::vector<uint8_t>>& packets, const Shape& enc,
-                const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores) {
+                AVPixelFormat score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores) {
 	const AVCodec* c = avcodec_find_decoder(codec);
 	AVCodecContext* dec = c ? avcodec_alloc_context3(c) : nullptr;
 	// Without VUI reorder info the H.264 decoder guesses the B-frame depth and can drop or misorder early frames;
@@ -85,24 +85,46 @@ bool vmaf_score(Source& ref, AVCodecID codec, const std::vector<std::vector<uint
 
 	// Original frame k shows encoded frame floor(k * enc.fps / ref.fps): dropped frames are held, never interpolated.
 	const int64_t num = (int64_t)enc.fps.num * ref.framerate.den, den = (int64_t)enc.fps.den * ref.framerate.num;
-	const bool rescale = enc.w != ref.width || enc.h != ref.height;
+	const bool convert_dis = enc.w != ref.width || enc.h != ref.height || enc.pix != score_fmt; // scale back, change format
+	const bool convert_ref = ref.pix != score_fmt;
 
 	bool ok = true;
 	{
 		Scorer scorer;
-		Scaler up;
+		Scaler up, ref_conv;
 		AVFrame* d = av_frame_alloc();
 		AVFrame* u = av_frame_alloc();
 		AVFrame* r = av_frame_alloc();
+		AVFrame* t = av_frame_alloc();
 		AVPacket* pkt = av_packet_alloc();
-		long long m = 0, mo = 0, k = 0; // decoded frames in, scaled frames out, original frame index
+		long long m = 0, mo = 0, k = 0; // decoded frames in, converted frames out, original frame index
+		long long ref_in = 0;
+		bool ref_done = false;
 
 		ok = scorer.open(opt);
+
+		// Next reference frame in the scoring format. The converter holds frames back, so feed it until one comes out.
+		auto next_ref = [&](AVFrame* out) -> int {
+			if (!convert_ref) return ref.next(out);
+			for (;;) {
+				int got = ref_conv.pop(out);
+				if (got != 0) return got;
+				if (ref_done) return 0;
+				int rr = ref.next(t);
+				if (rr < 0) return rr;
+				if (rr == 0) { ref_done = true; if (!ref_conv.push(nullptr)) return -1; continue; }
+				t->duration = 1;
+				if (ref_in == 0 && !ref_conv.open(t, av_inv_q(ref.framerate), ref.width, ref.height, score_fmt, scale)) return -1;
+				ref_in++;
+				if (!ref_conv.push(t)) return -1;
+				av_frame_unref(t);
+			}
+		};
 
 		// Hold `shown` (decoded frame number mi, at the original resolution) for every original frame up to the next one.
 		auto show = [&](const AVFrame* shown, int64_t mi) {
 			while (ok && k * num / den == mi) {
-				int rr = ref.next(r);
+				int rr = next_ref(r);
 				if (rr < 0) { ok = false; break; }
 				if (rr == 0) break;
 				ok = scorer.add(r, shown);
@@ -110,27 +132,27 @@ bool vmaf_score(Source& ref, AVCodecID codec, const std::vector<std::vector<uint
 				k++;
 			}
 		};
-		// libplacebo holds frames back until it has seen the next one, so scaled frames are collected as they appear.
-		auto collect_scaled = [&] {
+		// libplacebo holds frames back until it has seen the next one, so converted frames are collected as they appear.
+		auto collect_converted = [&] {
 			int got;
 			while (ok && (got = up.pop(u)) == 1) { show(u, mo++); av_frame_unref(u); }
 			ok = ok && got >= 0;
 		};
 		auto pump = [&] {
 			while (ok && avcodec_receive_frame(dec, d) >= 0) {
-				if (d->width != enc.w || d->height != enc.h || d->format != AV_PIX_FMT_YUV420P) {
-					fprintf(stderr, "decoded stream is %dx%d fmt %d, expected %dx%d yuv420p\n", d->width, d->height, d->format, enc.w, enc.h);
+				if (d->width != enc.w || d->height != enc.h || d->format != enc.pix) {
+					fprintf(stderr, "decoded stream is %dx%d fmt %d, expected %dx%d fmt %d\n", d->width, d->height, d->format, enc.w, enc.h, enc.pix);
 					ok = false; break;
 				}
-				// Encoders do not necessarily write the colour description, so restore the source's before scaling.
+				// Encoders do not necessarily write the colour description, so restore the source's before converting.
 				d->color_range = ref.range; d->colorspace = ref.space; d->color_primaries = ref.primaries; d->color_trc = ref.trc;
-				if (!rescale) show(d, m);
+				if (!convert_dis) show(d, m);
 				else {
 					d->pts = m;
 					d->duration = 1; // libplacebo needs it to know when the last frame ends; the packets carry none
-					if (m == 0 && !up.open(d, av_inv_q(enc.fps), ref.width, ref.height, scale)) { ok = false; break; }
+					if (m == 0 && !up.open(d, av_inv_q(enc.fps), ref.width, ref.height, score_fmt, scale)) { ok = false; break; }
 					if (!up.push(d)) { fprintf(stderr, "scaling the decoded frame back failed\n"); ok = false; break; }
-					collect_scaled();
+					collect_converted();
 				}
 				av_frame_unref(d);
 				m++;
@@ -145,12 +167,12 @@ bool vmaf_score(Source& ref, AVCodecID codec, const std::vector<std::vector<uint
 			if (ok) pump();
 		}
 		if (ok) { avcodec_send_packet(dec, nullptr); pump(); }
-		if (ok && rescale) { ok = up.push(nullptr); collect_scaled(); }
+		if (ok && convert_dis) { ok = up.push(nullptr); collect_converted(); }
 		if (ok && k == 0) { fprintf(stderr, "no frames were decoded\n"); ok = false; }
-		if (ok && ref.next(r) == 1) { fprintf(stderr, "encoded stream has fewer frames than the reference\n"); ok = false; }
+		if (ok && next_ref(r) == 1) { fprintf(stderr, "encoded stream has fewer frames than the reference\n"); ok = false; }
 		if (ok) ok = scorer.finish(scores);
 
-		av_frame_free(&d); av_frame_free(&u); av_frame_free(&r); av_packet_free(&pkt);
+		av_frame_free(&d); av_frame_free(&u); av_frame_free(&r); av_frame_free(&t); av_packet_free(&pkt);
 	}
 
 	avcodec_free_context(&dec);

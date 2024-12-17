@@ -17,6 +17,7 @@
 #include <tuple>
 
 #include "encoder.h"
+#include "formats.h"
 #include "json.h"
 #include "source.h"
 #include "vmaf.h"
@@ -230,6 +231,25 @@ static bool run_one(const std::string& input, const std::string& encoder, AVCode
 	p.framerate = enc.fps;
 	p.gop = std::max(1, (int)std::lround(kf * av_q2d(enc.fps)));
 
+	// Encoder input format: "chroma" and "bitdepth" options if given, else the source's, else the closest the encoder takes.
+	Fmt sf;
+	if (!describe_format(src.pix, sf)) { fprintf(stderr, "unsupported source pixel format %s\n", av_get_pix_fmt_name(src.pix)); return false; }
+	int chroma = sf.chroma, depth = sf.depth;
+	bool chroma_set = false, depth_set = false;
+	if (auto it = p.options.find("chroma"); it != p.options.end()) { chroma = atoi(it->second.c_str()); chroma_set = true; p.options.erase(it); }
+	if (auto it = p.options.find("bitdepth"); it != p.options.end()) { depth = atoi(it->second.c_str()); depth_set = true; p.options.erase(it); }
+	if (!encoder_supports(encoder, p.codec, chroma, depth)) {
+		if (chroma_set || depth_set) { fprintf(stderr, "%s cannot encode %d-bit %d here\n", encoder.c_str(), depth, chroma); return false; }
+		// Keep the chroma layout if possible and lower the depth, else fall back to 8-bit 4:2:0.
+		bool found = false;
+		for (int dd : {depth, 10, 8}) if (!found && dd <= depth && encoder_supports(encoder, p.codec, chroma, dd)) { depth = dd; found = true; }
+		if (!found) { chroma = 420; depth = 8; }
+	}
+	p.pix = enc.pix = planar_format(chroma, depth);
+	// Both sides are scored in the source's chroma layout at the higher of the two bit depths.
+	const AVPixelFormat score_fmt = planar_format(sf.chroma, std::max(sf.depth, depth));
+	if (p.pix == AV_PIX_FMT_NONE || score_fmt == AV_PIX_FMT_NONE) { fprintf(stderr, "unsupported chroma %d / bit depth %d\n", chroma, depth); return false; }
+
 	std::vector<std::vector<uint8_t>> packets;
 	auto codec = make_encoder(encoder);
 	// Packets arrive in coding order, which is also the order the decoder needs them.
@@ -238,7 +258,7 @@ static bool run_one(const std::string& input, const std::string& encoder, AVCode
 	// Frame rate conversion drops frames before scaling: source frame n belongs to encoded frame floor(n * enc.fps / src.fps)
 	// and only the first source frame of each such index is kept.
 	const int64_t num = (int64_t)enc.fps.num * src.framerate.den, den = (int64_t)enc.fps.den * src.framerate.num;
-	const bool rescale = enc.w != src.width || enc.h != src.height;
+	const bool rescale = enc.w != src.width || enc.h != src.height || enc.pix != src.pix; // scale and/or convert
 	Scaler scaler;
 	AVFrame* frame = av_frame_alloc();
 	AVFrame* scaled = av_frame_alloc();
@@ -259,7 +279,7 @@ static bool run_one(const std::string& input, const std::string& encoder, AVCode
 			frame->duration = 1; // one tick of the 1/enc.fps time base
 			if (!rescale) ok = codec->encode(frame);
 			else {
-				if (m == 0) ok = scaler.open(frame, av_inv_q(enc.fps), enc.w, enc.h, so);
+				if (m == 0) ok = scaler.open(frame, av_inv_q(enc.fps), enc.w, enc.h, enc.pix, so);
 				ok = ok && scaler.push(frame);
 				encode_scaled();
 			}
@@ -274,7 +294,7 @@ static bool run_one(const std::string& input, const std::string& encoder, AVCode
 	codec.reset();
 
 	Source ref;
-	if (!ref.open(input) || !vmaf_score(ref, id, packets, enc, vo, so, out.scores)) return false;
+	if (!ref.open(input) || !vmaf_score(ref, id, packets, enc, score_fmt, vo, so, out.scores)) return false;
 	if ((long long)out.scores.size() != frames) { fprintf(stderr, "%zu scores for %lld frames\n", out.scores.size(), frames); return false; }
 	return true;
 }
