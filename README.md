@@ -22,10 +22,13 @@ Only the NVENC and AMF headers are tracked in git. The rest are binaries you pla
 | `third-party/x264/ucrt64/` | `bin/`, `include/`, `lib/` | MSYS2 package `mingw-w64-ucrt-x86_64-libx264` |
 | `third-party/x265/ucrt64/` | same, plus `libstdc++-6.dll`, `libgcc_s_seh-1.dll`, `libwinpthread-1.dll` in `bin/` | MSYS2 packages `mingw-w64-ucrt-x86_64-x265` and the MinGW runtime |
 | `third-party/svt-av1/ucrt64/` | same | MSYS2 package `mingw-w64-ucrt-x86_64-svt-av1` |
+| `third-party/vmaf/ucrt64/` | same | MSYS2 package `mingw-w64-ucrt-x86_64-vmaf` (libvmaf; its MinGW runtime DLLs come with the x265 entry) |
 | `third-party/nv-codec-headers/` | NVENC API headers (tracked) | [FFmpeg/nv-codec-headers](https://github.com/FFmpeg/nv-codec-headers) |
 | `third-party/amf-include/` | AMF API headers (tracked) | [GPUOpen AMF](https://github.com/GPUOpen-LibrariesAndSDKs/AMF), `amf/public/include` |
 
 MSYS2 packages are `.pkg.tar.zst` files from <https://repo.msys2.org/mingw/ucrt64/>; Windows' `tar -xf` extracts them. NVENC and AMF are loaded at runtime from the GPU driver, so they need no libraries. x264, x265 and SVT-AV1 are GPL/BSD licensed libraries that end up next to the executable.
+
+VMAF models are JSON files in `models/` (from [Netflix/vmaf](https://github.com/Netflix/vmaf/tree/master/model); the MSYS2 libvmaf has no built-in models). `vmaf.model` is `path=<file>`, relative to the working directory.
 
 ## Building
 ```
@@ -52,7 +55,7 @@ Without arguments VES reads `config.json` from the working directory. The second
 	],
 	"scaling": { "upscaler": "ewa_lanczos", "downscaler": "ewa_lanczos" },
 	"over_penalty": 0.025,
-	"vmaf": { "model": "version=vmaf_4k_v0.6.1", "threads": 4 },
+	"vmaf": { "model": "path=models/vmaf_4k_v0.6.1.json", "threads": 4 },
 	"encoders": [
 		{
 			"enabled": true,
@@ -102,6 +105,4 @@ Constant bitrate encoders still miss their target, and spending more bits would 
 
 ## Current Limitations
 * 8-bit 4:2:0 input and output only; frames are assumed to arrive at a constant frame rate.
-* A resolution with a different aspect ratio than the source is stretched, not letterboxed.
-* VMAF is computed through FFmpeg's `libvmaf` filter and read from its JSON log.
 * Input videos should be properly tagged.

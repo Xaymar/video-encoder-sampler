@@ -29,7 +29,7 @@
 	},
 	"over_penalty": 0.025,
 	"vmaf": {
-		"model": "version=vmaf_4k_v0.6.1",
+		"model": "path=models/vmaf_4k_v0.6.1.json",
 		"threads": 4
 	},
 	"encoders": [

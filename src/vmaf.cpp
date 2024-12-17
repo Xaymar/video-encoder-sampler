@@ -1,62 +1,81 @@
 #include "vmaf.h"
 
-#include <atomic>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <filesystem>
-#include <fstream>
-#include <memory>
-#include <sstream>
 
 extern "C" {
-#include <libavfilter/avfilter.h>
-#include <libavfilter/buffersink.h>
-#include <libavfilter/buffersrc.h>
-#include <libavutil/opt.h>
+#include <libavutil/pixdesc.h>
+#include <libvmaf/libvmaf.h>
+#include <libvmaf/model.h>
+#include <libvmaf/picture.h>
 }
 
 namespace {
 
-struct Graph {
-	AVFilterGraph* g = avfilter_graph_alloc();
-	AVFilterContext *dis = nullptr, *ref = nullptr, *vmaf = nullptr, *sink = nullptr;
-	~Graph() { avfilter_graph_free(&g); }
+// Scores frame pairs with libvmaf in-process; every score stays in memory.
+class Scorer {
+	VmafContext* ctx = nullptr;
+	VmafModel* model = nullptr;
+	unsigned count = 0;
 
-	bool build(const AVFrame* dis_t, const AVFrame* ref_t, AVRational tb, const VmafOptions& o, const std::string& log) {
-		const AVFilter* buf = avfilter_get_by_name("buffer");
-		const AVFilter* lv = avfilter_get_by_name("libvmaf");
-		if (!lv) { fprintf(stderr, "this FFmpeg build has no libvmaf filter\n"); return false; }
-		vmaf = avfilter_graph_alloc_filter(g, lv, "vmaf");
-		av_opt_set(vmaf, "log_fmt", "json", AV_OPT_SEARCH_CHILDREN);
-		av_opt_set(vmaf, "log_path", log.c_str(), AV_OPT_SEARCH_CHILDREN);
-		av_opt_set(vmaf, "model", o.model.c_str(), AV_OPT_SEARCH_CHILDREN);
-		av_opt_set_int(vmaf, "n_threads", o.threads, AV_OPT_SEARCH_CHILDREN);
-		if (avfilter_init_str(vmaf, nullptr) < 0) { fprintf(stderr, "libvmaf init failed (model '%s'?)\n", o.model.c_str()); return false; }
-		return avfilter_graph_create_filter(&dis, buf, "dis", buffer_args(dis_t, tb).c_str(), nullptr, g) >= 0
-			&& avfilter_graph_create_filter(&ref, buf, "ref", buffer_args(ref_t, tb).c_str(), nullptr, g) >= 0
-			&& avfilter_graph_create_filter(&sink, avfilter_get_by_name("buffersink"), "out", nullptr, nullptr, g) >= 0
-			&& avfilter_link(dis, 0, vmaf, 0) >= 0 && avfilter_link(ref, 0, vmaf, 1) >= 0 && avfilter_link(vmaf, 0, sink, 0) >= 0
-			&& avfilter_graph_config(g, nullptr) >= 0;
+	static bool to_picture(const AVFrame* f, VmafPicture& pic) {
+		const AVPixFmtDescriptor* d = av_pix_fmt_desc_get((AVPixelFormat)f->format);
+		if (!d || !(d->flags & AV_PIX_FMT_FLAG_PLANAR) || (d->flags & AV_PIX_FMT_FLAG_RGB) || d->nb_components < 3 || d->comp[0].depth > 16) {
+			fprintf(stderr, "vmaf: unsupported pixel format %d\n", f->format);
+			return false;
+		}
+		enum VmafPixelFormat fmt = d->log2_chroma_w && d->log2_chroma_h ? VMAF_PIX_FMT_YUV420P : d->log2_chroma_w ? VMAF_PIX_FMT_YUV422P : VMAF_PIX_FMT_YUV444P;
+		if (vmaf_picture_alloc(&pic, fmt, d->comp[0].depth, f->width, f->height) < 0) return false;
+		for (int p = 0; p < 3; p++) {
+			size_t row = (size_t)pic.w[p] * (d->comp[0].depth > 8 ? 2 : 1);
+			for (unsigned y = 0; y < pic.h[p]; y++) memcpy((uint8_t*)pic.data[p] + y * pic.stride[p], f->data[p] + (size_t)y * f->linesize[p], row);
+		}
+		return true;
+	}
+
+public:
+	~Scorer() {
+		if (ctx) vmaf_close(ctx);
+		if (model) vmaf_model_destroy(model);
+	}
+
+	bool open(const VmafOptions& o) {
+		VmafConfiguration cfg{};
+		cfg.log_level = VMAF_LOG_LEVEL_WARNING;
+		cfg.n_threads = o.threads;
+		if (vmaf_init(&ctx, cfg) < 0) { fprintf(stderr, "vmaf: init failed\n"); return false; }
+		VmafModelConfig mc{"vmaf", 0};
+		bool from_path = o.model.rfind("path=", 0) == 0;
+		std::string spec = o.model.substr(o.model.find('=') == std::string::npos ? 0 : o.model.find('=') + 1);
+		int r = from_path ? vmaf_model_load_from_path(&model, &mc, spec.c_str()) : vmaf_model_load(&model, &mc, spec.c_str());
+		if (r < 0) { fprintf(stderr, "vmaf: cannot load model '%s'\n", o.model.c_str()); return false; }
+		if (vmaf_use_features_from_model(ctx, model) < 0) { fprintf(stderr, "vmaf: model features unavailable\n"); return false; }
+		return true;
+	}
+
+	bool add(const AVFrame* ref, const AVFrame* dis) {
+		VmafPicture rp{}, dp{};
+		if (!to_picture(ref, rp)) return false;
+		if (!to_picture(dis, dp)) { vmaf_picture_unref(&rp); return false; }
+		if (vmaf_read_pictures(ctx, &rp, &dp, count) < 0) { fprintf(stderr, "vmaf: scoring frame %u failed\n", count); return false; }
+		count++;
+		return true;
+	}
+
+	bool finish(std::vector<double>& scores) {
+		if (vmaf_read_pictures(ctx, nullptr, nullptr, 0) < 0) { fprintf(stderr, "vmaf: flushing failed\n"); return false; }
+		scores.assign(count, 0);
+		for (unsigned i = 0; i < count; i++) {
+			if (vmaf_score_at_index(ctx, model, &scores[i], i) < 0) { fprintf(stderr, "vmaf: no score for frame %u\n", i); return false; }
+		}
+		return true;
 	}
 };
-
-void parse_scores(const std::string& text, std::vector<double>& out) {
-	// Each frame object holds "frameNum" followed by its metrics; the first "vmaf" after it is that frame's score.
-	for (size_t pos = text.find("\"frameNum\""); pos != std::string::npos; pos = text.find("\"frameNum\"", pos + 1)) {
-		size_t m = text.find("\"vmaf\"", pos);
-		if (m == std::string::npos) break;
-		out.push_back(strtod(text.c_str() + text.find(':', m) + 1, nullptr));
-	}
-}
 
 } // namespace
 
 bool vmaf_score(Source& ref, AVCodecID codec, const std::vector<std::vector<uint8_t>>& packets, const Shape& enc,
                 const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores) {
-	static std::atomic<int> counter;
-	std::string log = (std::filesystem::temp_directory_path() / ("ves_vmaf_" + std::to_string(counter++) + ".json")).string();
-
 	const AVCodec* c = avcodec_find_decoder(codec);
 	AVCodecContext* dec = c ? avcodec_alloc_context3(c) : nullptr;
 	// Without VUI reorder info the H.264 decoder guesses the B-frame depth and can drop or misorder early frames;
@@ -67,37 +86,27 @@ bool vmaf_score(Source& ref, AVCodecID codec, const std::vector<std::vector<uint
 	// Original frame k shows encoded frame floor(k * enc.fps / ref.fps): dropped frames are held, never interpolated.
 	const int64_t num = (int64_t)enc.fps.num * ref.framerate.den, den = (int64_t)enc.fps.den * ref.framerate.num;
 	const bool rescale = enc.w != ref.width || enc.h != ref.height;
-	const AVRational tb = av_inv_q(ref.framerate);
 
 	bool ok = true;
 	{
-		Graph gr;
+		Scorer scorer;
 		Scaler up;
 		AVFrame* d = av_frame_alloc();
 		AVFrame* u = av_frame_alloc();
 		AVFrame* r = av_frame_alloc();
-		AVFrame* o = av_frame_alloc();
 		AVPacket* pkt = av_packet_alloc();
 		long long m = 0, mo = 0, k = 0; // decoded frames in, scaled frames out, original frame index
-		bool graph_ready = false;
 
-		auto drain_sink = [&] { while (av_buffersink_get_frame(gr.sink, o) >= 0) av_frame_unref(o); };
+		ok = scorer.open(opt);
+
 		// Hold `shown` (decoded frame number mi, at the original resolution) for every original frame up to the next one.
 		auto show = [&](const AVFrame* shown, int64_t mi) {
 			while (ok && k * num / den == mi) {
 				int rr = ref.next(r);
 				if (rr < 0) { ok = false; break; }
 				if (rr == 0) break;
-				AVFrame* dup = av_frame_clone(shown);
-				dup->pts = k;
-				if (!graph_ready) {
-					ok = gr.build(dup, r, tb, opt, log);
-					graph_ready = ok;
-				}
-				ok = ok && av_buffersrc_add_frame(gr.dis, dup) >= 0 && av_buffersrc_add_frame(gr.ref, r) >= 0;
-				av_frame_free(&dup);
+				ok = scorer.add(r, shown);
 				av_frame_unref(r);
-				drain_sink();
 				k++;
 			}
 		};
@@ -137,21 +146,13 @@ bool vmaf_score(Source& ref, AVCodecID codec, const std::vector<std::vector<uint
 		}
 		if (ok) { avcodec_send_packet(dec, nullptr); pump(); }
 		if (ok && rescale) { ok = up.push(nullptr); collect_scaled(); }
-		if (ok && !graph_ready) { fprintf(stderr, "no frames were decoded\n"); ok = false; }
-		if (ok) { ok = av_buffersrc_add_frame(gr.dis, nullptr) >= 0 && av_buffersrc_add_frame(gr.ref, nullptr) >= 0; drain_sink(); }
+		if (ok && k == 0) { fprintf(stderr, "no frames were decoded\n"); ok = false; }
 		if (ok && ref.next(r) == 1) { fprintf(stderr, "encoded stream has fewer frames than the reference\n"); ok = false; }
+		if (ok) ok = scorer.finish(scores);
 
-		av_frame_free(&d); av_frame_free(&u); av_frame_free(&r); av_frame_free(&o); av_packet_free(&pkt);
-	} // graph freed here: libvmaf writes its log on teardown
+		av_frame_free(&d); av_frame_free(&u); av_frame_free(&r); av_packet_free(&pkt);
+	}
 
 	avcodec_free_context(&dec);
-	if (ok) {
-		std::ifstream f(log);
-		std::stringstream ss; ss << f.rdbuf();
-		scores.clear();
-		parse_scores(ss.str(), scores);
-		if (scores.empty()) { fprintf(stderr, "no scores found in '%s'\n", log.c_str()); return false; }
-	}
-	std::error_code ec; std::filesystem::remove(log, ec);
 	return ok;
 }

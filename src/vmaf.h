@@ -7,7 +7,7 @@
 #include "source.h"
 
 struct VmafOptions {
-	std::string model = "version=vmaf_4k_v0.6.1"; // libvmaf model spec: "version=..." or "path=..."
+	std::string model = "path=models/vmaf_4k_v0.6.1.json"; // "path=<json model>", relative to the working directory, or "version=<builtin>" if libvmaf has it
 	int threads = 4;
 };
 
