@@ -5,14 +5,68 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <map>
+#include <mutex>
 #include <vector>
+
+#include "formats.h"
 
 extern "C" {
 #include <ffnvcodec/dynlink_loader.h>
-#include <libswscale/swscale.h>
 }
 
 namespace {
+
+GUID codec_guid(const std::string& codec, bool& known) {
+	known = true;
+	if (codec == "h264") return NV_ENC_CODEC_H264_GUID;
+	if (codec == "hevc") return NV_ENC_CODEC_HEVC_GUID;
+	if (codec == "av1") return NV_ENC_CODEC_AV1_GUID;
+	known = false;
+	return GUID{};
+}
+
+// What the GPU and driver can encode for a codec; asked once by opening a throwaway session.
+struct Caps {
+	bool b10 = false, c444 = false;
+};
+
+Caps probe_caps(const std::string& codec) {
+	Caps caps;
+	bool known;
+	GUID guid = codec_guid(codec, known);
+	CudaFunctions* cu = nullptr;
+	NvencFunctions* nv = nullptr;
+	CUcontext ctx = nullptr;
+	void* enc = nullptr;
+	NV_ENCODE_API_FUNCTION_LIST f{};
+	CUdevice dev;
+	if (known && cuda_load_functions(&cu, nullptr) >= 0 && nvenc_load_functions(&nv, nullptr) >= 0 && !cu->cuInit(0) && !cu->cuDeviceGet(&dev, 0) &&
+	    !cu->cuCtxCreate(&ctx, 0, dev)) {
+		f.version = NV_ENCODE_API_FUNCTION_LIST_VER;
+		NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS os{};
+		os.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+		os.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
+		os.device = ctx;
+		os.apiVersion = NVENCAPI_VERSION;
+		if (!nv->NvEncodeAPICreateInstance(&f) && !f.nvEncOpenEncodeSessionEx(&os, &enc)) {
+			auto query = [&](NV_ENC_CAPS c) {
+				NV_ENC_CAPS_PARAM cp{};
+				cp.version = NV_ENC_CAPS_PARAM_VER;
+				cp.capsToQuery = c;
+				int v = 0;
+				return !f.nvEncGetEncodeCaps(enc, guid, &cp, &v) && v > 0;
+			};
+			caps.b10 = query(NV_ENC_CAPS_SUPPORT_10BIT_ENCODE);
+			caps.c444 = query(NV_ENC_CAPS_SUPPORT_YUV444_ENCODE);
+			f.nvEncDestroyEncoder(enc);
+		}
+	}
+	if (ctx) cu->cuCtxDestroy(ctx);
+	nvenc_free_functions(&nv);
+	cuda_free_functions(&cu);
+	return caps;
+}
 
 struct Slot {
 	NV_ENC_INPUT_PTR in = nullptr;
@@ -33,7 +87,8 @@ class Nvenc : public Encoder {
 	std::vector<Slot> slots;
 	std::vector<Slot*> free_;
 	std::deque<Slot*> pending; // submitted, output not yet read (encoder reorders / looks ahead)
-	SwsContext* sws = nullptr;
+	NV_ENC_BUFFER_FORMAT buffer_fmt = NV_ENC_BUFFER_FORMAT_NV12;
+	int chroma = 420, depth = 8;
 	Sink sink;
 	int w = 0, h = 0;
 	size_t delay = 0;
@@ -54,7 +109,6 @@ public:
 			f.nvEncDestroyEncoder(enc);
 		}
 		if (ctx) cu->cuCtxDestroy(ctx);
-		sws_freeContext(sws);
 		nvenc_free_functions(&nv);
 		cuda_free_functions(&cu);
 	}
@@ -91,12 +145,17 @@ public:
 		os.apiVersion = NVENCAPI_VERSION;
 		if ((st = f.nvEncOpenEncodeSessionEx(&os, &enc))) { enc = nullptr; return fail(st, "open session"); }
 
-		GUID codec;
-		bool h26x = true;
-		if (p.codec == "h264") codec = NV_ENC_CODEC_H264_GUID;
-		else if (p.codec == "hevc") codec = NV_ENC_CODEC_HEVC_GUID;
-		else if (p.codec == "av1") { codec = NV_ENC_CODEC_AV1_GUID; h26x = false; }
-		else { fprintf(stderr, "nvenc: unknown codec '%s'\n", p.codec.c_str()); return false; }
+		bool known;
+		GUID codec = codec_guid(p.codec, known);
+		const bool h26x = p.codec != "av1";
+		if (!known) { fprintf(stderr, "nvenc: unknown codec '%s'\n", p.codec.c_str()); return false; }
+
+		Fmt fmt;
+		describe_format(p.pix, fmt);
+		chroma = fmt.chroma; depth = fmt.depth;
+		buffer_fmt = chroma == 444 ? (depth > 8 ? NV_ENC_BUFFER_FORMAT_YUV444_10BIT : NV_ENC_BUFFER_FORMAT_YUV444)
+		                           : (depth > 8 ? NV_ENC_BUFFER_FORMAT_YUV420_10BIT : NV_ENC_BUFFER_FORMAT_NV12);
+		if (chroma == 422 || depth > 10) { fprintf(stderr, "nvenc: cannot encode %d-bit %d\n", depth, chroma); return false; }
 
 		int preset = 4;
 		if (take("preset", v)) {
@@ -119,6 +178,13 @@ public:
 		NV_ENC_CONFIG cfg = pc.presetCfg;
 
 		cfg.gopLength = p.gop;
+		{ // chroma layout and bit depth; the input and output depth are kept equal
+			const NV_ENC_BIT_DEPTH bd = depth > 8 ? NV_ENC_BIT_DEPTH_10 : NV_ENC_BIT_DEPTH_8;
+			const uint32_t idc = chroma == 444 ? 3 : 1;
+			if (p.codec == "h264") { auto& c = cfg.encodeCodecConfig.h264Config; c.chromaFormatIDC = idc; c.inputBitDepth = c.outputBitDepth = bd; }
+			else if (p.codec == "hevc") { auto& c = cfg.encodeCodecConfig.hevcConfig; c.chromaFormatIDC = idc; c.inputBitDepth = c.outputBitDepth = bd; }
+			else { auto& c = cfg.encodeCodecConfig.av1Config; c.chromaFormatIDC = idc; c.inputBitDepth = c.outputBitDepth = bd; }
+		}
 		if (h26x) {
 			(codec == NV_ENC_CODEC_H264_GUID ? cfg.encodeCodecConfig.h264Config.idrPeriod : cfg.encodeCodecConfig.hevcConfig.idrPeriod) = p.gop;
 		}
@@ -167,7 +233,7 @@ public:
 			NV_ENC_CREATE_INPUT_BUFFER ci{};
 			ci.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
 			ci.width = w; ci.height = h;
-			ci.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
+			ci.bufferFmt = buffer_fmt;
 			if ((st = f.nvEncCreateInputBuffer(enc, &ci))) return fail(st, "create input buffer");
 			sl.in = ci.inputBuffer;
 			NV_ENC_CREATE_BITSTREAM_BUFFER cb{};
@@ -177,6 +243,29 @@ public:
 			free_.push_back(&sl);
 		}
 		return true;
+	}
+
+	// Copies the planar frame into the layout NVENC wants: NV12 / P010 (interleaved chroma) or planar 4:4:4.
+	// 10-bit samples go in the top bits of 16, as NVENC expects, so each one is shifted left by 6.
+	void repack(const AVFrame* fr, uint8_t* dst, uint32_t pitch) const {
+		const int sample = depth > 8 ? 2 : 1;
+		auto put = [&](uint8_t* d, int x, int v) { if (sample == 1) d[x] = (uint8_t)v; else ((uint16_t*)d)[x] = (uint16_t)(v << 6); };
+		auto get = [&](const uint8_t* s, int x) { return sample == 1 ? (int)s[x] : (int)((const uint16_t*)s)[x]; };
+		auto plane = [&](int p, uint8_t* out, int pw, int ph) {
+			for (int y = 0; y < ph; y++) for (int x = 0; x < pw; x++) put(out + (size_t)y * pitch, x, get(fr->data[p] + (size_t)y * fr->linesize[p], x));
+		};
+		plane(0, dst, w, h);
+		if (chroma == 444) {
+			plane(1, dst + (size_t)pitch * h, w, h);
+			plane(2, dst + (size_t)pitch * h * 2, w, h);
+			return;
+		}
+		uint8_t* uv = dst + (size_t)pitch * h;
+		for (int y = 0; y < (h + 1) / 2; y++) {
+			const uint8_t *u = fr->data[1] + (size_t)y * fr->linesize[1], *v = fr->data[2] + (size_t)y * fr->linesize[2];
+			uint8_t* row = uv + (size_t)y * pitch;
+			for (int x = 0; x < (w + 1) / 2; x++) { put(row, 2 * x, get(u, x)); put(row, 2 * x + 1, get(v, x)); }
+		}
 	}
 
 	// Outputs only become readable once the encoder has run `delay` frames past them; flush reads everything.
@@ -214,16 +303,13 @@ public:
 		li.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
 		li.inputBuffer = s->in;
 		if ((st = f.nvEncLockInputBuffer(enc, &li))) return fail(st, "lock input");
-		if (!sws) sws = sws_getContext(fr->width, fr->height, (AVPixelFormat)fr->format, w, h, AV_PIX_FMT_NV12, SWS_BICUBIC, nullptr, nullptr, nullptr);
-		uint8_t* dst[4] = {(uint8_t*)li.bufferDataPtr, (uint8_t*)li.bufferDataPtr + (size_t)li.pitch * h, nullptr, nullptr};
-		int stride[4] = {(int)li.pitch, (int)li.pitch, 0, 0};
-		sws_scale(sws, fr->data, fr->linesize, 0, fr->height, dst, stride);
+		repack(fr, (uint8_t*)li.bufferDataPtr, li.pitch);
 		f.nvEncUnlockInputBuffer(enc, s->in);
 
 		NV_ENC_PIC_PARAMS pp{};
 		pp.version = NV_ENC_PIC_PARAMS_VER;
 		pp.inputBuffer = s->in;
-		pp.bufferFmt = NV_ENC_BUFFER_FORMAT_NV12;
+		pp.bufferFmt = buffer_fmt;
 		pp.inputWidth = w; pp.inputHeight = h; pp.inputPitch = li.pitch;
 		pp.outputBitstream = s->out;
 		pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
@@ -238,3 +324,18 @@ public:
 } // namespace
 
 std::unique_ptr<Encoder> make_encoder_nvenc() { return std::make_unique<Nvenc>(); }
+
+bool nvenc_supports(const std::string& codec, int chroma, int depth) {
+	static std::mutex m;
+	static std::map<std::string, Caps> cache;
+	Caps c;
+	{
+		std::lock_guard<std::mutex> lock(m);
+		auto it = cache.find(codec);
+		if (it == cache.end()) it = cache.emplace(codec, probe_caps(codec)).first;
+		c = it->second;
+	}
+	if (chroma == 422 || depth > 10) return false;
+	if (depth == 10 && !c.b10) return false;
+	return chroma == 420 || c.c444;
+}

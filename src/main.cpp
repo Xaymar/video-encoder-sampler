@@ -234,17 +234,16 @@ static bool run_one(const std::string& input, const std::string& encoder, AVCode
 	// Encoder input format: "chroma" and "bitdepth" options if given, else the source's, else the closest the encoder takes.
 	Fmt sf;
 	if (!describe_format(src.pix, sf)) { fprintf(stderr, "unsupported source pixel format %s\n", av_get_pix_fmt_name(src.pix)); return false; }
-	int chroma = sf.chroma, depth = sf.depth;
-	bool chroma_set = false, depth_set = false;
-	if (auto it = p.options.find("chroma"); it != p.options.end()) { chroma = atoi(it->second.c_str()); chroma_set = true; p.options.erase(it); }
-	if (auto it = p.options.find("bitdepth"); it != p.options.end()) { depth = atoi(it->second.c_str()); depth_set = true; p.options.erase(it); }
-	if (!encoder_supports(encoder, p.codec, chroma, depth)) {
-		if (chroma_set || depth_set) { fprintf(stderr, "%s cannot encode %d-bit %d here\n", encoder.c_str(), depth, chroma); return false; }
-		// Keep the chroma layout if possible and lower the depth, else fall back to 8-bit 4:2:0.
-		bool found = false;
-		for (int dd : {depth, 10, 8}) if (!found && dd <= depth && encoder_supports(encoder, p.codec, chroma, dd)) { depth = dd; found = true; }
-		if (!found) { chroma = 420; depth = 8; }
+	// What the config asks for (chroma / bitdepth options) is used as is; what it leaves open follows the source,
+	// falling back to the closest thing the encoder takes: another chroma layout (4:2:0), then a lower depth.
+	std::vector<int> chromas{sf.chroma, 420}, depths{sf.depth, 10, 8};
+	if (auto it = p.options.find("chroma"); it != p.options.end()) { chromas = {atoi(it->second.c_str())}; p.options.erase(it); }
+	if (auto it = p.options.find("bitdepth"); it != p.options.end()) { depths = {atoi(it->second.c_str())}; p.options.erase(it); }
+	int chroma = 0, depth = 0;
+	for (int c : chromas) for (int d : depths) {
+		if (!chroma && (d <= sf.depth || depths.size() == 1) && encoder_supports(encoder, p.codec, c, d)) { chroma = c; depth = d; }
 	}
+	if (!chroma) { fprintf(stderr, "%s cannot encode %d-bit %d here\n", encoder.c_str(), depths[0], chromas[0]); return false; }
 	p.pix = enc.pix = planar_format(chroma, depth);
 	// Both sides are scored in the source's chroma layout at the higher of the two bit depths.
 	const AVPixelFormat score_fmt = planar_format(sf.chroma, std::max(sf.depth, depth));

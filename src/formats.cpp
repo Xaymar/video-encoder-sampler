@@ -1,5 +1,7 @@
 #include "formats.h"
 
+#include "encoder.h"
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/pixdesc.h>
@@ -30,7 +32,8 @@ AVPixelFormat planar_format(int chroma, int depth) {
 bool encoder_supports(const std::string& encoder, const std::string& codec, int chroma, int depth) {
 	if (planar_format(chroma, depth) == AV_PIX_FMT_NONE) return false;
 	if (encoder == "x264") return depth <= 10;
-	if (encoder == "x265" || encoder == "svtav1" || encoder == "nvenc" || encoder == "amf") return chroma == 420 && depth == 8; // shortcut: widened as each backend learns the formats
+	if (encoder == "nvenc") return nvenc_supports(codec, chroma, depth);
+	if (encoder == "x265" || encoder == "svtav1" || encoder == "amf") return chroma == 420 && depth == 8; // shortcut: widened as each backend learns the formats
 	const AVCodec* c = avcodec_find_encoder_by_name(encoder.c_str());
 	if (!c) return false;
 	const AVPixelFormat* fmts = nullptr;
