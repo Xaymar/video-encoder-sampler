@@ -47,6 +47,7 @@ std::unique_ptr<Encoder> make_encoder_svtav1();
 std::unique_ptr<Encoder> make_encoder_libav(const std::string& name);
 
 bool nvenc_supports(const std::string& codec, int chroma, int depth);
+bool amf_supports(const std::string& codec, int chroma, int depth);
 
 inline bool is_gpu_encoder(const std::string& name) { return name == "nvenc" || name == "amf"; }
 inline bool is_native_encoder(const std::string& name) { return is_gpu_encoder(name) || name == "x264" || name == "x265" || name == "svtav1"; }

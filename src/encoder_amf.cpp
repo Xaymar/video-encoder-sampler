@@ -5,8 +5,12 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
 #include <string>
 #include <thread>
+
+#include "formats.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -17,27 +21,23 @@
 #include <components/VideoEncoderVCE.h>
 #include <core/Factory.h>
 
-extern "C" {
-#include <libswscale/swscale.h>
-}
-
 using Microsoft::WRL::ComPtr;
 
 namespace {
 
 struct Names { // property names differ per codec
-	const wchar_t *component, *usage, *target, *peak, *size, *rate, *rc, *gop;
+	const wchar_t *component, *usage, *target, *peak, *size, *rate, *rc, *gop, *bitdepth;
 	int64_t usage_transcoding, rc_cbr;
 };
 
 const Names H264 = {AMFVideoEncoderVCE_AVC, AMF_VIDEO_ENCODER_USAGE, AMF_VIDEO_ENCODER_TARGET_BITRATE, AMF_VIDEO_ENCODER_PEAK_BITRATE,
-	AMF_VIDEO_ENCODER_FRAMESIZE, AMF_VIDEO_ENCODER_FRAMERATE, AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD, AMF_VIDEO_ENCODER_IDR_PERIOD,
+	AMF_VIDEO_ENCODER_FRAMESIZE, AMF_VIDEO_ENCODER_FRAMERATE, AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD, AMF_VIDEO_ENCODER_IDR_PERIOD, AMF_VIDEO_ENCODER_COLOR_BIT_DEPTH,
 	AMF_VIDEO_ENCODER_USAGE_TRANSCODING, AMF_VIDEO_ENCODER_RATE_CONTROL_METHOD_CBR};
 const Names HEVC = {AMFVideoEncoder_HEVC, AMF_VIDEO_ENCODER_HEVC_USAGE, AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE,
-	AMF_VIDEO_ENCODER_HEVC_FRAMESIZE, AMF_VIDEO_ENCODER_HEVC_FRAMERATE, AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD, AMF_VIDEO_ENCODER_HEVC_GOP_SIZE,
+	AMF_VIDEO_ENCODER_HEVC_FRAMESIZE, AMF_VIDEO_ENCODER_HEVC_FRAMERATE, AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD, AMF_VIDEO_ENCODER_HEVC_GOP_SIZE, AMF_VIDEO_ENCODER_HEVC_COLOR_BIT_DEPTH,
 	AMF_VIDEO_ENCODER_HEVC_USAGE_TRANSCODING, AMF_VIDEO_ENCODER_HEVC_RATE_CONTROL_METHOD_CBR};
 const Names AV1 = {AMFVideoEncoder_AV1, AMF_VIDEO_ENCODER_AV1_USAGE, AMF_VIDEO_ENCODER_AV1_TARGET_BITRATE, AMF_VIDEO_ENCODER_AV1_PEAK_BITRATE,
-	AMF_VIDEO_ENCODER_AV1_FRAMESIZE, AMF_VIDEO_ENCODER_AV1_FRAMERATE, AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD, AMF_VIDEO_ENCODER_AV1_GOP_SIZE,
+	AMF_VIDEO_ENCODER_AV1_FRAMESIZE, AMF_VIDEO_ENCODER_AV1_FRAMERATE, AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD, AMF_VIDEO_ENCODER_AV1_GOP_SIZE, AMF_VIDEO_ENCODER_AV1_COLOR_BIT_DEPTH,
 	AMF_VIDEO_ENCODER_AV1_USAGE_TRANSCODING, AMF_VIDEO_ENCODER_AV1_RATE_CONTROL_METHOD_CBR};
 
 std::wstring wide(const std::string& s) { return std::wstring(s.begin(), s.end()); } // property names are ASCII
@@ -48,7 +48,7 @@ class Amf : public Encoder {
 	ComPtr<ID3D11Device> device;
 	amf::AMFContextPtr ctx;
 	amf::AMFComponentPtr enc;
-	SwsContext* sws = nullptr;
+	int depth = 8;
 	Sink sink;
 	int w = 0, h = 0;
 	bool eof = false;
@@ -77,6 +77,21 @@ class Amf : public Encoder {
 		return true;
 	}
 
+	// Planar frame into NV12 / P010 (interleaved chroma); 10-bit samples go in the top bits of 16, so they are shifted left by 6.
+	void repack(const AVFrame* fr, amf::AMFSurface* surf) const {
+		const int sample = depth > 8 ? 2 : 1;
+		auto put = [&](uint8_t* d, int x, int v) { if (sample == 1) d[x] = (uint8_t)v; else ((uint16_t*)d)[x] = (uint16_t)(v << 6); };
+		auto get = [&](const uint8_t* s, int x) { return sample == 1 ? (int)s[x] : (int)((const uint16_t*)s)[x]; };
+		amf::AMFPlane *yp = surf->GetPlaneAt(0), *uvp = surf->GetPlaneAt(1);
+		uint8_t *y = (uint8_t*)yp->GetNative(), *uv = (uint8_t*)uvp->GetNative();
+		for (int row = 0; row < h; row++) for (int x = 0; x < w; x++) put(y + (size_t)row * yp->GetHPitch(), x, get(fr->data[0] + (size_t)row * fr->linesize[0], x));
+		for (int row = 0; row < (h + 1) / 2; row++) {
+			const uint8_t *u = fr->data[1] + (size_t)row * fr->linesize[1], *v = fr->data[2] + (size_t)row * fr->linesize[2];
+			uint8_t* out = uv + (size_t)row * uvp->GetHPitch();
+			for (int x = 0; x < (w + 1) / 2; x++) { put(out, 2 * x, get(u, x)); put(out, 2 * x + 1, get(v, x)); }
+		}
+	}
+
 	bool poll() { // collect whatever the encoder has finished
 		for (;;) {
 			amf::AMFDataPtr data;
@@ -96,13 +111,16 @@ public:
 		if (ctx) ctx->Terminate();
 		ctx = nullptr;
 		device.Reset();
-		sws_freeContext(sws);
 		// shortcut: amfrt64.dll stays loaded; unloading it while AMF's worker threads wind down has been unreliable
 	}
 
 	bool open(const Params& p, Sink s) override {
 		sink = std::move(s);
 		w = p.width; h = p.height;
+		Fmt fmt;
+		describe_format(p.pix, fmt);
+		depth = fmt.depth;
+		if (fmt.chroma != 420 || depth > 10) { fprintf(stderr, "amf: cannot encode %d-bit %d\n", depth, fmt.chroma); return false; }
 		const Names* n = p.codec == "h264" ? &H264 : p.codec == "hevc" ? &HEVC : p.codec == "av1" ? &AV1 : nullptr;
 		if (!n) { fprintf(stderr, "amf: unknown codec '%s'\n", p.codec.c_str()); return false; }
 		Options o = p.options;
@@ -141,9 +159,10 @@ public:
 		enc->SetProperty(n->size, AMFConstructSize(w, h));
 		enc->SetProperty(n->rate, AMFConstructRate(p.framerate.num, p.framerate.den));
 		enc->SetProperty(n->gop, (amf_int64)p.gop);
+		enc->SetProperty(n->bitdepth, (amf_int64)(depth > 8 ? 10 : 8));
 		for (auto& [k, v] : o) if (!set(k, v)) return false;
 
-		if ((r = enc->Init(amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init");
+		if ((r = enc->Init(depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init");
 		return true;
 	}
 
@@ -155,12 +174,8 @@ public:
 			return eof;
 		}
 		amf::AMFSurfacePtr surf;
-		if ((r = ctx->AllocSurface(amf::AMF_MEMORY_HOST, amf::AMF_SURFACE_NV12, w, h, &surf)) != AMF_OK) return fail(r, "AllocSurface");
-		amf::AMFPlane *y = surf->GetPlaneAt(0), *uv = surf->GetPlaneAt(1);
-		if (!sws) sws = sws_getContext(fr->width, fr->height, (AVPixelFormat)fr->format, w, h, AV_PIX_FMT_NV12, SWS_BICUBIC, nullptr, nullptr, nullptr);
-		uint8_t* dst[4] = {(uint8_t*)y->GetNative(), (uint8_t*)uv->GetNative(), nullptr, nullptr};
-		int stride[4] = {y->GetHPitch(), uv->GetHPitch(), 0, 0};
-		sws_scale(sws, fr->data, fr->linesize, 0, fr->height, dst, stride);
+		if ((r = ctx->AllocSurface(amf::AMF_MEMORY_HOST, depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h, &surf)) != AMF_OK) return fail(r, "AllocSurface");
+		repack(fr, surf);
 		surf->SetPts(fr->pts);
 		if ((r = surf->Convert(amf::AMF_MEMORY_DX11)) != AMF_OK) return fail(r, "Convert");
 
@@ -178,3 +193,21 @@ public:
 } // namespace
 
 std::unique_ptr<Encoder> make_encoder_amf() { return std::make_unique<Amf>(); }
+
+// Whether this machine's AMD GPU can encode the codec at that bit depth, found by initializing a throwaway encoder once.
+bool amf_supports(const std::string& codec, int chroma, int depth) {
+	if (chroma != 420 || depth > 10) return false;
+	static std::mutex m;
+	static std::map<std::string, bool> cache;
+	std::lock_guard<std::mutex> lock(m);
+	const std::string key = codec + std::to_string(depth);
+	auto it = cache.find(key);
+	if (it == cache.end()) {
+		Params p;
+		p.width = 1280; p.height = 720; p.bitrate = 5000000; p.gop = 60;
+		p.pix = depth > 8 ? AV_PIX_FMT_YUV420P10LE : AV_PIX_FMT_YUV420P;
+		p.codec = codec;
+		it = cache.emplace(key, make_encoder_amf()->open(p, nullptr)).first;
+	}
+	return it->second;
+}

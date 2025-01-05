@@ -91,7 +91,7 @@ Sources keep their pixel format. Every encoder run can set `chroma` (`420`, `422
 
 Quality is measured with both sides in the source's chroma layout at the higher of the source's and the output's bit depth (RGB counts as 4:4:4), so an 8-bit and a 10-bit encode of the same clip are directly comparable.
 
-Formats currently supported by each backend: `x264` 4:2:0, 4:2:2 and 4:4:4 at 8 and 10 bit; `nvenc` whatever the GPU reports (asked once per codec): 8-bit 4:2:0 everywhere, 10-bit and 4:4:4 where the codec and GPU allow it, never 4:2:2; `x265` 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bit; `svtav1` 4:2:0 at 8 and 10 bit (this SVT-AV1 refuses other layouts); libavcodec encoders whatever they list as planar YUV; `amf` 8-bit 4:2:0 for now.
+Formats currently supported by each backend: `x264` 4:2:0, 4:2:2 and 4:4:4 at 8 and 10 bit; `nvenc` whatever the GPU reports (asked once per codec): 8-bit 4:2:0 everywhere, 10-bit and 4:4:4 where the codec and GPU allow it, never 4:2:2; `x265` 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bit; `svtav1` 4:2:0 at 8 and 10 bit (this SVT-AV1 refuses other layouts); libavcodec encoders whatever they list as planar YUV; `amf` 4:2:0 at 8 bit, and at 10 bit for HEVC (and AV1) where the GPU does it, found by trying once per codec and depth; this Radeon iGPU has no AV1 and no 10-bit H.264.
 
 ### Encoders
 | `encoder` | Backend | Options |
