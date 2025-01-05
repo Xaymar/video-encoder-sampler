@@ -91,7 +91,7 @@ Sources keep their pixel format. Every encoder run can set `chroma` (`420`, `422
 
 Quality is measured with both sides in the source's chroma layout at the higher of the source's and the output's bit depth (RGB counts as 4:4:4), so an 8-bit and a 10-bit encode of the same clip are directly comparable.
 
-Formats currently supported by each backend: `x264` 4:2:0, 4:2:2 and 4:4:4 at 8 and 10 bit; `nvenc` whatever the GPU reports (asked once per codec): 8-bit 4:2:0 everywhere, 10-bit and 4:4:4 where the codec and GPU allow it, never 4:2:2; libavcodec encoders whatever they list as planar YUV; `amf`, `x265` and `svtav1` 8-bit 4:2:0 for now.
+Formats currently supported by each backend: `x264` 4:2:0, 4:2:2 and 4:4:4 at 8 and 10 bit; `nvenc` whatever the GPU reports (asked once per codec): 8-bit 4:2:0 everywhere, 10-bit and 4:4:4 where the codec and GPU allow it, never 4:2:2; `x265` 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bit; `svtav1` 4:2:0 at 8 and 10 bit (this SVT-AV1 refuses other layouts); libavcodec encoders whatever they list as planar YUV; `amf` 8-bit 4:2:0 for now.
 
 ### Encoders
 | `encoder` | Backend | Options |
@@ -112,5 +112,6 @@ Constant bitrate encoders still miss their target, and spending more bits would 
 
 ## Current Limitations
 * Frames are assumed to arrive at a constant frame rate.
+* SVT-AV1 is not deterministic: the same options give slightly different bitrates and scores from run to run (a few tenths of a VMAF point on a short clip). Compare its results with that in mind.
 * 4:1:0, 4:1:1 and 4:4:0 sources are treated as 4:2:0, and 16-bit or gray sources are not supported.
 * Input videos should be properly tagged.

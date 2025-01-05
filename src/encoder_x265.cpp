@@ -6,6 +6,8 @@
 
 #include <cstdio>
 
+#include "formats.h"
+
 extern "C" {
 #include <x265.h>
 }
@@ -18,6 +20,8 @@ class X265 : public Encoder {
 	x265_encoder* h = nullptr;
 	x265_picture *in = nullptr, *out = nullptr;
 	Sink sink;
+	AVPixelFormat pix = AV_PIX_FMT_YUV420P;
+	int csp = X265_CSP_I420, depth = 8;
 
 	void emit(x265_nal* nal, uint32_t n) {
 		size_t bytes = 0;
@@ -37,8 +41,12 @@ public:
 
 	bool open(const Params& p, Sink s) override {
 		sink = std::move(s);
-		api = x265_api_get(8);
-		if (!api) { fprintf(stderr, "x265: no 8-bit encoder available\n"); return false; }
+		Fmt f;
+		describe_format(p.pix, f);
+		pix = p.pix; depth = f.depth;
+		csp = f.chroma == 444 ? X265_CSP_I444 : f.chroma == 422 ? X265_CSP_I422 : X265_CSP_I420;
+		api = x265_api_get(depth);
+		if (!api) { fprintf(stderr, "x265: no %d-bit encoder available\n", depth); return false; }
 		Options o = p.options;
 		auto take = [&](const char* k, std::string& v) {
 			auto it = o.find(k);
@@ -54,7 +62,7 @@ public:
 			return false;
 		}
 		par->sourceWidth = p.width; par->sourceHeight = p.height;
-		par->internalCsp = X265_CSP_I420;
+		par->internalCsp = csp;
 		par->fpsNum = p.framerate.num; par->fpsDenom = p.framerate.den;
 		par->keyframeMax = p.gop;
 		par->bRepeatHeaders = 1; // parameter sets in-band so the stream decodes on its own
@@ -75,9 +83,9 @@ public:
 		x265_nal* nal;
 		uint32_t n = 0;
 		if (fr) {
-			if (fr->format != AV_PIX_FMT_YUV420P) { fprintf(stderr, "x265: input must be yuv420p\n"); return false; }
-			in->colorSpace = X265_CSP_I420;
-			in->bitDepth = 8;
+			if (fr->format != pix) { fprintf(stderr, "x265: input must be %s\n", av_get_pix_fmt_name(pix)); return false; }
+			in->colorSpace = csp;
+			in->bitDepth = depth;
 			for (int i = 0; i < 3; i++) { in->planes[i] = fr->data[i]; in->stride[i] = fr->linesize[i]; }
 			in->pts = fr->pts;
 			int r = api->encoder_encode(h, &nal, &n, in, out);
