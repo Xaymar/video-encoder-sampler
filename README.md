@@ -80,7 +80,7 @@ Without arguments VES reads `config.json` from the working directory. The second
 * `pool` / `parallel`: runs in one pool share a device and at most `parallel` of them run at once. Defaults: `nvenc` and `amf` 2, everything else (`cpu`) 1. Different pools run at the same time. Concurrency changes how long the sweep takes, never the scores.
 
 ### Scaling and frame rates
-Resolution changes use the libplacebo filter (GPU, Vulkan) with the `upscaler` / `downscaler` named in `scaling` (default `ewa_lanczos` for both). Frame rate conversion only drops frames, and it happens before scaling so no time is spent on frames that are thrown away. Resolutions or frame rates above the source's are rejected.
+Resolution changes use the libplacebo filter (GPU, Vulkan) with the `upscaler` / `downscaler` named in `scaling` (default `ewa_lanczos` for both). Frame rate conversion only drops frames, and it happens before scaling so no time is spent on frames that are thrown away. It follows the real presentation times from the file (every packet's timestamp is read), so variable frame rate sources work: the first frame in each `1/framerate` slot of the output timeline is kept, and bitrates are computed over the real duration. Without `framerates` every frame is kept. Resolutions or frame rates above the source's are rejected.
 
 Colours are never converted: pixel values go through unchanged and the source's range, matrix, primaries and transfer tags are used for scaling, including full range (`pc`, `yuvj420p`) sources. Encoders are not told the range, since it does not influence what they encode.
 
@@ -111,7 +111,7 @@ For every group (same input, target bitrate and key frame interval), a run count
 Constant bitrate encoders still miss their target, and spending more bits would win frames unfairly. A run that overshoots its target loses `over_penalty` VMAF points per percent of overshoot (default 0.025, taken from the VMAF gain between 3000 and 6000 kbps on a test clip). Undershooting costs nothing.
 
 ## Current Limitations
-* Frames are assumed to arrive at a constant frame rate.
+* Encoders are told one constant frame rate (the source's, or the measured average for a variable frame rate source) and get frames numbered in order; only the dropping of frames and the scoring follow the real timestamps.
 * SVT-AV1 is not deterministic: the same options give slightly different bitrates and scores from run to run (a few tenths of a VMAF point on a short clip). Compare its results with that in mind.
 * 4:1:0, 4:1:1 and 4:4:0 sources are treated as 4:2:0, and 16-bit or gray sources are not supported.
 * Input videos should be properly tagged.

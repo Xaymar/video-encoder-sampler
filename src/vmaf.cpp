@@ -75,7 +75,7 @@ public:
 } // namespace
 
 bool vmaf_score(Source& ref, AVCodecID codec, const std::vector<std::vector<uint8_t>>& packets, const Shape& enc,
-                AVPixelFormat score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores) {
+                const std::vector<uint32_t>& shown_map, AVPixelFormat score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores) {
 	const AVCodec* c = avcodec_find_decoder(codec);
 	AVCodecContext* dec = c ? avcodec_alloc_context3(c) : nullptr;
 	// Without VUI reorder info the H.264 decoder guesses the B-frame depth and can drop or misorder early frames;
@@ -83,8 +83,6 @@ bool vmaf_score(Source& ref, AVCodecID codec, const std::vector<std::vector<uint
 	if (dec) dec->strict_std_compliance = FF_COMPLIANCE_STRICT;
 	if (!dec || avcodec_open2(dec, c, nullptr) < 0) { fprintf(stderr, "no decoder for encoded stream\n"); avcodec_free_context(&dec); return false; }
 
-	// Original frame k shows encoded frame floor(k * enc.fps / ref.fps): dropped frames are held, never interpolated.
-	const int64_t num = (int64_t)enc.fps.num * ref.framerate.den, den = (int64_t)enc.fps.den * ref.framerate.num;
 	const bool convert_dis = enc.w != ref.width || enc.h != ref.height || enc.pix != score_fmt; // scale back, change format
 	const bool convert_ref = ref.pix != score_fmt;
 
@@ -123,7 +121,7 @@ bool vmaf_score(Source& ref, AVCodecID codec, const std::vector<std::vector<uint
 
 		// Hold `shown` (decoded frame number mi, at the original resolution) for every original frame up to the next one.
 		auto show = [&](const AVFrame* shown, int64_t mi) {
-			while (ok && k * num / den == mi) {
+			while (ok && k < (long long)shown_map.size() && shown_map[k] == mi) {
 				int rr = next_ref(r);
 				if (rr < 0) { ok = false; break; }
 				if (rr == 0) break;
@@ -169,7 +167,7 @@ bool vmaf_score(Source& ref, AVCodecID codec, const std::vector<std::vector<uint
 		if (ok) { avcodec_send_packet(dec, nullptr); pump(); }
 		if (ok && convert_dis) { ok = up.push(nullptr); collect_converted(); }
 		if (ok && k == 0) { fprintf(stderr, "no frames were decoded\n"); ok = false; }
-		if (ok && next_ref(r) == 1) { fprintf(stderr, "encoded stream has fewer frames than the reference\n"); ok = false; }
+		if (ok && (k != (long long)shown_map.size() || next_ref(r) == 1)) { fprintf(stderr, "encoded stream does not cover the reference frames\n"); ok = false; }
 		if (ok) ok = scorer.finish(scores);
 
 		av_frame_free(&d); av_frame_free(&u); av_frame_free(&r); av_frame_free(&t); av_packet_free(&pkt);

@@ -254,9 +254,13 @@ static bool run_one(const std::string& input, const std::string& encoder, AVCode
 	// Packets arrive in coding order, which is also the order the decoder needs them.
 	if (!codec->open(p, [&](const uint8_t* d, size_t n, int64_t, bool) { packets.emplace_back(d, d + n); })) return false;
 
-	// Frame rate conversion drops frames before scaling: source frame n belongs to encoded frame floor(n * enc.fps / src.fps)
-	// and only the first source frame of each such index is kept.
-	const int64_t num = (int64_t)enc.fps.num * src.framerate.den, den = (int64_t)enc.fps.den * src.framerate.num;
+	// Frame rate conversion drops frames before scaling. Each source frame falls into a slot of the output timeline
+	// (its real presentation time times enc.fps, rounded down) and only the first frame in each slot is kept.
+	// `shown[n]` records which encoded frame is on screen at source frame n, for scoring.
+	std::vector<uint32_t> shown;
+	const bool convert_rate = want.fps.num != 0;
+	int64_t last_slot = -1;
+	long long kept = 0;
 	const bool rescale = enc.w != src.width || enc.h != src.height || enc.pix != src.pix; // scale and/or convert
 	Scaler scaler;
 	AVFrame* frame = av_frame_alloc();
@@ -270,30 +274,36 @@ static bool run_one(const std::string& input, const std::string& encoder, AVCode
 		ok = ok && got >= 0;
 	};
 	while (ok && (r = src.next(frame)) == 1) {
-		int64_t m = frames * num / den;
-		bool keep = frames == 0 || m != (frames - 1) * num / den;
+		const int64_t slot = src.slot(frames, enc.fps);
+		const bool keep = !convert_rate || frames == 0 || slot != last_slot; // no target rate: every frame stays
+		last_slot = slot;
 		frames++;
 		if (keep) {
-			frame->pts = m;
+			frame->pts = kept++; // encoded frames are numbered consecutively, whatever the gaps in the source timing
 			frame->duration = 1; // one tick of the 1/enc.fps time base
 			if (!rescale) ok = codec->encode(frame);
 			else {
-				if (m == 0) ok = scaler.open(frame, av_inv_q(enc.fps), enc.w, enc.h, enc.pix, so);
+				if (frame->pts == 0) ok = scaler.open(frame, av_inv_q(enc.fps), enc.w, enc.h, enc.pix, so);
 				ok = ok && scaler.push(frame);
 				encode_scaled();
 			}
 		}
+		shown.push_back((uint32_t)(kept - 1));
 		av_frame_unref(frame);
+	}
+	if (ok && src.frame_count() && src.frame_count() != frames) {
+		fprintf(stderr, "the file lists %lld frames but %lld were decoded\n", src.frame_count(), frames);
+		ok = false;
 	}
 	if (ok && rescale) { ok = scaler.push(nullptr); encode_scaled(); }
 	ok = ok && r >= 0 && codec->encode(nullptr);
 	av_frame_free(&frame); av_frame_free(&scaled);
 	if (!ok) return false;
-	out.kbps = codec->stats.bytes * 8 / (frames / av_q2d(src.framerate)) / 1000;
+	out.kbps = codec->stats.bytes * 8 / src.duration() / 1000;
 	codec.reset();
 
 	Source ref;
-	if (!ref.open(input) || !vmaf_score(ref, id, packets, enc, score_fmt, vo, so, out.scores)) return false;
+	if (!ref.open(input) || !vmaf_score(ref, id, packets, enc, shown, score_fmt, vo, so, out.scores)) return false;
 	if ((long long)out.scores.size() != frames) { fprintf(stderr, "%zu scores for %lld frames\n", out.scores.size(), frames); return false; }
 	return true;
 }
