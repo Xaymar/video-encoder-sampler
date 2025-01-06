@@ -54,6 +54,7 @@ Without arguments VES reads `config.json` from the working directory. The second
 		{ "name": "low", "bitrates": [3500], "resolutions": ["1920x1080", "1280x720"], "framerates": [30] }
 	],
 	"scaling": { "upscaler": "ewa_lanczos", "downscaler": "ewa_lanczos" },
+	"cache": "cache",
 	"over_penalty": 0.025,
 	"vmaf": { "model": "path=models/vmaf_4k_v0.6.1.json", "threads": 4 },
 	"encoders": [
@@ -77,6 +78,7 @@ Without arguments VES reads `config.json` from the working directory. The second
 * A **scenario** is one sub-sweep: its `bitrates` (kbps), `kfintervals` (seconds, defaults to the top level, then 2.0), `resolutions` (`WxH`) and `framerates` (`30`, `29.97` or `30000/1001`) are combined with every combination of every encoder's options. Use several scenarios when some combinations only make sense together, such as 1080p60 at high bitrates and only 720p30 at 3.5 Mbit. Without `scenarios` the top level is the one scenario. Give a scenario a `name` to refer to it from an encoder. Leaving out `resolutions` or `framerates` keeps the source's.
 * Every encoder option is a list of values and **every combination is tested**. `null` leaves the option unset for that combination, an empty list ignores the option.
 * `scenarios` (per encoder): the names of the scenarios this encoder takes part in, e.g. to keep a slow CPU encoder out of the 4K ones. Leave it out to use all of them; an unknown name is an error.
+* `cache`: directory where finished runs are kept, `"cache"` by default; `false` turns it off (see below).
 * `pool` / `parallel`: runs in one pool share a device and at most `parallel` of them run at once. Defaults: `nvenc` and `amf` 2, everything else (`cpu`) 1. Different pools run at the same time. Concurrency changes how long the sweep takes, never the scores.
 
 ### Scaling and frame rates
@@ -104,6 +106,11 @@ Formats currently supported by each backend: `x264` 4:2:0, 4:2:2 and 4:4:4 at 8 
 | anything else | libavcodec encoder of that name (e.g. `libx264`) | Passed to `av_opt_set` |
 
 An unknown option makes that run fail with a message instead of being ignored. There is no QuickSync backend yet.
+
+## Result cache
+Every finished run is stored in the cache directory (one small file with the per-frame scores and the actual bitrate), and a run whose entry exists is not repeated, marked `(cached)` in the output. Adding a preset, a bitrate or a resolution to a config therefore only computes the new combinations.
+
+An entry is only reused when everything its result depends on is the same: the input file (name, size and modification time), encoder, codec and options, bitrate, key frame interval, resolution and frame rate, scaler and VMAF settings (including the model file's contents), the versions of the encoder library, FFmpeg and libvmaf, and for `nvenc` and `amf` the GPU name and driver version. Delete the directory (or pass `cache=off` on the command line) to recompute everything. The overshoot penalty and the ranking are applied to the stored scores each time, so changing `over_penalty` needs no new runs.
 
 ## How the result is picked
 For every group (same input, target bitrate and key frame interval), a run counts a frame when its VMAF is at least as high as every other run's on that frame. Runs that count at least 95% of the frames are marked `*`; if there are none, the closest one is listed on top.

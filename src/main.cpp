@@ -16,6 +16,7 @@
 #include <thread>
 #include <tuple>
 
+#include "cache.h"
 #include "encoder.h"
 #include "formats.h"
 #include "json.h"
@@ -57,6 +58,7 @@ struct Config {
 	std::vector<Scenario> scenarios;
 	VmafOptions vo;
 	ScaleOptions scale;
+	std::string cache_dir = "cache"; // finished runs are kept here and not repeated; empty turns it off
 	std::vector<Job> jobs;
 };
 
@@ -67,6 +69,7 @@ struct Run {
 	Shape shape;
 	double kbps = 0;        // actual
 	std::vector<double> scores; // per frame, display order
+	bool cached = false;    // taken from the result cache instead of being run
 	double penalty = 0;     // VMAF points deducted for exceeding the target bitrate
 	double best_share = 0;  // share of frames where this run is at least as good as every other run of its group
 };
@@ -154,6 +157,7 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* u = v->find("upscaler")) cfg.scale.upscaler = u->text();
 		if (auto* d = v->find("downscaler")) cfg.scale.downscaler = d->text();
 	}
+	if (auto* v = root.find("cache")) cfg.cache_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "cache" : "") : v->text();
 	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str());
 	if (auto* v = root.find("vmaf")) {
 		if (auto* m = v->find("model")) cfg.vo.model = m->text();
@@ -195,6 +199,7 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 		if (k == "vmaf.model") cfg.vo.model = v;
 		else if (k == "vmaf.threads") cfg.vo.threads = atoi(v.c_str());
 		else if (k == "over.penalty") over_penalty = atof(v.c_str());
+		else if (k == "cache") cfg.cache_dir = v == "off" ? "" : v;
 		else if (k == "pool") j.pool = v;
 		else if (k == "parallel") j.parallel = atoi(v.c_str());
 		else if (k == "kf") { sc.kfs.clear(); for (auto& x : split(v)) sc.kfs.push_back(atof(x.c_str())); }
@@ -377,14 +382,23 @@ int main(int argc, char** argv) {
 		for (size_t n; (n = pp->next++) < pp->tasks.size();) {
 			Task& t = tasks[pp->tasks[n]];
 			Run& r = t.r;
-			t.ok = run_one(r.input, t.job->encoder, t.id, t.p, r.kf, r.shape, cfg.vo, cfg.scale, r);
+			std::string key;
+			CachedRun hit;
+			if (!cfg.cache_dir.empty()) {
+				key = cache_key(r.input, t.job->encoder, t.job->codec, t.p.options, r.bitrate, r.kf, r.shape, cfg.scale, cfg.vo);
+				if (cache_load(cfg.cache_dir, key, hit)) { r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.cached = t.ok = true; }
+			}
+			if (!r.cached) {
+				t.ok = run_one(r.input, t.job->encoder, t.id, t.p, r.kf, r.shape, cfg.vo, cfg.scale, r);
+				if (t.ok && !key.empty()) cache_store(cfg.cache_dir, key, CachedRun{r.kbps, r.scores});
+			}
 			std::lock_guard lock(out_mutex);
 			if (!t.ok) { fprintf(stderr, "[%s %lld kbps kf %.1f] %s: FAILED\n", r.input.c_str(), (long long)r.bitrate, r.kf, r.label.c_str()); continue; }
 			r.penalty = std::max(0.0, r.kbps / r.bitrate - 1) * 100 * over_penalty;
 			std::vector<double> s = r.scores;
 			std::sort(s.begin(), s.end());
-			printf("[%s %lld kbps kf %.1f] %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f\n", r.input.c_str(), (long long)r.bitrate, r.kf, r.label.c_str(), r.kbps,
-			       std::accumulate(s.begin(), s.end(), 0.0) / s.size(), s.front(), s[(size_t)(s.size() * 0.05)]);
+			printf("[%s %lld kbps kf %.1f] %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s\n", r.input.c_str(), (long long)r.bitrate, r.kf, r.label.c_str(), r.kbps,
+			       std::accumulate(s.begin(), s.end(), 0.0) / s.size(), s.front(), s[(size_t)(s.size() * 0.05)], r.cached ? " (cached)" : "");
 			fflush(stdout);
 		}
 	});
