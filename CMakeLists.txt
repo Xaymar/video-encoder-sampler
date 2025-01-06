@@ -29,7 +29,7 @@ find_library(SVTAV1_LIB SvtAv1Enc.dll PATHS "${SVTAV1_DIR}/lib" NO_DEFAULT_PATH 
 set(VMAF_DIR "${CMAKE_SOURCE_DIR}/third-party/vmaf/ucrt64" CACHE PATH "libvmaf package root")
 find_library(VMAF_LIB vmaf.dll PATHS "${VMAF_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
 
-add_executable(ves src/main.cpp src/source.cpp src/scaler.cpp src/formats.cpp src/cache.cpp src/versions.cpp src/vmaf.cpp src/encoder_libav.cpp src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
+add_executable(ves src/main.cpp src/source.cpp src/scaler.cpp src/formats.cpp src/cache.cpp src/gpu.cpp src/versions.cpp src/vmaf.cpp src/encoder_libav.cpp src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
 target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include" "${CMAKE_SOURCE_DIR}/third-party/amf-include" "${X264_DIR}/include" "${X265_DIR}/include" "${SVTAV1_DIR}/include" "${VMAF_DIR}/include")
 target_compile_definitions(ves PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(ves PRIVATE ${FF_LINK} ${X264_LIB} ${X265_LIB} ${SVTAV1_LIB} ${VMAF_LIB} d3d11 dxgi)

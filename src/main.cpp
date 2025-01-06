@@ -19,6 +19,7 @@
 #include "cache.h"
 #include "encoder.h"
 #include "formats.h"
+#include "gpu.h"
 #include "json.h"
 #include "source.h"
 #include "vmaf.h"
@@ -70,6 +71,7 @@ struct Run {
 	double kbps = 0;        // actual
 	std::vector<double> scores; // per frame, display order
 	bool cached = false;    // taken from the result cache instead of being run
+	std::string gpu;        // name and driver of the GPU a GPU encoder ran on
 	double penalty = 0;     // VMAF points deducted for exceeding the target bitrate
 	double best_share = 0;  // share of frames where this run is at least as good as every other run of its group
 };
@@ -103,8 +105,16 @@ static std::vector<Options> expand(const Job& j) {
 	std::vector<Options> combos(1);
 	for (auto& ax : j.axes) {
 		if (ax.values.empty()) continue;
+		// gpu=all means every GPU of the encoder's vendor
+		std::vector<std::optional<std::string>> values;
+		for (auto& v : ax.values) {
+			if (ax.key == "gpu" && v && *v == "all") {
+				size_t n = std::max<size_t>(list_gpus(encoder_vendor(j.encoder)).size(), 1);
+				for (size_t i = 0; i < n; i++) values.push_back(std::to_string(i));
+			} else values.push_back(v);
+		}
 		std::vector<Options> next;
-		for (auto& c : combos) for (auto& v : ax.values) { Options n = c; if (v) n[ax.key] = *v; next.push_back(n); }
+		for (auto& c : combos) for (auto& v : values) { Options n = c; if (v) n[ax.key] = *v; next.push_back(n); }
 		combos = std::move(next);
 	}
 	return combos;
@@ -358,9 +368,6 @@ int main(int argc, char** argv) {
 	for (auto& input : cfg.inputs) for (auto& job : cfg.jobs) {
 		AVCodecID id;
 		if (!codec_id(job.encoder, job.codec, id)) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", job.encoder.c_str(), job.codec.c_str()); failed++; continue; }
-		std::string pool = job.pool.empty() ? (is_gpu_encoder(job.encoder) ? job.encoder : "cpu") : job.pool;
-		Pool& pl = pools[pool];
-		pl.parallel = std::max(pl.parallel, job.parallel ? job.parallel : (is_gpu_encoder(job.encoder) ? 2 : 1));
 			for (auto& sc : cfg.scenarios) if (takes_part(job, sc)) for (int64_t br : sc.bitrates) for (double kf : sc.kfs) for (auto& shape : sc.shapes) for (auto& opts : expand(job)) {
 			Task t;
 			t.job = &job; t.id = id;
@@ -370,6 +377,12 @@ int main(int argc, char** argv) {
 				if (shape.fps.num) t.r.label += " @" + std::to_string(av_q2d(shape.fps)).substr(0, 6);
 			for (auto& [k, v] : opts) t.r.label += " " + k + "=" + v;
 			t.p.codec = job.codec; t.p.bitrate = br * 1000; t.p.options = opts;
+			// Every GPU is a pool of its own, so GPUs work in parallel; CPU encoders share one pool.
+			std::string gpu_index = opts.count("gpu") ? opts.at("gpu") : "0";
+			if (is_gpu_encoder(job.encoder)) t.r.gpu = gpu_description(encoder_vendor(job.encoder), atoi(gpu_index.c_str()));
+			std::string pool = !job.pool.empty() ? job.pool : is_gpu_encoder(job.encoder) ? job.encoder + ":" + gpu_index : "cpu";
+			Pool& pl = pools[pool];
+			pl.parallel = std::max(pl.parallel, job.parallel ? job.parallel : (is_gpu_encoder(job.encoder) ? 2 : 1));
 			pl.tasks.push_back(tasks.size());
 			tasks.push_back(std::move(t));
 		}
@@ -397,8 +410,9 @@ int main(int argc, char** argv) {
 			r.penalty = std::max(0.0, r.kbps / r.bitrate - 1) * 100 * over_penalty;
 			std::vector<double> s = r.scores;
 			std::sort(s.begin(), s.end());
-			printf("[%s %lld kbps kf %.1f] %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s\n", r.input.c_str(), (long long)r.bitrate, r.kf, r.label.c_str(), r.kbps,
-			       std::accumulate(s.begin(), s.end(), 0.0) / s.size(), s.front(), s[(size_t)(s.size() * 0.05)], r.cached ? " (cached)" : "");
+			printf("[%s %lld kbps kf %.1f] %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s\n", r.input.c_str(), (long long)r.bitrate, r.kf, r.label.c_str(), r.kbps,
+			       std::accumulate(s.begin(), s.end(), 0.0) / s.size(), s.front(), s[(size_t)(s.size() * 0.05)], r.cached ? " (cached)" : "",
+			       r.gpu.empty() ? "" : " on ", r.gpu.c_str());
 			fflush(stdout);
 		}
 	});
@@ -431,7 +445,8 @@ int main(int argc, char** argv) {
 		for (size_t i = g; i < e; i++) {
 			bool win = runs[i].best_share >= BEST_FRAME_SHARE;
 			any |= win;
-			printf("%s %5.1f%%  %s  (%.0f kbps, penalty %.2f)\n", win ? "*" : " ", runs[i].best_share * 100, runs[i].label.c_str(), runs[i].kbps, runs[i].penalty);
+			printf("%s %5.1f%%  %s  (%.0f kbps, penalty %.2f%s%s)\n", win ? "*" : " ", runs[i].best_share * 100, runs[i].label.c_str(), runs[i].kbps, runs[i].penalty,
+			       runs[i].gpu.empty() ? "" : ", ", runs[i].gpu.c_str());
 		}
 		if (!any) printf("  no configuration reaches %.0f%%; the top entry is the closest\n", BEST_FRAME_SHARE * 100);
 		g = e;

@@ -24,6 +24,3 @@ void cache_store(const std::string& dir, const std::string& key, const CachedRun
 std::string encoder_library_version(const std::string& encoder); // versions.cpp
 std::string scaler_library_version();
 std::string vmaf_library_version();
-
-// "<adapter name> <driver version>" of the n-th adapter of a vendor (0x10DE NVIDIA, 0x1002 AMD), or "none".
-std::string gpu_description(unsigned vendor, int index);

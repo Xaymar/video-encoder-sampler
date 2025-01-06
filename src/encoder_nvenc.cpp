@@ -10,12 +10,32 @@
 #include <vector>
 
 #include "formats.h"
+#include "gpu.h"
 
 extern "C" {
 #include <ffnvcodec/dynlink_loader.h>
 }
 
 namespace {
+
+// CUDA numbers its devices in its own order; find the one that is the same GPU as DXGI's n-th NVIDIA adapter.
+bool cuda_device_for(CudaFunctions* cu, int index, CUdevice& dev) {
+	auto gpus = list_gpus(VENDOR_NVIDIA);
+	int count = 0;
+	if (cu->cuDeviceGetCount(&count) || index < 0) return false;
+	if (index < (int)gpus.size() && cu->cuDeviceGetLuid) {
+		for (int i = 0; i < count; i++) {
+			CUdevice d;
+			char luid[8];
+			unsigned mask;
+			if (cu->cuDeviceGet(&d, i) || cu->cuDeviceGetLuid(luid, &mask, d)) continue;
+			uint64_t v;
+			memcpy(&v, luid, 8);
+			if (v == gpus[index].luid) { dev = d; return true; }
+		}
+	}
+	return index < count && !cu->cuDeviceGet(&dev, index); // no LUID match: fall back to CUDA's own numbering
+}
 
 GUID codec_guid(const std::string& codec, bool& known) {
 	known = true;
@@ -130,7 +150,7 @@ public:
 		}
 		int gpu = take("gpu", v) ? atoi(v.c_str()) : 0;
 		CUdevice dev;
-		if (cu->cuInit(0) || cu->cuDeviceGet(&dev, gpu) || cu->cuCtxCreate(&ctx, 0, dev)) {
+		if (cu->cuInit(0) || !cuda_device_for(cu, gpu, dev) || cu->cuCtxCreate(&ctx, 0, dev)) {
 			fprintf(stderr, "nvenc: CUDA init failed for gpu %d\n", gpu);
 			return false;
 		}

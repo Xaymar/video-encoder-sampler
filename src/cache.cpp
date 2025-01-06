@@ -6,32 +6,10 @@
 #include <fstream>
 #include <sstream>
 
-#include <dxgi.h>
-#include <wrl/client.h>
-
+#include "gpu.h"
 #include "json.h"
 
 namespace fs = std::filesystem;
-
-std::string gpu_description(unsigned vendor, int index) {
-	Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
-	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return "none";
-	Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-	int seen = 0;
-	for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; i++, adapter.Reset()) {
-		DXGI_ADAPTER_DESC1 d;
-		adapter->GetDesc1(&d);
-		if (d.VendorId != vendor || seen++ != index) continue;
-		LARGE_INTEGER umd{};
-		adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd);
-		char name[256];
-		WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof name, nullptr, nullptr);
-		char out[400];
-		snprintf(out, sizeof out, "%s driver %u.%u.%u.%u", name, HIWORD(umd.HighPart), LOWORD(umd.HighPart), HIWORD(umd.LowPart), LOWORD(umd.LowPart));
-		return out;
-	}
-	return "none";
-}
 
 static uint64_t fnv1a(const std::string& s) {
 	uint64_t h = 1469598103934665603ull;
@@ -51,8 +29,8 @@ static std::string encoder_environment(const std::string& encoder, const Options
 		auto it = options.find("gpu");
 		return gpu_description(vendor, it == options.end() ? 0 : atoi(it->second.c_str()));
 	};
-	if (encoder == "nvenc") return "nvenc " + gpu(0x10DE);
-	if (encoder == "amf") return "amf " + gpu(0x1002);
+	if (encoder == "nvenc") return "nvenc " + gpu(VENDOR_NVIDIA);
+	if (encoder == "amf") return "amf " + gpu(VENDOR_AMD);
 	return encoder_library_version(encoder);
 }
 
