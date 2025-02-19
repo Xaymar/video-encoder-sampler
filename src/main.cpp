@@ -20,6 +20,7 @@
 #include "encoder.h"
 #include "formats.h"
 #include "gpu.h"
+#include "convert.h"
 #include "json.h"
 #include "source.h"
 #include "vmaf.h"
@@ -83,10 +84,10 @@ static std::vector<std::string> split(const std::string& s) {
 	return out;
 }
 
-static AVRational parse_fps(const std::string& s) { // "30", "29.97" or "30000/1001"
+static Rational parse_fps(const std::string& s) { // "30", "29.97" or "30000/1001"
 	int n, d;
 	if (sscanf(s.c_str(), "%d/%d", &n, &d) == 2) return {n, d};
-	return av_d2q(atof(s.c_str()), 100000);
+	return {(int)std::lround(atof(s.c_str()) * 1000), 1000}; // "29.97" -> 29970/1000, close enough to 30000/1001 for slot arithmetic
 }
 
 // Resolutions x frame rates; either list may be empty (= source).
@@ -223,32 +224,31 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 	return true;
 }
 
-static bool codec_id(const std::string& encoder, const std::string& codec, AVCodecID& id) {
-	if (encoder == "x264" || encoder == "x265" || encoder == "svtav1") {
-		id = encoder == "x264" ? AV_CODEC_ID_H264 : encoder == "x265" ? AV_CODEC_ID_HEVC : AV_CODEC_ID_AV1;
-	} else if (is_native_encoder(encoder)) {
-		id = codec == "h264" ? AV_CODEC_ID_H264 : codec == "hevc" ? AV_CODEC_ID_HEVC : codec == "av1" ? AV_CODEC_ID_AV1 : AV_CODEC_ID_NONE;
-	} else {
-		const AVCodec* c = avcodec_find_encoder_by_name(encoder.c_str());
-		id = c ? c->id : AV_CODEC_ID_NONE;
-	}
-	return id != AV_CODEC_ID_NONE;
+static Codec codec_of(const std::string& encoder, const std::string& codec) {
+	if (encoder == "x264") return Codec::H264;
+	if (encoder == "x265") return Codec::HEVC;
+	if (encoder == "svtav1") return Codec::AV1;
+	if (is_native_encoder(encoder)) return codec == "h264" ? Codec::H264 : codec == "hevc" ? Codec::HEVC : codec == "av1" ? Codec::AV1 : Codec::None;
+	return libav_encoder_codec(encoder);
 }
 
-static bool run_one(const std::string& input, const std::string& encoder, AVCodecID id, Params p, double kf, const Shape& want,
+static bool run_one(const std::string& input, const std::string& encoder, Codec id, Params p, double kf, const Shape& want,
                     const VmafOptions& vo, const ScaleOptions& so, Run& out) {
-	Source src;
-	if (!src.open(input)) return false;
-	Shape enc{want.w ? want.w : src.width, want.h ? want.h : src.height, want.fps.num ? want.fps : src.framerate};
+	auto src_ptr = open_source(input);
+	if (!src_ptr) return false;
+	Source& src = *src_ptr;
+	Shape enc;
+	enc.w = want.w ? want.w : src.width;
+	enc.h = want.h ? want.h : src.height;
+	enc.fps = want.fps.num ? want.fps : src.framerate;
 	if (enc.w > src.width || enc.h > src.height) { fprintf(stderr, "%dx%d is larger than the source (%dx%d)\n", enc.w, enc.h, src.width, src.height); return false; }
-	if (av_cmp_q(enc.fps, src.framerate) > 0) { fprintf(stderr, "frame rate %.3f is higher than the source (%.3f)\n", av_q2d(enc.fps), av_q2d(src.framerate)); return false; }
+	if (compare(enc.fps, src.framerate) > 0) { fprintf(stderr, "frame rate %.3f is higher than the source (%.3f)\n", enc.fps.value(), src.framerate.value()); return false; }
 	p.width = enc.w; p.height = enc.h;
 	p.framerate = enc.fps;
-	p.gop = std::max(1, (int)std::lround(kf * av_q2d(enc.fps)));
+	p.gop = std::max(1, (int)std::lround(kf * enc.fps.value()));
 
 	// Encoder input format: "chroma" and "bitdepth" options if given, else the source's, else the closest the encoder takes.
-	Fmt sf;
-	if (!describe_format(src.pix, sf)) { fprintf(stderr, "unsupported source pixel format %s\n", av_get_pix_fmt_name(src.pix)); return false; }
+	const Fmt sf = src.fmt;
 	// What the config asks for (chroma / bitdepth options) is used as is; what it leaves open follows the source,
 	// falling back to the closest thing the encoder takes: another chroma layout (4:2:0), then a lower depth.
 	std::vector<int> chromas{sf.chroma, 420}, depths{sf.depth, 10, 8};
@@ -259,10 +259,11 @@ static bool run_one(const std::string& input, const std::string& encoder, AVCode
 		if (!chroma && (d <= sf.depth || depths.size() == 1) && encoder_supports(encoder, p.codec, c, d)) { chroma = c; depth = d; }
 	}
 	if (!chroma) { fprintf(stderr, "%s cannot encode %d-bit %d here\n", encoder.c_str(), depths[0], chromas[0]); return false; }
-	p.pix = enc.pix = planar_format(chroma, depth);
+	p.pix = enc.pix = planar_fmt(chroma, depth);
+	enc.has_pix = true;
 	// Both sides are scored in the source's chroma layout at the higher of the two bit depths.
-	const AVPixelFormat score_fmt = planar_format(sf.chroma, std::max(sf.depth, depth));
-	if (p.pix == AV_PIX_FMT_NONE || score_fmt == AV_PIX_FMT_NONE) { fprintf(stderr, "unsupported chroma %d / bit depth %d\n", chroma, depth); return false; }
+	const Fmt score_fmt = planar_fmt(sf.chroma, std::max(sf.depth, depth));
+	if (!valid(p.pix) || !valid(score_fmt)) { fprintf(stderr, "unsupported chroma %d / bit depth %d\n", chroma, depth); return false; }
 
 	std::vector<std::vector<uint8_t>> packets;
 	auto codec = make_encoder(encoder);
@@ -276,16 +277,15 @@ static bool run_one(const std::string& input, const std::string& encoder, AVCode
 	const bool convert_rate = want.fps.num != 0;
 	int64_t last_slot = -1;
 	long long kept = 0;
-	const bool rescale = enc.w != src.width || enc.h != src.height || enc.pix != src.pix; // scale and/or convert
-	Scaler scaler;
-	AVFrame* frame = av_frame_alloc();
-	AVFrame* scaled = av_frame_alloc();
+	const bool rescale = enc.w != src.width || enc.h != src.height || enc.pix != src.fmt; // scale and/or convert
+	auto scaler = make_converter();
+	Picture frame, scaled;
 	long long frames = 0; // source frames
 	bool ok = true;
 	int r;
 	auto encode_scaled = [&] {
 		int got;
-		while (ok && (got = scaler.pop(scaled)) == 1) { ok = codec->encode(scaled); av_frame_unref(scaled); }
+		while (ok && (got = scaler->pop(scaled)) == 1) ok = codec->encode(&scaled);
 		ok = ok && got >= 0;
 	};
 	while (ok && (r = src.next(frame)) == 1) {
@@ -294,31 +294,29 @@ static bool run_one(const std::string& input, const std::string& encoder, AVCode
 		last_slot = slot;
 		frames++;
 		if (keep) {
-			frame->pts = kept++; // encoded frames are numbered consecutively, whatever the gaps in the source timing
-			frame->duration = 1; // one tick of the 1/enc.fps time base
-			if (!rescale) ok = codec->encode(frame);
+			frame.pts = kept++; // encoded frames are numbered consecutively, whatever the gaps in the source timing
+			frame.duration = 1; // one tick of the 1/enc.fps time base
+			if (!rescale) ok = codec->encode(&frame);
 			else {
-				if (frame->pts == 0) ok = scaler.open(frame, av_inv_q(enc.fps), enc.w, enc.h, enc.pix, so);
-				ok = ok && scaler.push(frame);
+				if (frame.pts == 0) ok = scaler->open(frame, enc.fps.inverse(), enc.w, enc.h, enc.pix, so);
+				ok = ok && scaler->push(&frame);
 				encode_scaled();
 			}
 		}
 		shown.push_back((uint32_t)(kept - 1));
-		av_frame_unref(frame);
 	}
 	if (ok && src.frame_count() && src.frame_count() != frames) {
 		fprintf(stderr, "the file lists %lld frames but %lld were decoded\n", src.frame_count(), frames);
 		ok = false;
 	}
-	if (ok && rescale) { ok = scaler.push(nullptr); encode_scaled(); }
+	if (ok && rescale) { ok = scaler->push(nullptr); encode_scaled(); }
 	ok = ok && r >= 0 && codec->encode(nullptr);
-	av_frame_free(&frame); av_frame_free(&scaled);
 	if (!ok) return false;
 	out.kbps = codec->stats.bytes * 8 / src.duration() / 1000;
 	codec.reset();
 
-	Source ref;
-	if (!ref.open(input) || !vmaf_score(ref, id, packets, enc, shown, score_fmt, vo, so, out.scores)) return false;
+	auto ref = open_source(input);
+	if (!ref || !vmaf_score(*ref, id, packets, enc, shown, score_fmt, vo, so, out.scores)) return false;
 	if ((long long)out.scores.size() != frames) { fprintf(stderr, "%zu scores for %lld frames\n", out.scores.size(), frames); return false; }
 	return true;
 }
@@ -344,7 +342,7 @@ int main(int argc, char** argv) {
 	struct Task {
 		Run r;
 		const Job* job;
-		AVCodecID id;
+		Codec id;
 		Params p;
 		bool ok = false;
 	};
@@ -366,15 +364,15 @@ int main(int argc, char** argv) {
 	};
 
 	for (auto& input : cfg.inputs) for (auto& job : cfg.jobs) {
-		AVCodecID id;
-		if (!codec_id(job.encoder, job.codec, id)) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", job.encoder.c_str(), job.codec.c_str()); failed++; continue; }
+		const Codec id = codec_of(job.encoder, job.codec);
+		if (id == Codec::None) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", job.encoder.c_str(), job.codec.c_str()); failed++; continue; }
 			for (auto& sc : cfg.scenarios) if (takes_part(job, sc)) for (int64_t br : sc.bitrates) for (double kf : sc.kfs) for (auto& shape : sc.shapes) for (auto& opts : expand(job)) {
 			Task t;
 			t.job = &job; t.id = id;
 				t.r.input = input; t.r.bitrate = br; t.r.kf = kf; t.r.shape = shape;
 				t.r.label = is_gpu_encoder(job.encoder) ? job.encoder + "/" + job.codec : job.encoder;
 				if (shape.w) t.r.label += " " + std::to_string(shape.w) + "x" + std::to_string(shape.h);
-				if (shape.fps.num) t.r.label += " @" + std::to_string(av_q2d(shape.fps)).substr(0, 6);
+				if (shape.fps.num) t.r.label += " @" + std::to_string(shape.fps.value()).substr(0, 6);
 			for (auto& [k, v] : opts) t.r.label += " " + k + "=" + v;
 			t.p.codec = job.codec; t.p.bitrate = br * 1000; t.p.options = opts;
 			// Every GPU is a pool of its own, so GPUs work in parallel; CPU encoders share one pool.

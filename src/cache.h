@@ -4,7 +4,7 @@
 #include <vector>
 
 #include "encoder.h"
-#include "scaler.h"
+#include "convert.h"
 #include "vmaf.h"
 
 struct CachedRun {

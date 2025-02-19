@@ -120,6 +120,18 @@ For every group (same input, target bitrate and key frame interval), a run count
 
 Constant bitrate encoders still miss their target, and spending more bits would win frames unfairly. A run that overshoots its target loses `over_penalty` VMAF points per percent of overshoot (default 0.025, taken from the VMAF gain between 3000 and 6000 kbps on a test clip). Undershooting costs nothing.
 
+## Where FFmpeg is still used
+The encoders, the scoring and the sweep logic work on the tool's own types (`src/picture.h`) and no longer include FFmpeg. FFmpeg is confined to a few replaceable pieces behind small interfaces, all in files named `ff_*.cpp`:
+
+| Piece | Interface | What FFmpeg does for it |
+|---|---|---|
+| `ff_source.cpp` | `Source` (`source.h`) | demuxes and decodes the input videos, whatever container and codec |
+| `ff_decode.cpp` | `Decoder` (`decode.h`) | decodes our own H.264, HEVC and AV1 output for scoring |
+| `ff_convert.cpp` | `Converter` (`convert.h`) | scaling and pixel format conversion through the `libplacebo` filter |
+| `encoder_libav.cpp` | `Encoder` (`encoder.h`) | the optional generic encoder, any libavcodec encoder by name |
+
+Dropping FFmpeg means providing another implementation of each interface: libplacebo's own API for the converter, and demuxers and decoders for the input formats you need and for our own streams (the hard part, since 10-bit and 4:4:4 H.264/HEVC/AV1 decoding is wanted). The native encoders (`nvenc`, `amf`, `x264`, `x265`, `svtav1`) do not need FFmpeg at all.
+
 ## Current Limitations
 * Encoders are told one constant frame rate (the source's, or the measured average for a variable frame rate source) and get frames numbered in order; only the dropping of frames and the scoring follow the real timestamps.
 * SVT-AV1 is not deterministic: the same options give slightly different bitrates and scores from run to run (a few tenths of a VMAF point on a short clip). Compare its results with that in mind.

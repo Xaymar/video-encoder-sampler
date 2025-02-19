@@ -27,7 +27,7 @@ class SvtAv1 : public Encoder {
 	EbComponentType* h = nullptr;
 	bool initialized = false;
 	Sink sink;
-	AVPixelFormat pix = AV_PIX_FMT_YUV420P;
+	Fmt pix;
 	int chroma = 420, depth = 8;
 
 	// Hand every finished packet to the sink; returns true once the end-of-stream packet arrived.
@@ -62,8 +62,7 @@ public:
 		if (svt_av1_enc_init_handle(&h, &cfg) != EB_ErrorNone) { fprintf(stderr, "svtav1: init_handle failed\n"); return false; }
 		cfg.source_width = p.width; cfg.source_height = p.height;
 		cfg.frame_rate_numerator = p.framerate.num; cfg.frame_rate_denominator = p.framerate.den;
-		Fmt f;
-		describe_format(p.pix, f);
+		const Fmt f = p.pix;
 		pix = p.pix; chroma = f.chroma; depth = f.depth;
 		cfg.encoder_bit_depth = depth;
 		cfg.encoder_color_format = chroma == 444 ? EB_YUV444 : chroma == 422 ? EB_YUV422 : EB_YUV420;
@@ -80,18 +79,18 @@ public:
 		return true;
 	}
 
-	bool encode(const AVFrame* fr) override {
+	bool encode(const Picture* fr) override {
 		bool eos = false, ok = true;
 		EbBufferHeaderType in{};
 		in.size = sizeof in;
 		in.pic_type = EB_AV1_INVALID_PICTURE;
 		if (fr) {
-			if (fr->format != pix) { fprintf(stderr, "svtav1: input must be %s\n", av_get_pix_fmt_name(pix)); return false; }
+			if (fr->fmt != pix) { fprintf(stderr, "svtav1: input must be %d-bit %d\n", pix.depth, pix.chroma); return false; }
 			EbSvtIOFormat io{};
-			io.luma = fr->data[0]; io.cb = fr->data[1]; io.cr = fr->data[2];
+			io.luma = (uint8_t*)fr->data[0]; io.cb = (uint8_t*)fr->data[1]; io.cr = (uint8_t*)fr->data[2];
 			// strides count samples, not bytes; 10-bit samples are 16 bits, low bits used
 			const int bytes = depth > 8 ? 2 : 1;
-			io.y_stride = fr->linesize[0] / bytes; io.cb_stride = fr->linesize[1] / bytes; io.cr_stride = fr->linesize[2] / bytes;
+			io.y_stride = fr->stride[0] / bytes; io.cb_stride = fr->stride[1] / bytes; io.cr_stride = fr->stride[2] / bytes;
 			in.p_buffer = (uint8_t*)&io;
 			const long long luma = (long long)fr->width * fr->height;
 			in.n_filled_len = in.n_alloc_len = (uint32_t)((chroma == 444 ? luma * 3 : chroma == 422 ? luma * 2 : luma * 3 / 2) * bytes);

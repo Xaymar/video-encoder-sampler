@@ -19,7 +19,7 @@ namespace {
 class X264 : public Encoder {
 	x264_t* h = nullptr;
 	Sink sink;
-	AVPixelFormat pix = AV_PIX_FMT_YUV420P;
+	Fmt pix;
 	int csp = X264_CSP_I420;
 
 	bool emit(x264_nal_t* nal, int n, int bytes, const x264_picture_t& out) {
@@ -54,8 +54,7 @@ public:
 			return false;
 		}
 		par.i_width = p.width; par.i_height = p.height;
-		Fmt f;
-		describe_format(p.pix, f);
+		const Fmt f = p.pix;
 		pix = p.pix;
 		csp = (f.chroma == 444 ? X264_CSP_I444 : f.chroma == 422 ? X264_CSP_I422 : X264_CSP_I420) | (f.depth > 8 ? X264_CSP_HIGH_DEPTH : 0);
 		par.i_csp = csp;
@@ -75,16 +74,16 @@ public:
 		return true;
 	}
 
-	bool encode(const AVFrame* fr) override {
+	bool encode(const Picture* fr) override {
 		x264_picture_t in, out;
 		x264_nal_t* nal;
 		int n;
 		if (fr) {
-			if (fr->format != pix) { fprintf(stderr, "x264: input must be %s\n", av_get_pix_fmt_name(pix)); return false; }
+			if (fr->fmt != pix) { fprintf(stderr, "x264: input must be %d-bit %d\n", pix.depth, pix.chroma); return false; }
 			x264_picture_init(&in);
 			in.img.i_csp = csp;
 			in.img.i_plane = 3;
-			for (int i = 0; i < 3; i++) { in.img.plane[i] = fr->data[i]; in.img.i_stride[i] = fr->linesize[i]; }
+			for (int i = 0; i < 3; i++) { in.img.plane[i] = (uint8_t*)fr->data[i]; in.img.i_stride[i] = fr->stride[i]; }
 			in.i_pts = fr->pts;
 			int bytes = x264_encoder_encode(h, &nal, &n, &in, &out);
 			return bytes >= 0 && emit(nal, n, bytes, out);

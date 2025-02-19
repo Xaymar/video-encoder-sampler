@@ -5,19 +5,14 @@
 #include <memory>
 #include <string>
 
-extern "C" {
-#include <libavutil/frame.h>
-#include <libavutil/pixdesc.h>
-#include <libavutil/pixfmt.h>
-#include <libavutil/rational.h>
-}
+#include "picture.h"
 
 using Options = std::map<std::string, std::string>;
 
 struct Params {
 	int width = 0, height = 0;
-	AVPixelFormat pix = AV_PIX_FMT_YUV420P; // planar YUV format of the frames handed to encode()
-	AVRational framerate{30, 1}; // shortcut: constant frame rate, frame pts == frame index; revisit for VFR sources
+	Fmt pix;                     // planar YUV format of the pictures handed to encode()
+	Rational framerate{30, 1};   // what rate control assumes; pictures are numbered in order (pts)
 	int64_t bitrate = 0;         // bits per second
 	int gop = 0;                 // frames
 	std::string codec = "h264";  // used by native backends
@@ -34,7 +29,7 @@ public:
 
 	virtual ~Encoder() = default;
 	virtual bool open(const Params&, Sink) = 0;
-	virtual bool encode(const AVFrame*) = 0; // nullptr flushes
+	virtual bool encode(const Picture*) = 0; // nullptr flushes
 	Stats stats;
 };
 
@@ -48,6 +43,8 @@ std::unique_ptr<Encoder> make_encoder_libav(const std::string& name);
 
 bool nvenc_supports(const std::string& codec, int chroma, int depth);
 bool amf_supports(const std::string& codec, int chroma, int depth);
+bool libav_encoder_supports(const std::string& encoder, int chroma, int depth);
+Codec libav_encoder_codec(const std::string& encoder); // which codec a libavcodec encoder produces, Codec::None if unknown
 
 inline bool is_gpu_encoder(const std::string& name) { return name == "nvenc" || name == "amf"; }
 inline bool is_native_encoder(const std::string& name) { return is_gpu_encoder(name) || name == "x264" || name == "x265" || name == "svtav1"; }
