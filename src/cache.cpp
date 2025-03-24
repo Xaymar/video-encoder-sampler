@@ -47,7 +47,8 @@ std::string cache_key(const std::string& input, const std::string& encoder, cons
 	char buf[128];
 	snprintf(buf, sizeof buf, "\nbitrate=%lld kf=%.6g shape=%dx%d@%d/%d\n", bitrate_kbps, kf, shape.w, shape.h, shape.fps.num, shape.fps.den);
 	k << buf;
-	k << "scaling=" << scale.upscaler << '/' << scale.downscaler << ' ' << scaler_library_version() << '\n';
+	k << "scaling=" << scale.upscaler << '/' << scale.downscaler << ' ' << scale.device << ' ' << scaler_library_version() << '\n';
+	k << "decoder=" << decoder_library_version() << '\n';
 	// the scorer: library version, model, and the model file's contents when it is a path
 	k << "vmaf=" << vmaf_library_version() << ' ' << vmaf.model;
 	if (vmaf.model.rfind("path=", 0) == 0) {

@@ -167,6 +167,7 @@ static void load_config(const std::string& path, Config& cfg) {
 	if (auto* v = root.find("scaling")) {
 		if (auto* u = v->find("upscaler")) cfg.scale.upscaler = u->text();
 		if (auto* d = v->find("downscaler")) cfg.scale.downscaler = d->text();
+		if (auto* g = v->find("gpu")) cfg.scale.device = g->text();
 	}
 	if (auto* v = root.find("cache")) cfg.cache_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "cache" : "") : v->text();
 	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str());
@@ -229,7 +230,7 @@ static Codec codec_of(const std::string& encoder, const std::string& codec) {
 	if (encoder == "x265") return Codec::HEVC;
 	if (encoder == "svtav1") return Codec::AV1;
 	if (is_native_encoder(encoder)) return codec == "h264" ? Codec::H264 : codec == "hevc" ? Codec::HEVC : codec == "av1" ? Codec::AV1 : Codec::None;
-	return libav_encoder_codec(encoder);
+	return Codec::None;
 }
 
 static bool run_one(const std::string& input, const std::string& encoder, Codec id, Params p, double kf, const Shape& want,
@@ -330,7 +331,7 @@ int main(int argc, char** argv) {
 		else {
 			fprintf(stderr, "usage: ves [config.json]\n"
 			                "       ves <input> <encoder> <codec> <bitrate-kbps[,..]> [key=value[,value..] ...]\n"
-			                "  encoder: nvenc | any libavcodec encoder name (codec is ignored for the latter)\n"
+			                "  encoder: nvenc | amf | x264 | x265 | svtav1 (codec is ignored for the CPU encoders)\n"
 			                "  comma separated values are swept; every combination is tested\n"
 			                "  kf=<seconds>, vmaf.model=<spec>, vmaf.threads=<n>, over.penalty=<vmaf points per %% over target>;\n"
 			                "  other keys go to the encoder\n");

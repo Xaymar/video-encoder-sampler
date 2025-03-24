@@ -16,8 +16,8 @@ struct Fmt {
 	int chroma = 420;       // 420, 422 or 444 (RGB counts as 444)
 	int depth = 8;          // bits per component
 	bool rgb = false;
-	bool planar_yuv = true; // three planes Y, U, V with 8-bit or 16-bit little-endian samples; false: packed, semi-planar, RGB, with alpha, ...
-	bool operator==(const Fmt& o) const { return chroma == o.chroma && depth == o.depth && rgb == o.rgb && planar_yuv == o.planar_yuv; }
+	bool planar = true;     // three separate planes (Y, U, V or G, B, R) of 8-bit or 16-bit little-endian samples; false: anything else
+	bool operator==(const Fmt& o) const { return chroma == o.chroma && depth == o.depth && rgb == o.rgb && planar == o.planar; }
 	bool operator!=(const Fmt& o) const { return !(*this == o); }
 };
 

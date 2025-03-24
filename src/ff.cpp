@@ -10,7 +10,7 @@ bool describe_native(AVPixelFormat f, Fmt& out) {
 	if (out.depth > 12) return false;
 	// shortcut: layouts libvmaf and the encoders lack (4:1:0, 4:1:1, 4:4:0) are treated as 4:2:0
 	out.chroma = out.rgb || (!d->log2_chroma_w && !d->log2_chroma_h) ? 444 : d->log2_chroma_w == 1 && !d->log2_chroma_h ? 422 : 420;
-	out.planar_yuv = (d->flags & AV_PIX_FMT_FLAG_PLANAR) && !out.rgb && d->nb_components == 3 && !(d->flags & AV_PIX_FMT_FLAG_BE) &&
+	out.planar = (d->flags & AV_PIX_FMT_FLAG_PLANAR) && d->nb_components == 3 && !(d->flags & AV_PIX_FMT_FLAG_BE) &&
 	                 (d->log2_chroma_w + d->log2_chroma_h == (out.chroma == 420 ? 2 : out.chroma == 422 ? 1 : 0));
 	return true;
 }
@@ -39,17 +39,4 @@ Picture picture_from_frame(AVFrame* frame, const Fmt& fmt) {
 	p.color = {(int)own->color_range, (int)own->colorspace, (int)own->color_primaries, (int)own->color_trc};
 	p.owner = std::shared_ptr<void>(own, [](void* f) { AVFrame* a = (AVFrame*)f; av_frame_free(&a); });
 	return p;
-}
-
-void frame_view(const Picture& p, AVFrame& f) {
-	memset(&f, 0, sizeof f);
-	f.width = p.width; f.height = p.height;
-	f.format = p.native;
-	for (int i = 0; i < 3; i++) { f.data[i] = (uint8_t*)p.data[i]; f.linesize[i] = p.stride[i]; }
-	f.pts = p.pts;
-	f.duration = p.duration;
-	f.color_range = (AVColorRange)p.color.range;
-	f.colorspace = (AVColorSpace)p.color.space;
-	f.color_primaries = (AVColorPrimaries)p.color.primaries;
-	f.color_trc = (AVColorTransferCharacteristic)p.color.trc;
 }

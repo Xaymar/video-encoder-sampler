@@ -18,11 +18,12 @@ Only the NVENC and AMF headers are tracked in git. The rest are binaries you pla
 
 | Directory | Contents | Where it came from |
 |---|---|---|
-| `third-party/ffmpeg-dev/` | `include/`, `lib/`, `bin/` of a **shared** FFmpeg build with libvmaf | [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) `ffmpeg-release-full-shared` (BtbN builds are not compatible) |
+| `third-party/ffmpeg-dev/` | `include/`, `lib/`, `bin/` of a **shared** FFmpeg build (used for reading the inputs and decoding our own output) | [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) `ffmpeg-release-full-shared` (BtbN builds are not compatible) |
 | `third-party/x264/ucrt64/` | `bin/`, `include/`, `lib/` | MSYS2 package `mingw-w64-ucrt-x86_64-libx264` |
 | `third-party/x265/ucrt64/` | same, plus `libstdc++-6.dll`, `libgcc_s_seh-1.dll`, `libwinpthread-1.dll` in `bin/` | MSYS2 packages `mingw-w64-ucrt-x86_64-x265` and the MinGW runtime |
 | `third-party/svt-av1/ucrt64/` | same | MSYS2 package `mingw-w64-ucrt-x86_64-svt-av1` |
 | `third-party/vmaf/ucrt64/` | same | MSYS2 package `mingw-w64-ucrt-x86_64-vmaf` (libvmaf; its MinGW runtime DLLs come with the x265 entry) |
+| `third-party/libplacebo/ucrt64/` | the same layout, merged from the packages `libplacebo`, `lcms2`, `libdovi`, `shaderc`, `spirv-cross` and `vulkan-headers` | MSYS2 `mingw-w64-ucrt-x86_64-*`; needs a Vulkan driver at run time |
 | `third-party/nv-codec-headers/` | NVENC API headers (tracked) | [FFmpeg/nv-codec-headers](https://github.com/FFmpeg/nv-codec-headers) |
 | `third-party/amf-include/` | AMF API headers (tracked) | [GPUOpen AMF](https://github.com/GPUOpen-LibrariesAndSDKs/AMF), `amf/public/include` |
 
@@ -82,10 +83,10 @@ Without arguments VES reads `config.json` from the working directory. The second
 * `pool` / `parallel`: runs in one pool share a device and at most `parallel` of them run at once. Every GPU gets a pool of its own (`nvenc:0`, `amf:0`, `nvenc:1`, ...) with `parallel` defaulting to 2; everything else (`cpu`) shares one pool with 1. Different pools run at the same time. Concurrency changes how long the sweep takes, never the scores.
 
 ### GPUs
-`nvenc` and `amf` take a `gpu` option: the number of the GPU among the adapters of that vendor, in Windows adapter order (default `0`). Like any option it can be swept, `"gpu": [0, 1]`, and `"gpu": ["all"]` means every GPU of the vendor. Each GPU is a pool of its own, so several GPUs encode at the same time, and every run lists the GPU it ran on with its name and driver version (NVIDIA's own version number, e.g. `617.42`, with the Windows one in brackets). NVENC finds the CUDA device that is the same GPU by its LUID, so the numbers match Windows' and not CUDA's own order. The cache key includes the GPU and driver, so a driver update recomputes. Scaling and score conversion use libplacebo's default Vulkan GPU; there is no setting for it yet.
+`nvenc` and `amf` take a `gpu` option: the number of the GPU among the adapters of that vendor, in Windows adapter order (default `0`). Like any option it can be swept, `"gpu": [0, 1]`, and `"gpu": ["all"]` means every GPU of the vendor. Each GPU is a pool of its own, so several GPUs encode at the same time, and every run lists the GPU it ran on with its name and driver version (NVIDIA's own version number, e.g. `617.42`, with the Windows one in brackets). NVENC finds the CUDA device that is the same GPU by its LUID, so the numbers match Windows' and not CUDA's own order. The cache key includes the GPU and driver, so a driver update recomputes. Scaling and score conversion run on the GPU named in `scaling.gpu`, or libplacebo's choice.
 
 ### Scaling and frame rates
-Resolution changes use the libplacebo filter (GPU, Vulkan) with the `upscaler` / `downscaler` named in `scaling` (default `ewa_lanczos` for both). Frame rate conversion only drops frames, and it happens before scaling so no time is spent on frames that are thrown away. It follows the real presentation times from the file (every packet's timestamp is read), so variable frame rate sources work: the first frame in each `1/framerate` slot of the output timeline is kept, and bitrates are computed over the real duration. Without `framerates` every frame is kept. Resolutions or frame rates above the source's are rejected.
+Resolution changes and format conversions use libplacebo directly (GPU, Vulkan) with the `upscaler` / `downscaler` named in `scaling` (default `ewa_lanczos` for both). `"scaling": {"gpu": "<Vulkan device name>"}` picks the GPU for it by its exact name, e.g. `NVIDIA GeForce RTX 4080 SUPER`; without it libplacebo chooses. Frame rate conversion only drops frames, and it happens before scaling so no time is spent on frames that are thrown away. It follows the real presentation times from the file (every packet's timestamp is read), so variable frame rate sources work: the first frame in each `1/framerate` slot of the output timeline is kept, and bitrates are computed over the real duration. Without `framerates` every frame is kept. Resolutions or frame rates above the source's are rejected.
 
 Colours are never converted: pixel values go through unchanged and the source's range, matrix, primaries and transfer tags are used for scaling, including full range (`pc`, `yuvj420p`) sources. Encoders are not told the range, since it does not influence what they encode.
 
@@ -96,7 +97,7 @@ Sources keep their pixel format. Every encoder run can set `chroma` (`420`, `422
 
 Quality is measured with both sides in the source's chroma layout at the higher of the source's and the output's bit depth (RGB counts as 4:4:4), so an 8-bit and a 10-bit encode of the same clip are directly comparable.
 
-Formats currently supported by each backend: `x264` 4:2:0, 4:2:2 and 4:4:4 at 8 and 10 bit; `nvenc` whatever the GPU reports (asked once per codec): 8-bit 4:2:0 everywhere, 10-bit and 4:4:4 where the codec and GPU allow it, never 4:2:2; `x265` 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bit; `svtav1` 4:2:0 at 8 and 10 bit (this SVT-AV1 refuses other layouts); libavcodec encoders whatever they list as planar YUV; `amf` 4:2:0 at 8 bit, and at 10 bit for HEVC (and AV1) where the GPU does it, found by trying once per codec and depth; this Radeon iGPU has no AV1 and no 10-bit H.264.
+Formats currently supported by each backend: `x264` 4:2:0, 4:2:2 and 4:4:4 at 8 and 10 bit; `nvenc` whatever the GPU reports (asked once per codec): 8-bit 4:2:0 everywhere, 10-bit and 4:4:4 where the codec and GPU allow it, never 4:2:2; `x265` 4:2:0, 4:2:2 and 4:4:4 at 8, 10 and 12 bit; `svtav1` 4:2:0 at 8 and 10 bit (this SVT-AV1 refuses other layouts); `amf` 4:2:0 at 8 bit, and at 10 bit for HEVC (and AV1) where the GPU does it, found by trying once per codec and depth; this Radeon iGPU has no AV1 and no 10-bit H.264.
 
 ### Encoders
 | `encoder` | Backend | Options |
@@ -106,7 +107,6 @@ Formats currently supported by each backend: `x264` 4:2:0, 4:2:2 and 4:4:4 at 8 
 | `x264` | libx264 | `preset`, `tune`, `profile`, plus any x264 long option (`bframes`, `rc-lookahead`, `aq-mode`, ...) |
 | `x265` | libx265 | `preset`, `tune`, `profile`, plus any x265 long option |
 | `svtav1` | libSvtAv1Enc | any `SvtAv1EncApp` long option (`preset`, `lookahead`, `enable-tf`, ...) |
-| anything else | libavcodec encoder of that name (e.g. `libx264`) | Passed to `av_opt_set` |
 
 An unknown option makes that run fail with a message instead of being ignored. There is no QuickSync backend yet.
 
@@ -121,16 +121,14 @@ For every group (same input, target bitrate and key frame interval), a run count
 Constant bitrate encoders still miss their target, and spending more bits would win frames unfairly. A run that overshoots its target loses `over_penalty` VMAF points per percent of overshoot (default 0.025, taken from the VMAF gain between 3000 and 6000 kbps on a test clip). Undershooting costs nothing.
 
 ## Where FFmpeg is still used
-The encoders, the scoring and the sweep logic work on the tool's own types (`src/picture.h`) and no longer include FFmpeg. FFmpeg is confined to a few replaceable pieces behind small interfaces, all in files named `ff_*.cpp`:
+FFmpeg only reads and decodes video; everything else is native. The encoders, scaling and conversion (libplacebo), scoring (libvmaf) and the sweep logic work on the tool's own types (`src/picture.h`). FFmpeg sits behind two small interfaces in files named `ff_*.cpp`:
 
 | Piece | Interface | What FFmpeg does for it |
 |---|---|---|
-| `ff_source.cpp` | `Source` (`source.h`) | demuxes and decodes the input videos, whatever container and codec |
+| `ff_source.cpp` | `Source` (`source.h`) | demuxes and decodes the input videos, whatever container and codec, and repacks odd pixel layouts (packed RGB, semi-planar, ...) into planar ones |
 | `ff_decode.cpp` | `Decoder` (`decode.h`) | decodes our own H.264, HEVC and AV1 output for scoring |
-| `ff_convert.cpp` | `Converter` (`convert.h`) | scaling and pixel format conversion through the `libplacebo` filter |
-| `encoder_libav.cpp` | `Encoder` (`encoder.h`) | the optional generic encoder, any libavcodec encoder by name |
 
-Dropping FFmpeg means providing another implementation of each interface: libplacebo's own API for the converter, and demuxers and decoders for the input formats you need and for our own streams (the hard part, since 10-bit and 4:4:4 H.264/HEVC/AV1 decoding is wanted). The native encoders (`nvenc`, `amf`, `x264`, `x265`, `svtav1`) do not need FFmpeg at all.
+Replacing FFmpeg would mean providing another implementation of those two interfaces (demuxers and decoders for the formats you need, including 10-bit and 4:4:4 H.264/HEVC/AV1 for our own streams); nothing else depends on it. The FFmpeg version is part of the result cache key.
 
 ## Current Limitations
 * Encoders are told one constant frame rate (the source's, or the measured average for a variable frame rate source) and get frames numbered in order; only the dropping of frames and the scoring follow the real timestamps.

@@ -13,5 +13,5 @@ bool encoder_supports(const std::string& encoder, const std::string& codec, int 
 	if (encoder == "x265") return x265_api_get(depth) != nullptr; // the multi-bit-depth build links 8, 10 and 12 bit encoders; 4:2:0/4:2:2/4:4:4 all work
 	if (encoder == "svtav1") return chroma == 420 && depth <= 10; // this SVT-AV1 refuses anything but 4:2:0 ("Only support 420 now")
 	if (encoder == "amf") return amf_supports(codec, chroma, depth);
-	return libav_encoder_supports(encoder, chroma, depth);
+	return false; // unknown encoder
 }

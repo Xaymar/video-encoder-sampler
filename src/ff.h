@@ -21,5 +21,3 @@ AVPixelFormat av_planar_format(int chroma, int depth);
 // Moves the frame's contents into a Picture that owns them.
 Picture picture_from_frame(AVFrame* frame, const Fmt& fmt);
 
-// A non-owning AVFrame describing the picture's memory. Valid as long as the picture is.
-void frame_view(const Picture& p, AVFrame& f);

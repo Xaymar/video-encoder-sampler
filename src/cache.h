@@ -22,5 +22,6 @@ bool cache_load(const std::string& dir, const std::string& key, CachedRun& out);
 void cache_store(const std::string& dir, const std::string& key, const CachedRun& run);
 
 std::string encoder_library_version(const std::string& encoder); // versions.cpp
+std::string decoder_library_version();
 std::string scaler_library_version();
 std::string vmaf_library_version();

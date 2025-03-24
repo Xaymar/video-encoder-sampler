@@ -20,7 +20,7 @@ class Scorer {
 	unsigned count = 0;
 
 	static bool to_picture(const Picture& p, VmafPicture& pic) {
-		if (!p.fmt.planar_yuv || p.fmt.rgb) { fprintf(stderr, "vmaf: unsupported pixel format\n"); return false; }
+		if (!p.fmt.planar || p.fmt.rgb) { fprintf(stderr, "vmaf: unsupported pixel format\n"); return false; }
 		enum VmafPixelFormat fmt = p.fmt.chroma == 420 ? VMAF_PIX_FMT_YUV420P : p.fmt.chroma == 422 ? VMAF_PIX_FMT_YUV422P : VMAF_PIX_FMT_YUV444P;
 		if (vmaf_picture_alloc(&pic, fmt, p.fmt.depth, p.width, p.height) < 0) return false;
 		for (int i = 0; i < 3; i++) {
