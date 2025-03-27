@@ -263,7 +263,8 @@ static bool run_one(const std::string& input, const std::string& encoder, Codec 
 	p.pix = enc.pix = planar_fmt(chroma, depth);
 	enc.has_pix = true;
 	// Both sides are scored in the source's chroma layout at the higher of the two bit depths.
-	const Fmt score_fmt = planar_fmt(sf.chroma, std::max(sf.depth, depth));
+	// 4:2:2 sources are scored as 4:4:4, which holds all of their chroma.
+	const Fmt score_fmt = planar_fmt(sf.chroma == 422 ? 444 : sf.chroma, std::max(sf.depth, depth));
 	if (!valid(p.pix) || !valid(score_fmt)) { fprintf(stderr, "unsupported chroma %d / bit depth %d\n", chroma, depth); return false; }
 
 	std::vector<std::vector<uint8_t>> packets;
