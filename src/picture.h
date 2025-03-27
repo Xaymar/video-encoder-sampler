@@ -26,13 +26,25 @@ struct Color {
 	int range = 0, space = 2, primaries = 2, trc = 2;
 };
 
+// How a picture stores its samples, in neutral terms, so the converter can read whatever layout a source has: planar,
+// semi-planar (NV12, P010), packed RGB, with padding bytes or alpha. Component 0..3 are Y/R, U/G, V/B and alpha.
+struct Layout {
+	struct Comp { int plane = -1, offset = 0, shift = 0, depth = 0; }; // plane -1: not present; offset in bytes within a pixel
+	int planes = 0;
+	int step[4]{};               // bytes from one pixel to the next, per plane
+	Comp comp[4];
+	int log2_cw = 0, log2_ch = 0; // chroma subsampling
+	bool big_endian = false;
+};
+
 // One video frame. The memory belongs to `owner`, so a Picture can be copied and kept around cheaply.
 struct Picture {
 	int width = 0, height = 0;
 	Fmt fmt;
 	int native = -1;                // the FFmpeg pixel format code behind fmt, meaningful to the ff_*.cpp files only
-	const uint8_t* data[3]{};
-	int stride[3]{};                // bytes per row
+	Layout layout;                  // how the samples are stored; for sources that are not Fmt::planar
+	const uint8_t* data[4]{};
+	int stride[4]{};                // bytes per row
 	int64_t pts = 0;                // frame number in the stream it belongs to
 	int64_t duration = 1;           // in the same units
 	Color color;

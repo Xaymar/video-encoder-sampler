@@ -11,6 +11,7 @@ bool describe_native(AVPixelFormat f, Fmt& out) {
 	// shortcut: layouts libvmaf and the encoders lack (4:1:0, 4:1:1, 4:4:0) are treated as 4:2:0
 	out.chroma = out.rgb || (!d->log2_chroma_w && !d->log2_chroma_h) ? 444 : d->log2_chroma_w == 1 && !d->log2_chroma_h ? 422 : 420;
 	out.planar = (d->flags & AV_PIX_FMT_FLAG_PLANAR) && d->nb_components == 3 && !(d->flags & AV_PIX_FMT_FLAG_BE) &&
+	                 d->comp[0].plane == 0 && d->comp[1].plane == 1 && d->comp[2].plane == 2 && // not NV12 and friends
 	                 (d->log2_chroma_w + d->log2_chroma_h == (out.chroma == 420 ? 2 : out.chroma == 422 ? 1 : 0));
 	return true;
 }
@@ -26,6 +27,21 @@ AVPixelFormat av_planar_format(int chroma, int depth) {
 	return c < 0 || d < 0 ? AV_PIX_FMT_NONE : t[c][d];
 }
 
+Layout layout_of(AVPixelFormat f) {
+	Layout l;
+	const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(f);
+	if (!d) return l;
+	for (int i = 0; i < d->nb_components && i < 4; i++) {
+		const AVComponentDescriptor& c = d->comp[i];
+		l.comp[i] = {c.plane, c.offset, c.shift, c.depth};
+		l.step[c.plane] = c.step;
+		if (c.plane + 1 > l.planes) l.planes = c.plane + 1;
+	}
+	l.log2_cw = d->log2_chroma_w; l.log2_ch = d->log2_chroma_h;
+	l.big_endian = d->flags & AV_PIX_FMT_FLAG_BE;
+	return l;
+}
+
 Picture picture_from_frame(AVFrame* frame, const Fmt& fmt) {
 	AVFrame* own = av_frame_alloc();
 	av_frame_move_ref(own, frame);
@@ -33,7 +49,8 @@ Picture picture_from_frame(AVFrame* frame, const Fmt& fmt) {
 	p.width = own->width; p.height = own->height;
 	p.fmt = fmt;
 	p.native = own->format;
-	for (int i = 0; i < 3; i++) { p.data[i] = own->data[i]; p.stride[i] = own->linesize[i]; }
+	p.layout = layout_of((AVPixelFormat)own->format);
+	for (int i = 0; i < 4; i++) { p.data[i] = own->data[i]; p.stride[i] = own->linesize[i]; }
 	p.pts = own->pts;
 	p.duration = own->duration;
 	p.color = {(int)own->color_range, (int)own->colorspace, (int)own->color_primaries, (int)own->color_trc};

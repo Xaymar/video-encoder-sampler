@@ -10,7 +10,6 @@
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
-#include <libswscale/swscale.h>
 }
 
 namespace {
@@ -34,12 +33,6 @@ class FfSource : public Source {
 	AVFrame* frame = av_frame_alloc();
 	int vi = -1;
 	bool flushed = false;
-	// Layouts the converter cannot read (packed, semi-planar, with alpha, big-endian, ...) are repacked into planar ones here,
-	// sample for sample; for formats that need it (4:1:0, ...) the chroma is resampled to the nearest supported layout.
-	bool repack = false;
-	AVPixelFormat repack_to = AV_PIX_FMT_NONE;
-	SwsContext* sws = nullptr;
-
 	// Reads every video packet's timestamp (no decoding) to learn the real frame times.
 	void scan(const std::string& path) {
 		AVFormatContext* sc = nullptr;
@@ -75,7 +68,6 @@ public:
 		av_packet_free(&pkt);
 		avcodec_free_context(&dec);
 		avformat_close_input(&ctx);
-		sws_freeContext(sws);
 	}
 
 	bool open(const std::string& path) override {
@@ -98,11 +90,6 @@ public:
 		AVPixelFormat native = unj(dec->pix_fmt, full);
 		if (full) color.range = AVCOL_RANGE_JPEG;
 		if (!describe_native(native, fmt)) { fprintf(stderr, "unsupported source pixel format %s\n", av_get_pix_fmt_name(native)); return false; }
-		if (!fmt.planar) {
-			repack = true;
-			repack_to = fmt.rgb ? (fmt.depth <= 8 ? AV_PIX_FMT_GBRP : fmt.depth <= 10 ? AV_PIX_FMT_GBRP10LE : AV_PIX_FMT_GBRP12LE) : av_planar_format(fmt.chroma, fmt.depth);
-			fmt.planar = true;
-		}
 		scan(path);
 		return true;
 	}
@@ -114,18 +101,6 @@ public:
 				bool full = false;
 				frame->format = unj((AVPixelFormat)frame->format, full);
 				if (full) frame->color_range = AVCOL_RANGE_JPEG;
-				if (repack) {
-					AVFrame* dst = av_frame_alloc();
-					dst->format = repack_to; dst->width = frame->width; dst->height = frame->height;
-					av_frame_get_buffer(dst, 0);
-					av_frame_copy_props(dst, frame);
-					sws = sws_getCachedContext(sws, frame->width, frame->height, (AVPixelFormat)frame->format, dst->width, dst->height, repack_to,
-					                           SWS_BICUBIC | SWS_ACCURATE_RND | SWS_FULL_CHR_H_INT | SWS_FULL_CHR_H_INP, nullptr, nullptr, nullptr);
-					sws_scale_frame(sws, dst, frame);
-					av_frame_unref(frame);
-					av_frame_move_ref(frame, dst);
-					av_frame_free(&dst);
-				}
 				frame->pts = read++;
 				frame->duration = 1;
 				frame->pict_type = AV_PICTURE_TYPE_NONE;

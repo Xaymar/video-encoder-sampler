@@ -1,6 +1,8 @@
-// Converter on libplacebo's own API (Vulkan). Takes planar frames (YUV or GBR), scales them and converts them to planar YUV.
+// Converter on libplacebo's own API (Vulkan). Reads frames in whatever sample layout the source has (planar, NV12/P010, packed RGB,
+// ...), scales them and converts them to planar YUV.
 #include "convert.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <deque>
@@ -122,31 +124,58 @@ public:
 
 	bool push(const Picture* p) override {
 		if (!p) return true; // nothing is ever held back
-		if (!vk || !p->fmt.planar) return false;
-		const int depth = p->fmt.depth, bytes = depth > 8 ? 2 : 1;
+		const Layout& L = p->layout;
+		if (!vk || L.planes == 0) return false;
 		const pl_color_system sys = color_system(*p);
 
+		// Read the source's own layout: every plane becomes one texture with the components it holds in memory order,
+		// padding bytes (the 0 in bgr0, say) are filled in as unused components, and an alpha component is ignored.
 		struct pl_frame image = {};
-		image.num_planes = 3;
-		for (int i = 0; i < 3; i++) {
+		struct pl_bit_encoding bits = {};
+		static const int map_rgb[4] = {PL_CHANNEL_R, PL_CHANNEL_G, PL_CHANNEL_B, PL_CHANNEL_NONE};
+		static const int map_yuv[4] = {PL_CHANNEL_Y, PL_CHANNEL_CB, PL_CHANNEL_CR, PL_CHANNEL_NONE};
+		for (int pn = 0; pn < L.planes; pn++) {
+			int idx[4], n = 0;
+			for (int c = 0; c < 4; c++) if (L.comp[c].plane == pn) idx[n++] = c;
+			for (int i = 1; i < n; i++) for (int j = i; j > 0 && L.comp[idx[j]].offset < L.comp[idx[j - 1]].offset; j--) std::swap(idx[j], idx[j - 1]);
+			if (n == 0 || idx[0] == 3 || image.num_planes >= 3) continue; // nothing but alpha in this plane
+
 			struct pl_plane_data d = {};
 			d.type = PL_FMT_UNORM;
-			d.width = plane_w(p->width, p->fmt.chroma, i);
-			d.height = plane_h(p->height, p->fmt.chroma, i);
-			d.component_size[0] = bytes * 8; // the depth in the sample is told through repr.bits
-			d.component_map[0] = p->fmt.rgb ? (i == 0 ? PL_CHANNEL_G : i == 1 ? PL_CHANNEL_B : PL_CHANNEL_R) : (i == 0 ? PL_CHANNEL_Y : i == 1 ? PL_CHANNEL_CB : PL_CHANNEL_CR);
-			d.pixel_stride = bytes;
-			d.row_stride = p->stride[i];
-			d.pixels = p->data[i];
-			if (!pl_upload_plane(vk->gpu, &image.planes[i], &in_tex[i], &d)) { fprintf(stderr, "libplacebo: upload failed\n"); return false; }
+			const bool subsampled = !p->fmt.rgb && (idx[0] == 1 || idx[0] == 2);
+			d.width = subsampled ? (p->width + (1 << L.log2_cw) - 1) >> L.log2_cw : p->width;
+			d.height = subsampled ? (p->height + (1 << L.log2_ch) - 1) >> L.log2_ch : p->height;
+			int slot = 0, cursor = 0;
+			bool ok = true;
+			auto add = [&](int size_bits, int map) {
+				if (slot >= 4) { ok = false; return; }
+				d.component_size[slot] = size_bits; d.component_map[slot] = map; slot++;
+			};
+			for (int k = 0; k < n; k++) {
+				const Layout::Comp& c = L.comp[idx[k]];
+				const int cbytes = c.depth + c.shift > 8 ? 2 : 1;
+				if (c.depth < 8) ok = false; // sub-byte samples (rgb565, ...)
+				if (c.offset > cursor) add(8 * (c.offset - cursor), PL_CHANNEL_NONE);
+				add(8 * cbytes, idx[k] < 3 ? (p->fmt.rgb ? map_rgb[idx[k]] : map_yuv[idx[k]]) : PL_CHANNEL_NONE);
+				cursor = c.offset + cbytes;
+				if (idx[k] < 3 && bits.sample_depth == 0) { bits.sample_depth = 8 * cbytes; bits.color_depth = c.depth; bits.bit_shift = c.shift; } // the depth of the samples is told through repr.bits
+			}
+			if (cursor < L.step[pn]) add(8 * (L.step[pn] - cursor), PL_CHANNEL_NONE);
+			if (!ok) { fprintf(stderr, "libplacebo: unsupported sample layout\n"); return false; }
+			d.pixel_stride = L.step[pn];
+			d.row_stride = p->stride[pn];
+			d.pixels = p->data[pn];
+			d.swapped = L.big_endian;
+			if (!pl_upload_plane(vk->gpu, &image.planes[image.num_planes], &in_tex[image.num_planes], &d)) { fprintf(stderr, "libplacebo: upload failed\n"); return false; }
+			image.num_planes++;
 		}
 		image.repr.sys = sys;
 		image.repr.levels = color_levels(*p);
 		image.repr.alpha = PL_ALPHA_NONE;
-		image.repr.bits.sample_depth = bytes * 8; image.repr.bits.color_depth = depth; image.repr.bits.bit_shift = 0;
+		image.repr.bits = bits;
 		image.color.primaries = color_primaries(p->color.primaries);
 		image.color.transfer = color_transfer(p->color.trc);
-		if (!p->fmt.rgb && p->fmt.chroma != 444) pl_frame_set_chroma_location(&image, PL_CHROMA_LEFT);
+		if (L.log2_cw || L.log2_ch) pl_frame_set_chroma_location(&image, PL_CHROMA_LEFT);
 
 		const int obytes = out_fmt.depth > 8 ? 2 : 1;
 		struct pl_frame target = {};
@@ -167,7 +196,7 @@ public:
 		struct pl_render_params rp = pl_render_default_params;
 		rp.upscaler = up;
 		rp.downscaler = down;
-		if (out_fmt.depth >= depth) rp.dither_params = nullptr; // only reducing the bit depth needs dithering, it would just add noise otherwise
+		if (out_fmt.depth >= p->fmt.depth) rp.dither_params = nullptr; // only reducing the bit depth needs dithering, it would just add noise otherwise
 		if (!pl_render_image(rr, &image, &target, &rp)) { fprintf(stderr, "libplacebo: rendering failed\n"); return false; }
 
 		auto planes = std::make_shared<Planes>();

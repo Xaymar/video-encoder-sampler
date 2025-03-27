@@ -18,6 +18,9 @@ bool describe_native(AVPixelFormat f, Fmt& out);
 // The planar YUV format for a chroma layout and bit depth, AV_PIX_FMT_NONE if there is none.
 AVPixelFormat av_planar_format(int chroma, int depth);
 
+// The sample layout of an FFmpeg pixel format.
+Layout layout_of(AVPixelFormat f);
+
 // Moves the frame's contents into a Picture that owns them.
 Picture picture_from_frame(AVFrame* frame, const Fmt& fmt);
 

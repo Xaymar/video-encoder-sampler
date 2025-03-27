@@ -93,7 +93,7 @@ Colours are never converted: pixel values go through unchanged and the source's 
 Scores are always measured against the original: the decoded video is scaled back to the source resolution and each dropped frame is shown again until the next kept frame, so every run has one VMAF value per original frame and runs with different resolutions or frame rates can be compared directly.
 
 ### Pixel formats and bit depth
-Sources keep their pixel format. Every encoder run can set `chroma` (`420`, `422`, `444`) and `bitdepth` (`8`, `10`, `12`) in its options, and like any option they can be swept (`"bitdepth": [8, 10]`). Without them the encoder gets the source's layout and depth, or the closest one it supports (another layout, 4:2:0, then a lower depth). Asking for something the encoder cannot do fails that run. Conversions are done by libplacebo; RGB sources are converted to YUV as BT.709 limited range, 4:4:4.
+Sources keep their pixel format and sample layout: planar, semi-planar (NV12, P010), packed or planar RGB, 4:2:2, 4:4:4, 8 to 16 bit, with padding bytes or alpha, little or big endian. libplacebo reads whatever the source has, so nothing is repacked on the CPU. Every encoder run can set `chroma` (`420`, `422`, `444`) and `bitdepth` (`8`, `10`, `12`) in its options, and like any option they can be swept (`"bitdepth": [8, 10]`). Without them the encoder gets the source's layout and depth, or the closest one it supports (another layout, 4:2:0, then a lower depth). Asking for something the encoder cannot do fails that run. Conversions are done by libplacebo; RGB sources are converted to YUV as BT.709 limited range, 4:4:4.
 
 Quality is measured with both sides in the source's chroma layout at the higher of the source's and the output's bit depth (RGB counts as 4:4:4), so an 8-bit and a 10-bit encode of the same clip are directly comparable.
 
@@ -125,7 +125,7 @@ FFmpeg only reads and decodes video; everything else is native. The encoders, sc
 
 | Piece | Interface | What FFmpeg does for it |
 |---|---|---|
-| `ff_source.cpp` | `Source` (`source.h`) | demuxes and decodes the input videos, whatever container and codec, and repacks odd pixel layouts (packed RGB, semi-planar, ...) into planar ones |
+| `ff_source.cpp` | `Source` (`source.h`) | demuxes and decodes the input videos, whatever container and codec; frames are handed on in the layout the decoder produced |
 | `ff_decode.cpp` | `Decoder` (`decode.h`) | decodes our own H.264, HEVC and AV1 output for scoring |
 
 Replacing FFmpeg would mean providing another implementation of those two interfaces (demuxers and decoders for the formats you need, including 10-bit and 4:4:4 H.264/HEVC/AV1 for our own streams); nothing else depends on it. The FFmpeg version is part of the result cache key.
