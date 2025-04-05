@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Shared FFmpeg dev build (include/, lib/, bin/).
 set(FFMPEG_DIR "${CMAKE_SOURCE_DIR}/third-party/ffmpeg-dev" CACHE PATH "FFmpeg dev build root")
 
-set(FF_LIBS avformat avcodec avfilter avutil swscale swresample)
+set(FF_LIBS avformat avcodec avutil)
 foreach(l ${FF_LIBS})
 	find_library(FF_${l} ${l} PATHS "${FFMPEG_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
 	list(APPEND FF_LINK ${FF_${l}})
