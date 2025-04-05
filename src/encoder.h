@@ -33,22 +33,25 @@ public:
 	Stats stats;
 };
 
-// The native backends, selected by the names "nvenc", "amf", "x264", "x265" and "svtav1".
+// The native backends, selected by the names "nvenc", "amf", "qsv", "x264", "x265" and "svtav1".
 std::unique_ptr<Encoder> make_encoder_nvenc();
 std::unique_ptr<Encoder> make_encoder_amf();
+std::unique_ptr<Encoder> make_encoder_qsv();
 std::unique_ptr<Encoder> make_encoder_x264();
 std::unique_ptr<Encoder> make_encoder_x265();
 std::unique_ptr<Encoder> make_encoder_svtav1();
 
 bool nvenc_supports(const std::string& codec, int chroma, int depth);
 bool amf_supports(const std::string& codec, int chroma, int depth);
+bool qsv_supports(const std::string& codec, int chroma, int depth);
 
-inline bool is_gpu_encoder(const std::string& name) { return name == "nvenc" || name == "amf"; }
+inline bool is_gpu_encoder(const std::string& name) { return name == "nvenc" || name == "amf" || name == "qsv"; }
 inline bool is_native_encoder(const std::string& name) { return is_gpu_encoder(name) || name == "x264" || name == "x265" || name == "svtav1"; }
 
 inline std::unique_ptr<Encoder> make_encoder(const std::string& name) {
 	if (name == "nvenc") return make_encoder_nvenc();
 	if (name == "amf") return make_encoder_amf();
+	if (name == "qsv") return make_encoder_qsv();
 	if (name == "x264") return make_encoder_x264();
 	if (name == "x265") return make_encoder_x265();
 	if (name == "svtav1") return make_encoder_svtav1();

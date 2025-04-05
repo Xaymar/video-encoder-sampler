@@ -332,7 +332,7 @@ int main(int argc, char** argv) {
 		else {
 			fprintf(stderr, "usage: ves [config.json]\n"
 			                "       ves <input> <encoder> <codec> <bitrate-kbps[,..]> [key=value[,value..] ...]\n"
-			                "  encoder: nvenc | amf | x264 | x265 | svtav1 (codec is ignored for the CPU encoders)\n"
+			                "  encoder: nvenc | amf | qsv | x264 | x265 | svtav1 (codec is ignored for the CPU encoders)\n"
 			                "  comma separated values are swept; every combination is tested\n"
 			                "  kf=<seconds>, vmaf.model=<spec>, vmaf.threads=<n>, over.penalty=<vmaf points per %% over target>;\n"
 			                "  other keys go to the encoder\n");

@@ -26,8 +26,9 @@ Only the NVENC and AMF headers are tracked in git. The rest are binaries you pla
 | `third-party/libplacebo/ucrt64/` | the same layout, merged from the packages `libplacebo`, `lcms2`, `libdovi`, `shaderc`, `spirv-cross` and `vulkan-headers` | MSYS2 `mingw-w64-ucrt-x86_64-*`; needs a Vulkan driver at run time |
 | `third-party/nv-codec-headers/` | NVENC API headers (tracked) | [FFmpeg/nv-codec-headers](https://github.com/FFmpeg/nv-codec-headers) |
 | `third-party/amf-include/` | AMF API headers (tracked) | [GPUOpen AMF](https://github.com/GPUOpen-LibrariesAndSDKs/AMF), `amf/public/include` |
+| `third-party/libvpl/` | `ucrt64/` of the oneVPL package (QuickSync headers and the `libvpl-2.dll` dispatcher, loaded at runtime) | MSYS2 `mingw-w64-ucrt-x86_64-libvpl` |
 
-MSYS2 packages are `.pkg.tar.zst` files from <https://repo.msys2.org/mingw/ucrt64/>; Windows' `tar -xf` extracts them. NVENC and AMF are loaded at runtime from the GPU driver, so they need no libraries. x264, x265 and SVT-AV1 are GPL/BSD licensed libraries that end up next to the executable.
+MSYS2 packages are `.pkg.tar.zst` files from <https://repo.msys2.org/mingw/ucrt64/>; Windows' `tar -xf` extracts them. NVENC, AMF and QuickSync are loaded at runtime from the GPU driver (QuickSync through `libvpl-2.dll`), so they need no libraries. x264, x265 and SVT-AV1 are GPL/BSD licensed libraries that end up next to the executable.
 
 VMAF models are JSON files in `models/` (from [Netflix/vmaf](https://github.com/Netflix/vmaf/tree/master/model); the MSYS2 libvmaf has no built-in models). `vmaf.model` is `path=<file>`, relative to the working directory.
 
@@ -83,7 +84,7 @@ Without arguments VES reads `config.json` from the working directory. The second
 * `pool` / `parallel`: runs in one pool share a device and at most `parallel` of them run at once. Every GPU gets a pool of its own (`nvenc:0`, `amf:0`, `nvenc:1`, ...) with `parallel` defaulting to 2; everything else (`cpu`) shares one pool with 1. Different pools run at the same time. Concurrency changes how long the sweep takes, never the scores.
 
 ### GPUs
-`nvenc` and `amf` take a `gpu` option: the number of the GPU among the adapters of that vendor, in Windows adapter order (default `0`). Like any option it can be swept, `"gpu": [0, 1]`, and `"gpu": ["all"]` means every GPU of the vendor. Each GPU is a pool of its own, so several GPUs encode at the same time, and every run lists the GPU it ran on with its name and driver version (NVIDIA's own version number, e.g. `617.42`, with the Windows one in brackets). NVENC finds the CUDA device that is the same GPU by its LUID, so the numbers match Windows' and not CUDA's own order. The cache key includes the GPU and driver, so a driver update recomputes. Scaling and score conversion run on the GPU named in `scaling.gpu`, or libplacebo's choice.
+`nvenc`, `amf` and `qsv` take a `gpu` option: the number of the GPU among the adapters of that vendor, in Windows adapter order (default `0`). Like any option it can be swept, `"gpu": [0, 1]`, and `"gpu": ["all"]` means every GPU of the vendor. Each GPU is a pool of its own, so several GPUs encode at the same time, and every run lists the GPU it ran on with its name and driver version (NVIDIA's own version number, e.g. `617.42`, with the Windows one in brackets). NVENC finds the CUDA device that is the same GPU by its LUID, so the numbers match Windows' and not CUDA's own order. The cache key includes the GPU and driver, so a driver update recomputes. Scaling and score conversion run on the GPU named in `scaling.gpu`, or libplacebo's choice.
 
 ### Scaling and frame rates
 Resolution changes and format conversions use libplacebo directly (GPU, Vulkan) with the `upscaler` / `downscaler` named in `scaling` (default `ewa_lanczos` for both). `"scaling": {"gpu": "<Vulkan device name>"}` picks the GPU for it by its exact name, e.g. `NVIDIA GeForce RTX 4080 SUPER`; without it libplacebo chooses. Frame rate conversion only drops frames, and it happens before scaling so no time is spent on frames that are thrown away. It follows the real presentation times from the file (every packet's timestamp is read), so variable frame rate sources work: the first frame in each `1/framerate` slot of the output timeline is kept, and bitrates are computed over the real duration. Without `framerates` every frame is kept. Resolutions or frame rates above the source's are rejected.
@@ -104,11 +105,12 @@ Formats currently supported by each backend: `x264` 4:2:0 and 4:4:4 at 8 and 10 
 |---|---|---|
 | `nvenc` | NVENC API (`codec`: h264, hevc, av1) | `preset` p1-p7, `tune` hq/ll/ull/lossless, `rc` cbr/vbr, `bf`, `rc-lookahead`, `spatial-aq`, `temporal-aq`, `aq-strength`, `b_ref_mode` none/each/middle, `gpu` |
 | `amf` | AMF API (`codec`: h264, hevc, av1) | Raw AMF property names, e.g. `QualityPreset`, `BPicturesPattern` (H.264) or `HevcQualityPreset` (HEVC). Values are numeric. `gpu` selects the n-th AMD adapter |
+| `qsv` | oneVPL (`codec`: h264, hevc, av1) | Raw oneVPL field names of `mfxInfoMFX`, `mfxExtCodingOption2` and `mfxExtCodingOption3`, e.g. `TargetUsage`, `GopRefDist`, `LookAheadDepth`, `BRefType`, `MBBRC`. Values are numbers, or `on`/`off`/`adaptive` for the toggles, `best_quality`/`balanced`/`best_speed` for `TargetUsage`, `cbr`/`vbr`/`icq`/... for `RateControlMethod`. `gpu` selects the n-th Intel adapter. **Written against the headers and never run: no Intel GPU was available.** |
 | `x264` | libx264 | `preset`, `tune`, `profile`, plus any x264 long option (`bframes`, `rc-lookahead`, `aq-mode`, ...) |
 | `x265` | libx265 | `preset`, `tune`, `profile`, plus any x265 long option |
 | `svtav1` | libSvtAv1Enc | any `SvtAv1EncApp` long option (`preset`, `lookahead`, `enable-tf`, ...) |
 
-An unknown option makes that run fail with a message instead of being ignored. There is no QuickSync backend yet.
+An unknown option makes that run fail with a message instead of being ignored.
 
 ## Result cache
 Every finished run is stored in the cache directory (one small file with the per-frame scores and the actual bitrate), and a run whose entry exists is not repeated, marked `(cached)` in the output. Adding a preset, a bitrate or a resolution to a config therefore only computes the new combinations.

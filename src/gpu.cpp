@@ -38,4 +38,4 @@ std::string gpu_description(unsigned vendor, int index) {
 	return index >= 0 && index < (int)all.size() ? all[index].describe() : "none";
 }
 
-unsigned encoder_vendor(const std::string& encoder) { return encoder == "nvenc" ? VENDOR_NVIDIA : encoder == "amf" ? VENDOR_AMD : 0; }
+unsigned encoder_vendor(const std::string& encoder) { return encoder == "nvenc" ? VENDOR_NVIDIA : encoder == "amf" ? VENDOR_AMD : encoder == "qsv" ? VENDOR_INTEL : 0; }

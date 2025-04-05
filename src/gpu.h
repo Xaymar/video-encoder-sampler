@@ -6,6 +6,7 @@
 
 constexpr unsigned VENDOR_NVIDIA = 0x10DE;
 constexpr unsigned VENDOR_AMD = 0x1002;
+constexpr unsigned VENDOR_INTEL = 0x8086;
 
 struct GpuInfo {
 	std::string name;

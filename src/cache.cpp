@@ -31,6 +31,7 @@ static std::string encoder_environment(const std::string& encoder, const Options
 	};
 	if (encoder == "nvenc") return "nvenc " + gpu(VENDOR_NVIDIA);
 	if (encoder == "amf") return "amf " + gpu(VENDOR_AMD);
+	if (encoder == "qsv") return "qsv " + gpu(VENDOR_INTEL);
 	return encoder_library_version(encoder);
 }
 

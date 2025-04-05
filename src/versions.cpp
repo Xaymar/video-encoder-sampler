@@ -18,7 +18,7 @@ std::string encoder_library_version(const std::string& encoder) {
 	if (encoder == "x264") return "x264 build " + std::to_string(X264_BUILD) + " " X264_VERSION;
 	if (encoder == "x265") return std::string("x265 ") + x265_version_str + " " + x265_build_info_str;
 	if (encoder == "svtav1") return std::string("svt-av1 ") + svt_av1_get_version();
-	return encoder; // nvenc and amf: the GPU and driver matter there, see gpu_description()
+	return encoder; // nvenc, amf and qsv: the GPU and driver matter there, see gpu_description()
 }
 
 std::string decoder_library_version() { return std::string("ffmpeg ") + av_version_info(); }

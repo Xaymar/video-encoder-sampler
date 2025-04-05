@@ -33,8 +33,8 @@ find_library(PLACEBO_LIB placebo.dll PATHS "${PLACEBO_DIR}/lib" NO_DEFAULT_PATH 
 set(VMAF_DIR "${CMAKE_SOURCE_DIR}/third-party/vmaf/ucrt64" CACHE PATH "libvmaf package root")
 find_library(VMAF_LIB vmaf.dll PATHS "${VMAF_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
 
-add_executable(ves src/main.cpp src/source.cpp src/ff.cpp src/ff_source.cpp src/pl_convert.cpp src/ff_decode.cpp src/formats.cpp src/cache.cpp src/gpu.cpp src/versions.cpp src/vmaf.cpp src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
-target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include" "${CMAKE_SOURCE_DIR}/third-party/amf-include" "${X264_DIR}/include" "${X265_DIR}/include" "${SVTAV1_DIR}/include" "${VMAF_DIR}/include" "${PLACEBO_DIR}/include")
+add_executable(ves src/main.cpp src/source.cpp src/ff.cpp src/ff_source.cpp src/pl_convert.cpp src/ff_decode.cpp src/formats.cpp src/cache.cpp src/gpu.cpp src/versions.cpp src/vmaf.cpp src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_qsv.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
+target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include" "${CMAKE_SOURCE_DIR}/third-party/amf-include" "${CMAKE_SOURCE_DIR}/third-party/libvpl/ucrt64/include" "${X264_DIR}/include" "${X265_DIR}/include" "${SVTAV1_DIR}/include" "${VMAF_DIR}/include" "${PLACEBO_DIR}/include")
 target_compile_definitions(ves PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(ves PRIVATE ${FF_LINK} ${X264_LIB} ${X265_LIB} ${SVTAV1_LIB} ${VMAF_LIB} ${PLACEBO_LIB} d3d11 dxgi)
 
@@ -44,5 +44,6 @@ add_custom_command(TARGET ves POST_BUILD
 	COMMAND ${CMAKE_COMMAND} -E copy_directory "${X264_DIR}/bin" "$<TARGET_FILE_DIR:ves>"
 	COMMAND ${CMAKE_COMMAND} -E copy_directory "${X265_DIR}/bin" "$<TARGET_FILE_DIR:ves>"
 	COMMAND ${CMAKE_COMMAND} -E copy_directory "${SVTAV1_DIR}/bin" "$<TARGET_FILE_DIR:ves>"
+	COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/third-party/libvpl/ucrt64/bin/libvpl-2.dll" "$<TARGET_FILE_DIR:ves>"
 	COMMAND ${CMAKE_COMMAND} -E copy "${VMAF_DIR}/bin/libvmaf.dll" "$<TARGET_FILE_DIR:ves>"
 	COMMAND ${CMAKE_COMMAND} -E copy_directory "${PLACEBO_DIR}/bin" "$<TARGET_FILE_DIR:ves>")
