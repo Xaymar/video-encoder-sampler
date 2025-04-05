@@ -57,3 +57,10 @@ Picture picture_from_frame(AVFrame* frame, const Fmt& fmt) {
 	p.owner = std::shared_ptr<void>(own, [](void* f) { AVFrame* a = (AVFrame*)f; av_frame_free(&a); });
 	return p;
 }
+
+const AVCodec* software_decoder(AVCodecID id) {
+	void* it = nullptr;
+	while (const AVCodec* c = av_codec_iterate(&it))
+		if (c->id == id && av_codec_is_decoder(c) && !(c->capabilities & (AV_CODEC_CAP_HARDWARE | AV_CODEC_CAP_HYBRID))) return c;
+	return nullptr;
+}

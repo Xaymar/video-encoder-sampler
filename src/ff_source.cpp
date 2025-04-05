@@ -78,7 +78,8 @@ public:
 		vi = av_find_best_stream(ctx, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
 		if (vi < 0) { fprintf(stderr, "'%s' has no video stream\n", path.c_str()); return false; }
 		AVStream* st = ctx->streams[vi];
-		const AVCodec* c = avcodec_find_decoder(st->codecpar->codec_id);
+		const AVCodec* c = software_decoder(st->codecpar->codec_id);
+		if (!c) { fprintf(stderr, "no software decoder for this video\n"); return false; }
 		dec = avcodec_alloc_context3(c);
 		avcodec_parameters_to_context(dec, st->codecpar);
 		if (avcodec_open2(dec, c, nullptr) < 0) { fprintf(stderr, "decoder open failed\n"); return false; }

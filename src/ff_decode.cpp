@@ -26,7 +26,7 @@ public:
 
 	bool open(Codec codec) override {
 		AVCodecID id = codec == Codec::H264 ? AV_CODEC_ID_H264 : codec == Codec::HEVC ? AV_CODEC_ID_HEVC : codec == Codec::AV1 ? AV_CODEC_ID_AV1 : AV_CODEC_ID_NONE;
-		const AVCodec* c = id == AV_CODEC_ID_NONE ? nullptr : avcodec_find_decoder(id);
+		const AVCodec* c = id == AV_CODEC_ID_NONE ? nullptr : software_decoder(id);
 		ctx = c ? avcodec_alloc_context3(c) : nullptr;
 		// Without VUI reorder info the H.264 decoder guesses the B-frame depth and can drop or misorder early frames;
 		// strict mode makes it assume the maximum, so every frame comes out in display order.

@@ -121,7 +121,7 @@ For every group (same input, target bitrate and key frame interval), a run count
 Constant bitrate encoders still miss their target, and spending more bits would win frames unfairly. A run that overshoots its target loses `over_penalty` VMAF points per percent of overshoot (default 0.025, taken from the VMAF gain between 3000 and 6000 kbps on a test clip). Undershooting costs nothing.
 
 ## Where FFmpeg is still used
-FFmpeg only reads and decodes video; everything else is native. The encoders, scaling and conversion (libplacebo), scoring (libvmaf) and the sweep logic work on the tool's own types (`src/picture.h`). FFmpeg sits behind two small interfaces in files named `ff_*.cpp`:
+FFmpeg only reads and decodes video, always with software decoders (hardware decoders are less exact, so they are refused); everything else is native. The encoders, scaling and conversion (libplacebo), scoring (libvmaf) and the sweep logic work on the tool's own types (`src/picture.h`). FFmpeg sits behind two small interfaces in files named `ff_*.cpp`:
 
 | Piece | Interface | What FFmpeg does for it |
 |---|---|---|
