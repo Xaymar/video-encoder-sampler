@@ -447,7 +447,7 @@ static std::vector<Axis> screen(const std::vector<Axis>& axes, const Options& ba
 // and shape, once for every combination of the `fixed` options (preset, ...), since those change what the others do.
 // shortcut: an option that only matters at another bitrate or shape, or only together with one in a different group, can be missed; use prune=off then.
 static std::vector<Options> option_sets(const Config& cfg, const std::string& input, const Job& job, const Scenario& sc) {
-	if (!job.prune || job.encoder == "svtav1") return expand(job.encoder, job.axes); // SVT-AV1 output varies from run to run
+	if (!job.prune || !is_deterministic(job.encoder)) return expand(job.encoder, job.axes);
 	std::vector<Axis> fixed, free;
 	bool any = false;
 	for (auto& ax : job.axes) {
