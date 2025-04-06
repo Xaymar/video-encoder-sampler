@@ -125,6 +125,8 @@ For every group (same input, target bitrate and key frame interval), a run count
 Constant bitrate encoders still miss their target, and spending more bits would win frames unfairly. A run that overshoots its target loses `over_penalty` VMAF points per percent of overshoot (default 0.025, taken from the VMAF gain between 3000 and 6000 kbps on a test clip). Undershooting costs nothing.
 
 ## Where FFmpeg is still used
+Every run is a small pipeline: one thread decodes, drops frames, scales and converts them (FFmpeg and libplacebo), and hands them through a queue of 8 frames to the thread that submits them to the encoder. Decoding therefore never gets more than 8 frames ahead of that run's encoder, however much faster it is, and a slow encoder does not hold up decoding for the other runs. Receiving packets is separate where the encoder allows it (SVT-AV1 has a thread for it; NVENC and AMF collect packets from within the submitting thread, x264, x265 and QuickSync return them from the call).
+
 FFmpeg only reads and decodes video, always with software decoders (hardware decoders are less exact, so they are refused); everything else is native. The encoders, scaling and conversion (libplacebo), scoring (libvmaf) and the sweep logic work on the tool's own types (`src/picture.h`). FFmpeg sits behind two small interfaces in files named `ff_*.cpp`:
 
 | Piece | Interface | What FFmpeg does for it |

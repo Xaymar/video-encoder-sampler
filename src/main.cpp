@@ -3,8 +3,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -255,6 +257,40 @@ struct Encoded {
 	Fmt score_fmt;
 };
 
+// How many converted frames may wait between decoding and the encoder.
+static constexpr size_t DECODE_AHEAD = 8;
+
+// Hands frames from one thread to another; push() waits while the queue is full, pop() while it is empty.
+class FrameQueue {
+	std::mutex m;
+	std::condition_variable cv;
+	std::deque<Picture> q;
+	const size_t cap;
+	bool closed = false, cancelled = false;
+
+public:
+	explicit FrameQueue(size_t cap) : cap(cap) {}
+	bool push(Picture&& p) { // false once the consumer gave up
+		std::unique_lock lock(m);
+		cv.wait(lock, [&] { return q.size() < cap || cancelled; });
+		if (cancelled) return false;
+		q.push_back(std::move(p));
+		cv.notify_all();
+		return true;
+	}
+	bool pop(Picture& p) { // false when nothing more will come
+		std::unique_lock lock(m);
+		cv.wait(lock, [&] { return !q.empty() || closed; });
+		if (q.empty()) return false;
+		p = std::move(q.front());
+		q.pop_front();
+		cv.notify_all();
+		return true;
+	}
+	void close() { std::lock_guard lock(m); closed = true; cv.notify_all(); }
+	void cancel() { std::lock_guard lock(m); cancelled = closed = true; q.clear(); cv.notify_all(); }
+};
+
 static bool encode_one(const std::string& input, const std::string& encoder, Params p, double kf, const Shape& want, const ScaleOptions& so, Encoded& e) {
 	auto src_ptr = open_source(input);
 	if (!src_ptr) return false;
@@ -301,39 +337,53 @@ static bool encode_one(const std::string& input, const std::string& encoder, Par
 	int64_t last_slot = -1;
 	long long kept = 0;
 	const bool rescale = enc.w != src.width || enc.h != src.height || enc.pix != src.fmt; // scale and/or convert
-	auto scaler = make_converter();
-	Picture frame, scaled;
 	long long& frames = e.frames;
-	bool ok = true;
-	int r;
-	auto encode_scaled = [&] {
-		int got;
-		while (ok && (got = scaler->pop(scaled)) == 1) ok = codec->encode(&scaled);
-		ok = ok && got >= 0;
-	};
-	while (ok && (r = src.next(frame)) == 1) {
-		const int64_t slot = src.slot(frames, enc.fps);
-		const bool keep = !convert_rate || frames == 0 || slot != last_slot; // no target rate: every frame stays
-		last_slot = slot;
-		frames++;
-		if (keep) {
-			frame.pts = kept++; // encoded frames are numbered consecutively, whatever the gaps in the source timing
-			frame.duration = 1; // one tick of the 1/enc.fps time base
-			if (!rescale) ok = codec->encode(&frame);
-			else {
-				if (frame.pts == 0) ok = scaler->open(frame, enc.fps.inverse(), enc.w, enc.h, enc.pix, so);
-				ok = ok && scaler->push(&frame);
-				encode_scaled();
+
+	// Decoding and converting (this thread's producer) and submitting to the encoder (this thread) are separate stages joined by a queue
+	// that holds a few frames, so a fast decoder cannot run ahead of a slow encoder. The encoder's own receiving is separate where it is asynchronous.
+	FrameQueue queue(DECODE_AHEAD);
+	bool produced = true;
+	std::thread producer([&] {
+		auto scaler = make_converter();
+		Picture frame, scaled;
+		bool ok = true;
+		int r;
+		auto queue_scaled = [&] {
+			int got;
+			while (ok && (got = scaler->pop(scaled)) == 1) ok = queue.push(std::move(scaled));
+			ok = ok && got >= 0;
+		};
+		while (ok && (r = src.next(frame)) == 1) {
+			const int64_t slot = src.slot(frames, enc.fps);
+			const bool keep = !convert_rate || frames == 0 || slot != last_slot; // no target rate: every frame stays
+			last_slot = slot;
+			frames++;
+			if (keep) {
+				frame.pts = kept++; // encoded frames are numbered consecutively, whatever the gaps in the source timing
+				frame.duration = 1; // one tick of the 1/enc.fps time base
+				if (!rescale) ok = queue.push(Picture(frame));
+				else {
+					if (frame.pts == 0) ok = scaler->open(frame, enc.fps.inverse(), enc.w, enc.h, enc.pix, so);
+					ok = ok && scaler->push(&frame);
+					queue_scaled();
+				}
 			}
+			shown.push_back((uint32_t)(kept - 1));
 		}
-		shown.push_back((uint32_t)(kept - 1));
+		if (ok && src.frame_count() && src.frame_count() != frames) {
+			fprintf(stderr, "the file lists %lld frames but %lld were decoded\n", src.frame_count(), frames);
+			ok = false;
+		}
+		if (ok && rescale) { ok = scaler->push(nullptr); queue_scaled(); }
+		produced = ok && r >= 0;
+		queue.close();
+	});
+	bool ok = true;
+	for (Picture pic; queue.pop(pic);) {
+		if (ok && !(ok = codec->encode(&pic))) queue.cancel(); // frees the producer if it is waiting for room
 	}
-	if (ok && src.frame_count() && src.frame_count() != frames) {
-		fprintf(stderr, "the file lists %lld frames but %lld were decoded\n", src.frame_count(), frames);
-		ok = false;
-	}
-	if (ok && rescale) { ok = scaler->push(nullptr); encode_scaled(); }
-	ok = ok && r >= 0 && codec->encode(nullptr);
+	producer.join();
+	ok = ok && produced && codec->encode(nullptr);
 	if (!ok) return false;
 	e.kbps = codec->stats.bytes * 8 / src.duration() / 1000;
 	return true;
