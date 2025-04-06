@@ -11,6 +11,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -44,6 +45,8 @@ struct Job {
 	std::vector<std::string> scenarios; // names of the scenarios this encoder takes part in; empty: all of them
 	int parallel = 0;  // 0: default for the pool (NVENC 2, everything else 1 since CPU encoders use every core)
 	std::vector<Axis> axes;
+	bool prune = true;                 // leave out options that change nothing, found by comparing output bytes
+	std::set<std::string> fixed;       // options that are never left out, and every combination of them is screened on its own (preset, ...)
 };
 
 // One sub-sweep: every combination of its lists is tested with every encoder. Several scenarios let a setup
@@ -72,6 +75,8 @@ struct Run {
 	double kbps = 0;        // actual
 	std::vector<double> scores; // per frame, display order
 	bool cached = false;    // taken from the result cache instead of being run
+	bool same = false;      // its encoder produced the same bytes as an earlier run, so that run's scores were reused
+	std::string group;      // what runs must share for identical output to mean identical scores
 	std::string gpu;        // name and driver of the GPU a GPU encoder ran on
 	double penalty = 0;     // VMAF points deducted for exceeding the target bitrate
 	double best_share = 0;  // share of frames where this run is at least as good as every other run of its group
@@ -102,15 +107,16 @@ static std::vector<Shape> make_shapes(const std::vector<std::string>& res, const
 	return out;
 }
 
-static std::vector<Options> expand(const Job& j) {
-	std::vector<Options> combos(1);
-	for (auto& ax : j.axes) {
+// Every combination of the axes on top of `base`.
+static std::vector<Options> expand(const std::string& encoder, const std::vector<Axis>& axes, const Options& base = {}) {
+	std::vector<Options> combos{base};
+	for (auto& ax : axes) {
 		if (ax.values.empty()) continue;
 		// gpu=all means every GPU of the encoder's vendor
 		std::vector<std::optional<std::string>> values;
 		for (auto& v : ax.values) {
 			if (ax.key == "gpu" && v && *v == "all") {
-				size_t n = std::max<size_t>(list_gpus(encoder_vendor(j.encoder)).size(), 1);
+				size_t n = std::max<size_t>(list_gpus(encoder_vendor(encoder)).size(), 1);
 				for (size_t i = 0; i < n; i++) values.push_back(std::to_string(i));
 			} else values.push_back(v);
 		}
@@ -175,9 +181,13 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* m = v->find("model")) cfg.vo.model = m->text();
 		if (auto* t = v->find("threads")) cfg.vo.threads = atoi(t->text().c_str());
 	}
+	auto off = [](const Json* v) { return v && (v->text() == "0" || v->text() == "false"); };
+	const bool default_prune = !off(root.find("prune"));
 	list("encoders", [&](const Json& e) {
-		if (auto* en = e.find("enabled"); en && en->text() == "0") return;
+		if (off(e.find("enabled"))) return;
 		Job j;
+		j.prune = default_prune && !off(e.find("prune"));
+		if (auto* f = e.find("fixed")) for (auto& x : f->a) j.fixed.insert(x.text());
 		auto* name = e.find("encoder");
 		if (!name) throw std::runtime_error("encoder entry without 'encoder'");
 		j.encoder = name->text();
@@ -212,6 +222,8 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 		else if (k == "vmaf.threads") cfg.vo.threads = atoi(v.c_str());
 		else if (k == "over.penalty") over_penalty = atof(v.c_str());
 		else if (k == "cache") cfg.cache_dir = v == "off" ? "" : v;
+		else if (k == "prune") j.prune = v != "off";
+		else if (k == "fixed") { for (auto& x : split(v)) j.fixed.insert(x); }
 		else if (k == "pool") j.pool = v;
 		else if (k == "parallel") j.parallel = atoi(v.c_str());
 		else if (k == "kf") { sc.kfs.clear(); for (auto& x : split(v)) sc.kfs.push_back(atof(x.c_str())); }
@@ -233,12 +245,21 @@ static Codec codec_of(const std::string& encoder, const std::string& codec) {
 	return Codec::None;
 }
 
-static bool run_one(const std::string& input, const std::string& encoder, Codec id, Params p, double kf, const Shape& want,
-                    const VmafOptions& vo, const ScaleOptions& so, Run& out) {
+// What encoding one configuration leaves behind, ready to be decoded and scored.
+struct Encoded {
+	std::vector<std::vector<uint8_t>> packets;
+	Shape enc;
+	std::vector<uint32_t> shown;
+	long long frames = 0; // source frames
+	double kbps = 0;
+	Fmt score_fmt;
+};
+
+static bool encode_one(const std::string& input, const std::string& encoder, Params p, double kf, const Shape& want, const ScaleOptions& so, Encoded& e) {
 	auto src_ptr = open_source(input);
 	if (!src_ptr) return false;
 	Source& src = *src_ptr;
-	Shape enc;
+	Shape& enc = e.enc;
 	enc.w = want.w ? want.w : src.width;
 	enc.h = want.h ? want.h : src.height;
 	enc.fps = want.fps.num ? want.fps : src.framerate;
@@ -264,10 +285,10 @@ static bool run_one(const std::string& input, const std::string& encoder, Codec 
 	enc.has_pix = true;
 	// Both sides are scored in the source's chroma layout at the higher of the two bit depths.
 	// 4:2:2 sources are scored as 4:4:4, which holds all of their chroma.
-	const Fmt score_fmt = planar_fmt(sf.chroma == 422 ? 444 : sf.chroma, std::max(sf.depth, depth));
+	const Fmt score_fmt = e.score_fmt = planar_fmt(sf.chroma == 422 ? 444 : sf.chroma, std::max(sf.depth, depth));
 	if (!valid(p.pix) || !valid(score_fmt)) { fprintf(stderr, "unsupported chroma %d / bit depth %d\n", chroma, depth); return false; }
 
-	std::vector<std::vector<uint8_t>> packets;
+	auto& packets = e.packets;
 	auto codec = make_encoder(encoder);
 	// Packets arrive in coding order, which is also the order the decoder needs them.
 	if (!codec->open(p, [&](const uint8_t* d, size_t n, int64_t, bool) { packets.emplace_back(d, d + n); })) return false;
@@ -275,14 +296,14 @@ static bool run_one(const std::string& input, const std::string& encoder, Codec 
 	// Frame rate conversion drops frames before scaling. Each source frame falls into a slot of the output timeline
 	// (its real presentation time times enc.fps, rounded down) and only the first frame in each slot is kept.
 	// `shown[n]` records which encoded frame is on screen at source frame n, for scoring.
-	std::vector<uint32_t> shown;
+	auto& shown = e.shown;
 	const bool convert_rate = want.fps.num != 0;
 	int64_t last_slot = -1;
 	long long kept = 0;
 	const bool rescale = enc.w != src.width || enc.h != src.height || enc.pix != src.fmt; // scale and/or convert
 	auto scaler = make_converter();
 	Picture frame, scaled;
-	long long frames = 0; // source frames
+	long long& frames = e.frames;
 	bool ok = true;
 	int r;
 	auto encode_scaled = [&] {
@@ -314,13 +335,148 @@ static bool run_one(const std::string& input, const std::string& encoder, Codec 
 	if (ok && rescale) { ok = scaler->push(nullptr); encode_scaled(); }
 	ok = ok && r >= 0 && codec->encode(nullptr);
 	if (!ok) return false;
-	out.kbps = codec->stats.bytes * 8 / src.duration() / 1000;
-	codec.reset();
-
-	auto ref = open_source(input);
-	if (!ref || !vmaf_score(*ref, id, packets, enc, shown, score_fmt, vo, so, out.scores)) return false;
-	if ((long long)out.scores.size() != frames) { fprintf(stderr, "%zu scores for %lld frames\n", out.scores.size(), frames); return false; }
+	e.kbps = codec->stats.bytes * 8 / src.duration() / 1000;
 	return true;
+}
+
+static uint64_t hash_packets(const Encoded& e) { // FNV-1a over every packet and its size
+	uint64_t h = 1469598103934665603ull;
+	auto mix = [&](uint8_t b) { h = (h ^ b) * 1099511628211ull; };
+	for (auto& p : e.packets) { for (int i = 0; i < 8; i++) mix((uint8_t)((uint64_t)p.size() >> (8 * i))); for (uint8_t b : p) mix(b); }
+	return h;
+}
+
+// Runs whose encoders produced the very same bytes decode to the very same frames, so they share one set of scores.
+static std::mutex same_mutex;
+static std::map<std::string, std::vector<double>> same_output;
+
+static bool run_one(const std::string& input, const std::string& encoder, Codec id, Params p, double kf, const Shape& want,
+                    const VmafOptions& vo, const ScaleOptions& so, Run& out) {
+	Encoded e;
+	if (!encode_one(input, encoder, p, kf, want, so, e)) return false;
+	out.kbps = e.kbps;
+	char hex[17];
+	snprintf(hex, sizeof hex, "%016llx", (unsigned long long)hash_packets(e));
+	const std::string same_key = out.group + "|" + hex;
+	{
+		std::lock_guard lock(same_mutex);
+		if (auto it = same_output.find(same_key); it != same_output.end()) { out.scores = it->second; out.same = true; return true; }
+	}
+	auto ref = open_source(input);
+	if (!ref || !vmaf_score(*ref, id, e.packets, e.enc, e.shown, e.score_fmt, vo, so, out.scores)) return false;
+	if ((long long)out.scores.size() != e.frames) { fprintf(stderr, "%zu scores for %lld frames\n", out.scores.size(), e.frames); return false; }
+	std::lock_guard lock(same_mutex);
+	same_output[same_key] = out.scores;
+	return true;
+}
+
+// Which of the swept options change anything. The baseline has every option at its default (unset when its list has a null,
+// else its first value). Options are tested in groups, always moving the whole group away from the baseline: a group whose output
+// bytes stay identical does nothing, so all of it is left out; otherwise the group is split in half and each half is tested again.
+// If both halves do nothing alone but the group does something, its options only matter together and all of them stay.
+// Whatever was left out is then tested again with the options found so far switched on.
+// The encoders are deterministic, so identical bytes mean the options did nothing in this setup. A run that fails counts as a difference.
+using Probe = std::function<std::optional<uint64_t>(const Options&)>; // hash of the output bytes; nullopt when the run failed
+
+static std::vector<Axis> screen(const std::vector<Axis>& axes, const Options& base, const Probe& probe, std::string& dropped) {
+	struct Info { std::optional<std::string> base; std::vector<std::optional<std::string>> alts; };
+	std::vector<Info> info(axes.size());
+	std::vector<size_t> swept;
+	size_t rounds = 0;
+	for (size_t i = 0; i < axes.size(); i++) {
+		auto& v = axes[i].values;
+		if (!v.empty() && std::find(v.begin(), v.end(), std::nullopt) == v.end()) info[i].base = v[0];
+		for (auto& x : v) if (x != info[i].base) info[i].alts.push_back(x);
+		if (!info[i].alts.empty()) { swept.push_back(i); rounds = std::max(rounds, info[i].alts.size()); }
+	}
+	std::map<std::string, std::optional<uint64_t>> seen;
+	auto hash_with = [&](const std::vector<size_t>& set, size_t round) {
+		Options o = base;
+		for (size_t i = 0; i < axes.size(); i++) {
+			const std::optional<std::string>* v = &info[i].base;
+			if (std::find(set.begin(), set.end(), i) != set.end()) v = &info[i].alts[std::min(round, info[i].alts.size() - 1)];
+			if (*v) o[axes[i].key] = **v;
+		}
+		std::string k;
+		for (auto& [a, b] : o) k += a + "=" + b + ";";
+		auto it = seen.find(k);
+		if (it == seen.end()) it = seen.emplace(k, probe(o)).first;
+		return it->second;
+	};
+	if (!hash_with({}, 0)) return axes; // nothing to compare against
+	// Whether moving `set` away from its defaults changes the output, with the options in `ctx` already moved.
+	auto inert = [&](std::vector<size_t> set, const std::vector<size_t>& ctx) {
+		const auto base_set = ctx;
+		set.insert(set.end(), ctx.begin(), ctx.end());
+		for (size_t j = 0; j < rounds; j++) {
+			auto h = hash_with(set, j), h0 = hash_with(base_set, j);
+			if (!h || !h0 || *h != *h0) return false;
+		}
+		return true;
+	};
+	std::function<std::vector<size_t>(const std::vector<size_t>&, const std::vector<size_t>&)> solve =
+	    [&](const std::vector<size_t>& set, const std::vector<size_t>& ctx) -> std::vector<size_t> {
+		if (inert(set, ctx)) return {};
+		if (set.size() == 1) return set;
+		std::vector<size_t> a(set.begin(), set.begin() + set.size() / 2), b(set.begin() + set.size() / 2, set.end());
+		std::vector<size_t> ka = solve(a, ctx), kb = solve(b, ctx);
+		if (ka.empty() && kb.empty()) return set;
+		ka.insert(ka.end(), kb.begin(), kb.end());
+		return ka;
+	};
+	// An option that did nothing next to the defaults may still do something once another one is on (weightb needs b-frames),
+	// so what was left out is tried again with everything found so far moved, until nothing new turns up.
+	std::vector<size_t> keep;
+	for (;;) {
+		std::vector<size_t> rest;
+		for (size_t i : swept) if (std::find(keep.begin(), keep.end(), i) == keep.end()) rest.push_back(i);
+		std::vector<size_t> found = rest.empty() ? rest : solve(rest, keep);
+		if (found.empty()) break;
+		keep.insert(keep.end(), found.begin(), found.end());
+	}
+	std::vector<Axis> out = axes;
+	for (size_t i : swept) {
+		if (std::find(keep.begin(), keep.end(), i) != keep.end()) continue;
+		out[i].values = {info[i].base}; // left out: stays at its default
+		dropped += (dropped.empty() ? "" : ", ") + axes[i].key;
+	}
+	return out;
+}
+
+// The option combinations to run for one input and scenario. Pruning is judged at the scenario's first bitrate, key frame interval
+// and shape, once for every combination of the `fixed` options (preset, ...), since those change what the others do.
+// shortcut: an option that only matters at another bitrate or shape, or only together with one in a different group, can be missed; use prune=off then.
+static std::vector<Options> option_sets(const Config& cfg, const std::string& input, const Job& job, const Scenario& sc) {
+	if (!job.prune || job.encoder == "svtav1") return expand(job.encoder, job.axes); // SVT-AV1 output varies from run to run
+	std::vector<Axis> fixed, free;
+	bool any = false;
+	for (auto& ax : job.axes) {
+		const bool pinned = job.fixed.count(ax.key) || ax.key == "gpu"; // gpu does not change the bytes, but is exactly what is being swept
+		(pinned ? fixed : free).push_back(ax);
+		any |= !pinned && ax.values.size() > 1;
+	}
+	if (!any) return expand(job.encoder, job.axes);
+	std::vector<Options> out;
+	for (auto& base : expand(job.encoder, fixed)) {
+		const Probe probe = [&](const Options& o) -> std::optional<uint64_t> {
+			Params p;
+			p.codec = job.codec; p.bitrate = sc.bitrates[0] * 1000; p.options = o;
+			Encoded e;
+			if (!encode_one(input, job.encoder, p, sc.kfs[0], sc.shapes[0], cfg.scale, e)) return std::nullopt;
+			return hash_packets(e);
+		};
+		std::string dropped;
+		auto kept = screen(free, base, probe, dropped);
+		if (!dropped.empty()) {
+			std::string ctx;
+			for (auto& [k, v] : base) ctx += " " + k + "=" + v;
+			printf("[%s] %s/%s%s: no effect on the output, left out: %s\n", sc.name.c_str(), job.encoder.c_str(), job.codec.c_str(), ctx.c_str(), dropped.c_str());
+			fflush(stdout);
+		}
+		auto sets = expand(job.encoder, kept, base);
+		out.insert(out.end(), sets.begin(), sets.end());
+	}
+	return out;
 }
 
 int main(int argc, char** argv) {
@@ -334,6 +490,7 @@ int main(int argc, char** argv) {
 			                "       ves <input> <encoder> <codec> <bitrate-kbps[,..]> [key=value[,value..] ...]\n"
 			                "  encoder: nvenc | amf | qsv | x264 | x265 | svtav1 (codec is ignored for the CPU encoders)\n"
 			                "  comma separated values are swept; every combination is tested\n"
+			                "  prune=off keeps options that change nothing; fixed=<key>[,..] keeps those options out of the pruning\n"
 			                "  kf=<seconds>, vmaf.model=<spec>, vmaf.threads=<n>, over.penalty=<vmaf points per %% over target>;\n"
 			                "  other keys go to the encoder\n");
 			return 1;
@@ -368,7 +525,8 @@ int main(int argc, char** argv) {
 	for (auto& input : cfg.inputs) for (auto& job : cfg.jobs) {
 		const Codec id = codec_of(job.encoder, job.codec);
 		if (id == Codec::None) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", job.encoder.c_str(), job.codec.c_str()); failed++; continue; }
-			for (auto& sc : cfg.scenarios) if (takes_part(job, sc)) for (int64_t br : sc.bitrates) for (double kf : sc.kfs) for (auto& shape : sc.shapes) for (auto& opts : expand(job)) {
+			for (auto& sc : cfg.scenarios) if (takes_part(job, sc)) { const std::vector<Options> sets = option_sets(cfg, input, job, sc);
+			for (int64_t br : sc.bitrates) for (double kf : sc.kfs) for (auto& shape : sc.shapes) for (auto& opts : sets) {
 			Task t;
 			t.job = &job; t.id = id;
 				t.r.input = input; t.r.bitrate = br; t.r.kf = kf; t.r.shape = shape;
@@ -379,12 +537,14 @@ int main(int argc, char** argv) {
 			t.p.codec = job.codec; t.p.bitrate = br * 1000; t.p.options = opts;
 			// Every GPU is a pool of its own, so GPUs work in parallel; CPU encoders share one pool.
 			std::string gpu_index = opts.count("gpu") ? opts.at("gpu") : "0";
+			t.r.group = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|" + gpu_index;
 			if (is_gpu_encoder(job.encoder)) t.r.gpu = gpu_description(encoder_vendor(job.encoder), atoi(gpu_index.c_str()));
 			std::string pool = !job.pool.empty() ? job.pool : is_gpu_encoder(job.encoder) ? job.encoder + ":" + gpu_index : "cpu";
 			Pool& pl = pools[pool];
 			pl.parallel = std::max(pl.parallel, job.parallel ? job.parallel : (is_gpu_encoder(job.encoder) ? 2 : 1));
 			pl.tasks.push_back(tasks.size());
 			tasks.push_back(std::move(t));
+		}
 		}
 	}
 
@@ -411,7 +571,7 @@ int main(int argc, char** argv) {
 			std::vector<double> s = r.scores;
 			std::sort(s.begin(), s.end());
 			printf("[%s %lld kbps kf %.1f] %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s\n", r.input.c_str(), (long long)r.bitrate, r.kf, r.label.c_str(), r.kbps,
-			       std::accumulate(s.begin(), s.end(), 0.0) / s.size(), s.front(), s[(size_t)(s.size() * 0.05)], r.cached ? " (cached)" : "",
+			       std::accumulate(s.begin(), s.end(), 0.0) / s.size(), s.front(), s[(size_t)(s.size() * 0.05)], r.cached ? " (cached)" : r.same ? " (same output as an earlier run)" : "",
 			       r.gpu.empty() ? "" : " on ", r.gpu.c_str());
 			fflush(stdout);
 		}

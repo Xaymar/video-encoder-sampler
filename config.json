@@ -38,6 +38,7 @@
 			"enabled": true,
 			"encoder": "nvenc",
 			"codec": "h264",
+			"fixed": ["preset", "tune"],
 			"options": {
 				"preset": ["p7"],
 				"tune": ["hq"],
@@ -52,6 +53,7 @@
 			"enabled": true,
 			"encoder": "x264",
 			"scenarios": ["mid", "low"],
+			"fixed": ["preset", "tune"],
 			"options": {
 				"preset": ["veryfast", "fast", "medium", "slow", "veryslow"],
 				"tune": [null, "film", "animation"]
