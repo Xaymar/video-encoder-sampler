@@ -110,7 +110,7 @@ Formats currently supported by each backend: `x264` 4:2:0 and 4:4:4 at 8 and 10 
 | `qsv` | oneVPL (`codec`: h264, hevc, av1) | Raw oneVPL field names of `mfxInfoMFX`, `mfxExtCodingOption2` and `mfxExtCodingOption3`, e.g. `TargetUsage`, `GopRefDist`, `LookAheadDepth`, `BRefType`, `MBBRC`. Values are numbers, or `on`/`off`/`adaptive` for the toggles, `best_quality`/`balanced`/`best_speed` for `TargetUsage`, `cbr`/`vbr`/`icq`/... for `RateControlMethod`. `gpu` selects the n-th Intel adapter. **Written against the headers and never run: no Intel GPU was available.** |
 | `x264` | libx264 | `preset`, `tune`, `profile`, plus any x264 long option (`bframes`, `rc-lookahead`, `aq-mode`, ...) |
 | `x265` | libx265 | `preset`, `tune`, `profile`, plus any x265 long option |
-| `svtav1` | libSvtAv1Enc | any `SvtAv1EncApp` long option (`preset`, `lookahead`, `enable-tf`, ...) |
+| `svtav1` | libSvtAv1Enc | any `SvtAv1EncApp` long option (`preset`, `lookahead`, `enable-tf`, ...). Runs as CBR with the low-delay prediction structure, which CBR requires; `rc=1 pred-struct=2` gives VBR with the random-access structure |
 
 An unknown option makes that run fail with a message instead of being ignored.
 
