@@ -3,6 +3,8 @@
 // HevcQualityPreset for HEVC) so every property AMF exposes can be swept. Enums are numeric.
 #include "encoder.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -51,7 +53,9 @@ class Amf : public Encoder {
 	int depth = 8;
 	Sink sink;
 	int w = 0, h = 0;
-	bool eof = false;
+	// Finished packets are collected on a thread of their own; AMF has no blocking read, so it polls.
+	std::thread rx;
+	std::atomic<bool> eof{false}, stop{false};
 
 	bool fail(AMF_RESULT r, const char* what) {
 		fprintf(stderr, "amf: %s failed (result %d)\n", what, (int)r);
@@ -92,12 +96,12 @@ class Amf : public Encoder {
 		}
 	}
 
-	bool poll() { // collect whatever the encoder has finished
-		for (;;) {
+	void receive() {
+		while (!stop && !eof) {
 			amf::AMFDataPtr data;
 			AMF_RESULT r = enc->QueryOutput(&data);
-			if (r == AMF_EOF) { eof = true; return true; }
-			if (r != AMF_OK || !data) return true; // AMF_REPEAT: nothing ready yet
+			if (r == AMF_EOF) { eof = true; return; }
+			if (r != AMF_OK || !data) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; } // AMF_REPEAT: nothing ready yet
 			amf::AMFBufferPtr buf(data);
 			stats.packets++; stats.bytes += buf->GetSize();
 			if (sink) sink((const uint8_t*)buf->GetNative(), buf->GetSize(), data->GetPts(), false);
@@ -106,6 +110,8 @@ class Amf : public Encoder {
 
 public:
 	~Amf() override {
+		stop = true;
+		if (rx.joinable()) rx.join();
 		if (enc) enc->Terminate();
 		enc = nullptr;
 		if (ctx) ctx->Terminate();
@@ -162,6 +168,7 @@ public:
 		for (auto& [k, v] : o) if (!set(k, v)) return false;
 
 		if ((r = enc->Init(depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init");
+		rx = std::thread([this] { receive(); });
 		return true;
 	}
 
@@ -169,7 +176,7 @@ public:
 		AMF_RESULT r;
 		if (!fr) { // flush
 			if ((r = enc->Drain()) != AMF_OK) return fail(r, "Drain");
-			for (int i = 0; !eof && i < 20000; i++) { poll(); if (!eof) std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+			for (int i = 0; !eof && i < 20000; i++) std::this_thread::sleep_for(std::chrono::milliseconds(1));
 			return eof;
 		}
 		amf::AMFSurfacePtr surf;
@@ -181,11 +188,10 @@ public:
 		for (;;) {
 			r = enc->SubmitInput(surf);
 			if (r != AMF_INPUT_FULL) break;
-			poll();
 			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		}
 		if (r != AMF_OK) return fail(r, "SubmitInput");
-		return poll();
+		return true;
 	}
 };
 

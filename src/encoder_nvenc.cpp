@@ -1,16 +1,22 @@
 // Native NVENC backend: talks to nvEncodeAPI directly (loaded at runtime), no libavcodec.
 #include "encoder.h"
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "formats.h"
 #include "gpu.h"
+
+#include <windows.h>
 
 extern "C" {
 #include <ffnvcodec/dynlink_loader.h>
@@ -91,6 +97,7 @@ Caps probe_caps(const std::string& codec) {
 struct Slot {
 	NV_ENC_INPUT_PTR in = nullptr;
 	NV_ENC_OUTPUT_PTR out = nullptr;
+	void* ev = nullptr; // signaled when the encoder is done with this slot's picture
 };
 
 const GUID* const PRESETS[] = {
@@ -105,8 +112,15 @@ class Nvenc : public Encoder {
 	CUcontext ctx = nullptr;
 	void* enc = nullptr;
 	std::vector<Slot> slots;
+	// Submitting and receiving run on different threads (asynchronous mode: the encoder signals an event per finished picture).
+	// Slots go from free_ to pending_ when submitted and back once the receiver has read their output, strictly in submission order.
+	std::mutex m;
+	std::condition_variable cv;
 	std::vector<Slot*> free_;
-	std::deque<Slot*> pending; // submitted, output not yet read (encoder reorders / looks ahead)
+	std::deque<Slot*> pending_;
+	std::thread rx;
+	void* eos_event = nullptr; // for the end-of-stream picture, which has no slot
+	bool flushing = false, finished = false, stop = false, rx_ok = true;
 	NV_ENC_BUFFER_FORMAT buffer_fmt = NV_ENC_BUFFER_FORMAT_NV12;
 	int chroma = 420, depth = 8;
 	Sink sink;
@@ -121,7 +135,22 @@ class Nvenc : public Encoder {
 
 public:
 	~Nvenc() override {
+		if (rx.joinable()) {
+			{ std::lock_guard lock(m); stop = true; }
+			cv.notify_all();
+			rx.join();
+		}
 		if (enc) {
+			auto unregister = [&](void* ev) {
+				if (!ev) return;
+				NV_ENC_EVENT_PARAMS ep{};
+				ep.version = NV_ENC_EVENT_PARAMS_VER;
+				ep.completionEvent = ev;
+				f.nvEncUnregisterAsyncEvent(enc, &ep);
+				CloseHandle((HANDLE)ev);
+			};
+			unregister(eos_event);
+			for (auto& s : slots) unregister(s.ev);
 			for (auto& s : slots) {
 				if (s.in) f.nvEncDestroyInputBuffer(enc, s.in);
 				if (s.out) f.nvEncDestroyBitstreamBuffer(enc, s.out);
@@ -242,6 +271,7 @@ public:
 		ip.frameRateNum = p.framerate.num;
 		ip.frameRateDen = p.framerate.den;
 		ip.enablePTD = 1;
+		ip.enableEncodeAsync = 1;
 		ip.encodeConfig = &cfg;
 		if ((st = f.nvEncInitializeEncoder(enc, &ip))) return fail(st, "initialize");
 
@@ -261,6 +291,16 @@ public:
 			sl.out = cb.bitstreamBuffer;
 			free_.push_back(&sl);
 		}
+		auto make_event = [&](void*& ev) {
+			ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+			NV_ENC_EVENT_PARAMS ep{};
+			ep.version = NV_ENC_EVENT_PARAMS_VER;
+			ep.completionEvent = ev;
+			return ev && f.nvEncRegisterAsyncEvent(enc, &ep) == NV_ENC_SUCCESS;
+		};
+		for (auto& sl : slots) if (!make_event(sl.ev)) { fprintf(stderr, "nvenc: cannot register a completion event\n"); return false; }
+		if (!make_event(eos_event)) { fprintf(stderr, "nvenc: cannot register a completion event\n"); return false; }
+		rx = std::thread([this] { receive(); });
 		return true;
 	}
 
@@ -287,23 +327,52 @@ public:
 		}
 	}
 
-	// Outputs only become readable once the encoder has run `delay` frames past them; flush reads everything.
-	bool drain(bool all = false) {
-		while (!pending.empty() && (all || pending.size() > delay)) {
-			Slot* s = pending.front();
-			NV_ENC_LOCK_BITSTREAM lb{};
-			lb.version = NV_ENC_LOCK_BITSTREAM_VER;
-			lb.outputBitstream = s->out;
-			NVENCSTATUS st = f.nvEncLockBitstream(enc, &lb);
-			if (st) return fail(st, "lock bitstream");
-			stats.packets++; stats.bytes += lb.bitstreamSizeInBytes;
-			if (sink) sink((const uint8_t*)lb.bitstreamBufferPtr, lb.bitstreamSizeInBytes, (int64_t)lb.outputTimeStamp,
-				lb.pictureType == NV_ENC_PIC_TYPE_IDR || lb.pictureType == NV_ENC_PIC_TYPE_I);
-			f.nvEncUnlockBitstream(enc, s->out);
-			pending.pop_front();
-			free_.push_back(s);
+	// Waits for the event, giving up when the encoder is being torn down.
+	bool wait(void* ev) {
+		for (;;) {
+			if (WaitForSingleObject((HANDLE)ev, 20) == WAIT_OBJECT_0) return true;
+			std::lock_guard lock(m);
+			if (stop) return false;
 		}
-		return true;
+	}
+
+	void receive() {
+		for (;;) {
+			Slot* s = nullptr;
+			{
+				std::unique_lock lock(m);
+				cv.wait(lock, [&] { return !pending_.empty() || flushing || stop; });
+				if (stop) return;
+				if (!pending_.empty()) s = pending_.front();
+			}
+			if (!s) { // everything submitted has been read; the end-of-stream picture is what is left
+				bool ok = wait(eos_event);
+				std::lock_guard lock(m);
+				finished = true;
+				rx_ok = rx_ok && ok;
+				cv.notify_all();
+				return;
+			}
+			bool ok = wait(s->ev);
+			if (ok) {
+				NV_ENC_LOCK_BITSTREAM lb{};
+				lb.version = NV_ENC_LOCK_BITSTREAM_VER;
+				lb.outputBitstream = s->out;
+				NVENCSTATUS st = f.nvEncLockBitstream(enc, &lb);
+				if (st) { fail(st, "lock bitstream"); ok = false; }
+				else {
+					stats.packets++; stats.bytes += lb.bitstreamSizeInBytes;
+					if (sink) sink((const uint8_t*)lb.bitstreamBufferPtr, lb.bitstreamSizeInBytes, (int64_t)lb.outputTimeStamp,
+						lb.pictureType == NV_ENC_PIC_TYPE_IDR || lb.pictureType == NV_ENC_PIC_TYPE_I);
+					f.nvEncUnlockBitstream(enc, s->out);
+				}
+			}
+			std::lock_guard lock(m);
+			if (!ok) { rx_ok = false; finished = true; cv.notify_all(); return; }
+			pending_.pop_front();
+			free_.push_back(s);
+			cv.notify_all();
+		}
 	}
 
 	bool encode(const Picture* fr) override {
@@ -312,11 +381,21 @@ public:
 			NV_ENC_PIC_PARAMS pp{};
 			pp.version = NV_ENC_PIC_PARAMS_VER;
 			pp.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
+			pp.completionEvent = eos_event;
 			if ((st = f.nvEncEncodePicture(enc, &pp))) return fail(st, "flush");
-			return drain(true);
+			std::unique_lock lock(m);
+			flushing = true;
+			cv.notify_all();
+			cv.wait(lock, [&] { return finished; });
+			return rx_ok;
 		}
-		if (free_.empty()) { fprintf(stderr, "nvenc: out of buffers\n"); return false; }
-		Slot* s = free_.back(); free_.pop_back();
+		Slot* s;
+		{
+			std::unique_lock lock(m);
+			cv.wait(lock, [&] { return !free_.empty() || !rx_ok; }); // never empties for good: the slots outnumber what the encoder holds back
+			if (!rx_ok) return false;
+			s = free_.back(); free_.pop_back();
+		}
 
 		NV_ENC_LOCK_INPUT_BUFFER li{};
 		li.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
@@ -331,11 +410,16 @@ public:
 		pp.bufferFmt = buffer_fmt;
 		pp.inputWidth = w; pp.inputHeight = h; pp.inputPitch = li.pitch;
 		pp.outputBitstream = s->out;
+		pp.completionEvent = s->ev;
 		pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
 		pp.inputTimeStamp = fr->pts;
+		{ // queue it before submitting: the event can fire as soon as the call is made
+			std::lock_guard lock(m);
+			pending_.push_back(s);
+		}
+		cv.notify_all();
 		st = f.nvEncEncodePicture(enc, &pp);
-		pending.push_back(s);
-		if (st == NV_ENC_SUCCESS || st == NV_ENC_ERR_NEED_MORE_INPUT) return drain();
+		if (st == NV_ENC_SUCCESS || st == NV_ENC_ERR_NEED_MORE_INPUT) return true;
 		return fail(st, "encode");
 	}
 };
