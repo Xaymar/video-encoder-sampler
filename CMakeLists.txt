@@ -38,12 +38,15 @@ target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_D
 target_compile_definitions(ves PRIVATE _CRT_SECURE_NO_WARNINGS)
 target_link_libraries(ves PRIVATE ${FF_LINK} ${X264_LIB} ${X265_LIB} ${SVTAV1_LIB} ${VMAF_LIB} ${PLACEBO_LIB} d3d11 dxgi)
 
-# Runtime DLLs next to the executable.
+# Runtime DLLs next to the executable (only the DLLs: the packages' bin folders also hold command line tools).
+file(GLOB RUNTIME_DLLS CONFIGURE_DEPENDS
+	"${FFMPEG_DIR}/bin/*.dll" "${X264_DIR}/bin/*.dll" "${X265_DIR}/bin/*.dll" "${SVTAV1_DIR}/bin/*.dll"
+	"${CMAKE_SOURCE_DIR}/third-party/libvpl/ucrt64/bin/libvpl-2.dll" "${VMAF_DIR}/bin/libvmaf.dll" "${PLACEBO_DIR}/bin/*.dll")
 add_custom_command(TARGET ves POST_BUILD
-	COMMAND ${CMAKE_COMMAND} -E copy_directory "${FFMPEG_DIR}/bin" "$<TARGET_FILE_DIR:ves>"
-	COMMAND ${CMAKE_COMMAND} -E copy_directory "${X264_DIR}/bin" "$<TARGET_FILE_DIR:ves>"
-	COMMAND ${CMAKE_COMMAND} -E copy_directory "${X265_DIR}/bin" "$<TARGET_FILE_DIR:ves>"
-	COMMAND ${CMAKE_COMMAND} -E copy_directory "${SVTAV1_DIR}/bin" "$<TARGET_FILE_DIR:ves>"
-	COMMAND ${CMAKE_COMMAND} -E copy "${CMAKE_SOURCE_DIR}/third-party/libvpl/ucrt64/bin/libvpl-2.dll" "$<TARGET_FILE_DIR:ves>"
-	COMMAND ${CMAKE_COMMAND} -E copy "${VMAF_DIR}/bin/libvmaf.dll" "$<TARGET_FILE_DIR:ves>"
-	COMMAND ${CMAKE_COMMAND} -E copy_directory "${PLACEBO_DIR}/bin" "$<TARGET_FILE_DIR:ves>")
+	COMMAND ${CMAKE_COMMAND} -E copy_if_different ${RUNTIME_DLLS} "$<TARGET_FILE_DIR:ves>")
+
+# cmake --install build --prefix <dir>: the program, its DLLs, the VMAF models and an example config.
+install(TARGETS ves RUNTIME DESTINATION .)
+install(FILES ${RUNTIME_DLLS} DESTINATION .)
+install(DIRECTORY models DESTINATION .)
+install(FILES config.json README.md DESTINATION .)

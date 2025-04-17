@@ -2,6 +2,7 @@
 // frame with VMAF, then report which configurations are the best in at least 95% of frames.
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -36,6 +37,9 @@ static constexpr double BEST_FRAME_SHARE = 0.95;
 // Default slope: the 3000 -> 6000 kbps sweep gains roughly 2.5 VMAF over +100%, i.e. ~0.025 per percent.
 static double over_penalty = 0.025; // VMAF points per percent over target
 
+// Console output from several worker threads goes through this.
+static std::mutex print_mutex;
+
 struct Axis { // one swept option; a missing value (JSON null) leaves the option unset
 	std::string key;
 	std::vector<std::optional<std::string>> values;
@@ -66,6 +70,8 @@ struct Config {
 	VmafOptions vo;
 	ScaleOptions scale;
 	std::string cache_dir = "cache"; // finished runs are kept here and not repeated; empty turns it off
+	std::string output_dir = "output"; // encoded streams and result files go here; empty: nothing is written
+	bool save_videos = true;
 	std::vector<Job> jobs;
 };
 
@@ -79,6 +85,11 @@ struct Run {
 	bool cached = false;    // taken from the result cache instead of being run
 	bool same = false;      // its encoder produced the same bytes as an earlier run, so that run's scores were reused
 	std::string group;      // what runs must share for identical output to mean identical scores
+	std::string encoder, codec;
+	Options options;
+	std::string video;      // the saved stream, relative to the output directory; empty if none was saved
+	std::string video_file; // where run_one() writes it
+	std::string tag;        // "[run 12/240]", for the progress lines
 	std::string gpu;        // name and driver of the GPU a GPU encoder ran on
 	double penalty = 0;     // VMAF points deducted for exceeding the target bitrate
 	double best_share = 0;  // share of frames where this run is at least as good as every other run of its group
@@ -178,6 +189,8 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* g = v->find("gpu")) cfg.scale.device = g->text();
 	}
 	if (auto* v = root.find("cache")) cfg.cache_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "cache" : "") : v->text();
+	if (auto* v = root.find("output")) cfg.output_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "output" : "") : v->text();
+	if (auto* v = root.find("videos")) cfg.save_videos = !(v->text() == "0" || v->text() == "false");
 	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str());
 	if (auto* v = root.find("vmaf")) {
 		if (auto* m = v->find("model")) cfg.vo.model = m->text();
@@ -207,8 +220,53 @@ static void load_config(const std::string& path, Config& cfg) {
 	});
 }
 
+static const char* VERSION = "0.2.0";
+
+static void print_help(FILE* f) {
+	fputs(R"HELP(ves - tries encoder option combinations, scores every frame with VMAF and reports the configurations
+that are the best in at least 95% of frames.
+
+usage: ves [options]                  run a config file (config.json unless --config says otherwise)
+       ves -enc <encoder> -br <kbps> -i <input> [--option key=a,b ...]    a quick run without a config file
+       ves <input> <encoder> <codec> <kbps[,..]> [key=a,b ...]           the same, short form
+
+Paths
+  -cfg, --config <file>     config file (default: config.json)
+  -i,   --input <path>      an input video or a directory with videos (.mkv, .mp4, .mov); replaces the
+                            inputs of the config file; can be given more than once
+  -o,   --output <dir>      where the results go (default: output): the encoded stream of every run in
+                            <dir>/<input>/ (.h264, .h265 or .ivf) and the result file <dir>/<input>.json;
+                            "off" writes nothing
+        --no-videos         write the result files but not the encoded streams
+  -c,   --cache <dir>       finished runs are kept here and not repeated (default: cache); "off" disables it
+
+Scoring
+        --vmaf-model <spec> libvmaf model, e.g. path=models/vmaf_4k_v0.6.1.json
+        --vmaf-threads <n>
+        --over-penalty <p>  VMAF points deducted per percent over the target bitrate (default: 0.025)
+
+Quick run (replaces the encoders and scenarios of the config file)
+  -enc, --encoder <name>    nvenc | amf | qsv | x264 | x265 | svtav1
+  -cd,  --codec <name>      h264 | hevc | av1, for the GPU encoders
+  -br,  --bitrate <kbps[,..]>
+  -res, --resolution <WxH[,..]>    -fps, --framerate <n[,..]>    --kf <seconds[,..]>
+        --option <key=a,b>  an encoder option, can be given more than once; comma separated values are swept
+                            and every combination is tested; "null" leaves the option unset
+        --fixed <key[,..]>  options that are never left out when pruning
+        --no-prune          test options even when they change nothing
+        --pool <name>  --parallel <n>
+
+  -h, --help                this text
+  -v, --version
+)HELP", f);
+}
+
+// Command line made of --flags. Sets `quit` when there is nothing left to do (--help, --version).
+static void parse_flags(int argc, char** argv, Config& cfg, bool& quit);
+
 // Legacy one-liner: ves <input> <encoder> <codec> <kbps[,..]> [key=a,b ...]
 static bool parse_cli(int argc, char** argv, Config& cfg) {
+	cfg.output_dir.clear();
 	add_inputs(cfg, argv[1]);
 	Job j;
 	j.encoder = argv[2]; j.codec = argv[3];
@@ -224,6 +282,7 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 		else if (k == "vmaf.threads") cfg.vo.threads = atoi(v.c_str());
 		else if (k == "over.penalty") over_penalty = atof(v.c_str());
 		else if (k == "cache") cfg.cache_dir = v == "off" ? "" : v;
+		else if (k == "output") cfg.output_dir = v;
 		else if (k == "prune") j.prune = v != "off";
 		else if (k == "fixed") { for (auto& x : split(v)) j.fixed.insert(x); }
 		else if (k == "pool") j.pool = v;
@@ -237,6 +296,73 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 	cfg.scenarios.push_back(std::move(sc));
 	cfg.jobs.push_back(std::move(j));
 	return true;
+}
+
+static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
+	std::string config_path = "config.json";
+	std::vector<std::string> inputs, bitrates, res, fps, kfs;
+	std::optional<std::string> output, cache, model;
+	std::optional<int> threads;
+	std::optional<double> penalty;
+	bool videos = true, quick = false;
+	Job job;
+	for (int i = 1; i < argc; i++) {
+		std::string a = argv[i], v;
+		bool inline_value = false;
+		if (a.rfind("--", 0) == 0) {
+			if (size_t eq = a.find('='); eq != std::string::npos) { v = a.substr(eq + 1); a.resize(eq); inline_value = true; }
+		}
+		auto value = [&]() -> std::string {
+			if (inline_value) return v;
+			if (i + 1 >= argc) throw std::runtime_error("missing value after " + a);
+			return argv[++i];
+		};
+		if (a == "-h" || a == "--help") { print_help(stdout); quit = true; return; }
+		else if (a == "-v" || a == "--version") { printf("ves %s\n", VERSION); quit = true; return; }
+		else if (a == "-cfg" || a == "--config") config_path = value();
+		else if (a == "-i" || a == "--input") inputs.push_back(value());
+		else if (a == "-o" || a == "--output") output = value();
+		else if (a == "--no-videos") videos = false;
+		else if (a == "-c" || a == "--cache") cache = value();
+		else if (a == "--vmaf-model") model = value();
+		else if (a == "--vmaf-threads") threads = atoi(value().c_str());
+		else if (a == "--over-penalty") penalty = atof(value().c_str());
+		else if (a == "-enc" || a == "--encoder") { job.encoder = value(); quick = true; }
+		else if (a == "-cd" || a == "--codec") job.codec = value();
+		else if (a == "-br" || a == "--bitrate") bitrates = split(value());
+		else if (a == "-res" || a == "--resolution") res = split(value());
+		else if (a == "-fps" || a == "--framerate") fps = split(value());
+		else if (a == "--kf") kfs = split(value());
+		else if (a == "--option") {
+			const std::string o = value();
+			const size_t eq = o.find('=');
+			if (eq == std::string::npos) throw std::runtime_error("bad option '" + o + "', expected key=value");
+			Axis ax{o.substr(0, eq), {}};
+			for (auto& x : split(o.substr(eq + 1))) ax.values.push_back(x == "null" ? std::nullopt : std::optional<std::string>(x));
+			job.axes.push_back(std::move(ax));
+		}
+		else if (a == "--fixed") { for (auto& x : split(value())) job.fixed.insert(x); }
+		else if (a == "--no-prune") job.prune = false;
+		else if (a == "--pool") job.pool = value();
+		else if (a == "--parallel") job.parallel = atoi(value().c_str());
+		else throw std::runtime_error("unknown option '" + a + "', see --help");
+	}
+	if (quick) {
+		if (bitrates.empty()) throw std::runtime_error("--encoder needs --bitrate");
+		Scenario sc;
+		for (auto& b : bitrates) sc.bitrates.push_back(atoll(b.c_str()));
+		if (!kfs.empty()) { sc.kfs.clear(); for (auto& k : kfs) sc.kfs.push_back(atof(k.c_str())); }
+		sc.shapes = make_shapes(res, fps);
+		cfg.scenarios.push_back(std::move(sc));
+		cfg.jobs.push_back(std::move(job));
+	} else load_config(config_path, cfg);
+	if (!inputs.empty()) { cfg.inputs.clear(); for (auto& i : inputs) add_inputs(cfg, i); }
+	if (output) cfg.output_dir = *output == "off" ? "" : *output;
+	cfg.save_videos = cfg.save_videos && videos;
+	if (cache) cfg.cache_dir = *cache == "off" ? "" : *cache;
+	if (model) cfg.vo.model = *model;
+	if (threads) cfg.vo.threads = *threads;
+	if (penalty) over_penalty = *penalty;
 }
 
 static Codec codec_of(const std::string& encoder, const std::string& codec) {
@@ -389,6 +515,29 @@ static bool encode_one(const std::string& input, const std::string& encoder, Par
 	return true;
 }
 
+// H.264 and HEVC are written as plain Annex B streams, AV1 as IVF; players and FFmpeg read both.
+static bool save_stream(const std::string& path, Codec id, const Encoded& e) {
+	std::ofstream f(path, std::ios::binary);
+	if (!f) return false;
+	auto put = [&](uint64_t v, int n) { for (int i = 0; i < n; i++) f.put((char)(v >> (8 * i))); };
+	if (id == Codec::AV1) {
+		f.write("DKIF", 4); put(0, 2); put(32, 2); f.write("AV01", 4);
+		put(e.enc.w, 2); put(e.enc.h, 2); put(e.enc.fps.num, 4); put(e.enc.fps.den, 4); put(e.packets.size(), 4); put(0, 4);
+	}
+	uint64_t n = 0;
+	for (auto& p : e.packets) {
+		if (id == Codec::AV1) { put(p.size(), 4); put(n++, 8); }
+		f.write((const char*)p.data(), (std::streamsize)p.size());
+	}
+	return (bool)f;
+}
+
+static std::string sanitize(std::string s, size_t max = 100) {
+	for (char& c : s) if (!isalnum((unsigned char)c) && c != '-' && c != '_' && c != '.' && c != '=') c = '_';
+	if (s.size() > max) s.resize(max);
+	return s;
+}
+
 static uint64_t hash_packets(const Encoded& e) { // FNV-1a over every packet and its size
 	uint64_t h = 1469598103934665603ull;
 	auto mix = [&](uint8_t b) { h = (h ^ b) * 1099511628211ull; };
@@ -405,12 +554,18 @@ static bool run_one(const std::string& input, const std::string& encoder, Codec 
 	Encoded e;
 	if (!encode_one(input, encoder, p, kf, want, so, e)) return false;
 	out.kbps = e.kbps;
+	if (!out.video_file.empty() && !save_stream(out.video_file, id, e)) { fprintf(stderr, "cannot write %s\n", out.video_file.c_str()); out.video.clear(); }
 	char hex[17];
 	snprintf(hex, sizeof hex, "%016llx", (unsigned long long)hash_packets(e));
 	const std::string same_key = out.group + "|" + hex;
 	{
 		std::lock_guard lock(same_mutex);
 		if (auto it = same_output.find(same_key); it != same_output.end()) { out.scores = it->second; out.same = true; return true; }
+	}
+	{
+		std::lock_guard lock(print_mutex);
+		printf("%s scoring   %s\n", out.tag.c_str(), out.label.c_str());
+		fflush(stdout);
 	}
 	auto ref = open_source(input);
 	if (!ref || !vmaf_score(*ref, id, e.packets, e.enc, e.shown, e.score_fmt, vo, so, out.scores)) return false;
@@ -529,24 +684,31 @@ static std::vector<Options> option_sets(const Config& cfg, const std::string& in
 	return out;
 }
 
+static std::string jq(const std::string& s) { // JSON string
+	std::string o = "\"";
+	for (unsigned char c : s) {
+		if (c == '"' || c == '\\') { o += '\\'; o += (char)c; }
+		else if (c < 0x20) { char b[8]; snprintf(b, sizeof b, "\\u%04x", c); o += b; }
+		else o += (char)c;
+	}
+	return o + "\"";
+}
+
 int main(int argc, char** argv) {
 	Config cfg;
 	try {
-		if (argc >= 5) { if (!parse_cli(argc, argv, cfg)) return 1; }
 		// (config errors, including missing inputs, throw and are reported below)
-		else if (argc <= 2) load_config(argc == 2 ? argv[1] : "config.json", cfg);
-		else {
-			fprintf(stderr, "usage: ves [config.json]\n"
-			                "       ves <input> <encoder> <codec> <bitrate-kbps[,..]> [key=value[,value..] ...]\n"
-			                "  encoder: nvenc | amf | qsv | x264 | x265 | svtav1 (codec is ignored for the CPU encoders)\n"
-			                "  comma separated values are swept; every combination is tested\n"
-			                "  prune=off keeps options that change nothing; fixed=<key>[,..] keeps those options out of the pruning\n"
-			                "  kf=<seconds>, vmaf.model=<spec>, vmaf.threads=<n>, over.penalty=<vmaf points per %% over target>;\n"
-			                "  other keys go to the encoder\n");
-			return 1;
+		if (argc >= 2 && argv[1][0] == '-') {
+			bool quit = false;
+			parse_flags(argc, argv, cfg, quit);
+			if (quit) return 0;
 		}
-	} catch (const std::exception& e) { fprintf(stderr, "config: %s\n", e.what()); return 1; }
-	if (cfg.inputs.empty() || cfg.scenarios.empty() || cfg.jobs.empty()) { fprintf(stderr, "config needs inputs, bitrates and at least one enabled encoder\n"); return 1; }
+		else if (argc >= 5) { if (!parse_cli(argc, argv, cfg)) return 1; }
+		else if (argc == 1) load_config("config.json", cfg);
+		else if (argc == 2 && !fs::is_directory(argv[1]) && fs::path(argv[1]).extension() == ".json") load_config(argv[1], cfg);
+		else { print_help(stderr); return 1; }
+	} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
+	if (cfg.inputs.empty() || cfg.scenarios.empty() || cfg.jobs.empty()) { fprintf(stderr, "error: need inputs, bitrates and at least one enabled encoder (see --help)\n"); return 1; }
 
 	struct Task {
 		Run r;
@@ -575,7 +737,9 @@ int main(int argc, char** argv) {
 	for (auto& input : cfg.inputs) for (auto& job : cfg.jobs) {
 		const Codec id = codec_of(job.encoder, job.codec);
 		if (id == Codec::None) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", job.encoder.c_str(), job.codec.c_str()); failed++; continue; }
-			for (auto& sc : cfg.scenarios) if (takes_part(job, sc)) { const std::vector<Options> sets = option_sets(cfg, input, job, sc);
+			for (auto& sc : cfg.scenarios) if (takes_part(job, sc)) {
+				{ std::lock_guard lock(print_mutex); printf("Preparing %s/%s, scenario %s, %s\n", job.encoder.c_str(), job.codec.c_str(), sc.name.empty() ? "(unnamed)" : sc.name.c_str(), fs::path(input).filename().string().c_str()); fflush(stdout); }
+				const std::vector<Options> sets = option_sets(cfg, input, job, sc);
 			for (int64_t br : sc.bitrates) for (double kf : sc.kfs) for (auto& shape : sc.shapes) for (auto& opts : sets) {
 			Task t;
 			t.job = &job; t.id = id;
@@ -585,6 +749,15 @@ int main(int argc, char** argv) {
 				if (shape.fps.num) t.r.label += " @" + std::to_string(shape.fps.value()).substr(0, 6);
 			for (auto& [k, v] : opts) t.r.label += " " + k + "=" + v;
 			t.p.codec = job.codec; t.p.bitrate = br * 1000; t.p.options = opts;
+			t.r.encoder = job.encoder; t.r.codec = job.codec; t.r.options = opts;
+			if (!cfg.output_dir.empty() && cfg.save_videos) {
+				char idx[16];
+				snprintf(idx, sizeof idx, "%04zu", tasks.size());
+				t.r.video = sanitize(fs::path(input).stem().string()) + "/" + idx + "_" + sanitize(t.r.label) + (id == Codec::AV1 ? ".ivf" : id == Codec::HEVC ? ".h265" : ".h264");
+				t.r.video_file = (fs::path(cfg.output_dir) / t.r.video).string();
+				std::error_code ec;
+				fs::create_directories(fs::path(t.r.video_file).parent_path(), ec);
+			}
 			// Every GPU is a pool of its own, so GPUs work in parallel; CPU encoders share one pool.
 			std::string gpu_index = opts.count("gpu") ? opts.at("gpu") : "0";
 			t.r.group = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|" + gpu_index;
@@ -598,31 +771,80 @@ int main(int argc, char** argv) {
 		}
 	}
 
+	// What is about to happen.
+	{
+		printf("ves %s\n\nInputs (%zu)\n", VERSION, cfg.inputs.size());
+		for (auto& in : cfg.inputs) printf("  %s\n", in.c_str());
+		printf("Scenarios\n");
+		for (auto& sc : cfg.scenarios) {
+			printf("  %s: ", sc.name.empty() ? "(unnamed)" : sc.name.c_str());
+			for (size_t k = 0; k < sc.bitrates.size(); k++) printf("%s%lld", k ? "," : "", (long long)sc.bitrates[k]);
+			printf(" kbps, key frames every ");
+			for (size_t k = 0; k < sc.kfs.size(); k++) printf("%s%g", k ? "," : "", sc.kfs[k]);
+			printf(" s");
+			for (auto& sh : sc.shapes) if (sh.w || sh.fps.num) printf(", %dx%d@%g", sh.w, sh.h, sh.fps.num ? sh.fps.value() : 0.0);
+			printf("\n");
+		}
+		printf("Encoders\n");
+		for (auto& job : cfg.jobs) {
+			size_t runs_here = 0;
+			for (auto& t : tasks) runs_here += t.job == &job;
+			printf("  %s%s%s: %zu runs%s\n", job.encoder.c_str(), is_gpu_encoder(job.encoder) ? "/" : "", is_gpu_encoder(job.encoder) ? job.codec.c_str() : "", runs_here, job.prune ? "" : " (pruning off)");
+		}
+		printf("Pools:");
+		for (auto& [name, pl] : pools) printf(" %s x%d (%zu runs)", name.c_str(), pl.parallel, pl.tasks.size());
+		printf("\nCache: %s   Output: %s%s\n\n%zu runs in total\n\n", cfg.cache_dir.empty() ? "off" : cfg.cache_dir.c_str(), cfg.output_dir.empty() ? "off" : cfg.output_dir.c_str(),
+		       cfg.output_dir.empty() || !cfg.save_videos ? "" : " (with encoded streams)", tasks.size());
+		fflush(stdout);
+	}
+
 	// Each pool gets `parallel` workers; pools run side by side. Concurrency only affects speed, never the scores.
-	std::mutex out_mutex;
+	const auto t0 = std::chrono::steady_clock::now();
+	std::atomic<int> started{0}, finished{0};
+	const int total = (int)tasks.size();
+	auto span = [](double sec) {
+		char b[32];
+		if (sec < 90) snprintf(b, sizeof b, "%.0fs", sec);
+		else if (sec < 5400) snprintf(b, sizeof b, "%.0fm%02.0fs", std::floor(sec / 60), std::fmod(sec, 60));
+		else snprintf(b, sizeof b, "%.0fh%02.0fm", std::floor(sec / 3600), std::fmod(sec / 60, 60));
+		return std::string(b);
+	};
 	std::vector<std::thread> workers;
-	for (auto& [name, pl] : pools) for (int w = 0; w < pl.parallel; w++) workers.emplace_back([&, pp = &pl] {
+	for (auto& [name, pl] : pools) for (int w = 0; w < pl.parallel; w++) workers.emplace_back([&, pp = &pl, pool_name = name] {
 		for (size_t n; (n = pp->next++) < pp->tasks.size();) {
 			Task& t = tasks[pp->tasks[n]];
 			Run& r = t.r;
+			char tag[48];
+			snprintf(tag, sizeof tag, "[run %d/%d]", ++started, total);
+			r.tag = tag;
 			std::string key;
 			CachedRun hit;
 			if (!cfg.cache_dir.empty()) {
 				key = cache_key(r.input, t.job->encoder, t.job->codec, t.p.options, r.bitrate, r.kf, r.shape, cfg.scale, cfg.vo);
 				if (cache_load(cfg.cache_dir, key, hit)) { r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.cached = t.ok = true; }
 			}
-			if (!r.cached) {
+			if (r.cached) { r.video.clear(); r.video_file.clear(); } // nothing was encoded
+			else {
+				{
+					std::lock_guard lock(print_mutex);
+					printf("%s encoding  %s  (%s, %lld kbps, kf %.1f s, pool %s)\n", r.tag.c_str(), r.label.c_str(), fs::path(r.input).filename().string().c_str(), (long long)r.bitrate, r.kf, pool_name.c_str());
+					fflush(stdout);
+				}
 				t.ok = run_one(r.input, t.job->encoder, t.id, t.p, r.kf, r.shape, cfg.vo, cfg.scale, r);
 				if (t.ok && !key.empty()) cache_store(cfg.cache_dir, key, CachedRun{r.kbps, r.scores});
 			}
-			std::lock_guard lock(out_mutex);
-			if (!t.ok) { fprintf(stderr, "[%s %lld kbps kf %.1f] %s: FAILED\n", r.input.c_str(), (long long)r.bitrate, r.kf, r.label.c_str()); continue; }
+			std::lock_guard lock(print_mutex);
+			const int done = ++finished;
+			const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+			char progress[96];
+			snprintf(progress, sizeof progress, "%d/%d done, %s, ~%s left", done, total, span(elapsed).c_str(), done < total ? span(elapsed / done * (total - done)).c_str() : "0s");
+			if (!t.ok) { fprintf(stderr, "%s FAILED  %s  (%s, %lld kbps)  [%s]\n", r.tag.c_str(), r.label.c_str(), r.input.c_str(), (long long)r.bitrate, progress); continue; }
 			r.penalty = std::max(0.0, r.kbps / r.bitrate - 1) * 100 * over_penalty;
-			std::vector<double> s = r.scores;
-			std::sort(s.begin(), s.end());
-			printf("[%s %lld kbps kf %.1f] %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s\n", r.input.c_str(), (long long)r.bitrate, r.kf, r.label.c_str(), r.kbps,
-			       std::accumulate(s.begin(), s.end(), 0.0) / s.size(), s.front(), s[(size_t)(s.size() * 0.05)], r.cached ? " (cached)" : r.same ? " (same output as an earlier run)" : "",
-			       r.gpu.empty() ? "" : " on ", r.gpu.c_str());
+			std::vector<double> sc = r.scores;
+			std::sort(sc.begin(), sc.end());
+			printf("%s finished  %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s  [%s]\n", r.tag.c_str(), r.label.c_str(), r.kbps,
+			       std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size(), sc.front(), sc[(size_t)(sc.size() * 0.05)], r.cached ? " (cached)" : r.same ? " (same output as an earlier run)" : "",
+			       r.gpu.empty() ? "" : " on ", r.gpu.c_str(), progress);
 			fflush(stdout);
 		}
 	});
@@ -630,7 +852,8 @@ int main(int argc, char** argv) {
 
 	// Collect in task order so the ranking below does not depend on which run finished first.
 	std::vector<Run> runs;
-	for (auto& t : tasks) { if (t.ok) runs.push_back(std::move(t.r)); else failed++; }
+	std::map<std::string, std::vector<std::string>> failed_runs, group_json; // by input
+	for (auto& t : tasks) { if (t.ok) runs.push_back(std::move(t.r)); else { failed++; failed_runs[t.r.input].push_back(t.r.label); } }
 
 	// A group is every run that shares input, bitrate target and key frame interval.
 	auto key = [](const Run& r) { return std::make_tuple(r.input, -r.bitrate, r.kf); };
@@ -659,7 +882,41 @@ int main(int argc, char** argv) {
 			       runs[i].gpu.empty() ? "" : ", ", runs[i].gpu.c_str());
 		}
 		if (!any) printf("  no configuration reaches %.0f%%; the top entry is the closest\n", BEST_FRAME_SHARE * 100);
+
+		std::ostringstream o;
+		o << "{\"bitrate_kbps\":" << runs[g].bitrate << ",\"keyframe_interval_s\":" << runs[g].kf << ",\"frames\":" << frames << ",\"best_frame_share_required\":" << BEST_FRAME_SHARE << ",\"runs\":[";
+		for (size_t i = g; i < e; i++) {
+			const Run& r = runs[i];
+			std::vector<double> sc = r.scores;
+			std::sort(sc.begin(), sc.end());
+			o << (i > g ? "," : "") << "{\"label\":" << jq(r.label) << ",\"encoder\":" << jq(r.encoder) << ",\"codec\":" << jq(r.codec) << ",\"options\":{";
+			bool first = true;
+			for (auto& [k, v] : r.options) { o << (first ? "" : ",") << jq(k) << ":" << jq(v); first = false; }
+			o << "},\"width\":" << r.shape.w << ",\"height\":" << r.shape.h << ",\"fps\":" << (r.shape.fps.num ? r.shape.fps.value() : 0.0)
+			  << ",\"kbps\":" << r.kbps << ",\"over_target_penalty\":" << r.penalty << ",\"best_frame_share\":" << r.best_share << ",\"winner\":" << (r.best_share >= BEST_FRAME_SHARE ? "true" : "false")
+			  << ",\"vmaf\":{\"mean\":" << std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size() << ",\"min\":" << sc.front() << ",\"p5\":" << sc[(size_t)(sc.size() * 0.05)] << "}"
+			  << ",\"gpu\":" << (r.gpu.empty() ? "null" : jq(r.gpu)) << ",\"cached\":" << (r.cached ? "true" : "false") << ",\"same_output_as_earlier_run\":" << (r.same ? "true" : "false")
+			  << ",\"video\":" << (r.video.empty() ? "null" : jq(r.video)) << "}";
+		}
+		o << "]}";
+		group_json[runs[g].input].push_back(o.str());
 		g = e;
+	}
+
+	if (!cfg.output_dir.empty()) {
+		std::error_code ec;
+		fs::create_directories(cfg.output_dir, ec);
+		for (auto& input : cfg.inputs) {
+			const fs::path file = fs::path(cfg.output_dir) / (sanitize(fs::path(input).stem().string()) + ".json");
+			std::ofstream f(file);
+			f << "{\"tool\":\"ves\",\"version\":" << jq(VERSION) << ",\"input\":" << jq(input) << ",\"vmaf_model\":" << jq(cfg.vo.model) << ",\"over_penalty\":" << over_penalty << ",\"failed\":[";
+			for (size_t i = 0; i < failed_runs[input].size(); i++) f << (i ? "," : "") << jq(failed_runs[input][i]);
+			f << "],\"groups\":[";
+			for (size_t i = 0; i < group_json[input].size(); i++) f << (i ? "," : "") << group_json[input][i];
+			f << "]}\n";
+			if (f) printf("%sResults: %s\n", &input == &cfg.inputs.front() ? "\n" : "", file.string().c_str());
+			else fprintf(stderr, "cannot write %s\n", file.string().c_str());
+		}
 	}
 	return failed ? 2 : 0;
 }

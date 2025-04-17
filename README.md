@@ -37,14 +37,30 @@ VMAF models are JSON files in `models/` (from [Netflix/vmaf](https://github.com/
 cmake -G Ninja -DCMAKE_CXX_COMPILER=clang++ -B build
 cmake --build build
 ```
-The DLLs from `third-party` are copied next to `build/ves.exe`.
+Only the DLLs from `third-party` are copied next to `build/ves.exe` (not the command line tools in those packages). `cmake --install build --prefix <dir>` puts the program, the DLLs, `models/`, `config.json` and this README into one folder.
 
 ## Usage
 ```
-ves [config.json]
+ves [options]
 ves <input> <encoder> <codec> <bitrate-kbps[,..]> [key=value[,value..] ...]
 ```
-Without arguments VES reads `config.json` from the working directory. The second form runs a quick sweep from the command line; `kf=<seconds>`, `res=WxH,..`, `fps=..`, `pool=`, `parallel=`, `vmaf.model=`, `vmaf.threads=` and `over.penalty=` are understood there, every other key goes to the encoder.
+`ves --help` lists everything. The main options:
+
+| Option | |
+|---|---|
+| `-cfg`, `--config <file>` | config file, `config.json` by default |
+| `-i`, `--input <path>` | an input video or a directory of videos (`.mkv`, `.mp4`, `.mov`); replaces the config file's inputs, can be repeated |
+| `-o`, `--output <dir>` | where the results go, `output` by default: the encoded stream of every run in `<dir>/<input name>/` (`.h264`, `.h265` or `.ivf` for AV1, numbered like the runs) and one result file `<dir>/<input name>.json` per input. `off` writes nothing, `--no-videos` skips the streams |
+| `-c`, `--cache <dir>` | where finished runs are kept (`cache`); `off` disables it |
+| `--vmaf-model`, `--vmaf-threads`, `--over-penalty` | scoring |
+| `-enc`, `-cd`, `-br`, `-res`, `-fps`, `--kf`, `--option key=a,b` ... | a quick run without a config file, e.g. `ves -i clip.mkv -enc x264 -br 3000,6000 --option preset=fast,medium` |
+
+The result file lists, for every input, each group (bitrate target and key frame interval) with all its runs: label, encoder, codec, options, resolution and frame rate, actual bitrate, overshoot penalty, share of frames in which the run is the best, whether it reached the threshold (`winner`), VMAF mean, minimum and 5th percentile, GPU, whether it came from the cache, and the stream file. Runs that failed are listed under `failed`. Runs taken from the cache have no stream, because nothing was encoded.
+
+While it runs, VES prints what it is about to do (inputs, scenarios, encoders, pools, number of runs), then one line when a run starts encoding, one when it starts scoring and one when it finishes, with the number of finished runs, the elapsed time and an estimate of the time left.
+
+The short form (and the config file's `"output"` key) work too; the short form writes no files unless `output=<dir>` is given. `kf=<seconds>`, `res=WxH,..`, `fps=..`, `pool=`, `parallel=`, `prune=off`, `fixed=`, `cache=`, `vmaf.model=`, `vmaf.threads=` and `over.penalty=` are understood there.
+
 
 ### config.json
 ```json
