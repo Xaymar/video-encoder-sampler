@@ -121,6 +121,7 @@ public:
 } // namespace
 
 std::unique_ptr<Source> open_source(const std::string& path) {
+	av_log_set_level(AV_LOG_ERROR); // warnings such as "UDTA parsing failed" repeat for every run that opens the file
 	auto s = std::make_unique<FfSource>();
 	return s->open(path) ? std::unique_ptr<Source>(std::move(s)) : nullptr;
 }

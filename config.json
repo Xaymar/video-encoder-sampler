@@ -1,17 +1,14 @@
 {
-	"inputs": [
-		"input"
-	],
 	"scenarios": [
 		{
 			"name": "high",
-			"bitrates": [16000, 8000],
+			"bitrates": [16000, 8500],
 			"resolutions": ["3840x2160", "2560x1440", "1920x1080"],
-			"framerates": [60, 30]
+			"framerates": [120, 60, 30]
 		},
 		{
 			"name": "mid",
-			"bitrates": [6000],
+			"bitrates": [8500, 6000],
 			"resolutions": ["2560x1440", "1920x1080", "1280x720"],
 			"framerates": [60, 30]
 		},
@@ -40,13 +37,8 @@
 			"codec": "h264",
 			"fixed": ["preset", "tune"],
 			"options": {
-				"preset": ["p7"],
-				"tune": ["hq"],
-				"rc-lookahead": [32, 16, 8, 0],
-				"bf": [null, 0, 1, 2, 3, 4],
-				"b_ref_mode": [null, "none", "middle"],
-				"spatial-aq": [null, 0, 1],
-				"aq-strength": []
+				"preset": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+				"tune": ["hq"]
 			}
 		},
 		{
