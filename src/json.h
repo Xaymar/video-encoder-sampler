@@ -1,5 +1,5 @@
 #pragma once
-// Minimal JSON reader for config files. Numbers keep their source text so "6000" and "2.0" survive round trips.
+// Minimal JSON reader for config files; also takes comments (// and /* */) and trailing commas. Numbers keep their source text so "6000" and "2.0" survive round trips.
 #include <cctype>
 #include <stdexcept>
 #include <string>
@@ -32,7 +32,19 @@ struct Json {
 
 private:
 	[[noreturn]] static void fail(size_t at, const char* what) { throw std::runtime_error(std::string("JSON error at offset ") + std::to_string(at) + ": " + what); }
-	static void ws(const std::string& s, size_t& i) { while (i < s.size() && isspace((unsigned char)s[i])) i++; }
+	// Whitespace, and the comments JSONC allows between tokens: // to the end of the line and /* ... */.
+	static void ws(const std::string& s, size_t& i) {
+		for (;;) {
+			while (i < s.size() && isspace((unsigned char)s[i])) i++;
+			if (s.compare(i, 2, "//") == 0) { while (i < s.size() && s[i] != '\n') i++; }
+			else if (s.compare(i, 2, "/*") == 0) {
+				size_t e = s.find("*/", i + 2);
+				if (e == std::string::npos) fail(i, "unterminated comment");
+				i = e + 2;
+			}
+			else return;
+		}
+	}
 
 	static std::string str(const std::string& s, size_t& i) {
 		std::string out;
@@ -75,6 +87,7 @@ private:
 			if (i < s.size() && s[i] == close) { i++; return j; }
 			for (;;) {
 				ws(s, i);
+				if (i < s.size() && s[i] == close) { i++; return j; } // a trailing comma is fine
 				std::string key;
 				if (obj) {
 					if (i >= s.size() || s[i] != '"') fail(i, "expected key");

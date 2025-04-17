@@ -63,6 +63,8 @@ The short form (and the config file's `"output"` key) work too; the short form w
 
 
 ### config.json
+
+The file may contain comments (`// ...` and `/* ... */`) and trailing commas.
 ```json
 {
 	"inputs": ["input"],
