@@ -425,7 +425,6 @@ static bool encode_one(const std::string& input, const std::string& encoder, Par
 	enc.w = want.w ? want.w : src.width;
 	enc.h = want.h ? want.h : src.height;
 	enc.fps = want.fps.num ? want.fps : src.framerate;
-	if (enc.w > src.width || enc.h > src.height) { fprintf(stderr, "%dx%d is larger than the source (%dx%d)\n", enc.w, enc.h, src.width, src.height); return false; }
 	if (compare(enc.fps, src.framerate) > 0) { fprintf(stderr, "frame rate %.3f is higher than the source (%.3f)\n", enc.fps.value(), src.framerate.value()); return false; }
 	p.width = enc.w; p.height = enc.h;
 	p.framerate = enc.fps;
