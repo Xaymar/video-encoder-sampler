@@ -188,6 +188,7 @@ static void load_config(const std::string& path, Config& cfg) {
 		strs("resolutions", [&](const std::string& t) { res.push_back(t); });
 		strs("framerates", [&](const std::string& t) { fps.push_back(t); });
 		sc.shapes = make_shapes(res, fps);
+		if (auto* u = o.find("upscale"); u && (u->text() == "1" || u->text() == "true")) for (auto& sh : sc.shapes) sh.upscale = true;
 		if (sc.bitrates.empty()) throw std::runtime_error("a scenario needs bitrates");
 		cfg.scenarios.push_back(std::move(sc));
 	};
@@ -264,6 +265,7 @@ Quick run (replaces the encoders and scenarios of the config file)
                             and every combination is tested; "null" leaves the option unset
         --fixed <key[,..]>  options that are never left out when pruning
         --no-prune          test options even when they change nothing
+        --upscale           allow encoding above the source's resolution, chroma layout and bit depth
         --pool <name>  --parallel <n>
 
   -h, --help                this text
@@ -282,6 +284,7 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 	j.encoder = argv[2]; j.codec = argv[3];
 	Scenario sc;
 	std::vector<std::string> res, fps;
+	bool upscale = false;
 	for (auto& b : split(argv[4])) sc.bitrates.push_back(atoll(b.c_str()));
 	for (int i = 5; i < argc; i++) {
 		std::string a = argv[i];
@@ -300,9 +303,11 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 		else if (k == "kf") { sc.kfs.clear(); for (auto& x : split(v)) sc.kfs.push_back(atof(x.c_str())); }
 		else if (k == "res") res = split(v);
 		else if (k == "fps") fps = split(v);
+		else if (k == "upscale") upscale = v == "on" || v == "1" || v == "true";
 		else { Axis ax{k, {}}; for (auto& x : split(v)) ax.values.push_back(x); j.axes.push_back(std::move(ax)); }
 	}
 	sc.shapes = make_shapes(res, fps);
+	for (auto& sh : sc.shapes) sh.upscale = upscale;
 	cfg.scenarios.push_back(std::move(sc));
 	cfg.jobs.push_back(std::move(j));
 	return true;
@@ -314,7 +319,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	std::optional<std::string> output, cache, model;
 	std::optional<int> threads;
 	std::optional<double> penalty;
-	bool videos = true, quick = false;
+	bool videos = true, quick = false, upscale = false;
 	Job job;
 	for (int i = 1; i < argc; i++) {
 		std::string a = argv[i], v;
@@ -354,6 +359,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		}
 		else if (a == "--fixed") { for (auto& x : split(value())) job.fixed.insert(x); }
 		else if (a == "--no-prune") job.prune = false;
+		else if (a == "--upscale") upscale = true;
 		else if (a == "--pool") job.pool = value();
 		else if (a == "--parallel") job.parallel = atoi(value().c_str());
 		else throw std::runtime_error("unknown option '" + a + "', see --help");
@@ -364,6 +370,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		for (auto& b : bitrates) sc.bitrates.push_back(atoll(b.c_str()));
 		if (!kfs.empty()) { sc.kfs.clear(); for (auto& k : kfs) sc.kfs.push_back(atof(k.c_str())); }
 		sc.shapes = make_shapes(res, fps);
+		for (auto& sh : sc.shapes) sh.upscale = upscale;
 		cfg.scenarios.push_back(std::move(sc));
 		cfg.jobs.push_back(std::move(job));
 	} else load_config(config_path, cfg);
@@ -439,6 +446,7 @@ static bool encode_one(const std::string& input, const std::string& encoder, Par
 	enc.w = want.w ? want.w : src.width;
 	enc.h = want.h ? want.h : src.height;
 	enc.fps = want.fps.num ? want.fps : src.framerate;
+	if (!want.upscale && (enc.w > src.width || enc.h > src.height)) { e.ignore("upscaling to " + std::to_string(enc.w) + "x" + std::to_string(enc.h) + " is off for this scenario (source: " + std::to_string(src.width) + "x" + std::to_string(src.height) + ")"); return false; }
 	// A source rate is a measurement (119.905 for a 120 fps clip with jittery timestamps), so a request within half a percent of it is the
 	// source's own rate: no frames are dropped, and the encoder is told the rate that was asked for.
 	const bool same_rate = std::fabs(enc.fps.value() / src.framerate.value() - 1) < 0.005;
@@ -459,6 +467,7 @@ static bool encode_one(const std::string& input, const std::string& encoder, Par
 		if (!chroma && (d <= sf.depth || depths.size() == 1) && encoder_supports(encoder, p.codec, c, d)) { chroma = c; depth = d; }
 	}
 	if (!chroma) { e.ignore(encoder + " cannot encode " + std::to_string(depths[0]) + "-bit " + std::to_string(chromas[0]) + " here"); return false; }
+	if (!want.upscale && (depth > sf.depth || chroma > sf.chroma)) { e.ignore("upsampling to " + std::to_string(depth) + "-bit " + std::to_string(chroma) + " is off for this scenario (source: " + std::to_string(sf.depth) + "-bit " + std::to_string(sf.chroma) + ")"); return false; }
 	p.pix = enc.pix = planar_fmt(chroma, depth);
 	enc.has_pix = true;
 	// Both sides are scored in the source's chroma layout at the higher of the two bit depths.

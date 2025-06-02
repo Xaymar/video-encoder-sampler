@@ -57,6 +57,7 @@ struct Shape {
 	Rational fps{0, 1};
 	Fmt pix;
 	bool has_pix = false;
+	bool upscale = false; // from the scenario: encoding above the source's resolution, chroma layout or bit depth is allowed
 };
 
 enum class Codec { None, H264, HEVC, AV1 };
