@@ -72,7 +72,8 @@ public:
 } // namespace
 
 bool vmaf_score(Source& ref, Codec codec, const std::vector<std::vector<uint8_t>>& packets, const Shape& enc,
-                const std::vector<uint32_t>& shown_map, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores) {
+                const std::vector<uint32_t>& shown_map, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp) {
+	if (rp) rp->begin(2, (long long)shown_map.size());
 	auto decoder = make_decoder();
 	if (!decoder->open(codec)) return false;
 
@@ -112,6 +113,7 @@ bool vmaf_score(Source& ref, Codec codec, const std::vector<std::vector<uint8_t>
 			if (rr == 0) break;
 			ok = scorer.add(r, pic);
 			k++;
+			if (rp) rp->step();
 		}
 	};
 	// libplacebo holds frames back until it has seen the next one, so converted frames are collected as they appear.
