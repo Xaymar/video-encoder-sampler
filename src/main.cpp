@@ -104,10 +104,17 @@ static std::vector<std::string> split(const std::string& s) {
 	return out;
 }
 
-static Rational parse_fps(const std::string& s) { // "30", "29.97" or "30000/1001"
+static Rational parse_fps(const std::string& s) { // "30", "29.97" (= 30000/1001) or "30000/1001"
 	int n, d;
-	if (sscanf(s.c_str(), "%d/%d", &n, &d) == 2) return {n, d};
-	return {(int)std::lround(atof(s.c_str()) * 1000), 1000}; // "29.97" -> 29970/1000, close enough to 30000/1001 for slot arithmetic
+	if (sscanf(s.c_str(), "%d/%d", &n, &d) == 2) {
+		if (n <= 0 || d <= 0) throw std::runtime_error("bad frame rate '" + s + "'");
+		return {n, d};
+	}
+	const double v = atof(s.c_str());
+	if (!(v > 0)) throw std::runtime_error("bad frame rate '" + s + "'");
+	// The NTSC rates are written as decimals (23.976, 29.97, 59.94) but are n*1000/1001 exactly.
+	for (int k : {24, 30, 48, 60, 120, 240}) if (std::fabs(v - k * 1000.0 / 1001) < 0.0005 * k) return {k * 1000, 1001};
+	return {(int)std::lround(v * 1000), 1000};
 }
 
 // Resolutions x frame rates; either list may be empty (= source).
