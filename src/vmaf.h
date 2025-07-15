@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -13,10 +14,18 @@ struct VmafOptions {
 	int threads = 4;
 };
 
+// What scoring needs to know about the original video; its frames come from a feed.
+struct RefInfo {
+	int width = 0, height = 0;
+	Rational framerate;
+	Color color;
+};
+using FrameFeed = std::function<int(Picture&)>; // 1: a frame, 0: no more, <0: error
+
 // Decodes the encoded packets, scales them back to the original resolution, holds frames up to the original
-// frame rate and scores them against `ref` (a fresh Source of the original input) with libvmaf, in-process.
+// frame rate and scores them against the original frames (delivered by `next_ref`, already in `score_fmt`) with libvmaf, in-process.
 // `enc` is the geometry and pixel format the packets were encoded at; `shown[k]` is the number of the encoded frame
-// that is on screen at original frame k (dropped frames are held). Both sides are compared in the planar YUV
-// format `score_fmt`, converting whichever side differs. `scores` receives one VMAF value per original frame.
-bool vmaf_score(Source& ref, Codec codec, const std::vector<std::vector<uint8_t>>& packets, const Shape& enc,
+// that is on screen at original frame k (dropped frames are held). Decoded frames are converted to `score_fmt` as well.
+// `scores` receives one VMAF value per original frame.
+bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const std::vector<std::vector<uint8_t>>& packets, const Shape& enc,
                 const std::vector<uint32_t>& shown, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp = nullptr);

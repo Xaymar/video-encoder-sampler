@@ -71,39 +71,19 @@ public:
 
 } // namespace
 
-bool vmaf_score(Source& ref, Codec codec, const std::vector<std::vector<uint8_t>>& packets, const Shape& enc,
+bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const std::vector<std::vector<uint8_t>>& packets, const Shape& enc,
                 const std::vector<uint32_t>& shown_map, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp) {
 	if (rp) rp->begin(2, (long long)shown_map.size());
 	auto decoder = make_decoder();
 	if (!decoder->open(codec)) return false;
 
 	const bool convert_dis = enc.w != ref.width || enc.h != ref.height || enc.pix != score_fmt; // scale back, change format
-	const bool convert_ref = ref.fmt != score_fmt;
 
 	Scorer scorer;
-	auto up = make_converter(), ref_conv = make_converter();
-	Picture d, u, r, t;
+	auto up = make_converter();
+	Picture d, u, r;
 	long long m = 0, mo = 0, k = 0; // decoded frames in, converted frames out, original frame index
-	long long ref_in = 0;
-	bool ref_done = false;
 	bool ok = scorer.open(opt);
-
-	// Next reference frame in the scoring format. The converter holds frames back, so feed it until one comes out.
-	auto next_ref = [&](Picture& out) -> int {
-		if (!convert_ref) return ref.next(out);
-		for (;;) {
-			int got = ref_conv->pop(out);
-			if (got != 0) return got;
-			if (ref_done) return 0;
-			int rr = ref.next(t);
-			if (rr < 0) return rr;
-			if (rr == 0) { ref_done = true; if (!ref_conv->push(nullptr)) return -1; continue; }
-			t.duration = 1;
-			if (ref_in == 0 && !ref_conv->open(t, ref.framerate.inverse(), ref.width, ref.height, score_fmt, scale)) return -1;
-			ref_in++;
-			if (!ref_conv->push(&t)) return -1;
-		}
-	};
 
 	// Hold `shown` (decoded frame number mi, at the original resolution) for every original frame up to the next one.
 	auto show = [&](const Picture& pic, int64_t mi) {
