@@ -241,6 +241,8 @@ void score_wave(const std::string& input, const SourceInfo& si, std::vector<Scor
 			if (ok && convert) { ok = conv->push(nullptr); flush_converted(); }
 			bc.close();
 		});
+		VmafOptions group_vo = vo;
+		if (group_vo.threads <= 0) group_vo.threads = std::max(2, (int)std::thread::hardware_concurrency() / (int)group.size());
 		RefInfo ref;
 		ref.width = si.width; ref.height = si.height; ref.framerate = si.framerate; ref.color = si.color;
 		std::vector<std::thread> scorers;
@@ -248,7 +250,7 @@ void score_wave(const std::string& input, const SourceInfo& si, std::vector<Scor
 			ScoreJob& j = *group[i];
 			FrameQueue& q = bc.at(i);
 			const FrameFeed feed = [&q](Picture& out) { return q.pop(out) ? 1 : 0; };
-			j.ok = vmaf_score(ref, feed, j.codec, j.encoded->packets, j.encoded->plan->enc, j.feed->shown, score_fmt, vo, so, j.scores, j.rp);
+			j.ok = vmaf_score(ref, feed, j.codec, j.encoded->packets, j.encoded->plan->enc, j.feed->shown, score_fmt, group_vo, so, j.scores, j.rp);
 			if (j.ok && (long long)j.scores.size() != j.feed->frames) { fprintf(stderr, "%zu scores for %lld frames\n", j.scores.size(), j.feed->frames); j.ok = false; }
 			q.cancel(); // done with the original frames: do not hold the producer back
 		});

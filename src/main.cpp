@@ -93,6 +93,7 @@ struct Run {
 	bool ignored = false;   // incompatible with the input or the encoder, so it was not run
 	std::string reason;
 	std::shared_ptr<RunProgress> progress;
+	double encode_s = 0, score_s = 0; // wall time of the encoding wave this run was in, and of the scoring wave
 	std::string gpu;        // name and driver of the GPU a GPU encoder ran on
 	double penalty = 0;     // VMAF points deducted for exceeding the target bitrate
 	double best_share = 0;  // share of frames where this run is at least as good as every other run of its group
@@ -688,9 +689,9 @@ int main(int argc, char** argv) {
 		r.penalty = std::max(0.0, r.kbps / r.bitrate - 1) * 100 * over_penalty;
 		std::vector<double> sc = r.scores;
 		std::sort(sc.begin(), sc.end());
-		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s", r.tag.c_str(), r.label.c_str(), r.kbps,
+		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s  [encode %.1fs, score %.1fs]", r.tag.c_str(), r.label.c_str(), r.kbps,
 		         std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size(), sc.front(), sc[(size_t)(sc.size() * 0.05)], r.cached ? " (cached)" : r.same ? " (same output as an earlier run)" : "",
-		         r.gpu.empty() ? "" : " on ", r.gpu.c_str());
+		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.score_s);
 		ui::log(line);
 	};
 
@@ -760,7 +761,10 @@ int main(int argc, char** argv) {
 			ui::log_plain(r.tag + " scoring   " + r.label);
 			to_score.push_back(&sjobs[i]);
 		}
+		const auto t_score = std::chrono::steady_clock::now();
 		if (!to_score.empty()) score_wave(w->tasks[0]->r.input, si, to_score, cfg.vo, cfg.scale);
+		const double score_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_score).count();
+		for (Task* t : w->tasks) t->r.score_s = score_s;
 		for (size_t i = 0; i < w->tasks.size(); i++) {
 			Task& t = *w->tasks[i];
 			Run& r = t.r;
@@ -804,7 +808,10 @@ int main(int argc, char** argv) {
 				w->handles.push_back(ui::attach(t.r.progress.get(), t.r.label, t.pool));
 			}
 			const int feed_handle = ui::attach(&w->feed_rp, "decode+convert " + fs::path(input).filename().string() + " to " + std::to_string(w->tasks[0]->plan.enc.w) + "x" + std::to_string(w->tasks[0]->plan.enc.h), "decode");
+			const auto t_enc = std::chrono::steady_clock::now();
 			encode_wave(input, si, ptrs, cfg.scale, &w->feed_rp, w->fr);
+			const double enc_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_enc).count();
+			for (Task* t : w->tasks) t->r.encode_s = enc_s;
 			ui::detach(feed_handle);
 			if (scoring.joinable()) scoring.join();
 			scoring = std::thread([&, w] { score_and_finish(w); });

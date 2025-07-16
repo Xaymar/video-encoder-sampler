@@ -82,6 +82,8 @@ public:
 		if (!c) { fprintf(stderr, "no software decoder for this video\n"); return false; }
 		dec = avcodec_alloc_context3(c);
 		avcodec_parameters_to_context(dec, st->codecpar);
+		dec->thread_count = 0; // every core: the library decodes on one thread unless told otherwise
+		dec->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
 		if (avcodec_open2(dec, c, nullptr) < 0) { fprintf(stderr, "decoder open failed\n"); return false; }
 		width = dec->width; height = dec->height;
 		framerate = from_av(av_guess_frame_rate(ctx, st, nullptr));

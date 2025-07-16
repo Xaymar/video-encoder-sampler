@@ -18,6 +18,7 @@
 
 #include "formats.h"
 #include "gpu.h"
+#include "repack.h"
 
 #include <windows.h>
 #include <vpl/mfx.h>
@@ -147,14 +148,8 @@ class Qsv : public Encoder {
 				else { uint8_t* px = d.V + (size_t)row * pitch + 4 * x; px[0] = (uint8_t)v; px[1] = (uint8_t)u; px[2] = (uint8_t)y; px[3] = 255; }
 			}
 		} else {
-			// NV12 / P010: interleaved chroma; 10-bit samples go in the top bits of 16, so they are shifted left by 6.
-			auto put = [&](uint8_t* line, int x, int v) { if (sample == 1) line[x] = (uint8_t)v; else ((uint16_t*)line)[x] = (uint16_t)(v << 6); };
-			for (int row = 0; row < h; row++) for (int x = 0; x < w; x++) put(d.Y + (size_t)row * pitch, x, get(0, row, x));
-			for (int row = 0; row < (h + 1) / 2; row++) for (int x = 0; x < (w + 1) / 2; x++) {
-				uint8_t* line = d.UV + (size_t)row * pitch;
-				put(line, 2 * x, get(1, row, x));
-				put(line, 2 * x + 1, get(2, row, x));
-			}
+			pack_plane(*fr, 0, w, h, depth, d.Y, pitch);
+			pack_uv(*fr, w, h, depth, d.UV, pitch);
 		}
 		d.TimeStamp = (mfxU64)fr->pts;
 	}

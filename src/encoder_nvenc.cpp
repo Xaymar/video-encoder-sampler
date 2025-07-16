@@ -15,6 +15,7 @@
 
 #include "formats.h"
 #include "gpu.h"
+#include "repack.h"
 
 #include <windows.h>
 
@@ -307,24 +308,13 @@ public:
 	// Copies the planar frame into the layout NVENC wants: NV12 / P010 (interleaved chroma) or planar 4:4:4.
 	// 10-bit samples go in the top bits of 16, as NVENC expects, so each one is shifted left by 6.
 	void repack(const Picture* fr, uint8_t* dst, uint32_t pitch) const {
-		const int sample = depth > 8 ? 2 : 1;
-		auto put = [&](uint8_t* d, int x, int v) { if (sample == 1) d[x] = (uint8_t)v; else ((uint16_t*)d)[x] = (uint16_t)(v << 6); };
-		auto get = [&](const uint8_t* s, int x) { return sample == 1 ? (int)s[x] : (int)((const uint16_t*)s)[x]; };
-		auto plane = [&](int p, uint8_t* out, int pw, int ph) {
-			for (int y = 0; y < ph; y++) for (int x = 0; x < pw; x++) put(out + (size_t)y * pitch, x, get(fr->data[p] + (size_t)y * fr->stride[p], x));
-		};
-		plane(0, dst, w, h);
+		pack_plane(*fr, 0, w, h, depth, dst, pitch);
 		if (chroma == 444) {
-			plane(1, dst + (size_t)pitch * h, w, h);
-			plane(2, dst + (size_t)pitch * h * 2, w, h);
+			pack_plane(*fr, 1, w, h, depth, dst + (size_t)pitch * h, pitch);
+			pack_plane(*fr, 2, w, h, depth, dst + (size_t)pitch * h * 2, pitch);
 			return;
 		}
-		uint8_t* uv = dst + (size_t)pitch * h;
-		for (int y = 0; y < (h + 1) / 2; y++) {
-			const uint8_t *u = fr->data[1] + (size_t)y * fr->stride[1], *v = fr->data[2] + (size_t)y * fr->stride[2];
-			uint8_t* row = uv + (size_t)y * pitch;
-			for (int x = 0; x < (w + 1) / 2; x++) { put(row, 2 * x, get(u, x)); put(row, 2 * x + 1, get(v, x)); }
-		}
+		pack_uv(*fr, w, h, depth, dst + (size_t)pitch * h, pitch);
 	}
 
 	// Waits for the event, giving up when the encoder is being torn down.

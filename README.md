@@ -52,7 +52,7 @@ ves <input> <encoder> <codec> <bitrate-kbps[,..]> [key=value[,value..] ...]
 | `-i`, `--input <path>` | an input video or a directory of videos (`.mkv`, `.mp4`, `.mov`); replaces the config file's inputs, can be repeated |
 | `-o`, `--output <dir>` | where the results go, `output` by default: the encoded stream of every run in `<dir>/<input name>/` (`.h264`, `.h265` or `.ivf` for AV1, numbered like the runs) and one result file `<dir>/<input name>.json` per input. `off` writes nothing, `--no-videos` skips the streams |
 | `-c`, `--cache <dir>` | where finished runs are kept (`cache`); `off` disables it |
-| `--vmaf-model`, `--vmaf-threads`, `--over-penalty` | scoring |
+| `--vmaf-model`, `--vmaf-threads`, `--over-penalty` | scoring; `--vmaf-threads` defaults to 0, all cores shared between the runs scored at the same time |
 | `-enc`, `-cd`, `-br`, `-res`, `-fps`, `--kf`, `--option key=a,b` ... | a quick run without a config file, e.g. `ves -i clip.mkv -enc x264 -br 3000,6000 --option preset=fast,medium` |
 
 The result file lists, for every input, each group (bitrate target and key frame interval) with all its runs: label, encoder, codec, options, resolution and frame rate, actual bitrate, overshoot penalty, share of frames in which the run is the best, whether it reached the threshold (`winner`), VMAF mean, minimum and 5th percentile, GPU, whether it came from the cache, and the stream file. Runs that failed are listed under `failed`. Runs taken from the cache have no stream, because nothing was encoded.
@@ -76,7 +76,7 @@ The file may contain comments (`// ...` and `/* ... */`) and trailing commas.
 	"scaling": { "upscaler": "ewa_lanczos", "downscaler": "ewa_lanczos" },
 	"cache": "cache",
 	"over_penalty": 0.025,
-	"vmaf": { "model": "path=models/vmaf_4k_v0.6.1.json", "threads": 4 },
+	"vmaf": { "model": "path=models/vmaf_4k_v0.6.1.json", "threads": 0 },
 	"encoders": [
 		{
 			"enabled": true,

@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "formats.h"
+#include "repack.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -83,17 +84,9 @@ class Amf : public Encoder {
 
 	// Planar frame into NV12 / P010 (interleaved chroma); 10-bit samples go in the top bits of 16, so they are shifted left by 6.
 	void repack(const Picture* fr, amf::AMFSurface* surf) const {
-		const int sample = depth > 8 ? 2 : 1;
-		auto put = [&](uint8_t* d, int x, int v) { if (sample == 1) d[x] = (uint8_t)v; else ((uint16_t*)d)[x] = (uint16_t)(v << 6); };
-		auto get = [&](const uint8_t* s, int x) { return sample == 1 ? (int)s[x] : (int)((const uint16_t*)s)[x]; };
 		amf::AMFPlane *yp = surf->GetPlaneAt(0), *uvp = surf->GetPlaneAt(1);
-		uint8_t *y = (uint8_t*)yp->GetNative(), *uv = (uint8_t*)uvp->GetNative();
-		for (int row = 0; row < h; row++) for (int x = 0; x < w; x++) put(y + (size_t)row * yp->GetHPitch(), x, get(fr->data[0] + (size_t)row * fr->stride[0], x));
-		for (int row = 0; row < (h + 1) / 2; row++) {
-			const uint8_t *u = fr->data[1] + (size_t)row * fr->stride[1], *v = fr->data[2] + (size_t)row * fr->stride[2];
-			uint8_t* out = uv + (size_t)row * uvp->GetHPitch();
-			for (int x = 0; x < (w + 1) / 2; x++) { put(out, 2 * x, get(u, x)); put(out, 2 * x + 1, get(v, x)); }
-		}
+		pack_plane(*fr, 0, w, h, depth, (uint8_t*)yp->GetNative(), yp->GetHPitch());
+		pack_uv(*fr, w, h, depth, (uint8_t*)uvp->GetNative(), uvp->GetHPitch());
 	}
 
 	void receive() {
