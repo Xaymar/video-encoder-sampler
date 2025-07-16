@@ -47,6 +47,8 @@ struct EncodeJob {
 	RunProgress* rp = nullptr;
 	// results
 	std::vector<std::vector<uint8_t>> packets;
+	std::vector<int64_t> pts;  // per packet: number of the frame in display order
+	std::vector<uint8_t> key;  // per packet: starts a key frame
 	double kbps = 0;
 	bool ok = false;
 };

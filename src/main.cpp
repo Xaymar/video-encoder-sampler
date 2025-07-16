@@ -27,6 +27,7 @@
 #include "convert.h"
 #include "json.h"
 #include "source.h"
+#include "mux.h"
 #include "pipeline.h"
 #include "ui.h"
 #include "vmaf.h"
@@ -247,7 +248,7 @@ Paths
   -i,   --input <path>      an input video or a directory with videos (.mkv, .mp4, .mov); replaces the
                             inputs of the config file; can be given more than once
   -o,   --output <dir>      where the results go (default: output): the encoded stream of every run in
-                            <dir>/<input>/ (.h264, .h265 or .ivf) and the result file <dir>/<input>.json;
+                            <dir>/<input>/ (fragmented .mp4) and the result file <dir>/<input>.json;
                             "off" writes nothing
         --no-videos         write the result files but not the encoded streams
         --plain             plain lines instead of the live display (also used when stdout is not a terminal)
@@ -391,23 +392,6 @@ static Codec codec_of(const std::string& encoder, const std::string& codec) {
 	if (encoder == "svtav1") return Codec::AV1;
 	if (is_native_encoder(encoder)) return codec == "h264" ? Codec::H264 : codec == "hevc" ? Codec::HEVC : codec == "av1" ? Codec::AV1 : Codec::None;
 	return Codec::None;
-}
-
-// H.264 and HEVC are written as plain Annex B streams, AV1 as IVF; players and FFmpeg read both.
-static bool save_stream(const std::string& path, Codec id, const std::vector<std::vector<uint8_t>>& packets, const Shape& enc) {
-	std::ofstream f(path, std::ios::binary);
-	if (!f) return false;
-	auto put = [&](uint64_t v, int n) { for (int i = 0; i < n; i++) f.put((char)(v >> (8 * i))); };
-	if (id == Codec::AV1) {
-		f.write("DKIF", 4); put(0, 2); put(32, 2); f.write("AV01", 4);
-		put(enc.w, 2); put(enc.h, 2); put(enc.fps.num, 4); put(enc.fps.den, 4); put(packets.size(), 4); put(0, 4);
-	}
-	uint64_t n = 0;
-	for (auto& p : packets) {
-		if (id == Codec::AV1) { put(p.size(), 4); put(n++, 8); }
-		f.write((const char*)p.data(), (std::streamsize)p.size());
-	}
-	return (bool)f;
 }
 
 static std::string sanitize(std::string s, size_t max = 100) {
@@ -623,7 +607,7 @@ int main(int argc, char** argv) {
 			if (!cfg.output_dir.empty() && cfg.save_videos) {
 				char idx[16];
 				snprintf(idx, sizeof idx, "%04zu", tasks.size());
-				t.r.video = sanitize(fs::path(input).stem().string()) + "/" + idx + "_" + sanitize(t.r.label) + (id == Codec::AV1 ? ".ivf" : id == Codec::HEVC ? ".h265" : ".h264");
+				t.r.video = sanitize(fs::path(input).stem().string()) + "/" + idx + "_" + sanitize(t.r.label) + ".mp4";
 				t.r.video_file = (fs::path(cfg.output_dir) / t.r.video).string();
 				std::error_code ec;
 				fs::create_directories(fs::path(t.r.video_file).parent_path(), ec);
@@ -747,7 +731,7 @@ int main(int argc, char** argv) {
 			EncodeJob& ej = w->jobs[i];
 			if (!ej.ok) continue;
 			r.kbps = ej.kbps;
-			if (!r.video_file.empty() && !save_stream(r.video_file, t.id, ej.packets, t.plan.enc)) { fprintf(stderr, "cannot write %s\n", r.video_file.c_str()); r.video.clear(); }
+			if (!r.video_file.empty() && !write_mp4(r.video_file, t.id, t.plan.enc, si.color, ej.packets, ej.pts, ej.key)) { fprintf(stderr, "cannot write %s\n", r.video_file.c_str()); r.video.clear(); }
 			char hex[17];
 			snprintf(hex, sizeof hex, "%016llx", (unsigned long long)hash_packets(ej.packets));
 			const std::string same_key = keys[i] = r.group + "|" + hex;

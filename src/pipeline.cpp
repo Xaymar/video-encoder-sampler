@@ -186,7 +186,7 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
 	p.options = pl.options;
 	auto codec = make_encoder(job.encoder);
 	// Packets arrive in coding order, which is also the order the decoder needs them.
-	if (!codec || !codec->open(p, [&](const uint8_t* d, size_t n, int64_t, bool) { job.packets.emplace_back(d, d + n); })) { q.cancel(); return; }
+	if (!codec || !codec->open(p, [&](const uint8_t* d, size_t n, int64_t pts, bool key) { job.packets.emplace_back(d, d + n); job.pts.push_back(pts); job.key.push_back(key); })) { q.cancel(); return; }
 	bool ok = true;
 	for (Picture pic; q.pop(pic);) {
 		if (ok && !(ok = codec->encode(&pic))) q.cancel(); // frees the producer if it is waiting for room
