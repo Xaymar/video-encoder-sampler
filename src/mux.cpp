@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "ff.h"
+#include "spool.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -66,9 +67,24 @@ std::vector<uint8_t> av1_sequence_header(const std::vector<uint8_t>& d) {
 
 } // namespace
 
-bool write_mp4(const std::string& path, Codec codec, const Shape& enc, const Color& color, const std::vector<std::vector<uint8_t>>& packets,
-               const std::vector<int64_t>& pts, const std::vector<uint8_t>& key) {
-	if (packets.empty() || pts.size() != packets.size() || key.size() != packets.size()) return false;
+bool write_mp4(const std::string& path, Codec codec, const Shape& enc, const Color& color, const std::string& spool_path) {
+	// First pass: the display numbers and the first packet. The delay B-frames put between coding and display order has to be known
+	// before the first packet is written, so it takes a look at the whole stream; the payloads are skipped.
+	std::vector<int64_t> pts;
+	std::vector<uint8_t> first;
+	int64_t lead = 0;
+	{
+		SpoolReader scan;
+		if (!scan.open(spool_path)) return false;
+		int64_t p;
+		for (bool more = scan.next(pts.empty() ? &first : nullptr, &p); more; more = scan.next(nullptr, &p)) {
+			lead = std::max<int64_t>(lead, (int64_t)pts.size() - p);
+			pts.push_back(p);
+		}
+	}
+	if (pts.empty()) return false;
+	SpoolReader packets;
+	if (!packets.open(spool_path)) return false;
 	const AVCodecID id = codec == Codec::H264 ? AV_CODEC_ID_H264 : codec == Codec::HEVC ? AV_CODEC_ID_HEVC : codec == Codec::AV1 ? AV_CODEC_ID_AV1 : AV_CODEC_ID_NONE;
 	if (id == AV_CODEC_ID_NONE) return false;
 
@@ -89,7 +105,7 @@ bool write_mp4(const std::string& path, Codec codec, const Shape& enc, const Col
 		cp->color_primaries = (AVColorPrimaries)color.primaries;
 		cp->color_trc = (AVColorTransferCharacteristic)color.trc;
 		// The header boxes (avcC, hvcC, av1C) are built from the parameter sets, which the first packet carries.
-		const std::vector<uint8_t> extra = id == AV_CODEC_ID_AV1 ? av1_sequence_header(packets[0]) : annexb_headers(packets[0], codec);
+		const std::vector<uint8_t> extra = id == AV_CODEC_ID_AV1 ? av1_sequence_header(first) : annexb_headers(first, codec);
 		if (extra.empty()) { fprintf(stderr, "mp4: no parameter sets in the first packet\n"); break; }
 		cp->extradata = (uint8_t*)av_mallocz(extra.size() + AV_INPUT_BUFFER_PADDING_SIZE);
 		if (!cp->extradata) break;
@@ -104,18 +120,20 @@ bool write_mp4(const std::string& path, Codec codec, const Shape& enc, const Col
 
 		// B-frames put the display time behind the coding time; shifting both by the largest lead keeps every decode time at or before
 		// its display time without negative values.
-		int64_t lead = 0;
-		for (size_t i = 0; i < packets.size(); i++) lead = std::max<int64_t>(lead, (int64_t)i - pts[i]);
 		ok = true;
-		for (size_t i = 0; ok && i < packets.size(); i++) {
+		std::vector<uint8_t> data;
+		bool is_key = false;
+		for (size_t i = 0; ok && i < pts.size(); i++) {
+			int64_t unused;
+			if (!packets.next(&data, &unused, &is_key)) { ok = false; break; }
 			AVPacket* pkt = av_packet_alloc();
-			if (!pkt || av_new_packet(pkt, (int)packets[i].size()) < 0) { av_packet_free(&pkt); ok = false; break; }
-			memcpy(pkt->data, packets[i].data(), packets[i].size());
+			if (!pkt || av_new_packet(pkt, (int)data.size()) < 0) { av_packet_free(&pkt); ok = false; break; }
+			memcpy(pkt->data, data.data(), data.size());
 			pkt->stream_index = 0;
 			pkt->dts = (int64_t)i;
 			pkt->pts = pts[i] + lead;
 			pkt->duration = 1;
-			if (key[i]) pkt->flags |= AV_PKT_FLAG_KEY;
+			if (is_key) pkt->flags |= AV_PKT_FLAG_KEY;
 			av_packet_rescale_ts(pkt, tb, st->time_base);
 			ok = av_interleaved_write_frame(oc, pkt) >= 0;
 			av_packet_free(&pkt);

@@ -13,6 +13,7 @@
 #include <thread>
 
 #include <windows.h>
+#include <psapi.h>
 
 namespace {
 
@@ -214,6 +215,11 @@ void log(const std::string& line) {
 void log_plain(const std::string& line) {
 	std::lock_guard lock(m);
 	if (!is_live) { printf("%s\n", line.c_str()); fflush(stdout); }
+}
+
+long long peak_memory_mb() {
+	PROCESS_MEMORY_COUNTERS pmc{};
+	return K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? (long long)(pmc.PeakWorkingSetSize >> 20) : 0;
 }
 
 void overall(int done, int total) {

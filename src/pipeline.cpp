@@ -186,13 +186,16 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
 	p.options = pl.options;
 	auto codec = make_encoder(job.encoder);
 	// Packets arrive in coding order, which is also the order the decoder needs them.
-	if (!codec || !codec->open(p, [&](const uint8_t* d, size_t n, int64_t pts, bool key) { job.packets.emplace_back(d, d + n); job.pts.push_back(pts); job.key.push_back(key); })) { q.cancel(); return; }
+	SpoolWriter spool;
+	if (!spool.open(job.spool)) { fprintf(stderr, "cannot write %s\n", job.spool.c_str()); q.cancel(); return; }
+	if (!codec || !codec->open(p, [&](const uint8_t* d, size_t n, int64_t pts, bool key) { spool.add(d, n, pts, key); })) { q.cancel(); return; }
 	bool ok = true;
 	for (Picture pic; q.pop(pic);) {
 		if (ok && !(ok = codec->encode(&pic))) q.cancel(); // frees the producer if it is waiting for room
 		else if (job.rp) job.rp->step();
 	}
-	job.ok = ok && codec->encode(nullptr);
+	job.ok = ok && codec->encode(nullptr) && spool.close();
+	job.output = spool.info();
 	job.kbps = codec->stats.bytes * 8 / si.duration / 1000;
 }
 
@@ -250,7 +253,10 @@ void score_wave(const std::string& input, const SourceInfo& si, std::vector<Scor
 			ScoreJob& j = *group[i];
 			FrameQueue& q = bc.at(i);
 			const FrameFeed feed = [&q](Picture& out) { return q.pop(out) ? 1 : 0; };
-			j.ok = vmaf_score(ref, feed, j.codec, j.encoded->packets, j.encoded->plan->enc, j.feed->shown, score_fmt, group_vo, so, j.scores, j.rp);
+			SpoolReader packets;
+			if (!packets.open(j.encoded->spool)) { fprintf(stderr, "cannot read %s\n", j.encoded->spool.c_str()); q.cancel(); return; }
+			const PacketFeed next_packet = [&packets](std::vector<uint8_t>& out) { return packets.next(&out); };
+			j.ok = vmaf_score(ref, feed, j.codec, next_packet, j.encoded->plan->enc, j.feed->shown, score_fmt, group_vo, so, j.scores, j.rp);
 			if (j.ok && (long long)j.scores.size() != j.feed->frames) { fprintf(stderr, "%zu scores for %lld frames\n", j.scores.size(), j.feed->frames); j.ok = false; }
 			q.cancel(); // done with the original frames: do not hold the producer back
 		});

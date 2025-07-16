@@ -58,6 +58,14 @@ Picture picture_from_frame(AVFrame* frame, const Fmt& fmt) {
 	return p;
 }
 
+int decode_threads() {
+	static const int n = [] {
+		if (const char* e = getenv("VES_DECODE_THREADS")) return atoi(e);
+		return 4;
+	}();
+	return n;
+}
+
 const AVCodec* software_decoder(AVCodecID id) {
 	void* it = nullptr;
 	while (const AVCodec* c = av_codec_iterate(&it))

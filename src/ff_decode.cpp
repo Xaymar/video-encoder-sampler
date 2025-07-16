@@ -31,7 +31,7 @@ public:
 		// Without VUI reorder info the H.264 decoder guesses the B-frame depth and can drop or misorder early frames;
 		// strict mode makes it assume the maximum, so every frame comes out in display order.
 		if (ctx) ctx->strict_std_compliance = FF_COMPLIANCE_STRICT;
-		if (ctx) { ctx->thread_count = 0; ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE; } // every core
+		if (ctx) { ctx->thread_count = decode_threads(); ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE; }
 		if (!ctx || avcodec_open2(ctx, c, nullptr) < 0) { fprintf(stderr, "no decoder for encoded stream\n"); return false; }
 		return true;
 	}

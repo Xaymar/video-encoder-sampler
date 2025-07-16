@@ -71,7 +71,7 @@ public:
 
 } // namespace
 
-bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const std::vector<std::vector<uint8_t>>& packets, const Shape& enc,
+bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const PacketFeed& next_packet, const Shape& enc,
                 const std::vector<uint32_t>& shown_map, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp) {
 	if (rp) rp->begin(2, (long long)shown_map.size());
 	auto decoder = make_decoder();
@@ -124,8 +124,8 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 		ok = ok && got >= 0;
 	};
 
-	for (size_t i = 0; ok && i < packets.size(); i++) {
-		ok = decoder->send(packets[i].data(), packets[i].size());
+	for (std::vector<uint8_t> packet; ok && next_packet(packet);) {
+		ok = decoder->send(packet.data(), packet.size());
 		if (ok) pump();
 	}
 	if (ok) { decoder->flush(); pump(); }

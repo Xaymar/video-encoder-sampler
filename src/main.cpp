@@ -73,6 +73,7 @@ struct Config {
 	std::string output_dir = "output"; // encoded streams and result files go here; empty: nothing is written
 	bool save_videos = true;
 	bool plain = false; // no live display, just lines
+	bool low_memory = false; // score a wave before encoding the next, and fewer VMAF threads
 	std::vector<Job> jobs;
 };
 
@@ -203,6 +204,7 @@ static void load_config(const std::string& path, Config& cfg) {
 	}
 	if (auto* v = root.find("cache")) cfg.cache_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "cache" : "") : v->text();
 	if (auto* v = root.find("output")) cfg.output_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "output" : "") : v->text();
+	if (auto* v = root.find("low_memory")) cfg.low_memory = v->text() == "1" || v->text() == "true";
 	if (auto* v = root.find("videos")) cfg.save_videos = !(v->text() == "0" || v->text() == "false");
 	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str());
 	if (auto* v = root.find("vmaf")) {
@@ -251,6 +253,7 @@ Paths
                             <dir>/<input>/ (fragmented .mp4) and the result file <dir>/<input>.json;
                             "off" writes nothing
         --no-videos         write the result files but not the encoded streams
+        --low-memory        score each wave before the next is encoded and use fewer VMAF threads: slower, takes much less memory
         --plain             plain lines instead of the live display (also used when stdout is not a terminal)
   -c,   --cache <dir>       finished runs are kept here and not repeated (default: cache); "off" disables it
 
@@ -342,6 +345,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "-o" || a == "--output") output = value();
 		else if (a == "--no-videos") videos = false;
 		else if (a == "--plain") cfg.plain = true;
+		else if (a == "--low-memory") cfg.low_memory = true;
 		else if (a == "-c" || a == "--cache") cache = value();
 		else if (a == "--vmaf-model") model = value();
 		else if (a == "--vmaf-threads") threads = atoi(value().c_str());
@@ -400,12 +404,6 @@ static std::string sanitize(std::string s, size_t max = 100) {
 	return s;
 }
 
-static uint64_t hash_packets(const std::vector<std::vector<uint8_t>>& packets) { // FNV-1a over every packet and its size
-	uint64_t h = 1469598103934665603ull;
-	auto mix = [&](uint8_t b) { h = (h ^ b) * 1099511628211ull; };
-	for (auto& p : packets) { for (int i = 0; i < 8; i++) mix((uint8_t)((uint64_t)p.size() >> (8 * i))); for (uint8_t b : p) mix(b); }
-	return h;
-}
 
 // Runs whose encoders produced the very same bytes decode to the very same frames, so they share one set of scores.
 static std::mutex same_mutex;
@@ -518,7 +516,7 @@ static std::vector<Options> option_sets(const Config& cfg, const std::string& in
 			ui::detach(h1);
 			ui::detach(h2);
 			if (!ej.ok) return std::nullopt;
-			return hash_packets(ej.packets);
+			return ej.output.hash;
 		};
 		std::string dropped;
 		auto kept = screen(free, base, probe, dropped);
@@ -559,6 +557,7 @@ int main(int argc, char** argv) {
 	} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
 	if (cfg.inputs.empty() || cfg.scenarios.empty() || cfg.jobs.empty()) { fprintf(stderr, "error: need inputs, bitrates and at least one enabled encoder (see --help)\n"); return 1; }
 
+	if (cfg.low_memory && cfg.vo.threads <= 0) cfg.vo.threads = 2;
 	ui::start(cfg.plain);
 	struct UiGuard { ~UiGuard() { ui::stop(); } } ui_guard; // the live display is cleared on every way out
 
@@ -731,9 +730,9 @@ int main(int argc, char** argv) {
 			EncodeJob& ej = w->jobs[i];
 			if (!ej.ok) continue;
 			r.kbps = ej.kbps;
-			if (!r.video_file.empty() && !write_mp4(r.video_file, t.id, t.plan.enc, si.color, ej.packets, ej.pts, ej.key)) { fprintf(stderr, "cannot write %s\n", r.video_file.c_str()); r.video.clear(); }
+			if (!r.video_file.empty() && !write_mp4(r.video_file, t.id, t.plan.enc, si.color, ej.spool)) { fprintf(stderr, "cannot write %s\n", r.video_file.c_str()); r.video.clear(); }
 			char hex[17];
-			snprintf(hex, sizeof hex, "%016llx", (unsigned long long)hash_packets(ej.packets));
+			snprintf(hex, sizeof hex, "%016llx", (unsigned long long)ej.output.hash);
 			const std::string same_key = keys[i] = r.group + "|" + hex;
 			{
 				std::lock_guard lock(same_mutex);
@@ -763,10 +762,15 @@ int main(int argc, char** argv) {
 				t.ok = true;
 			}
 			ui::detach(w->handles[i]);
+			std::error_code ec;
+			fs::remove(w->jobs[i].spool, ec);
 			finish(t);
 		}
 	};
 
+	// Encoded packets live on disk while a run is scored, not in memory; next to the results if there are any, else in the temp folder.
+	const fs::path spool_dir = (cfg.output_dir.empty() ? fs::temp_directory_path() : fs::path(cfg.output_dir)) / (".ves-spool-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+	{ std::error_code ec; fs::create_directories(spool_dir, ec); }
 	std::thread scoring;
 	for (auto& fk : feed_order) {
 		std::map<std::string, std::vector<Task*>> by_pool;
@@ -787,6 +791,7 @@ int main(int argc, char** argv) {
 				EncodeJob& ej = w->jobs[i];
 				ej.encoder = t.job->encoder; ej.codec = t.job->codec; ej.plan = &t.plan;
 				ej.bitrate = t.r.bitrate * 1000; ej.kf = t.r.kf; ej.rp = t.r.progress.get();
+				ej.spool = (spool_dir / ("run" + std::to_string(&t - tasks.data()) + ".spool")).string();
 				ptrs.push_back(&ej);
 				ui::log_plain(t.r.tag + " encoding  " + t.r.label + "  (" + fs::path(input).filename().string() + ", " + std::to_string(t.r.bitrate) + " kbps, pool " + t.pool + ")");
 				w->handles.push_back(ui::attach(t.r.progress.get(), t.r.label, t.pool));
@@ -799,9 +804,11 @@ int main(int argc, char** argv) {
 			ui::detach(feed_handle);
 			if (scoring.joinable()) scoring.join();
 			scoring = std::thread([&, w] { score_and_finish(w); });
+			if (cfg.low_memory) scoring.join();
 		}
 	}
 	if (scoring.joinable()) scoring.join();
+	{ std::error_code ec; fs::remove_all(spool_dir, ec); }
 	ui::stop();
 
 	// Collect in task order so the ranking below does not depend on which run finished first.
@@ -879,6 +886,7 @@ int main(int argc, char** argv) {
 			else fprintf(stderr, "cannot write %s\n", file.string().c_str());
 		}
 	}
+	printf("\nPeak memory use: %lld MB\n", ui::peak_memory_mb());
 	if (ignored) printf("\n%d runs were ignored: they cannot work with the input or the encoder (see the result files)\n", ignored);
 	return failed ? 2 : 0;
 }

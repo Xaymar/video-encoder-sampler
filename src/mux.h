@@ -6,7 +6,7 @@
 
 #include "picture.h"
 
-// `packets` are in coding order as the encoder produced them (H.264 and HEVC as Annex B, AV1 as temporal units), `pts[i]` is
-// the number of the frame in display order, `key[i]` whether the packet starts a key frame. `enc` gives size and frame rate.
-bool write_mp4(const std::string& path, Codec codec, const Shape& enc, const Color& color, const std::vector<std::vector<uint8_t>>& packets,
-               const std::vector<int64_t>& pts, const std::vector<uint8_t>& key);
+// The packets come from a spool file (spool.h), in coding order as the encoder produced them (H.264 and HEVC as Annex B, AV1 as
+// temporal units) with their frame number in display order and whether they start a key frame. `enc` gives size and frame rate.
+// Only one packet at a time is held in memory.
+bool write_mp4(const std::string& path, Codec codec, const Shape& enc, const Color& color, const std::string& spool_path);

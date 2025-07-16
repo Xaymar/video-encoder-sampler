@@ -28,4 +28,5 @@ void detach(int handle);
 void log(const std::string& line);             // a permanent line
 void log_plain(const std::string& line);       // only in plain mode: detail the live area already shows
 void overall(int done, int total);             // runs finished out of all of them
+long long peak_memory_mb();                    // largest working set of this process so far
 }

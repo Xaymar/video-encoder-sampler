@@ -10,6 +10,7 @@
 #include "convert.h"
 #include "encoder.h"
 #include "picture.h"
+#include "spool.h"
 #include "ui.h"
 #include "vmaf.h"
 
@@ -46,9 +47,8 @@ struct EncodeJob {
 	double kf = 2.0;     // key frame interval, seconds
 	RunProgress* rp = nullptr;
 	// results
-	std::vector<std::vector<uint8_t>> packets;
-	std::vector<int64_t> pts;  // per packet: number of the frame in display order
-	std::vector<uint8_t> key;  // per packet: starts a key frame
+	std::string spool;         // where the packets are kept while the run is scored; empty: only counted and hashed
+	SpoolInfo output;          // what the encoder produced
 	double kbps = 0;
 	bool ok = false;
 };
