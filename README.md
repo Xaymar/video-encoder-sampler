@@ -158,5 +158,6 @@ Replacing FFmpeg would mean providing another implementation of those two interf
 ## Current Limitations
 * Encoders are told one constant frame rate (the source's, or the measured average for a variable frame rate source) and get frames numbered in order; only the dropping of frames and the scoring follow the real timestamps.
 * SVT-AV1 is not deterministic: the same options give slightly different bitrates and scores from run to run (a few tenths of a VMAF point on a short clip). Compare its results with that in mind.
+* Old GPUs that hand back several frames in one packet, or one frame in several packets (AMF before RDNA1, QuickSync before 11th generation, NVENC on Maxwell and earlier), are not supported and untested: the MP4 timestamps assume one packet per frame, so they come out wrong there. Fixing that is left to whoever needs those cards.
 * 4:1:0, 4:1:1 and 4:4:0 sources are treated as 4:2:0, and 16-bit or gray sources are not supported.
 * Input videos should be properly tagged.
