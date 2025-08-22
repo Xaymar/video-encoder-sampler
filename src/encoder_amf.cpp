@@ -57,6 +57,7 @@ class Amf : public Encoder {
 	// Finished packets are collected on a thread of their own; AMF has no blocking read, so it polls.
 	std::thread rx;
 	std::atomic<bool> eof{false}, stop{false};
+	int b_delay = 0;
 
 	bool fail(AMF_RESULT r, const char* what) {
 		fprintf(stderr, "amf: %s failed (result %d)\n", what, (int)r);
@@ -97,7 +98,7 @@ class Amf : public Encoder {
 			if (r != AMF_OK || !data) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; } // AMF_REPEAT: nothing ready yet
 			amf::AMFBufferPtr buf(data);
 			stats.packets++; stats.bytes += buf->GetSize();
-			if (sink) sink((const uint8_t*)buf->GetNative(), buf->GetSize(), data->GetPts(), false);
+			if (sink) sink((const uint8_t*)buf->GetNative(), buf->GetSize(), data->GetPts(), false, NO_DTS);
 		}
 	}
 
@@ -161,9 +162,13 @@ public:
 		for (auto& [k, v] : o) if (!set(k, v)) return false;
 
 		if ((r = enc->Init(depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init");
+		amf::AMFVariant bp;
+		if (enc->GetProperty(L"BPicturesPattern", &bp) == AMF_OK && bp.ToInt64() > 0) b_delay = (int)bp.ToInt64() + 1; // H.264; the other codecs have no such property
 		rx = std::thread([this] { receive(); });
 		return true;
 	}
+
+	int reorder_delay() const override { return b_delay; }
 
 	bool encode(const Picture* fr) override {
 		AMF_RESULT r;

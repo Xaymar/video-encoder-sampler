@@ -28,5 +28,5 @@ using PacketFeed = std::function<bool(std::vector<uint8_t>&)>; // the next encod
 // `enc` is the geometry and pixel format the packets were encoded at; `shown[k]` is the number of the encoded frame
 // that is on screen at original frame k (dropped frames are held). Decoded frames are converted to `score_fmt` as well.
 // `scores` receives one VMAF value per original frame.
-bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const PacketFeed& next_packet, const Shape& enc,
+bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const PacketFeed& next_packet, const std::vector<uint8_t>& extradata, const Shape& enc,
                 const std::vector<uint32_t>& shown, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp = nullptr);

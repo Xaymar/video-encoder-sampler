@@ -25,11 +25,16 @@ struct Stats {
 
 class Encoder {
 public:
-	using Sink = std::function<void(const uint8_t* data, size_t size, int64_t pts, bool key)>;
+	// `dts` is the decode time the encoder reports in the same units as `pts`, or NO_DTS if it does not report one.
+	static constexpr int64_t NO_DTS = INT64_MIN;
+	using Sink = std::function<void(const uint8_t* data, size_t size, int64_t pts, bool key, int64_t dts)>;
 
 	virtual ~Encoder() = default;
 	virtual bool open(const Params&, Sink) = 0;
 	virtual bool encode(const Picture*) = 0; // nullptr flushes
+	// How many frames the display order can lag behind the coding order (B-frame depth), valid after open(); only needed from encoders
+	// that report no DTS, so that a muxer can offset the display times.
+	virtual int reorder_delay() const { return 0; }
 	Stats stats;
 };
 

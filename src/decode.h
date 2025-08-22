@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "picture.h"
 
@@ -9,7 +10,7 @@
 class Decoder {
 public:
 	virtual ~Decoder() = default;
-	virtual bool open(Codec codec) = 0;
+	virtual bool open(Codec codec, const std::vector<uint8_t>& extradata = {}) = 0; // extradata: avcC, hvcC or av1C when the packets come from an MP4
 	virtual bool send(const uint8_t* data, size_t size) = 0; // one encoded access unit
 	virtual bool flush() = 0;                                // no more input
 	virtual int receive(Picture& out) = 0;                   // 1: frame produced, 0: none ready, <0: error

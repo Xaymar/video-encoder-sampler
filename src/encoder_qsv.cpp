@@ -66,7 +66,7 @@ class Qsv : public Encoder {
 	mfxBitstream bs{};
 	std::deque<Surface> pool; // stable addresses; a surface is free when the runtime no longer holds a lock on it
 	Sink sink;
-	int w = 0, h = 0, depth = 8, chroma = 420, pitch = 0;
+	int w = 0, h = 0, depth = 8, chroma = 420, pitch = 0, b_delay = 0;
 	bool eof = false;
 
 	struct Field { void* p; int size; };
@@ -158,7 +158,7 @@ class Qsv : public Encoder {
 		mfxStatus r = a.MFXVideoCORE_SyncOperation(session, sp, 60000);
 		if (r < 0) return fail(r, "SyncOperation");
 		stats.packets++; stats.bytes += bs.DataLength;
-		if (sink) sink(bs.Data + bs.DataOffset, bs.DataLength, (int64_t)bs.TimeStamp, (bs.FrameType & MFX_FRAMETYPE_IDR) != 0);
+		if (sink) sink(bs.Data + bs.DataOffset, bs.DataLength, (int64_t)bs.TimeStamp, (bs.FrameType & MFX_FRAMETYPE_IDR) != 0, NO_DTS);
 		bs.DataOffset = 0; bs.DataLength = 0;
 		return true;
 	}
@@ -241,10 +241,13 @@ public:
 		mfxVideoParam got{};
 		got.mfx.CodecId = codec;
 		if ((r = a.MFXVideoENCODE_GetVideoParam(session, &got)) < 0) return fail(r, "GetVideoParam");
+		b_delay = (int)got.mfx.GopRefDist > 1 ? (int)got.mfx.GopRefDist - 1 : 0; // the runtime reports the distance it settled on
 		bits.resize((size_t)std::max<mfxU32>(got.mfx.BufferSizeInKB, 1024) * std::max<mfxU16>(got.mfx.BRCParamMultiplier, 1) * 1000);
 		bs.Data = bits.data(); bs.MaxLength = (mfxU32)bits.size();
 		return true;
 	}
+
+	int reorder_delay() const override { return b_delay; }
 
 	bool encode(const Picture* fr) override {
 		mfxFrameSurface1* s = nullptr;

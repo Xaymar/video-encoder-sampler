@@ -730,7 +730,6 @@ int main(int argc, char** argv) {
 			EncodeJob& ej = w->jobs[i];
 			if (!ej.ok) continue;
 			r.kbps = ej.kbps;
-			if (!r.video_file.empty() && !write_mp4(r.video_file, t.id, t.plan.enc, si.color, ej.spool)) { fprintf(stderr, "cannot write %s\n", r.video_file.c_str()); r.video.clear(); }
 			char hex[17];
 			snprintf(hex, sizeof hex, "%016llx", (unsigned long long)ej.output.hash);
 			const std::string same_key = keys[i] = r.group + "|" + hex;
@@ -763,13 +762,13 @@ int main(int argc, char** argv) {
 			}
 			ui::detach(w->handles[i]);
 			std::error_code ec;
-			fs::remove(w->jobs[i].spool, ec);
+			if (t.r.video_file.empty()) fs::remove(w->jobs[i].file, ec); // a temporary file for scoring
 			finish(t);
 		}
 	};
 
-	// Encoded packets live on disk while a run is scored, not in memory; next to the results if there are any, else in the temp folder.
-	const fs::path spool_dir = (cfg.output_dir.empty() ? fs::temp_directory_path() : fs::path(cfg.output_dir)) / (".ves-spool-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+	// Encoded packets are muxed to disk as they arrive and scored from there, not kept in memory; scratch files go next to the results if there are any, else in the temp folder.
+	const fs::path spool_dir = (cfg.output_dir.empty() ? fs::temp_directory_path() : fs::path(cfg.output_dir)) / (".ves-tmp-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 	{ std::error_code ec; fs::create_directories(spool_dir, ec); }
 	std::thread scoring;
 	for (auto& fk : feed_order) {
@@ -791,7 +790,8 @@ int main(int argc, char** argv) {
 				EncodeJob& ej = w->jobs[i];
 				ej.encoder = t.job->encoder; ej.codec = t.job->codec; ej.plan = &t.plan;
 				ej.bitrate = t.r.bitrate * 1000; ej.kf = t.r.kf; ej.rp = t.r.progress.get();
-				ej.spool = (spool_dir / ("run" + std::to_string(&t - tasks.data()) + ".spool")).string();
+				ej.file = !t.r.video_file.empty() ? t.r.video_file : (spool_dir / ("run" + std::to_string(&t - tasks.data()) + ".mp4")).string();
+				ej.id = t.id; ej.color = si.color;
 				ptrs.push_back(&ej);
 				ui::log_plain(t.r.tag + " encoding  " + t.r.label + "  (" + fs::path(input).filename().string() + ", " + std::to_string(t.r.bitrate) + " kbps, pool " + t.pool + ")");
 				w->handles.push_back(ui::attach(t.r.progress.get(), t.r.label, t.pool));

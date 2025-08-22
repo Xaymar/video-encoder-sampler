@@ -47,7 +47,7 @@ class SvtAv1 : public Encoder {
 			if (r != EB_ErrorNone || !pkt) { fprintf(stderr, "svtav1: get_packet failed (%d)\n", (int)r); rx_ok = false; return; }
 			if (pkt->n_filled_len > 0) {
 				stats.packets++; stats.bytes += pkt->n_filled_len;
-				if (sink) sink(pkt->p_buffer, pkt->n_filled_len, pkt->pts, pkt->pic_type == EB_AV1_KEY_PICTURE);
+				if (sink) sink(pkt->p_buffer, pkt->n_filled_len, pkt->pts, pkt->pic_type == EB_AV1_KEY_PICTURE, pkt->dts);
 			}
 			const bool eos = pkt->flags & EB_BUFFERFLAG_EOS;
 			svt_av1_enc_release_out_buffer(&pkt);

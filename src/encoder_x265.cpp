@@ -28,7 +28,7 @@ class X265 : public Encoder {
 		for (uint32_t i = 0; i < n; i++) bytes += nal[i].sizeBytes;
 		stats.packets++; stats.bytes += bytes;
 		// NAL payloads are contiguous, so the first one points at the whole access unit.
-		if (sink) sink(nal[0].payload, bytes, out->pts, IS_X265_TYPE_I(out->sliceType));
+		if (sink) sink(nal[0].payload, bytes, out->pts, IS_X265_TYPE_I(out->sliceType), out->dts);
 	}
 
 public:

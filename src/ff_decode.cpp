@@ -24,7 +24,7 @@ public:
 		avcodec_free_context(&ctx);
 	}
 
-	bool open(Codec codec) override {
+	bool open(Codec codec, const std::vector<uint8_t>& extradata) override {
 		AVCodecID id = codec == Codec::H264 ? AV_CODEC_ID_H264 : codec == Codec::HEVC ? AV_CODEC_ID_HEVC : codec == Codec::AV1 ? AV_CODEC_ID_AV1 : AV_CODEC_ID_NONE;
 		const AVCodec* c = id == AV_CODEC_ID_NONE ? nullptr : software_decoder(id);
 		ctx = c ? avcodec_alloc_context3(c) : nullptr;
@@ -32,6 +32,10 @@ public:
 		// strict mode makes it assume the maximum, so every frame comes out in display order.
 		if (ctx) ctx->strict_std_compliance = FF_COMPLIANCE_STRICT;
 		if (ctx) { ctx->thread_count = decode_threads(); ctx->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE; }
+		if (ctx && !extradata.empty()) {
+			ctx->extradata = (uint8_t*)av_mallocz(extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE);
+			if (ctx->extradata) { memcpy(ctx->extradata, extradata.data(), extradata.size()); ctx->extradata_size = (int)extradata.size(); }
+		}
 		if (!ctx || avcodec_open2(ctx, c, nullptr) < 0) { fprintf(stderr, "no decoder for encoded stream\n"); return false; }
 		return true;
 	}

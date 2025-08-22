@@ -26,7 +26,7 @@ class X264 : public Encoder {
 		if (bytes <= 0) return true;
 		stats.packets++; stats.bytes += bytes;
 		// NAL payloads are contiguous, so the first one points at the whole access unit.
-		if (sink) sink(nal[0].p_payload, (size_t)bytes, out.i_pts, out.b_keyframe != 0);
+		if (sink) sink(nal[0].p_payload, (size_t)bytes, out.i_pts, out.b_keyframe != 0, out.i_dts);
 		return true;
 	}
 

@@ -10,9 +10,20 @@
 #include "convert.h"
 #include "encoder.h"
 #include "picture.h"
-#include "spool.h"
 #include "ui.h"
 #include "vmaf.h"
+
+// Count, size and a hash of an encoder's packets: equal hashes, equal streams.
+struct OutputInfo {
+	long long count = 0, bytes = 0;
+	uint64_t hash = 1469598103934665603ull; // FNV-1a over every packet and its size
+	void add(const uint8_t* d, size_t n) {
+		for (int i = 0; i < 8; i++) hash = (hash ^ (uint8_t)((uint64_t)n >> (8 * i))) * 1099511628211ull;
+		for (size_t i = 0; i < n; i++) hash = (hash ^ d[i]) * 1099511628211ull;
+		count++;
+		bytes += (long long)n;
+	}
+};
 
 // How many converted frames may wait in front of an encoder (or scorer).
 constexpr size_t DECODE_AHEAD = 8;
@@ -47,8 +58,10 @@ struct EncodeJob {
 	double kf = 2.0;     // key frame interval, seconds
 	RunProgress* rp = nullptr;
 	// results
-	std::string spool;         // where the packets are kept while the run is scored; empty: only counted and hashed
-	SpoolInfo output;          // what the encoder produced
+	std::string file;          // the fragmented MP4 the packets are written to as they arrive; empty: they are only counted and hashed
+	Codec id = Codec::None;
+	Color color;
+	OutputInfo output;         // what the encoder produced
 	double kbps = 0;
 	bool ok = false;
 };

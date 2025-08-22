@@ -5,7 +5,6 @@
 #include <cstring>
 
 #include "ff.h"
-#include "spool.h"
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -67,81 +66,108 @@ std::vector<uint8_t> av1_sequence_header(const std::vector<uint8_t>& d) {
 
 } // namespace
 
-bool write_mp4(const std::string& path, Codec codec, const Shape& enc, const Color& color, const std::string& spool_path) {
-	// First pass: the display numbers and the first packet. The delay B-frames put between coding and display order has to be known
-	// before the first packet is written, so it takes a look at the whole stream; the payloads are skipped.
-	std::vector<int64_t> pts;
-	std::vector<uint8_t> first;
-	int64_t lead = 0;
-	{
-		SpoolReader scan;
-		if (!scan.open(spool_path)) return false;
-		int64_t p;
-		for (bool more = scan.next(pts.empty() ? &first : nullptr, &p); more; more = scan.next(nullptr, &p)) {
-			lead = std::max<int64_t>(lead, (int64_t)pts.size() - p);
-			pts.push_back(p);
-		}
+Mp4Writer::~Mp4Writer() {
+	if (oc) {
+		if (oc->pb) avio_closep(&oc->pb);
+		avformat_free_context(oc);
 	}
-	if (pts.empty()) return false;
-	SpoolReader packets;
-	if (!packets.open(spool_path)) return false;
-	const AVCodecID id = codec == Codec::H264 ? AV_CODEC_ID_H264 : codec == Codec::HEVC ? AV_CODEC_ID_HEVC : codec == Codec::AV1 ? AV_CODEC_ID_AV1 : AV_CODEC_ID_NONE;
-	if (id == AV_CODEC_ID_NONE) return false;
+}
 
-	AVFormatContext* oc = nullptr;
-	if (avformat_alloc_output_context2(&oc, nullptr, "mp4", path.c_str()) < 0 || !oc) return false;
-	bool ok = false;
+bool Mp4Writer::open(const std::string& path, Codec codec, const Shape& enc, const Color& color, int delay_hint) {
+	path_ = path; codec_ = codec; enc_ = enc; color_ = color; hint_ = delay_hint;
+	return codec == Codec::H264 || codec == Codec::HEVC || codec == Codec::AV1;
+}
+
+// The header boxes (avcC, hvcC, av1C) are built from the parameter sets, which the first packet carries.
+bool Mp4Writer::start(const uint8_t* first, size_t size) {
+	const AVCodecID id = codec_ == Codec::H264 ? AV_CODEC_ID_H264 : codec_ == Codec::HEVC ? AV_CODEC_ID_HEVC : AV_CODEC_ID_AV1;
+	if (avformat_alloc_output_context2(&oc, nullptr, "mp4", path_.c_str()) < 0 || !oc) return false;
+	st = avformat_new_stream(oc, nullptr);
+	if (!st) return false;
+	AVCodecParameters* cp = st->codecpar;
+	cp->codec_type = AVMEDIA_TYPE_VIDEO;
+	cp->codec_id = id;
+	cp->width = enc_.w; cp->height = enc_.h;
+	cp->format = av_planar_format(enc_.pix.chroma, enc_.pix.depth);
+	cp->color_range = (AVColorRange)color_.range;
+	cp->color_space = (AVColorSpace)color_.space;
+	cp->color_primaries = (AVColorPrimaries)color_.primaries;
+	cp->color_trc = (AVColorTransferCharacteristic)color_.trc;
+	const std::vector<uint8_t> data(first, first + size);
+	const std::vector<uint8_t> extra = id == AV_CODEC_ID_AV1 ? av1_sequence_header(data) : annexb_headers(data, codec_);
+	if (extra.empty()) { fprintf(stderr, "mp4: no parameter sets in the first packet\n"); return false; }
+	cp->extradata = (uint8_t*)av_mallocz(extra.size() + AV_INPUT_BUFFER_PADDING_SIZE);
+	if (!cp->extradata) return false;
+	memcpy(cp->extradata, extra.data(), extra.size());
+	cp->extradata_size = (int)extra.size();
+	st->time_base = AVRational{enc_.fps.den, enc_.fps.num}; // one tick per frame
+	st->avg_frame_rate = AVRational{enc_.fps.num, enc_.fps.den};
+	if (avio_open(&oc->pb, path_.c_str(), AVIO_FLAG_WRITE) < 0) return false;
 	AVDictionary* opts = nullptr;
-	do {
-		AVStream* st = avformat_new_stream(oc, nullptr);
-		if (!st) break;
-		AVCodecParameters* cp = st->codecpar;
-		cp->codec_type = AVMEDIA_TYPE_VIDEO;
-		cp->codec_id = id;
-		cp->width = enc.w; cp->height = enc.h;
-		cp->format = av_planar_format(enc.pix.chroma, enc.pix.depth);
-		cp->color_range = (AVColorRange)color.range;
-		cp->color_space = (AVColorSpace)color.space;
-		cp->color_primaries = (AVColorPrimaries)color.primaries;
-		cp->color_trc = (AVColorTransferCharacteristic)color.trc;
-		// The header boxes (avcC, hvcC, av1C) are built from the parameter sets, which the first packet carries.
-		const std::vector<uint8_t> extra = id == AV_CODEC_ID_AV1 ? av1_sequence_header(first) : annexb_headers(first, codec);
-		if (extra.empty()) { fprintf(stderr, "mp4: no parameter sets in the first packet\n"); break; }
-		cp->extradata = (uint8_t*)av_mallocz(extra.size() + AV_INPUT_BUFFER_PADDING_SIZE);
-		if (!cp->extradata) break;
-		memcpy(cp->extradata, extra.data(), extra.size());
-		cp->extradata_size = (int)extra.size();
-		const AVRational tb{enc.fps.den, enc.fps.num}; // one tick per frame
-		st->time_base = tb;
-		st->avg_frame_rate = AVRational{enc.fps.num, enc.fps.den};
-		if (avio_open(&oc->pb, path.c_str(), AVIO_FLAG_WRITE) < 0) break;
-		av_dict_set(&opts, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
-		if (avformat_write_header(oc, &opts) < 0) break;
-
-		// B-frames put the display time behind the coding time; shifting both by the largest lead keeps every decode time at or before
-		// its display time without negative values.
-		ok = true;
-		std::vector<uint8_t> data;
-		bool is_key = false;
-		for (size_t i = 0; ok && i < pts.size(); i++) {
-			int64_t unused;
-			if (!packets.next(&data, &unused, &is_key)) { ok = false; break; }
-			AVPacket* pkt = av_packet_alloc();
-			if (!pkt || av_new_packet(pkt, (int)data.size()) < 0) { av_packet_free(&pkt); ok = false; break; }
-			memcpy(pkt->data, data.data(), data.size());
-			pkt->stream_index = 0;
-			pkt->dts = (int64_t)i;
-			pkt->pts = pts[i] + lead;
-			pkt->duration = 1;
-			if (is_key) pkt->flags |= AV_PKT_FLAG_KEY;
-			av_packet_rescale_ts(pkt, tb, st->time_base);
-			ok = av_interleaved_write_frame(oc, pkt) >= 0;
-			av_packet_free(&pkt);
-		}
-		ok = ok && av_write_trailer(oc) >= 0;
-	} while (false);
+	av_dict_set(&opts, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
+	const int r = avformat_write_header(oc, &opts);
 	av_dict_free(&opts);
+	return r >= 0;
+}
+
+bool Mp4Writer::add(const uint8_t* data, size_t size, int64_t pts, bool key, int64_t dts) {
+	if (failed) return false;
+	if (!started) {
+		// Times are shifted so that no decode time is negative: by what the encoder's first DTS says, or by the B-frame depth.
+		reported = dts != INT64_MIN;
+		shift = reported ? std::max<int64_t>(0, -dts) : hint_;
+		if (!(started = start(data, size))) { failed = true; return false; }
+	}
+	int64_t d = reported ? dts + shift : index;
+	if (d <= last_dts) d = last_dts + 1; // decode times must increase
+	int64_t p = pts + shift;
+	if (p < d) { // the encoder reordered more than it said
+		if (!warned) { fprintf(stderr, "mp4: display time before decode time, the reorder depth was underestimated\n"); warned = true; }
+		p = d;
+	}
+	last_dts = d;
+	index++;
+	AVPacket* pkt = av_packet_alloc();
+	if (!pkt || av_new_packet(pkt, (int)size) < 0) { av_packet_free(&pkt); failed = true; return false; }
+	memcpy(pkt->data, data, size);
+	pkt->stream_index = 0;
+	pkt->dts = d;
+	pkt->pts = p;
+	pkt->duration = 1;
+	if (key) pkt->flags |= AV_PKT_FLAG_KEY;
+	av_packet_rescale_ts(pkt, AVRational{enc_.fps.den, enc_.fps.num}, st->time_base);
+	const bool ok = av_interleaved_write_frame(oc, pkt) >= 0;
+	av_packet_free(&pkt);
+	if (!ok) failed = true;
+	return ok;
+}
+
+bool Mp4Writer::close() {
+	if (!oc) return false;
+	const bool ok = !failed && av_write_trailer(oc) >= 0;
 	if (oc->pb) avio_closep(&oc->pb);
 	avformat_free_context(oc);
+	oc = nullptr;
+	return ok;
+}
+
+Mp4Reader::~Mp4Reader() { if (ic) avformat_close_input(&ic); }
+
+bool Mp4Reader::open(const std::string& path) {
+	if (avformat_open_input(&ic, path.c_str(), nullptr, nullptr) < 0) return false;
+	if (avformat_find_stream_info(ic, nullptr) < 0 || ic->nb_streams < 1) return false;
+	const AVCodecParameters* cp = ic->streams[0]->codecpar;
+	if (cp->extradata && cp->extradata_size > 0) extra_.assign(cp->extradata, cp->extradata + cp->extradata_size);
+	return true;
+}
+
+bool Mp4Reader::next(std::vector<uint8_t>& out) {
+	AVPacket* pkt = av_packet_alloc();
+	bool ok = false;
+	while (pkt && av_read_frame(ic, pkt) >= 0) {
+		if (pkt->stream_index == 0) { out.assign(pkt->data, pkt->data + pkt->size); ok = true; av_packet_unref(pkt); break; }
+		av_packet_unref(pkt);
+	}
+	av_packet_free(&pkt);
 	return ok;
 }

@@ -71,11 +71,11 @@ public:
 
 } // namespace
 
-bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const PacketFeed& next_packet, const Shape& enc,
+bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const PacketFeed& next_packet, const std::vector<uint8_t>& extradata, const Shape& enc,
                 const std::vector<uint32_t>& shown_map, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp) {
 	if (rp) rp->begin(2, (long long)shown_map.size());
 	auto decoder = make_decoder();
-	if (!decoder->open(codec)) return false;
+	if (!decoder->open(codec, extradata)) return false;
 
 	const bool convert_dis = enc.w != ref.width || enc.h != ref.height || enc.pix != score_fmt; // scale back, change format
 

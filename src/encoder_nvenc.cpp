@@ -127,6 +127,7 @@ class Nvenc : public Encoder {
 	Sink sink;
 	int w = 0, h = 0;
 	size_t delay = 0;
+	int b_delay = 0;
 
 	bool fail(NVENCSTATUS s, const char* what) {
 		const char* msg = enc ? f.nvEncGetLastErrorString(enc) : "";
@@ -278,6 +279,7 @@ public:
 
 		// Enough buffers to cover the reorder and lookahead delay.
 		delay = cfg.frameIntervalP + rc.lookaheadDepth + 3;
+		b_delay = (int)cfg.frameIntervalP > 1 ? (int)cfg.frameIntervalP - 1 : 0;
 		slots.resize(delay + 16);
 		for (auto& sl : slots) {
 			NV_ENC_CREATE_INPUT_BUFFER ci{};
@@ -353,7 +355,7 @@ public:
 				else {
 					stats.packets++; stats.bytes += lb.bitstreamSizeInBytes;
 					if (sink) sink((const uint8_t*)lb.bitstreamBufferPtr, lb.bitstreamSizeInBytes, (int64_t)lb.outputTimeStamp,
-						lb.pictureType == NV_ENC_PIC_TYPE_IDR || lb.pictureType == NV_ENC_PIC_TYPE_I);
+						lb.pictureType == NV_ENC_PIC_TYPE_IDR || lb.pictureType == NV_ENC_PIC_TYPE_I, NO_DTS);
 					f.nvEncUnlockBitstream(enc, s->out);
 				}
 			}
@@ -364,6 +366,8 @@ public:
 			cv.notify_all();
 		}
 	}
+
+	int reorder_delay() const override { return b_delay; }
 
 	bool encode(const Picture* fr) override {
 		NVENCSTATUS st;
