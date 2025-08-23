@@ -194,7 +194,7 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
 		job.output.add(d, n);
 		if (!job.file.empty() && !mp4.add(d, n, pts, key, dts)) write_failed = true;
 	})) { q.cancel(); return; }
-	if (!job.file.empty() && !mp4.open(job.file, job.id, pl.enc, job.color, codec->reorder_delay(), job.scratch)) { fprintf(stderr, "cannot write %s\n", job.file.c_str()); q.cancel(); return; }
+	if (!job.file.empty() && !mp4.open(job.file, job.id, pl.enc, job.color, codec->reorder_delay())) { fprintf(stderr, "cannot write %s\n", job.file.c_str()); q.cancel(); return; }
 	bool ok = true;
 	for (Picture pic; q.pop(pic);) {
 		if (ok && !(ok = codec->encode(&pic))) q.cancel(); // frees the producer if it is waiting for room

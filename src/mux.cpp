@@ -5,7 +5,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
-#include <map>
 #include <memory>
 
 #define NOMINMAX
@@ -73,17 +72,13 @@ std::vector<uint8_t> av1_sequence_header(const std::vector<uint8_t>& d) {
 
 } // namespace
 
-// File access for libavformat through Win32, with big buffers: the default 32 KB buffer turns a stream into thousands of small writes.
-// Scratch files get FILE_ATTRIBUTE_TEMPORARY, which tells the cache manager not to write them out unless memory runs short, so
-// they live in memory and only spill to disk under pressure.
+// File access for libavformat through memory-mapped files. The writer maps the file in windows and copies packets straight into
+// them, extending the file as it grows; the reader maps the finished file. The system's memory manager then decides what stays in
+// memory and what goes to storage, orders the writes, and reads ahead, instead of every packet going through a system call.
 namespace {
 
-constexpr int IO_BUFFER = 4 << 20;
-
-struct Win32File {
-	HANDLE h = INVALID_HANDLE_VALUE;
-	~Win32File() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
-};
+constexpr int IO_BUFFER = 1 << 20;
+constexpr uint64_t CHUNK = 64ull << 20; // size of a mapped window, a multiple of the allocation granularity; the file grows by this much
 
 std::wstring wide(const std::string& s) {
 	const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
@@ -92,46 +87,132 @@ std::wstring wide(const std::string& s) {
 	return w;
 }
 
-int io_write(void* o, const uint8_t* b, int n) {
-	DWORD w = 0;
-	return WriteFile(((Win32File*)o)->h, b, (DWORD)n, &w, nullptr) && (int)w == n ? n : AVERROR(EIO);
-}
+class Mapped {
+	HANDLE file = INVALID_HANDLE_VALUE, map = nullptr;
+	uint8_t* view = nullptr;
+	uint64_t view_off = 0, view_len = 0;
+	uint64_t pos = 0, size = 0, capacity = 0;
+	bool writing = false;
 
-int io_read(void* o, uint8_t* b, int n) {
-	DWORD r = 0;
-	if (!ReadFile(((Win32File*)o)->h, b, (DWORD)n, &r, nullptr)) return AVERROR(EIO);
-	return r ? (int)r : AVERROR_EOF;
-}
-
-int64_t io_seek(void* o, int64_t off, int whence) {
-	HANDLE h = ((Win32File*)o)->h;
-	if (whence & AVSEEK_SIZE) {
-		LARGE_INTEGER size;
-		return GetFileSizeEx(h, &size) ? size.QuadPart : AVERROR(EIO);
+	void unmap_view() {
+		if (view) UnmapViewOfFile(view);
+		view = nullptr;
+		view_len = 0;
 	}
-	LARGE_INTEGER to, now;
-	to.QuadPart = off;
-	const DWORD from = (whence & 3) == SEEK_SET ? FILE_BEGIN : (whence & 3) == SEEK_CUR ? FILE_CURRENT : FILE_END;
-	return SetFilePointerEx(h, to, &now, from) ? now.QuadPart : AVERROR(EIO);
-}
 
-// An AVIOContext over a file; the file and buffer go with it.
+	// Maps the window that holds `at`.
+	bool window(uint64_t at) {
+		if (view && at >= view_off && at < view_off + view_len) return true;
+		unmap_view();
+		view_off = at / CHUNK * CHUNK;
+		view_len = std::min<uint64_t>(CHUNK, capacity - view_off);
+		view = (uint8_t*)MapViewOfFile(map, writing ? FILE_MAP_WRITE : FILE_MAP_READ, (DWORD)(view_off >> 32), (DWORD)view_off, (SIZE_T)view_len);
+		if (!view) view_len = 0;
+		return view != nullptr;
+	}
+
+	bool grow(uint64_t need) {
+		const uint64_t cap = (need + CHUNK - 1) / CHUNK * CHUNK;
+		unmap_view();
+		if (map) { CloseHandle(map); map = nullptr; }
+		LARGE_INTEGER to;
+		to.QuadPart = (LONGLONG)cap;
+		if (!SetFilePointerEx(file, to, nullptr, FILE_BEGIN) || !SetEndOfFile(file)) return false;
+		capacity = cap;
+		map = CreateFileMappingW(file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+		return map != nullptr;
+	}
+
+public:
+	~Mapped() { close(); }
+
+	bool open(const std::string& path, bool write) {
+		writing = write;
+		file = CreateFileW(wide(path).c_str(), write ? GENERIC_READ | GENERIC_WRITE : GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+		                   write ? CREATE_ALWAYS : OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (file == INVALID_HANDLE_VALUE) return false;
+		if (write) return true; // mapped when the first bytes arrive
+		LARGE_INTEGER sz;
+		if (!GetFileSizeEx(file, &sz) || sz.QuadPart == 0) return false;
+		size = capacity = (uint64_t)sz.QuadPart;
+		map = CreateFileMappingW(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+		return map != nullptr;
+	}
+
+	int write_bytes(const uint8_t* b, int n) {
+		if (pos + (uint64_t)n > capacity && !grow(pos + (uint64_t)n)) return AVERROR(EIO);
+		int left = n;
+		while (left > 0) {
+			if (!window(pos)) return AVERROR(EIO);
+			const uint64_t here = std::min<uint64_t>((uint64_t)left, view_off + view_len - pos);
+			memcpy(view + (pos - view_off), b, (size_t)here);
+			b += here; pos += here; left -= (int)here;
+		}
+		size = std::max(size, pos);
+		return n;
+	}
+
+	int read_bytes(uint8_t* b, int n) {
+		if (pos >= size) return AVERROR_EOF;
+		const int total = (int)std::min<uint64_t>((uint64_t)n, size - pos);
+		int left = total;
+		while (left > 0) {
+			if (!window(pos)) return AVERROR(EIO);
+			const uint64_t here = std::min<uint64_t>((uint64_t)left, view_off + view_len - pos);
+			memcpy(b, view + (pos - view_off), (size_t)here);
+			b += here; pos += here; left -= (int)here;
+		}
+		return total;
+	}
+
+	int64_t seek(int64_t off, int whence) {
+		if (whence & AVSEEK_SIZE) return (int64_t)size;
+		switch (whence & 3) {
+		case SEEK_SET: pos = (uint64_t)off; break;
+		case SEEK_CUR: pos = (uint64_t)((int64_t)pos + off); break;
+		case SEEK_END: pos = (uint64_t)((int64_t)size + off); break;
+		default: return AVERROR(EINVAL);
+		}
+		return (int64_t)pos;
+	}
+
+	void close() {
+		unmap_view();
+		if (map) CloseHandle(map);
+		map = nullptr;
+		if (file != INVALID_HANDLE_VALUE) {
+			if (writing) { // the file was extended in whole windows; cut it back to what was written
+				LARGE_INTEGER to;
+				to.QuadPart = (LONGLONG)size;
+				SetFilePointerEx(file, to, nullptr, FILE_BEGIN);
+				SetEndOfFile(file);
+			}
+			CloseHandle(file);
+		}
+		file = INVALID_HANDLE_VALUE;
+	}
+};
+
+int io_write(void* o, const uint8_t* b, int n) { return ((Mapped*)o)->write_bytes(b, n); }
+int io_read(void* o, uint8_t* b, int n) { return ((Mapped*)o)->read_bytes(b, n); }
+int64_t io_seek(void* o, int64_t off, int whence) { return ((Mapped*)o)->seek(off, whence); }
+
+// An AVIOContext over a mapped file.
 struct Io {
-	std::unique_ptr<Win32File> file = std::make_unique<Win32File>();
+	Mapped file;
 	AVIOContext* ctx = nullptr;
 
-	bool open(const std::string& path, bool write, bool scratch) {
-		file->h = CreateFileW(wide(path).c_str(), write ? GENERIC_WRITE : GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-		                      write ? CREATE_ALWAYS : OPEN_EXISTING, (scratch ? FILE_ATTRIBUTE_TEMPORARY : FILE_ATTRIBUTE_NORMAL) | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-		if (file->h == INVALID_HANDLE_VALUE) return false;
+	bool open(const std::string& path, bool write) {
+		if (!file.open(path, write)) return false;
 		uint8_t* buf = (uint8_t*)av_malloc(IO_BUFFER);
 		if (!buf) return false;
-		ctx = avio_alloc_context(buf, IO_BUFFER, write, file.get(), write ? nullptr : io_read, write ? io_write : nullptr, io_seek);
+		ctx = avio_alloc_context(buf, IO_BUFFER, write, &file, write ? nullptr : io_read, write ? io_write : nullptr, io_seek);
 		if (!ctx) { av_free(buf); return false; }
 		return true;
 	}
 	~Io() {
 		if (!ctx) return;
+		avio_flush(ctx);
 		av_freep(&ctx->buffer);
 		avio_context_free(&ctx);
 	}
@@ -154,8 +235,8 @@ Mp4Writer::~Mp4Writer() {
 	delete impl;
 }
 
-bool Mp4Writer::open(const std::string& path, Codec codec, const Shape& enc, const Color& color, int delay_hint, bool scratch) {
-	path_ = path; codec_ = codec; enc_ = enc; color_ = color; hint_ = delay_hint; scratch_ = scratch;
+bool Mp4Writer::open(const std::string& path, Codec codec, const Shape& enc, const Color& color, int delay_hint) {
+	path_ = path; codec_ = codec; enc_ = enc; color_ = color; hint_ = delay_hint;
 	if (codec != Codec::H264 && codec != Codec::HEVC && codec != Codec::AV1) return false;
 	th = std::thread([this] { run(); });
 	return true;
@@ -186,7 +267,7 @@ bool Mp4Writer::start(const uint8_t* first, size_t size) {
 	st->time_base = AVRational{enc_.fps.den, enc_.fps.num}; // one tick per frame
 	st->avg_frame_rate = AVRational{enc_.fps.num, enc_.fps.den};
 	impl->io = std::make_unique<Io>();
-	if (!impl->io->open(path_, true, scratch_)) return false;
+	if (!impl->io->open(path_, true)) return false;
 	oc->pb = impl->io->ctx;
 	oc->flags |= AVFMT_FLAG_CUSTOM_IO;
 	AVDictionary* opts = nullptr;
@@ -284,7 +365,7 @@ Mp4Reader::~Mp4Reader() {
 
 bool Mp4Reader::open(const std::string& path) {
 	impl->io = std::make_unique<Io>();
-	if (!impl->io->open(path, false, false)) return false;
+	if (!impl->io->open(path, false)) return false;
 	ic = avformat_alloc_context();
 	if (!ic) return false;
 	ic->pb = impl->io->ctx;
