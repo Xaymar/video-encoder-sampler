@@ -61,6 +61,7 @@ struct EncodeJob {
 	std::string file;          // the fragmented MP4 the packets are written to as they arrive; empty: they are only counted and hashed
 	Codec id = Codec::None;
 	Color color;
+	bool scratch = false;      // the file is deleted after scoring
 	OutputInfo output;         // what the encoder produced
 	double kbps = 0;
 	bool ok = false;

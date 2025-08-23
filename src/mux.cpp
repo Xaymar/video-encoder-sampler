@@ -1,8 +1,15 @@
 #include "mux.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <memory>
+
+#define NOMINMAX
+#include <windows.h>
 
 #include "ff.h"
 
@@ -66,16 +73,92 @@ std::vector<uint8_t> av1_sequence_header(const std::vector<uint8_t>& d) {
 
 } // namespace
 
-Mp4Writer::~Mp4Writer() {
-	if (oc) {
-		if (oc->pb) avio_closep(&oc->pb);
-		avformat_free_context(oc);
-	}
+// File access for libavformat through Win32, with big buffers: the default 32 KB buffer turns a stream into thousands of small writes.
+// Scratch files get FILE_ATTRIBUTE_TEMPORARY, which tells the cache manager not to write them out unless memory runs short, so
+// they live in memory and only spill to disk under pressure.
+namespace {
+
+constexpr int IO_BUFFER = 4 << 20;
+
+struct Win32File {
+	HANDLE h = INVALID_HANDLE_VALUE;
+	~Win32File() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+};
+
+std::wstring wide(const std::string& s) {
+	const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+	std::wstring w((size_t)std::max(n, 1), L'\0');
+	MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
+	return w;
 }
 
-bool Mp4Writer::open(const std::string& path, Codec codec, const Shape& enc, const Color& color, int delay_hint) {
-	path_ = path; codec_ = codec; enc_ = enc; color_ = color; hint_ = delay_hint;
-	return codec == Codec::H264 || codec == Codec::HEVC || codec == Codec::AV1;
+int io_write(void* o, const uint8_t* b, int n) {
+	DWORD w = 0;
+	return WriteFile(((Win32File*)o)->h, b, (DWORD)n, &w, nullptr) && (int)w == n ? n : AVERROR(EIO);
+}
+
+int io_read(void* o, uint8_t* b, int n) {
+	DWORD r = 0;
+	if (!ReadFile(((Win32File*)o)->h, b, (DWORD)n, &r, nullptr)) return AVERROR(EIO);
+	return r ? (int)r : AVERROR_EOF;
+}
+
+int64_t io_seek(void* o, int64_t off, int whence) {
+	HANDLE h = ((Win32File*)o)->h;
+	if (whence & AVSEEK_SIZE) {
+		LARGE_INTEGER size;
+		return GetFileSizeEx(h, &size) ? size.QuadPart : AVERROR(EIO);
+	}
+	LARGE_INTEGER to, now;
+	to.QuadPart = off;
+	const DWORD from = (whence & 3) == SEEK_SET ? FILE_BEGIN : (whence & 3) == SEEK_CUR ? FILE_CURRENT : FILE_END;
+	return SetFilePointerEx(h, to, &now, from) ? now.QuadPart : AVERROR(EIO);
+}
+
+// An AVIOContext over a file; the file and buffer go with it.
+struct Io {
+	std::unique_ptr<Win32File> file = std::make_unique<Win32File>();
+	AVIOContext* ctx = nullptr;
+
+	bool open(const std::string& path, bool write, bool scratch) {
+		file->h = CreateFileW(wide(path).c_str(), write ? GENERIC_WRITE : GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+		                      write ? CREATE_ALWAYS : OPEN_EXISTING, (scratch ? FILE_ATTRIBUTE_TEMPORARY : FILE_ATTRIBUTE_NORMAL) | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+		if (file->h == INVALID_HANDLE_VALUE) return false;
+		uint8_t* buf = (uint8_t*)av_malloc(IO_BUFFER);
+		if (!buf) return false;
+		ctx = avio_alloc_context(buf, IO_BUFFER, write, file.get(), write ? nullptr : io_read, write ? io_write : nullptr, io_seek);
+		if (!ctx) { av_free(buf); return false; }
+		return true;
+	}
+	~Io() {
+		if (!ctx) return;
+		av_freep(&ctx->buffer);
+		avio_context_free(&ctx);
+	}
+};
+
+} // namespace
+
+struct Mp4Writer::Impl {
+	std::unique_ptr<Io> io;
+};
+
+Mp4Writer::Mp4Writer() : impl(new Impl) {}
+
+Mp4Writer::~Mp4Writer() {
+	if (th.joinable()) { { std::lock_guard lock(m); closing = true; } cv.notify_all(); th.join(); }
+	if (oc) {
+		oc->pb = nullptr; // the Io owns it
+		avformat_free_context(oc);
+	}
+	delete impl;
+}
+
+bool Mp4Writer::open(const std::string& path, Codec codec, const Shape& enc, const Color& color, int delay_hint, bool scratch) {
+	path_ = path; codec_ = codec; enc_ = enc; color_ = color; hint_ = delay_hint; scratch_ = scratch;
+	if (codec != Codec::H264 && codec != Codec::HEVC && codec != Codec::AV1) return false;
+	th = std::thread([this] { run(); });
+	return true;
 }
 
 // The header boxes (avcC, hvcC, av1C) are built from the parameter sets, which the first packet carries.
@@ -102,7 +185,10 @@ bool Mp4Writer::start(const uint8_t* first, size_t size) {
 	cp->extradata_size = (int)extra.size();
 	st->time_base = AVRational{enc_.fps.den, enc_.fps.num}; // one tick per frame
 	st->avg_frame_rate = AVRational{enc_.fps.num, enc_.fps.den};
-	if (avio_open(&oc->pb, path_.c_str(), AVIO_FLAG_WRITE) < 0) return false;
+	impl->io = std::make_unique<Io>();
+	if (!impl->io->open(path_, true, scratch_)) return false;
+	oc->pb = impl->io->ctx;
+	oc->flags |= AVFMT_FLAG_CUSTOM_IO;
 	AVDictionary* opts = nullptr;
 	av_dict_set(&opts, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
 	const int r = avformat_write_header(oc, &opts);
@@ -110,17 +196,16 @@ bool Mp4Writer::start(const uint8_t* first, size_t size) {
 	return r >= 0;
 }
 
-bool Mp4Writer::add(const uint8_t* data, size_t size, int64_t pts, bool key, int64_t dts) {
-	if (failed) return false;
+bool Mp4Writer::write(const Item& it) {
 	if (!started) {
 		// Times are shifted so that no decode time is negative: by what the encoder's first DTS says, or by the B-frame depth.
-		reported = dts != INT64_MIN;
-		shift = reported ? std::max<int64_t>(0, -dts) : hint_;
-		if (!(started = start(data, size))) { failed = true; return false; }
+		reported = it.dts != INT64_MIN;
+		shift = reported ? std::max<int64_t>(0, -it.dts) : hint_;
+		if (!(started = start(it.data.data(), it.data.size()))) return false;
 	}
-	int64_t d = reported ? dts + shift : index;
+	int64_t d = reported ? it.dts + shift : index;
 	if (d <= last_dts) d = last_dts + 1; // decode times must increase
-	int64_t p = pts + shift;
+	int64_t p = it.pts + shift;
 	if (p < d) { // the encoder reordered more than it said
 		if (!warned) { fprintf(stderr, "mp4: display time before decode time, the reorder depth was underestimated\n"); warned = true; }
 		p = d;
@@ -128,33 +213,83 @@ bool Mp4Writer::add(const uint8_t* data, size_t size, int64_t pts, bool key, int
 	last_dts = d;
 	index++;
 	AVPacket* pkt = av_packet_alloc();
-	if (!pkt || av_new_packet(pkt, (int)size) < 0) { av_packet_free(&pkt); failed = true; return false; }
-	memcpy(pkt->data, data, size);
+	if (!pkt || av_new_packet(pkt, (int)it.data.size()) < 0) { av_packet_free(&pkt); return false; }
+	memcpy(pkt->data, it.data.data(), it.data.size());
 	pkt->stream_index = 0;
 	pkt->dts = d;
 	pkt->pts = p;
 	pkt->duration = 1;
-	if (key) pkt->flags |= AV_PKT_FLAG_KEY;
+	if (it.key) pkt->flags |= AV_PKT_FLAG_KEY;
 	av_packet_rescale_ts(pkt, AVRational{enc_.fps.den, enc_.fps.num}, st->time_base);
 	const bool ok = av_interleaved_write_frame(oc, pkt) >= 0;
 	av_packet_free(&pkt);
-	if (!ok) failed = true;
 	return ok;
+}
+
+// The thread that does the muxing, so the encoder never waits for the disk: packets queue up to MAX_QUEUED bytes.
+void Mp4Writer::run() {
+	for (;;) {
+		Item it;
+		{
+			std::unique_lock lock(m);
+			cv.wait(lock, [&] { return !queue.empty() || closing; });
+			if (queue.empty()) return;
+			it = std::move(queue.front());
+			queue.pop_front();
+			queued -= it.data.size();
+			cv.notify_all();
+		}
+		if (!failed && !write(it)) failed = true;
+	}
+}
+
+bool Mp4Writer::add(const uint8_t* data, size_t size, int64_t pts, bool key, int64_t dts) {
+	if (failed) return false;
+	std::unique_lock lock(m);
+	cv.wait(lock, [&] { return queued < MAX_QUEUED || failed; });
+	queue.push_back(Item{std::vector<uint8_t>(data, data + size), pts, dts, key});
+	queued += size;
+	cv.notify_all();
+	return true;
 }
 
 bool Mp4Writer::close() {
-	if (!oc) return false;
-	const bool ok = !failed && av_write_trailer(oc) >= 0;
-	if (oc->pb) avio_closep(&oc->pb);
-	avformat_free_context(oc);
-	oc = nullptr;
+	if (!th.joinable()) return false;
+	{ std::lock_guard lock(m); closing = true; }
+	cv.notify_all();
+	th.join();
+	bool ok = !failed && started && oc && av_write_trailer(oc) >= 0;
+	if (oc) {
+		oc->pb = nullptr;
+		avformat_free_context(oc);
+		oc = nullptr;
+	}
+	impl->io.reset(); // flushes nothing more: the trailer went through avio already; closes the file
 	return ok;
 }
 
-Mp4Reader::~Mp4Reader() { if (ic) avformat_close_input(&ic); }
+struct Mp4Reader::Impl {
+	std::unique_ptr<Io> io;
+};
+
+Mp4Reader::Mp4Reader() : impl(new Impl) {}
+
+Mp4Reader::~Mp4Reader() {
+	if (ic) {
+		ic->pb = nullptr;
+		avformat_close_input(&ic);
+	}
+	delete impl;
+}
 
 bool Mp4Reader::open(const std::string& path) {
-	if (avformat_open_input(&ic, path.c_str(), nullptr, nullptr) < 0) return false;
+	impl->io = std::make_unique<Io>();
+	if (!impl->io->open(path, false, false)) return false;
+	ic = avformat_alloc_context();
+	if (!ic) return false;
+	ic->pb = impl->io->ctx;
+	ic->flags |= AVFMT_FLAG_CUSTOM_IO;
+	if (avformat_open_input(&ic, path.c_str(), nullptr, nullptr) < 0) { ic = nullptr; return false; }
 	if (avformat_find_stream_info(ic, nullptr) < 0 || ic->nb_streams < 1) return false;
 	const AVCodecParameters* cp = ic->streams[0]->codecpar;
 	if (cp->extradata && cp->extradata_size > 0) extra_.assign(cp->extradata, cp->extradata + cp->extradata_size);

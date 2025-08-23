@@ -791,7 +791,7 @@ int main(int argc, char** argv) {
 				ej.encoder = t.job->encoder; ej.codec = t.job->codec; ej.plan = &t.plan;
 				ej.bitrate = t.r.bitrate * 1000; ej.kf = t.r.kf; ej.rp = t.r.progress.get();
 				ej.file = !t.r.video_file.empty() ? t.r.video_file : (spool_dir / ("run" + std::to_string(&t - tasks.data()) + ".mp4")).string();
-				ej.id = t.id; ej.color = si.color;
+				ej.id = t.id; ej.color = si.color; ej.scratch = t.r.video_file.empty();
 				ptrs.push_back(&ej);
 				ui::log_plain(t.r.tag + " encoding  " + t.r.label + "  (" + fs::path(input).filename().string() + ", " + std::to_string(t.r.bitrate) + " kbps, pool " + t.pool + ")");
 				w->handles.push_back(ui::attach(t.r.progress.get(), t.r.label, t.pool));
