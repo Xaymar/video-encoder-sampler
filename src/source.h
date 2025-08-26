@@ -32,3 +32,6 @@ public:
 };
 
 std::unique_ptr<Source> open_source(const std::string& path); // nullptr if it cannot be opened
+
+// Threads per decoder: 0 for as many as there are cores. Each decodes a frame of its own, which is what makes high bitrate sources fast.
+void set_decode_threads(int threads);

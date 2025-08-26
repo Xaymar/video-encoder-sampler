@@ -73,6 +73,7 @@ struct Config {
 	std::string output_dir = "output"; // encoded streams and result files go here; empty: nothing is written
 	bool save_videos = true;
 	bool plain = false; // no live display, just lines
+	int decode_threads = 0;  // 0: as many as the cores allow within a memory budget
 	bool low_memory = false; // score a wave before encoding the next, and fewer VMAF threads
 	std::vector<Job> jobs;
 };
@@ -205,6 +206,7 @@ static void load_config(const std::string& path, Config& cfg) {
 	}
 	if (auto* v = root.find("cache")) cfg.cache_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "cache" : "") : v->text();
 	if (auto* v = root.find("output")) cfg.output_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "output" : "") : v->text();
+	if (auto* v = root.find("decode_threads")) cfg.decode_threads = atoi(v->text().c_str());
 	if (auto* v = root.find("low_memory")) cfg.low_memory = v->text() == "1" || v->text() == "true";
 	if (auto* v = root.find("videos")) cfg.save_videos = !(v->text() == "0" || v->text() == "false");
 	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str());
@@ -254,6 +256,7 @@ Paths
                             <dir>/<input>/ (fragmented .mp4) and the result file <dir>/<input>.json;
                             "off" writes nothing
         --no-videos         write the result files but not the encoded streams
+        --decode-threads <n> threads per decoder (default: all cores; 4 with --low-memory)
         --low-memory        score each wave before the next is encoded and use fewer VMAF threads: slower, takes much less memory
         --plain             plain lines instead of the live display (also used when stdout is not a terminal)
   -c,   --cache <dir>       finished runs are kept here and not repeated (default: cache); "off" disables it
@@ -347,6 +350,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--no-videos") videos = false;
 		else if (a == "--plain") cfg.plain = true;
 		else if (a == "--low-memory") cfg.low_memory = true;
+		else if (a == "--decode-threads") cfg.decode_threads = atoi(value().c_str());
 		else if (a == "-c" || a == "--cache") cache = value();
 		else if (a == "--vmaf-model") model = value();
 		else if (a == "--vmaf-threads") threads = atoi(value().c_str());
@@ -559,6 +563,7 @@ int main(int argc, char** argv) {
 	if (cfg.inputs.empty() || cfg.scenarios.empty() || cfg.jobs.empty()) { fprintf(stderr, "error: need inputs, bitrates and at least one enabled encoder (see --help)\n"); return 1; }
 
 	if (cfg.low_memory && cfg.vo.threads <= 0) cfg.vo.threads = 2;
+	set_decode_threads(cfg.decode_threads > 0 ? cfg.decode_threads : cfg.low_memory ? 4 : 0);
 	ui::start(cfg.plain);
 	struct UiGuard { ~UiGuard() { ui::stop(); } } ui_guard; // the live display is cleared on every way out
 

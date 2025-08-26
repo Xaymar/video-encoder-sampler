@@ -25,7 +25,7 @@ Layout layout_of(AVPixelFormat f);
 // A software decoder for the codec, never a hardware or hybrid one (those are less exact); nullptr if there is none.
 const AVCodec* software_decoder(AVCodecID id);
 
-// How many threads a decoder may use: every frame in flight is memory, so it is capped (VES_DECODE_THREADS overrides).
+// Threads for a decoder (see set_decode_threads()).
 int decode_threads();
 
 // Moves the frame's contents into a Picture that owns them.

@@ -1,4 +1,10 @@
 #include "ff.h"
+#include "source.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+#include <thread>
 
 #include <cstring>
 
@@ -58,12 +64,15 @@ Picture picture_from_frame(AVFrame* frame, const Fmt& fmt) {
 	return p;
 }
 
+static std::atomic<int> g_threads{0};
+
+void set_decode_threads(int threads) { g_threads = threads; }
+
+// All the cores by default: the pipeline never lets the decoder get more than a few frames ahead anyway.
 int decode_threads() {
-	static const int n = [] {
-		if (const char* e = getenv("VES_DECODE_THREADS")) return atoi(e);
-		return 4;
-	}();
-	return n;
+	if (const char* e = getenv("VES_DECODE_THREADS")) return atoi(e);
+	if (g_threads > 0) return g_threads;
+	return std::max(2, (int)std::thread::hardware_concurrency());
 }
 
 const AVCodec* software_decoder(AVCodecID id) {
