@@ -8,9 +8,13 @@
 
 // How far one run has got. Written by the run's threads, read by the UI.
 struct RunProgress {
-	std::atomic<int> stage{0};            // 0 waiting, 1 encoding, 2 scoring
+	std::atomic<int> stage{0};            // 0 waiting, 1 encoding, 2 scoring, 3 decoding (the shared decode feeding several runs)
 	std::atomic<long long> done{0}, total{0};
 	std::atomic<int64_t> since_ms{0};     // when the stage began, steady clock
+	// What the stage is doing when it is not working: 0 working, 1 starved (waiting for frames from upstream), 2 backed up (waiting for
+	// room downstream). The times add up over the stage; "busy" is time spent in the encoder or scorer itself.
+	std::atomic<int> state{0};
+	std::atomic<int64_t> busy_ms{0}, starved_ms{0}, blocked_ms{0};
 
 	void begin(int st, long long tot);
 	void step() { done++; }

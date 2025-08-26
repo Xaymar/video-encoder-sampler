@@ -1,6 +1,7 @@
 #include "pipeline.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -91,17 +92,29 @@ class FrameQueue {
 
 public:
 	explicit FrameQueue(size_t cap) : cap(cap) {}
-	bool push(Picture&& p) { // false once the consumer gave up
+	// Time spent waiting is added to the stage's counters, and the stage shows what it waits for.
+	template <class Pred> void wait_for(std::unique_lock<std::mutex>& lock, Pred pred, RunProgress* rp, int state, std::atomic<int64_t> RunProgress::*counter) {
+		if (pred()) return;
+		const auto t = std::chrono::steady_clock::now();
+		if (rp) rp->state = state;
+		cv.wait(lock, pred);
+		if (rp) {
+			rp->state = 0;
+			(rp->*counter) += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
+		}
+	}
+
+	bool push(Picture&& p, RunProgress* rp = nullptr) { // false once the consumer gave up; rp: the producer, backed up while the queue is full
 		std::unique_lock lock(m);
-		cv.wait(lock, [&] { return q.size() < cap || cancelled; });
+		wait_for(lock, [&] { return q.size() < cap || cancelled; }, rp, 2, &RunProgress::blocked_ms);
 		if (cancelled) return false;
 		q.push_back(std::move(p));
 		cv.notify_all();
 		return true;
 	}
-	bool pop(Picture& p) { // false when nothing more will come
+	bool pop(Picture& p, RunProgress* rp = nullptr) { // false when nothing more will come; rp: the consumer, starved while the queue is empty
 		std::unique_lock lock(m);
-		cv.wait(lock, [&] { return !q.empty() || closed; });
+		wait_for(lock, [&] { return !q.empty() || closed; }, rp, 1, &RunProgress::starved_ms);
 		if (q.empty()) return false;
 		p = std::move(q.front());
 		q.pop_front();
@@ -119,9 +132,9 @@ class Broadcast {
 public:
 	explicit Broadcast(size_t n) { for (size_t i = 0; i < n; i++) qs.push_back(std::make_unique<FrameQueue>(DECODE_AHEAD)); }
 	FrameQueue& at(size_t i) { return *qs[i]; }
-	bool push(const Picture& p) { // false once every consumer has given up
+	bool push(const Picture& p, RunProgress* rp = nullptr) { // false once every consumer has given up
 		bool any = false;
-		for (auto& q : qs) any |= q->push(Picture(p));
+		for (auto& q : qs) any |= q->push(Picture(p), rp);
 		return any;
 	}
 	void close() { for (auto& q : qs) q->close(); }
@@ -135,7 +148,7 @@ void produce(const std::string& input, const SourceInfo& si, const Plan& pl, con
 	auto src = open_source(input);
 	if (!src) { fprintf(stderr, "cannot open %s\n", input.c_str()); bc.close(); return; }
 	const Shape& enc = pl.enc;
-	if (rp) rp->begin(1, pl.convert_rate ? std::max<long long>(1, std::llround(si.duration * enc.fps.value())) : std::max<long long>(1, si.frame_count));
+	if (rp) rp->begin(3, pl.convert_rate ? std::max<long long>(1, std::llround(si.duration * enc.fps.value())) : std::max<long long>(1, si.frame_count));
 	auto scaler = make_converter();
 	Picture frame, scaled;
 	int64_t last_slot = -1;
@@ -144,7 +157,7 @@ void produce(const std::string& input, const SourceInfo& si, const Plan& pl, con
 	int r = 1;
 	auto queue_scaled = [&] {
 		int got;
-		while (ok && (got = scaler->pop(scaled)) == 1) ok = bc.push(scaled);
+		while (ok && (got = scaler->pop(scaled)) == 1) ok = bc.push(scaled, rp);
 		ok = ok && got >= 0;
 	};
 	while (ok && (r = src->next(frame)) == 1) {
@@ -156,7 +169,7 @@ void produce(const std::string& input, const SourceInfo& si, const Plan& pl, con
 		if (keep) {
 			frame.pts = kept++; // encoded frames are numbered consecutively, whatever the gaps in the source timing
 			frame.duration = 1; // one tick of the 1/enc.fps time base
-			if (!pl.rescale) ok = bc.push(frame);
+			if (!pl.rescale) ok = bc.push(frame, rp);
 			else {
 				if (frame.pts == 0) ok = scaler->open(frame, enc.fps.inverse(), enc.w, enc.h, enc.pix, so);
 				ok = ok && scaler->push(&frame);
@@ -196,11 +209,15 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
 	})) { q.cancel(); return; }
 	if (!job.file.empty() && !mp4.open(job.file, job.id, pl.enc, job.color, codec->reorder_delay())) { fprintf(stderr, "cannot write %s\n", job.file.c_str()); q.cancel(); return; }
 	bool ok = true;
-	for (Picture pic; q.pop(pic);) {
+	for (Picture pic; q.pop(pic, job.rp);) {
+		const auto t = std::chrono::steady_clock::now();
 		if (ok && !(ok = codec->encode(&pic))) q.cancel(); // frees the producer if it is waiting for room
 		else if (job.rp) job.rp->step();
+		if (job.rp) job.rp->busy_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
 	}
-	ok = ok && codec->encode(nullptr);
+	const auto t_flush = std::chrono::steady_clock::now();
+	ok = ok && codec->encode(nullptr); // the encoder finishing what it still holds counts as busy
+	if (job.rp) job.rp->busy_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_flush).count();
 	if (!job.file.empty() && !(mp4.close() && !write_failed)) { fprintf(stderr, "cannot write %s\n", job.file.c_str()); ok = false; }
 	job.ok = ok;
 	job.kbps = codec->stats.bytes * 8 / si.duration / 1000;
@@ -228,6 +245,9 @@ void score_wave(const std::string& input, const SourceInfo& si, std::vector<Scor
 		std::vector<ScoreJob*> group;
 		for (auto* j : jobs) if (j->encoded->plan->score_fmt == score_fmt) group.push_back(j);
 		Broadcast bc(group.size());
+		RunProgress ref_rp;
+		ref_rp.begin(3, std::max<long long>(1, si.frame_count));
+		const int ref_handle = ui::attach(&ref_rp, "reference decode " + std::to_string(si.width) + "x" + std::to_string(si.height), "decode");
 		std::thread ref_producer([&] {
 			auto src = open_source(input);
 			if (!src) { fprintf(stderr, "cannot open %s\n", input.c_str()); bc.close(); return; }
@@ -238,11 +258,12 @@ void score_wave(const std::string& input, const SourceInfo& si, std::vector<Scor
 			int r;
 			auto flush_converted = [&] {
 				int got;
-				while (ok && (got = conv->pop(o)) == 1) ok = bc.push(o);
+				while (ok && (got = conv->pop(o)) == 1) ok = bc.push(o, &ref_rp);
 				ok = ok && got >= 0;
 			};
 			while (ok && (r = src->next(t)) == 1) {
-				if (!convert) { ok = bc.push(t); continue; }
+				ref_rp.step();
+				if (!convert) { ok = bc.push(t, &ref_rp); continue; }
 				t.duration = 1;
 				if (first) { ok = conv->open(t, src->framerate.inverse(), src->width, src->height, score_fmt, so); first = false; }
 				ok = ok && conv->push(&t);
@@ -259,7 +280,7 @@ void score_wave(const std::string& input, const SourceInfo& si, std::vector<Scor
 		for (size_t i = 0; i < group.size(); i++) scorers.emplace_back([&, i] {
 			ScoreJob& j = *group[i];
 			FrameQueue& q = bc.at(i);
-			const FrameFeed feed = [&q](Picture& out) { return q.pop(out) ? 1 : 0; };
+			const FrameFeed feed = [&q, rp = j.rp](Picture& out) { return q.pop(out, rp) ? 1 : 0; };
 			Mp4Reader packets;
 			if (!packets.open(j.encoded->file)) { fprintf(stderr, "cannot read %s\n", j.encoded->file.c_str()); q.cancel(); return; }
 			const PacketFeed next_packet = [&packets](std::vector<uint8_t>& out) { return packets.next(out); };
@@ -269,5 +290,6 @@ void score_wave(const std::string& input, const SourceInfo& si, std::vector<Scor
 		});
 		for (auto& s : scorers) s.join();
 		ref_producer.join();
+		ui::detach(ref_handle);
 	}
 }

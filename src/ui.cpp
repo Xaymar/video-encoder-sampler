@@ -62,7 +62,7 @@ std::string fit(std::string s, int width) {
 
 // One line per run in flight.
 std::string run_line(const Entry& e, int width) {
-	static const char* names[] = {"wait ", "encode", "score "};
+	static const char* names[] = {"wait ", "encode", "score ", "decode"};
 	const int st = e.p->stage;
 	const long long done = e.p->done, total = e.p->total;
 	const double secs = std::max(0.001, (now_ms() - e.p->since_ms) / 1000.0);
@@ -70,7 +70,9 @@ std::string run_line(const Entry& e, int width) {
 	const int pct = total > 0 ? (int)std::min<long long>(100, done * 100 / total) : 0;
 	std::string bar(20, '-');
 	for (int i = 0; i < pct / 5; i++) bar[i] = '#';
-	snprintf(head, sizeof head, "%-9.9s %-6s [%s] %3d%% %5lld/%-5lld %6.1f fps  ", e.pool.c_str(), names[st < 3 ? st : 0], bar.c_str(), pct, done, total, done / secs);
+	static const char* waits[] = {"", "starved", "backed up"};
+	const int ws = e.p->state;
+	snprintf(head, sizeof head, "%-9.9s %-6s [%s] %3d%% %5lld/%-5lld %6.1f fps %-9s ", e.pool.c_str(), names[st >= 0 && st < 4 ? st : 0], bar.c_str(), pct, done, total, done / secs, waits[ws >= 0 && ws < 3 ? ws : 0]);
 	return fit(head + e.label, width);
 }
 
@@ -108,7 +110,9 @@ void plain_status() {
 	for (auto& [h, e] : entries) {
 		const long long total = e.p->total, done = e.p->done;
 		if (e.p->stage == 0 || total <= 0) continue;
-		printf("  %s %s: %lld%% (%lld/%lld frames)  %s\n", e.p->stage == 1 ? "encoding" : "scoring", e.pool.c_str(), done * 100 / total, done, total, e.label.c_str());
+		static const char* waits[] = {"", " [starved: waiting for frames]", " [backed up: waiting for room downstream]"};
+		const int ws = e.p->state;
+		printf("  %s %s: %lld%% (%lld/%lld frames)%s  %s\n", e.p->stage == 1 ? "encoding" : e.p->stage == 3 ? "decoding" : "scoring", e.pool.c_str(), done * 100 / total, done, total, waits[ws >= 0 && ws < 3 ? ws : 0], e.label.c_str());
 	}
 	fflush(stdout);
 }
@@ -147,6 +151,8 @@ void capture_stderr() {
 } // namespace
 
 void RunProgress::begin(int st, long long tot) {
+	busy_ms = starved_ms = blocked_ms = 0;
+	state = 0;
 	done = 0;
 	total = tot;
 	since_ms = now_ms();

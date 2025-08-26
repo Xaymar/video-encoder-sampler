@@ -96,6 +96,7 @@ struct Run {
 	std::string reason;
 	std::shared_ptr<RunProgress> progress;
 	double encode_s = 0, score_s = 0; // wall time of the encoding wave this run was in, and of the scoring wave
+	double enc_busy_s = 0, enc_starved_s = 0, decode_blocked_s = 0, score_starved_s = 0; // where that time went
 	std::string gpu;        // name and driver of the GPU a GPU encoder ran on
 	double penalty = 0;     // VMAF points deducted for exceeding the target bitrate
 	double best_share = 0;  // share of frames where this run is at least as good as every other run of its group
@@ -672,9 +673,9 @@ int main(int argc, char** argv) {
 		r.penalty = std::max(0.0, r.kbps / r.bitrate - 1) * 100 * over_penalty;
 		std::vector<double> sc = r.scores;
 		std::sort(sc.begin(), sc.end());
-		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s  [encode %.1fs, score %.1fs]", r.tag.c_str(), r.label.c_str(), r.kbps,
+		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s  [encode %.1fs: encoder busy %.1f, starved %.1f, decoder backed up %.1f | score %.1fs: scorer starved %.1f]", r.tag.c_str(), r.label.c_str(), r.kbps,
 		         std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size(), sc.front(), sc[(size_t)(sc.size() * 0.05)], r.cached ? " (cached)" : r.same ? " (same output as an earlier run)" : "",
-		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.score_s);
+		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.enc_busy_s, r.enc_starved_s, r.decode_blocked_s, r.score_s, r.score_starved_s);
 		ui::log(line);
 	};
 
@@ -746,7 +747,10 @@ int main(int argc, char** argv) {
 		const auto t_score = std::chrono::steady_clock::now();
 		if (!to_score.empty()) score_wave(w->tasks[0]->r.input, si, to_score, cfg.vo, cfg.scale);
 		const double score_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_score).count();
-		for (Task* t : w->tasks) t->r.score_s = score_s;
+		for (Task* t : w->tasks) {
+			t->r.score_s = score_s;
+			t->r.score_starved_s = t->r.progress->starved_ms / 1000.0;
+		}
 		for (size_t i = 0; i < w->tasks.size(); i++) {
 			Task& t = *w->tasks[i];
 			Run& r = t.r;
@@ -800,7 +804,12 @@ int main(int argc, char** argv) {
 			const auto t_enc = std::chrono::steady_clock::now();
 			encode_wave(input, si, ptrs, cfg.scale, &w->feed_rp, w->fr);
 			const double enc_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_enc).count();
-			for (Task* t : w->tasks) t->r.encode_s = enc_s;
+			for (Task* t : w->tasks) {
+				t->r.encode_s = enc_s;
+				t->r.enc_busy_s = t->r.progress->busy_ms / 1000.0;
+				t->r.enc_starved_s = t->r.progress->starved_ms / 1000.0;
+				t->r.decode_blocked_s = w->feed_rp.blocked_ms / 1000.0;
+			}
 			ui::detach(feed_handle);
 			if (scoring.joinable()) scoring.join();
 			scoring = std::thread([&, w] { score_and_finish(w); });
