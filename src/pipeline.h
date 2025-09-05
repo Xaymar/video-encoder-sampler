@@ -4,6 +4,9 @@
 // are encoded together as a "wave": one thread decodes and converts, every encoder has a thread that takes the frames from a
 // queue of its own, and the decoder stays at most DECODE_AHEAD frames ahead of the slowest encoder. Scoring works the same way:
 // one thread produces the original frames in the scoring format and every scorer takes them from its own queue.
+#include <condition_variable>
+#include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -62,28 +65,50 @@ struct EncodeJob {
 	Codec id = Codec::None;
 	Color color;
 	OutputInfo output;         // what the encoder produced
+	std::function<bool(const uint8_t*, size_t)> tee; // also gets every packet as it arrives (for scoring); false once nobody wants them
 	double kbps = 0;
 	bool ok = false;
 };
 
+// The frame map grows while the video is read, and scoring follows it.
+class ShownMap {
+	std::mutex m;
+	std::condition_variable cv;
+	std::vector<uint32_t> v;
+	bool done = false;
+
+public:
+	void push(uint32_t n) { std::lock_guard lock(m); v.push_back(n); cv.notify_all(); }
+	void finish() { std::lock_guard lock(m); done = true; cv.notify_all(); }
+	// The encoded frame on screen at source frame k; waits until that is known. False once k is past the last frame.
+	bool get(size_t k, uint32_t& n) {
+		std::unique_lock lock(m);
+		cv.wait(lock, [&] { return k < v.size() || done; });
+		if (k >= v.size()) return false;
+		n = v[k];
+		return true;
+	}
+};
+
 // What decoding and converting leaves for scoring; the same for every job of a wave.
 struct FeedResult {
-	std::vector<uint32_t> shown; // shown[n]: the encoded frame that is on screen at source frame n
-	long long frames = 0;        // source frames
+	ShownMap shown;       // shown[n]: the encoded frame that is on screen at source frame n
+	long long frames = 0; // source frames
 	bool ok = false;
 };
 
 // Encodes all jobs (which must share a feed key) from one decode of `input`. `feed_rp` shows the decoder's progress.
 bool encode_wave(const std::string& input, const SourceInfo& si, std::vector<EncodeJob*>& jobs, const ScaleOptions& so, RunProgress* feed_rp, FeedResult& fr);
 
-struct ScoreJob {
-	const EncodeJob* encoded = nullptr;
-	const FeedResult* feed = nullptr;
+// A run of a wave: its encoder, and the scoring that follows the encoder's output while it is still being written.
+struct WaveRun {
+	EncodeJob enc;
 	Codec codec = Codec::None;
-	RunProgress* rp = nullptr;
+	RunProgress* score_rp = nullptr;
 	std::vector<double> scores;
-	bool ok = false;
+	bool score_ok = false;
 };
 
-// Scores all jobs against one decode of the original.
-void score_wave(const std::string& input, const SourceInfo& si, std::vector<ScoreJob*>& jobs, const VmafOptions& vo, const ScaleOptions& so);
+// Encodes all runs (which must share a feed key) from one decode of `input`, and scores each against the original at the same time.
+// Runs that compare in the same format share one decode of the original.
+bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRun*>& runs, const ScaleOptions& so, const VmafOptions& vo, RunProgress* feed_rp, FeedResult& fr);

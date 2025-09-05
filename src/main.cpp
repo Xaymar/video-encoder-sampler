@@ -95,7 +95,7 @@ struct Run {
 	std::string tag;        // "[run 12/240]", for the progress lines
 	bool ignored = false;   // incompatible with the input or the encoder, so it was not run
 	std::string reason;
-	std::shared_ptr<RunProgress> progress;
+	std::shared_ptr<RunProgress> progress, score_progress; // the encoding and the scoring of this run
 	double encode_s = 0, score_s = 0; // wall time of the encoding wave this run was in, and of the scoring wave
 	double enc_busy_s = 0, enc_starved_s = 0, decode_blocked_s = 0, score_starved_s = 0; // where that time went
 	std::string gpu;        // name and driver of the GPU a GPU encoder ran on
@@ -410,9 +410,6 @@ static std::string sanitize(std::string s, size_t max = 100) {
 }
 
 
-// Runs whose encoders produced the very same bytes decode to the very same frames, so they share one set of scores.
-static std::mutex same_mutex;
-static std::map<std::string, std::vector<double>> same_output;
 
 // Which of the swept options change anything. The baseline has every option at its default (unset when its list has a null,
 // else its first value). Options are tested in groups, always moving the whole group away from the baseline: a group whose output
@@ -678,9 +675,9 @@ int main(int argc, char** argv) {
 		r.penalty = std::max(0.0, r.kbps / r.bitrate - 1) * 100 * over_penalty;
 		std::vector<double> sc = r.scores;
 		std::sort(sc.begin(), sc.end());
-		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s  [encode %.1fs: encoder busy %.1f, starved %.1f, decoder backed up %.1f | score %.1fs: scorer starved %.1f]", r.tag.c_str(), r.label.c_str(), r.kbps,
-		         std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size(), sc.front(), sc[(size_t)(sc.size() * 0.05)], r.cached ? " (cached)" : r.same ? " (same output as an earlier run)" : "",
-		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.enc_busy_s, r.enc_starved_s, r.decode_blocked_s, r.score_s, r.score_starved_s);
+		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s  [wave %.1fs: encoder busy %.1f, starved %.1f; decoder backed up %.1f; scorer starved %.1f]", r.tag.c_str(), r.label.c_str(), r.kbps,
+		         std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size(), sc.front(), sc[(size_t)(sc.size() * 0.05)], r.cached ? " (cached)" : "",
+		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.enc_busy_s, r.enc_starved_s, r.decode_blocked_s, r.score_starved_s);
 		ui::log(line);
 	};
 
@@ -714,114 +711,69 @@ int main(int argc, char** argv) {
 		by_feed[fk].push_back(&t);
 	}
 
-	// A wave is the runs that are encoded at the same time from one decode: up to `parallel` of each pool. Scoring of one wave
-	// goes on while the next is being encoded.
-	struct Wave {
-		std::vector<Task*> tasks;
-		std::vector<EncodeJob> jobs;
-		std::vector<int> handles;
-		FeedResult fr;
-		RunProgress feed_rp;
-	};
-	auto score_and_finish = [&](std::shared_ptr<Wave> w) {
-		const SourceInfo& si = infos.at(w->tasks[0]->r.input);
-		std::vector<ScoreJob> sjobs(w->tasks.size());
-		std::vector<ScoreJob*> to_score;
-		std::map<std::string, size_t> leader;  // output bytes -> the job that is scored for it
-		std::vector<long long> follows(w->tasks.size(), -1);
-		std::vector<std::string> keys(w->tasks.size());
-		for (size_t i = 0; i < w->tasks.size(); i++) {
-			Task& t = *w->tasks[i];
-			Run& r = t.r;
-			EncodeJob& ej = w->jobs[i];
-			if (!ej.ok) continue;
-			r.kbps = ej.kbps;
-			char hex[17];
-			snprintf(hex, sizeof hex, "%016llx", (unsigned long long)ej.output.hash);
-			const std::string same_key = keys[i] = r.group + "|" + hex;
-			{
-				std::lock_guard lock(same_mutex);
-				if (auto it = same_output.find(same_key); it != same_output.end()) { r.scores = it->second; r.same = true; t.ok = true; continue; }
-			}
-			if (auto it = leader.find(same_key); it != leader.end()) { follows[i] = (long long)it->second; continue; }
-			leader[same_key] = i;
-			sjobs[i].encoded = &ej; sjobs[i].feed = &w->fr; sjobs[i].codec = t.id; sjobs[i].rp = r.progress.get();
-			ui::log_plain(r.tag + " scoring   " + r.label);
-			to_score.push_back(&sjobs[i]);
-		}
-		const auto t_score = std::chrono::steady_clock::now();
-		if (!to_score.empty()) score_wave(w->tasks[0]->r.input, si, to_score, cfg.vo, cfg.scale);
-		const double score_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_score).count();
-		for (Task* t : w->tasks) {
-			t->r.score_s = score_s;
-			t->r.score_starved_s = t->r.progress->starved_ms / 1000.0;
-		}
-		for (size_t i = 0; i < w->tasks.size(); i++) {
-			Task& t = *w->tasks[i];
-			Run& r = t.r;
-			if (sjobs[i].encoded && sjobs[i].ok) {
-				r.scores = sjobs[i].scores;
-				t.ok = true;
-				std::lock_guard lock(same_mutex);
-				same_output[keys[i]] = r.scores;
-			} else if (follows[i] >= 0 && sjobs[follows[i]].ok) {
-				r.scores = sjobs[follows[i]].scores;
-				r.same = true;
-				t.ok = true;
-			}
-			ui::detach(w->handles[i]);
-			std::error_code ec;
-			if (t.r.video_file.empty()) fs::remove(w->jobs[i].file, ec); // a temporary file for scoring
-			finish(t);
-		}
-	};
-
-	// Encoded packets are muxed to disk as they arrive and scored from there, not kept in memory; scratch files go next to the results if there are any, else in the temp folder.
+	// A wave is the runs that are encoded at the same time from one decode: up to `parallel` of each pool. Each run is scored while it is
+	// being encoded, from the packets as they come out, so a wave is done when its slowest encoder and scorer are.
+	// Encoded packets are muxed to disk as they arrive; scratch files go next to the results if there are any, else in the temp folder.
 	const fs::path spool_dir = (cfg.output_dir.empty() ? fs::temp_directory_path() : fs::path(cfg.output_dir)) / (".ves-tmp-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 	{ std::error_code ec; fs::create_directories(spool_dir, ec); }
-	std::thread scoring;
 	for (auto& fk : feed_order) {
 		std::map<std::string, std::vector<Task*>> by_pool;
 		for (Task* t : by_feed[fk]) by_pool[t->pool].push_back(t);
 		std::map<std::string, size_t> taken;
 		for (;;) {
-			auto w = std::make_shared<Wave>();
+			std::vector<Task*> wave;
 			for (auto& [pool, list] : by_pool) {
-				for (int k = 0; k < pools[pool].parallel && taken[pool] < list.size(); k++) w->tasks.push_back(list[taken[pool]++]);
+				for (int k = 0; k < pools[pool].parallel && taken[pool] < list.size(); k++) wave.push_back(list[taken[pool]++]);
 			}
-			if (w->tasks.empty()) break;
-			const std::string& input = w->tasks[0]->r.input;
+			if (wave.empty()) break;
+			const std::string& input = wave[0]->r.input;
 			const SourceInfo& si = infos.at(input);
-			w->jobs.resize(w->tasks.size());
-			std::vector<EncodeJob*> ptrs;
-			for (size_t i = 0; i < w->tasks.size(); i++) {
-				Task& t = *w->tasks[i];
-				EncodeJob& ej = w->jobs[i];
+			std::vector<WaveRun> wr(wave.size());
+			std::vector<WaveRun*> ptrs;
+			std::vector<int> handles;
+			for (size_t i = 0; i < wave.size(); i++) {
+				Task& t = *wave[i];
+				WaveRun& run = wr[i];
+				EncodeJob& ej = run.enc;
+				t.r.score_progress = std::make_shared<RunProgress>();
 				ej.encoder = t.job->encoder; ej.codec = t.job->codec; ej.plan = &t.plan;
 				ej.bitrate = t.r.bitrate * 1000; ej.kf = t.r.kf; ej.rp = t.r.progress.get();
 				ej.file = !t.r.video_file.empty() ? t.r.video_file : (spool_dir / ("run" + std::to_string(&t - tasks.data()) + ".mp4")).string();
 				ej.id = t.id; ej.color = si.color;
-				ptrs.push_back(&ej);
-				ui::log_plain(t.r.tag + " encoding  " + t.r.label + "  (" + fs::path(input).filename().string() + ", " + std::to_string(t.r.bitrate) + " kbps, pool " + t.pool + ")");
-				w->handles.push_back(ui::attach(t.r.progress.get(), t.r.label, t.pool));
+				run.codec = t.id; run.score_rp = t.r.score_progress.get();
+				ptrs.push_back(&run);
+				ui::log_plain(t.r.tag + " encoding and scoring  " + t.r.label + "  (" + fs::path(input).filename().string() + ", " + std::to_string(t.r.bitrate) + " kbps, pool " + t.pool + ")");
+				handles.push_back(ui::attach(t.r.progress.get(), t.r.label, t.pool));
+				handles.push_back(ui::attach(t.r.score_progress.get(), t.r.label, t.pool));
 			}
-			const int feed_handle = ui::attach(&w->feed_rp, "decode+convert " + fs::path(input).filename().string() + " to " + std::to_string(w->tasks[0]->plan.enc.w) + "x" + std::to_string(w->tasks[0]->plan.enc.h), "decode");
-			const auto t_enc = std::chrono::steady_clock::now();
-			encode_wave(input, si, ptrs, cfg.scale, &w->feed_rp, w->fr);
-			const double enc_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_enc).count();
-			for (Task* t : w->tasks) {
-				t->r.encode_s = enc_s;
-				t->r.enc_busy_s = t->r.progress->busy_ms / 1000.0;
-				t->r.enc_starved_s = t->r.progress->starved_ms / 1000.0;
-				t->r.decode_blocked_s = w->feed_rp.blocked_ms / 1000.0;
-			}
+			RunProgress feed_rp;
+			feed_rp.begin(3, 1);
+			const int feed_handle = ui::attach(&feed_rp, "decode+convert " + fs::path(input).filename().string() + " to " + std::to_string(wave[0]->plan.enc.w) + "x" + std::to_string(wave[0]->plan.enc.h), "decode");
+			FeedResult fr;
+			const auto t_wave = std::chrono::steady_clock::now();
+			run_wave(input, si, ptrs, cfg.scale, cfg.vo, &feed_rp, fr);
+			const double wave_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_wave).count();
 			ui::detach(feed_handle);
-			if (scoring.joinable()) scoring.join();
-			scoring = std::thread([&, w] { score_and_finish(w); });
-			if (cfg.low_memory) scoring.join();
+			for (int h : handles) ui::detach(h);
+			for (size_t i = 0; i < wave.size(); i++) {
+				Task& t = *wave[i];
+				Run& r = t.r;
+				r.encode_s = wave_s;
+				r.enc_busy_s = r.progress->busy_ms / 1000.0;
+				r.enc_starved_s = r.progress->starved_ms / 1000.0;
+				r.decode_blocked_s = feed_rp.blocked_ms / 1000.0;
+				r.score_starved_s = r.score_progress->starved_ms / 1000.0;
+				if (wr[i].enc.ok && wr[i].score_ok) {
+					r.kbps = wr[i].enc.kbps;
+					r.scores = std::move(wr[i].scores);
+					t.ok = true;
+				}
+				std::error_code ec;
+				if (r.video_file.empty()) fs::remove(wr[i].enc.file, ec); // a temporary file
+				finish(t);
+			}
 		}
 	}
-	if (scoring.joinable()) scoring.join();
 	{ std::error_code ec; fs::remove_all(spool_dir, ec); }
 	ui::stop();
 
@@ -875,7 +827,7 @@ int main(int argc, char** argv) {
 			o << "},\"width\":" << r.shape.w << ",\"height\":" << r.shape.h << ",\"fps\":" << (r.shape.fps.num ? r.shape.fps.value() : 0.0)
 			  << ",\"kbps\":" << r.kbps << ",\"over_target_penalty\":" << r.penalty << ",\"best_frame_share\":" << r.best_share << ",\"winner\":" << (r.best_share >= BEST_FRAME_SHARE ? "true" : "false")
 			  << ",\"vmaf\":{\"mean\":" << std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size() << ",\"min\":" << sc.front() << ",\"p5\":" << sc[(size_t)(sc.size() * 0.05)] << "}"
-			  << ",\"gpu\":" << (r.gpu.empty() ? "null" : jq(r.gpu)) << ",\"cached\":" << (r.cached ? "true" : "false") << ",\"same_output_as_earlier_run\":" << (r.same ? "true" : "false")
+			  << ",\"gpu\":" << (r.gpu.empty() ? "null" : jq(r.gpu)) << ",\"cached\":" << (r.cached ? "true" : "false")
 			  << ",\"video\":" << (r.video.empty() ? "null" : jq(r.video)) << "}";
 		}
 		o << "]}";
