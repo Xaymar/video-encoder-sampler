@@ -28,6 +28,7 @@ bool source_info(const std::string& path, SourceInfo& out) {
 	si.framerate = src->framerate;
 	si.color = src->color;
 	si.duration = src->duration();
+	si.decoder = src->decoder;
 	si.frame_count = src->frame_count();
 	out = known[path] = si;
 	return true;

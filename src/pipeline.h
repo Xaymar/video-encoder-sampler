@@ -38,6 +38,7 @@ struct SourceInfo {
 	Rational framerate;
 	Color color;
 	double duration = 0;       // seconds
+	std::string decoder;       // what decodes the original (software, or which hardware)
 	long long frame_count = 0; // 0 if the file carries no usable timestamps
 };
 bool source_info(const std::string& path, SourceInfo& out); // opens the file once and remembers the answer
