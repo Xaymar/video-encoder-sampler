@@ -193,10 +193,18 @@ public:
 		if (vi < 0) { fprintf(stderr, "'%s' has no video stream\n", path.c_str()); return false; }
 		AVStream* st = ctx->streams[vi];
 		const AVCodec* c = software_decoder(st->codecpar->codec_id);
+		const AVCodec* dedicated = hw_type.empty() ? nullptr : avcodec_find_decoder_by_name(hw_type.c_str());
+		if (dedicated) {
+			if (dedicated->id != st->codecpar->codec_id) return false; // a decoder for some other codec
+			c = dedicated;
+		}
 		if (!c) { fprintf(stderr, "no software decoder for this video\n"); return false; }
 		dec = avcodec_alloc_context3(c);
 		avcodec_parameters_to_context(dec, st->codecpar);
-		if (!hw_type.empty()) {
+		if (dedicated) {
+			dec->thread_count = 1; // the hardware does the work
+			fmt_known = false;
+		} else if (!hw_type.empty()) {
 			const AVHWDeviceType type = av_hwdevice_find_type_by_name(hw_type.c_str());
 			if (type == AV_HWDEVICE_TYPE_NONE) return false;
 			for (int i = 0;; i++) { // the pixel format this decoder gives for that device type
@@ -234,12 +242,14 @@ public:
 			if (!describe_native(native, fmt)) { fprintf(stderr, "unsupported source pixel format %s\n", av_get_pix_fmt_name(native)); return false; }
 		} else {
 			// The first frame tells what the download looks like (NV12, planar 4:4:4, ...) and whether the GPU took the stream at all.
-			if (pull(pending) != 1 || !hw_used) return false;
+			if (pull(pending) != 1) return false;
+			if (dedicated) hw_used = true;
+			if (!hw_used) return false;
 			has_pending = true;
 			if (pending.color.range == AVCOL_RANGE_JPEG) color.range = AVCOL_RANGE_JPEG;
 		}
 		if (do_scan) scan(path);
-		decoder_name = std::string(c->name) + (hw_type.empty() ? " (software)" : " (" + hw_type + " hardware)");
+		decoder_name = std::string(c->name) + (hw_type.empty() ? " (software)" : dedicated ? " (hardware)" : " (" + hw_type + " hardware)");
 		decoder = decoder_name;
 		return true;
 	}
@@ -307,6 +317,24 @@ bool verify_hardware(const std::string& path, const std::string& type) {
 	return true;
 }
 
+// The codec of the file's video stream, found once per file.
+AVCodecID codec_id_of(const std::string& path) {
+	static std::mutex m;
+	static std::map<std::string, AVCodecID> known;
+	std::lock_guard lock(m);
+	if (auto it = known.find(path); it != known.end()) return it->second;
+	AVCodecID id = AV_CODEC_ID_NONE;
+	AVFormatContext* c = nullptr;
+	if (avformat_open_input(&c, path.c_str(), nullptr, nullptr) >= 0) {
+		if (avformat_find_stream_info(c, nullptr) >= 0) {
+			const int v = av_find_best_stream(c, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+			if (v >= 0) id = c->streams[v]->codecpar->codec_id;
+		}
+		avformat_close_input(&c);
+	}
+	return known[path] = id;
+}
+
 std::mutex g_mutex;
 std::string g_hw;                  // "", "auto" or a device type
 std::map<std::string, bool> g_verdict; // path|type -> identical to software
@@ -327,8 +355,19 @@ std::unique_ptr<Source> open_source(const std::string& path) {
 	}
 	if (!want.empty()) {
 		std::vector<std::string> types;
-		if (want == "auto") types = {"cuda", "d3d11va", "qsv", "vulkan", "d3d12va"};
-		else types = {want};
+		if (want == "auto") {
+			// The normal decoders on a hardware device first, then the dedicated hardware decoders of the stream's codec.
+			types = {"cuda", "d3d11va", "d3d12va", "qsv", "vulkan"};
+			const AVCodecID id = codec_id_of(path);
+			for (const std::string suffix : {"_cuvid", "_qsv", "_amf"}) {
+				void* it = nullptr;
+				while (const AVCodec* c = av_codec_iterate(&it)) {
+					const std::string name = c->name;
+					if (av_codec_is_decoder(c) && c->id == id && (c->capabilities & AV_CODEC_CAP_HARDWARE) && name.size() > suffix.size() &&
+					    name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) types.push_back(name);
+				}
+			}
+		} else types = {want};
 		for (const auto& type : types) {
 			const std::string key = path + "|" + type;
 			bool known = false, good = false;

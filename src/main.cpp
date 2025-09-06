@@ -73,7 +73,7 @@ struct Config {
 	std::string output_dir = "output"; // encoded streams and result files go here; empty: nothing is written
 	bool save_videos = true;
 	bool plain = false; // no live display, just lines
-	std::string hw_decode;   // "" software only, "auto", or a device type: see set_hw_decode()
+	std::string hw_decode = "auto"; // "" software only, "auto", or a device type or decoder name: see set_hw_decode()
 	int decode_threads = 0;  // 0: as many as the cores allow within a memory budget
 	bool low_memory = false; // score a wave before encoding the next, and fewer VMAF threads
 	std::vector<Job> jobs;
@@ -258,7 +258,8 @@ Paths
                             <dir>/<input>/ (fragmented .mp4) and the result file <dir>/<input>.json;
                             "off" writes nothing
         --no-videos         write the result files but not the encoded streams
-        --hw-decode <auto|cuda|d3d11va|qsv|vulkan|off>  decode the sources on the GPU, once its first frames match a software decode exactly
+        --hw-decode <auto|off|name>  decode the sources on the GPU when their first frames match a software decode exactly (default: auto);
+                            a name is a device type (cuda, d3d11va, d3d12va, qsv, vulkan) or a hardware decoder (hevc_cuvid, h264_qsv, ...)
         --decode-threads <n> threads per decoder (default: all cores; 4 with --low-memory)
         --low-memory        score each wave before the next is encoded and use fewer VMAF threads: slower, takes much less memory
         --plain             plain lines instead of the live display (also used when stdout is not a terminal)
