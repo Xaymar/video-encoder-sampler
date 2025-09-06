@@ -259,7 +259,7 @@ Paths
                             "off" writes nothing
         --no-videos         write the result files but not the encoded streams
         --hw-decode <auto|off|name>  decode the sources on the GPU when their first frames match a software decode exactly (default: auto);
-                            a name is a device type (cuda, d3d11va, d3d12va, qsv, vulkan) or a hardware decoder (hevc_cuvid, h264_qsv, ...)
+                            a name is a device type (cuda, d3d11va, d3d12va, dxva2, qsv, amf, vaapi, vulkan) or a hardware decoder (hevc_cuvid, h264_qsv, ...)
         --decode-threads <n> threads per decoder (default: all cores; 4 with --low-memory)
         --low-memory        score each wave before the next is encoded and use fewer VMAF threads: slower, takes much less memory
         --plain             plain lines instead of the live display (also used when stdout is not a terminal)

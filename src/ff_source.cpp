@@ -357,7 +357,8 @@ std::unique_ptr<Source> open_source(const std::string& path) {
 		std::vector<std::string> types;
 		if (want == "auto") {
 			// The normal decoders on a hardware device first, then the dedicated hardware decoders of the stream's codec.
-			types = {"cuda", "d3d11va", "d3d12va", "qsv", "vulkan"};
+			// (OpenCL is left out: it breaks more often than it works on systems with several GPUs.)
+			types = {"cuda", "d3d11va", "d3d12va", "dxva2", "qsv", "amf", "vaapi", "vulkan"};
 			const AVCodecID id = codec_id_of(path);
 			for (const std::string suffix : {"_cuvid", "_qsv", "_amf"}) {
 				void* it = nullptr;
