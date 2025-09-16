@@ -226,6 +226,7 @@ void produce(const std::string& input, const SourceInfo& si, const Plan& pl, con
 	}
 	if (ok && pl.rescale) { ok = scaler->push(nullptr); queue_scaled(); }
 	fr.ok = ok && r >= 0;
+	if (rp) rp->finish();
 	fr.shown.finish();
 	bc.close();
 }
@@ -264,6 +265,7 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
 	if (job.rp) job.rp->busy_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_flush).count();
 	if (!job.file.empty() && !(mp4.close() && !write_failed)) { fprintf(stderr, "cannot write %s\n", job.file.c_str()); ok = false; }
 	job.ok = ok;
+	if (job.rp) job.rp->finish();
 	job.kbps = codec->stats.bytes * 8 / si.duration / 1000;
 }
 
@@ -348,6 +350,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 				flush_converted();
 			}
 			if (ok && convert) { ok = conv->push(nullptr); flush_converted(); }
+			g.ref_rp.finish();
 			g.bc->close();
 		});
 		VmafOptions group_vo = vo;
@@ -362,6 +365,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 			const ShownFeed shown = [&fr](size_t k, uint32_t& v) { return fr.shown.get(k, v); };
 			run.score_ok = vmaf_score(ref, feed, run.codec, next_packet, {}, run.enc.plan->enc, shown, g.fmt, group_vo, so, run.scores, run.score_rp);
 			if (run.score_ok && (long long)run.scores.size() != fr.frames) { fprintf(stderr, "%zu scores for %lld frames\n", run.scores.size(), fr.frames); run.score_ok = false; }
+			if (run.score_rp) run.score_rp->finish();
 			rq.cancel(); // done with the original frames: do not hold the reference decode back
 			pq.cancel(); // and with the packets: do not hold the encoder back
 		});
