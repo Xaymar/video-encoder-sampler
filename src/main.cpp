@@ -207,17 +207,23 @@ static void load_config(const std::string& path, Config& cfg) {
 	}
 	if (auto* v = root.find("cache")) cfg.cache_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "cache" : "") : v->text();
 	if (auto* v = root.find("output")) cfg.output_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "output" : "") : v->text();
-	if (auto* v = root.find("hw_decode")) cfg.hw_decode = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "auto" : "") : v->text();
-	if (auto* v = root.find("decode_threads")) cfg.decode_threads = atoi(v->text().c_str());
-	if (auto* v = root.find("low_memory")) cfg.low_memory = v->text() == "1" || v->text() == "true";
+	// These live in "settings"; older files have them at the top level, which still works.
+	auto setting = [&](const char* k) -> const Json* {
+		if (auto* g = root.find("settings")) if (auto* v = g->find(k)) return v;
+		return root.find(k);
+	};
+	if (auto* v = setting("hw_decode")) cfg.hw_decode = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "auto" : "") : v->text();
+	if (auto* v = setting("decode_threads")) cfg.decode_threads = atoi(v->text().c_str());
+	if (auto* v = setting("low_memory")) cfg.low_memory = v->text() == "1" || v->text() == "true";
 	if (auto* v = root.find("videos")) cfg.save_videos = !(v->text() == "0" || v->text() == "false");
-	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str());
+	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str()); // where older files have it; it belongs in "vmaf" now
 	if (auto* v = root.find("vmaf")) {
 		if (auto* m = v->find("model")) cfg.vo.model = m->text();
 		if (auto* t = v->find("threads")) cfg.vo.threads = atoi(t->text().c_str());
+		if (auto* p = v->find("over_penalty")) over_penalty = atof(p->text().c_str());
 	}
 	auto off = [](const Json* v) { return v && (v->text() == "0" || v->text() == "false"); };
-	const bool default_prune = !off(root.find("prune"));
+	const bool default_prune = !off(setting("prune"));
 	list("encoders", [&](const Json& e) {
 		if (off(e.find("enabled"))) return;
 		Job j;

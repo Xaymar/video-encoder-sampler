@@ -17,7 +17,7 @@
 	"scenarios": [
 		{
 			"name": "high",
-			// Target bitrates in kbit/s. Running over the target is penalised (see "over_penalty"), running under is not.
+			// Target bitrates in kbit/s. Running over the target is penalised (see "vmaf" below), running under is not.
 			"bitrates": [16000, 12000],
 			// Encoded resolutions. They are scaled back to the source resolution for scoring.
 			"resolutions": ["3840x2160", "2560x1440"],
@@ -52,9 +52,9 @@
 	},
 
 	// ---- Scoring ------------------------------------------------------------------------------------------------------------------
-	// Running over the target bitrate costs this many VMAF points per percent. The default is about what 3000 -> 6000 kbit/s gains.
-	"over_penalty": 0.025,
 	"vmaf": {
+		// Running over the target bitrate costs this many VMAF points per percent. The default is about what 3000 -> 6000 kbit/s gains.
+		"over_penalty": 0.025,
 		// Model file, relative to the working directory ("path=..."), or a built-in one ("version=vmaf_v0.6.1").
 		"model": "path=models/vmaf_4k_v0.6.1.json",
 		// Threads per run being scored; 0 shares all cores between the runs that are scored at the same time.
@@ -69,19 +69,19 @@
 	"output": "output",
 	"videos": true,        // false: write the result files but not the encoded streams
 
-	// ---- Decoding and memory -----------------------------------------------------------------------------------------------------
-	// Decode the sources on the GPU when that gives exactly the same frames as software (checked on the first 120 frames):
-	// "auto", false for software only, a device ("cuda", "d3d11va", "d3d12va", "dxva2", "qsv", "amf", "vaapi", "vulkan") or a decoder ("hevc_cuvid").
-	// The encoded streams that are scored are always decoded in software.
-	"hw_decode": "auto",
-	"decode_threads": 0,   // threads per decoder; 0 uses every core
-	"low_memory": false,   // true: fewer VMAF and decoder threads, much less memory, a bit slower
-
-	// ---- Option pruning -----------------------------------------------------------------------------------------------------------
-	// Options that change nothing (alone or together with the others) are found by comparing output bytes and left out of the sweep.
-	// Set to false to test every combination regardless. Per encoder, "fixed" lists options that are never pruned (presets and tunes
-	// set the defaults of everything else, so each of their combinations is screened separately).
-	"prune": true,
+	// ---- Settings: decoding, memory and pruning -----------------------------------------------------------------------------------
+	"settings": {
+		// Decode the sources on the GPU when that gives exactly the same frames as software (checked on the first 120 frames):
+		// "auto", false for software only, a device ("cuda", "d3d11va", "d3d12va", "dxva2", "qsv", "amf", "vaapi", "vulkan") or a decoder
+		// ("hevc_cuvid"). The encoded streams that are scored are always decoded in software.
+		"hw_decode": "auto",
+		"decode_threads": 0,   // threads per decoder; 0 uses every core
+		"low_memory": false,   // true: fewer VMAF and decoder threads, much less memory, a bit slower
+		// Options that change nothing (alone or together with the others) are found by comparing output bytes and left out of the sweep.
+		// Set to false to test every combination regardless. Per encoder, "fixed" lists options that are never pruned (presets and tunes
+		// set the defaults of everything else, so each of their combinations is screened separately).
+		"prune": true,
+	},
 
 	// ---- Encoders -----------------------------------------------------------------------------------------------------------------
 	// Every option is a list of values and every combination is tested. Special values:
