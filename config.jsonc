@@ -1,6 +1,6 @@
 // Example configuration for ves. Comments (// and /* */) and trailing commas are allowed.
 //
-// Run it with:   ves --config config.json -i <video or folder>
+// Run it with:   ves --config config.jsonc -i <video or folder>   (or just `ves` in this folder: config.jsonc is the default)
 // Everything here can also be given on the command line, see `ves --help`.
 //
 // How a sweep is made up: for every input, scenario (bitrates x resolutions x frame rates x key frame intervals) and encoder,

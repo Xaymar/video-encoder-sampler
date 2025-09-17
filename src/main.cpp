@@ -242,16 +242,19 @@ static void load_config(const std::string& path, Config& cfg) {
 
 static const char* VERSION = "0.2.0";
 
+// The config file used when none is named: config.jsonc, or config.json if that is what there is.
+static std::string default_config() { return !fs::exists("config.jsonc") && fs::exists("config.json") ? "config.json" : "config.jsonc"; }
+
 static void print_help(FILE* f) {
 	fputs(R"HELP(ves - tries encoder option combinations, scores every frame with VMAF and reports the configurations
 that are the best in at least 95% of frames.
 
-usage: ves [options]                  run a config file (config.json unless --config says otherwise)
+usage: ves [options]                  run a config file (config.jsonc, or config.json, unless --config says otherwise)
        ves -enc <encoder> -br <kbps> -i <input> [--option key=a,b ...]    a quick run without a config file
        ves <input> <encoder> <codec> <kbps[,..]> [key=a,b ...]           the same, short form
 
 Paths
-  -cfg, --config <file>     config file (default: config.json)
+  -cfg, --config <file>     config file, with comments allowed (default: config.jsonc, else config.json)
   -i,   --input <path>      an input video or a directory with videos (.mkv, .mp4, .mov); replaces the
                             inputs of the config file; can be given more than once
   -o,   --output <dir>      where the results go (default: output): the encoded stream of every run in
@@ -328,7 +331,7 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 }
 
 static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
-	std::string config_path = "config.json";
+	std::string config_path = default_config();
 	std::vector<std::string> inputs, bitrates, res, fps, kfs;
 	std::optional<std::string> output, cache, model;
 	std::optional<int> threads;
@@ -558,8 +561,8 @@ int main(int argc, char** argv) {
 			if (quit) return 0;
 		}
 		else if (argc >= 5) { if (!parse_cli(argc, argv, cfg)) return 1; }
-		else if (argc == 1) load_config("config.json", cfg);
-		else if (argc == 2 && !fs::is_directory(argv[1]) && fs::path(argv[1]).extension() == ".json") load_config(argv[1], cfg);
+		else if (argc == 1) load_config(default_config(), cfg);
+		else if (argc == 2 && !fs::is_directory(argv[1]) && (fs::path(argv[1]).extension() == ".json" || fs::path(argv[1]).extension() == ".jsonc")) load_config(argv[1], cfg);
 		else { print_help(stderr); return 1; }
 	} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
 	if (cfg.inputs.empty() || cfg.scenarios.empty() || cfg.jobs.empty()) { fprintf(stderr, "error: need inputs, bitrates and at least one enabled encoder (see --help)\n"); return 1; }

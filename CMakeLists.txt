@@ -49,4 +49,4 @@ add_custom_command(TARGET ves POST_BUILD
 install(TARGETS ves RUNTIME DESTINATION .)
 install(FILES ${RUNTIME_DLLS} DESTINATION .)
 install(DIRECTORY models DESTINATION .)
-install(FILES config.json README.md DESTINATION .)
+install(FILES config.jsonc README.md DESTINATION .)

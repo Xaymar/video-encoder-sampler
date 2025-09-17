@@ -37,7 +37,7 @@ VMAF models are JSON files in `models/` (from [Netflix/vmaf](https://github.com/
 cmake -G Ninja -DCMAKE_CXX_COMPILER=clang++ -B build
 cmake --build build
 ```
-Only the DLLs from `third-party` are copied next to `build/ves.exe` (not the command line tools in those packages). `cmake --install build --prefix <dir>` puts the program, the DLLs, `models/`, `config.json` and this README into one folder.
+Only the DLLs from `third-party` are copied next to `build/ves.exe` (not the command line tools in those packages). `cmake --install build --prefix <dir>` puts the program, the DLLs, `models/`, `config.jsonc` and this README into one folder.
 
 ## Usage
 ```
@@ -48,7 +48,7 @@ ves <input> <encoder> <codec> <bitrate-kbps[,..]> [key=value[,value..] ...]
 
 | Option | |
 |---|---|
-| `-cfg`, `--config <file>` | config file, `config.json` by default |
+| `-cfg`, `--config <file>` | config file, `config.jsonc` by default (`config.json` if that is what there is) |
 | `-i`, `--input <path>` | an input video or a directory of videos (`.mkv`, `.mp4`, `.mov`); replaces the config file's inputs, can be repeated |
 | `-o`, `--output <dir>` | where the results go, `output` by default: the encoded stream of every run in `<dir>/<input name>/` (fragmented `.mp4`, numbered like the runs: the `moov` box comes first and every key frame starts a new fragment, so players and browsers can start right away; the frames carry the encoder's timing, shifted by the B-frame delay) and one result file `<dir>/<input name>.json` per input. `off` writes nothing, `--no-videos` skips the streams |
 | `-c`, `--cache <dir>` | where finished runs are kept (`cache`); `off` disables it |
@@ -63,9 +63,9 @@ In a terminal VES shows a live display at the bottom: the number of finished run
 The short form (and the config file's `"output"` key) work too; the short form writes no files unless `output=<dir>` is given. `kf=<seconds>`, `res=WxH,..`, `fps=..`, `pool=`, `parallel=`, `prune=off`, `fixed=`, `cache=`, `vmaf.model=`, `vmaf.threads=` and `over.penalty=` are understood there.
 
 
-### config.json
+### config.jsonc
 
-The file may contain comments (`// ...` and `/* ... */`) and trailing commas.
+The file may contain comments (`// ...` and `/* ... */`) and trailing commas, which is why it is `.jsonc`; a plain `.json` file works the same. The result files VES writes are plain `.json`, without comments.
 ```json
 {
 	"inputs": ["input"],
