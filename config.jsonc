@@ -12,6 +12,9 @@
 	// (Left out here so that a missing folder does not stop the run.)
 	// "inputs": ["videos", "D:/clips/one.mp4"],
 
+	// Where the results go: the encoded stream of every run (a fragmented .mp4) and one result .json per input. "" / false writes nothing.
+	"output": "output",
+
 	// A scenario is one sub-sweep. Encoders can be limited to some of them with "scenarios" (see below), so that combinations that make
 	// no sense together are not run, e.g. 4k at 3.5 Mbit.
 	"scenarios": [
@@ -61,16 +64,12 @@
 		"threads": 0,
 	},
 
-	// ---- Where things go ----------------------------------------------------------------------------------------------------------
-	// Finished runs are kept here and not repeated when the same input, encoder, options, bitrate and tool versions come up again.
-	// Delete the folder to start over, or use "" / false (or `--cache off`) to turn it off.
-	"cache": "cache",
-	// The encoded stream of every run (a fragmented .mp4) and one result .json per input go here. "" / false writes nothing.
-	"output": "output",
-	"videos": true,        // false: write the result files but not the encoded streams
-
-	// ---- Settings: decoding, memory and pruning -----------------------------------------------------------------------------------
+	// ---- Settings: caching, saved streams, decoding, memory and pruning ------------------------------------------------------------
 	"settings": {
+		// Finished runs are kept here and not repeated when the same input, encoder, options, bitrate and tool versions come up again.
+		// Delete the folder to start over, or use "" / false (or `--cache off`) to turn it off.
+		"cache": "cache",
+		"videos": true,        // false: write the result files but not the encoded streams
 		// Decode the sources on the GPU when that gives exactly the same frames as software (checked on the first 120 frames):
 		// "auto", false for software only, a device ("cuda", "d3d11va", "d3d12va", "dxva2", "qsv", "amf", "vaapi", "vulkan") or a decoder
 		// ("hevc_cuvid"). The encoded streams that are scored are always decoded in software.

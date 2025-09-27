@@ -205,17 +205,17 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* d = v->find("downscaler")) cfg.scale.downscaler = d->text();
 		if (auto* g = v->find("gpu")) cfg.scale.device = g->text();
 	}
-	if (auto* v = root.find("cache")) cfg.cache_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "cache" : "") : v->text();
-	if (auto* v = root.find("output")) cfg.output_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "output" : "") : v->text();
 	// These live in "settings"; older files have them at the top level, which still works.
 	auto setting = [&](const char* k) -> const Json* {
 		if (auto* g = root.find("settings")) if (auto* v = g->find(k)) return v;
 		return root.find(k);
 	};
+	if (auto* v = setting("cache")) cfg.cache_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "cache" : "") : v->text();
+	if (auto* v = root.find("output")) cfg.output_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "output" : "") : v->text();
 	if (auto* v = setting("hw_decode")) cfg.hw_decode = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "auto" : "") : v->text();
 	if (auto* v = setting("decode_threads")) cfg.decode_threads = atoi(v->text().c_str());
 	if (auto* v = setting("low_memory")) cfg.low_memory = v->text() == "1" || v->text() == "true";
-	if (auto* v = root.find("videos")) cfg.save_videos = !(v->text() == "0" || v->text() == "false");
+	if (auto* v = setting("videos")) cfg.save_videos = !(v->text() == "0" || v->text() == "false");
 	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str()); // where older files have it; it belongs in "vmaf" now
 	if (auto* v = root.find("vmaf")) {
 		if (auto* m = v->find("model")) cfg.vo.model = m->text();

@@ -69,15 +69,15 @@ The file may contain comments (`// ...` and `/* ... */`) and trailing commas, wh
 ```json
 {
 	"inputs": ["input"],
+	"output": "output",
 	"kfintervals": [2.0],
 	"scenarios": [
 		{ "name": "high", "bitrates": [16000, 8000], "resolutions": ["3840x2160", "1920x1080"], "framerates": [60, 30] },
 		{ "name": "low", "bitrates": [3500], "resolutions": ["1920x1080", "1280x720"], "framerates": [30] }
 	],
 	"scaling": { "upscaler": "ewa_lanczos", "downscaler": "ewa_lanczos" },
-	"cache": "cache",
 	"vmaf": { "model": "path=models/vmaf_4k_v0.6.1.json", "threads": 0, "over_penalty": 0.025 },
-	"settings": { "hw_decode": "auto", "decode_threads": 0, "low_memory": false, "prune": true },
+	"settings": { "cache": "cache", "videos": true, "hw_decode": "auto", "decode_threads": 0, "low_memory": false, "prune": true },
 	"encoders": [
 		{
 			"enabled": true,
@@ -99,7 +99,7 @@ The file may contain comments (`// ...` and `/* ... */`) and trailing commas, wh
 * A **scenario** is one sub-sweep: its `bitrates` (kbps), `kfintervals` (seconds, defaults to the top level, then 2.0), `resolutions` (`WxH`) and `framerates` (`30`, `29.97` or `30000/1001`; the decimals 23.976, 29.97, 59.94 and 119.88 mean the exact `n*1000/1001` rates) are combined with every combination of every encoder's options. Use several scenarios when some combinations only make sense together, such as 1080p60 at high bitrates and only 720p30 at 3.5 Mbit. Without `scenarios` the top level is the one scenario. Give a scenario a `name` to refer to it from an encoder. Leaving out `resolutions` or `framerates` keeps the source's.
 * Every encoder option is a list of values and **every combination is tested**. `null` leaves the option unset for that combination, an empty list ignores the option.
 * `scenarios` (per encoder): the names of the scenarios this encoder takes part in, e.g. to keep a slow CPU encoder out of the 4K ones. Leave it out to use all of them; an unknown name is an error.
-* `cache`: directory where finished runs are kept, `"cache"` by default; `false` turns it off (see below).
+* `settings.cache`: directory where finished runs are kept, `"cache"` by default; `false` turns it off (see below). `settings.videos` (default `true`) is whether the encoded streams are saved to the `output` folder; the other settings are `hw_decode`, `decode_threads`, `low_memory` and `prune`, described where they apply. The top-level spellings of these keys, from older files, still work.
 * `pool` / `parallel`: runs in one pool share a device and at most `parallel` of them run at once. Every GPU gets a pool of its own (`nvenc:0`, `amf:0`, `nvenc:1`, ...) with `parallel` defaulting to 2; everything else (`cpu`) shares one pool with 1. Different pools run at the same time. Concurrency changes how long the sweep takes, never the scores.
 
 ### GPUs
