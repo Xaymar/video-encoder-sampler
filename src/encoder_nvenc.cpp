@@ -58,6 +58,21 @@ struct Caps {
 	bool b10 = false, c444 = false;
 };
 
+// Every capability the SDK headers define; the values are a fingerprint of the encoder block (how many B-frames, engines, what it supports).
+#define NVENC_CAPS(X) \
+	X(NUM_MAX_BFRAMES) X(SUPPORTED_RATECONTROL_MODES) X(SUPPORT_FIELD_ENCODING) X(SUPPORT_MONOCHROME) X(SUPPORT_FMO) \
+	X(SUPPORT_QPELMV) X(SUPPORT_BDIRECT_MODE) X(SUPPORT_CABAC) X(SUPPORT_ADAPTIVE_TRANSFORM) X(SUPPORT_STEREO_MVC) \
+	X(NUM_MAX_TEMPORAL_LAYERS) X(SUPPORT_HIERARCHICAL_PFRAMES) X(SUPPORT_HIERARCHICAL_BFRAMES) X(LEVEL_MAX) X(LEVEL_MIN) \
+	X(SEPARATE_COLOUR_PLANE) X(WIDTH_MAX) X(HEIGHT_MAX) X(SUPPORT_TEMPORAL_SVC) X(SUPPORT_DYN_RES_CHANGE) \
+	X(SUPPORT_DYN_BITRATE_CHANGE) X(SUPPORT_DYN_FORCE_CONSTQP) X(SUPPORT_DYN_RCMODE_CHANGE) X(SUPPORT_SUBFRAME_READBACK) X(SUPPORT_CONSTRAINED_ENCODING) \
+	X(SUPPORT_INTRA_REFRESH) X(SUPPORT_CUSTOM_VBV_BUF_SIZE) X(SUPPORT_DYNAMIC_SLICE_MODE) X(SUPPORT_REF_PIC_INVALIDATION) X(PREPROC_SUPPORT) \
+	X(ASYNC_ENCODE_SUPPORT) X(MB_NUM_MAX) X(MB_PER_SEC_MAX) X(SUPPORT_YUV444_ENCODE) X(SUPPORT_LOSSLESS_ENCODE) \
+	X(SUPPORT_SAO) X(SUPPORT_MEONLY_MODE) X(SUPPORT_LOOKAHEAD) X(SUPPORT_TEMPORAL_AQ) X(SUPPORT_10BIT_ENCODE) \
+	X(NUM_MAX_LTR_FRAMES) X(SUPPORT_WEIGHTED_PREDICTION) X(DYNAMIC_QUERY_ENCODER_CAPACITY) X(SUPPORT_BFRAME_REF_MODE) X(SUPPORT_EMPHASIS_LEVEL_MAP) \
+	X(WIDTH_MIN) X(HEIGHT_MIN) X(SUPPORT_MULTIPLE_REF_FRAMES) X(SUPPORT_ALPHA_LAYER_ENCODING) X(NUM_ENCODER_ENGINES) \
+	X(SINGLE_SLICE_INTRA_REFRESH) X(DISABLE_ENC_STATE_ADVANCE) X(OUTPUT_RECON_SURFACE) X(OUTPUT_BLOCK_STATS) X(OUTPUT_ROW_STATS) \
+	X(SUPPORT_TEMPORAL_FILTER) X(SUPPORT_LOOKAHEAD_LEVEL) X(SUPPORT_UNIDIRECTIONAL_B) X(SUPPORT_MVHEVC_ENCODE) X(SUPPORT_YUV422_ENCODE)
+
 Caps probe_caps(const std::string& codec) {
 	Caps caps;
 	bool known;
@@ -421,6 +436,51 @@ public:
 } // namespace
 
 std::unique_ptr<Encoder> make_encoder_nvenc() { return std::make_unique<Nvenc>(); }
+
+// All capabilities of the NVENC on the n-th NVIDIA GPU for a codec, as a JSON object; "null" if it cannot be asked.
+std::string nvenc_caps_json(const std::string& codec, int gpu) {
+	bool known;
+	GUID guid = codec_guid(codec, known);
+	CudaFunctions* cu = nullptr;
+	NvencFunctions* nv = nullptr;
+	CUcontext ctx = nullptr;
+	void* enc = nullptr;
+	NV_ENCODE_API_FUNCTION_LIST f{};
+	CUdevice dev;
+	std::string out = "null";
+	if (known && cuda_load_functions(&cu, nullptr) >= 0 && nvenc_load_functions(&nv, nullptr) >= 0 && !cu->cuInit(0) && cuda_device_for(cu, gpu, dev) &&
+	    !cu->cuCtxCreate(&ctx, 0, dev)) {
+		f.version = NV_ENCODE_API_FUNCTION_LIST_VER;
+		NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS os{};
+		os.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+		os.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
+		os.device = ctx;
+		os.apiVersion = NVENCAPI_VERSION;
+		if (!nv->NvEncodeAPICreateInstance(&f) && !f.nvEncOpenEncodeSessionEx(&os, &enc)) {
+			out = "{";
+			bool first = true;
+			auto add = [&](const char* name, NV_ENC_CAPS c) {
+				NV_ENC_CAPS_PARAM cp{};
+				cp.version = NV_ENC_CAPS_PARAM_VER;
+				cp.capsToQuery = c;
+				int v = 0;
+				if (f.nvEncGetEncodeCaps(enc, guid, &cp, &v)) return; // not available for this codec or driver: left out
+				out += std::string(first ? "\"" : ",\"") + name + "\":" + std::to_string(v);
+				first = false;
+			};
+#define X(n) add(#n, NV_ENC_CAPS_##n);
+			NVENC_CAPS(X)
+#undef X
+			out += "}";
+			f.nvEncDestroyEncoder(enc);
+		}
+	}
+	if (ctx) cu->cuCtxDestroy(ctx);
+	nvenc_free_functions(&nv);
+	cuda_free_functions(&cu);
+	return out;
+}
+
 
 bool nvenc_supports(const std::string& codec, int chroma, int depth) {
 	static std::mutex m;

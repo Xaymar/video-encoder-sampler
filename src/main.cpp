@@ -100,6 +100,7 @@ struct Run {
 	double encode_s = 0, score_s = 0; // wall time of the encoding wave this run was in, and of the scoring wave
 	double enc_busy_s = 0, enc_starved_s = 0, decode_blocked_s = 0, score_starved_s = 0; // where that time went
 	std::string gpu;        // name and driver of the GPU a GPU encoder ran on
+	std::string gpu_json = "null", caps_json = "null"; // its PCI ids, and what its encoder reports about itself (see encoder_caps_json)
 	double penalty = 0;     // VMAF points deducted for exceeding the target bitrate
 	double best_share = 0;  // share of frames where this run is at least as good as every other run of its group
 };
@@ -632,7 +633,15 @@ int main(int argc, char** argv) {
 			// Every GPU is a pool of its own, so GPUs work in parallel; CPU encoders share one pool.
 			std::string gpu_index = opts.count("gpu") ? opts.at("gpu") : "0";
 			t.r.group = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|" + gpu_index;
-			if (is_gpu_encoder(job.encoder)) t.r.gpu = gpu_description(encoder_vendor(job.encoder), atoi(gpu_index.c_str()));
+			if (is_gpu_encoder(job.encoder)) {
+				t.r.gpu = gpu_description(encoder_vendor(job.encoder), atoi(gpu_index.c_str()));
+				t.r.gpu_json = gpu_json(encoder_vendor(job.encoder), atoi(gpu_index.c_str()));
+				static std::map<std::string, std::string> caps_known; // asked once per encoder, codec and GPU
+				const std::string caps_key = job.encoder + "/" + job.codec + "/" + gpu_index;
+				auto known = caps_known.find(caps_key);
+				if (known == caps_known.end()) known = caps_known.emplace(caps_key, encoder_caps_json(job.encoder, job.codec, atoi(gpu_index.c_str()))).first;
+				t.r.caps_json = known->second;
+			}
 			std::string pool = !job.pool.empty() ? job.pool : is_gpu_encoder(job.encoder) ? job.encoder + ":" + gpu_index : "cpu";
 			t.pool = pool;
 			Pool& pl = pools[pool];
@@ -843,7 +852,7 @@ int main(int argc, char** argv) {
 			o << "},\"width\":" << r.shape.w << ",\"height\":" << r.shape.h << ",\"fps\":" << (r.shape.fps.num ? r.shape.fps.value() : 0.0)
 			  << ",\"kbps\":" << r.kbps << ",\"over_target_penalty\":" << r.penalty << ",\"best_frame_share\":" << r.best_share << ",\"winner\":" << (r.best_share >= BEST_FRAME_SHARE ? "true" : "false")
 			  << ",\"vmaf\":{\"mean\":" << std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size() << ",\"min\":" << sc.front() << ",\"p5\":" << sc[(size_t)(sc.size() * 0.05)] << "}"
-			  << ",\"gpu\":" << (r.gpu.empty() ? "null" : jq(r.gpu)) << ",\"cached\":" << (r.cached ? "true" : "false")
+			  << ",\"gpu\":" << (r.gpu.empty() ? "null" : jq(r.gpu)) << ",\"gpu_info\":" << r.gpu_json << ",\"encoder_caps\":" << r.caps_json << ",\"cached\":" << (r.cached ? "true" : "false")
 			  << ",\"video\":" << (r.video.empty() ? "null" : jq(r.video)) << "}";
 		}
 		o << "]}";
