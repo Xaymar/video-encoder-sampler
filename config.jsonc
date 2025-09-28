@@ -8,7 +8,8 @@
 // are the best in at least 95% of the frames are the winners.
 {
 	// ---- What to test -------------------------------------------------------------------------------------------------------------
-	// Input videos: files or folders of .mkv, .mp4 and .mov. `--input` on the command line replaces this list.
+	// Input videos: files, folders of .mkv, .mp4 and .mov, or http(s) URLs (downloaded once into the cache folder). `--input` on the command line
+	// replaces this list.
 	// (Left out here so that a missing folder does not stop the run.)
 	// "inputs": ["videos", "D:/clips/one.mp4"],
 

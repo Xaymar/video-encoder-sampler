@@ -26,6 +26,7 @@ Only the NVENC and AMF headers are tracked in git. The rest are binaries you pla
 | `third-party/libplacebo/ucrt64/` | the same layout, merged from the packages `libplacebo`, `lcms2`, `libdovi`, `shaderc`, `spirv-cross` and `vulkan-headers` | MSYS2 `mingw-w64-ucrt-x86_64-*`; needs a Vulkan driver at run time |
 | `third-party/nv-codec-headers/` | NVENC API headers (tracked) | [FFmpeg/nv-codec-headers](https://github.com/FFmpeg/nv-codec-headers) |
 | `third-party/amf-include/` | AMF API headers (tracked) | [GPUOpen AMF](https://github.com/GPUOpen-LibrariesAndSDKs/AMF), `amf/public/include` |
+| `third-party/curl/` | libcurl, a git submodule (`git submodule update --init`), built with the project: static, with Windows' own TLS (Schannel), no extra DLL. Downloads inputs given as URLs | [curl](https://github.com/curl/curl), tag `curl-8_23_0` |
 | `third-party/libvpl/` | `ucrt64/` of the oneVPL package (QuickSync headers and the `libvpl-2.dll` dispatcher, loaded at runtime) | MSYS2 `mingw-w64-ucrt-x86_64-libvpl` |
 
 MSYS2 packages are `.pkg.tar.zst` files from <https://repo.msys2.org/mingw/ucrt64/>; Windows' `tar -xf` extracts them. NVENC, AMF and QuickSync are loaded at runtime from the GPU driver (QuickSync through `libvpl-2.dll`), so they need no libraries. x264, x265 and SVT-AV1 are GPL/BSD licensed libraries that end up next to the executable.
@@ -49,7 +50,7 @@ ves <input> <encoder> <codec> <bitrate-kbps[,..]> [key=value[,value..] ...]
 | Option | |
 |---|---|
 | `-cfg`, `--config <file>` | config file, `config.jsonc` by default (`config.json` if that is what there is) |
-| `-i`, `--input <path>` | an input video or a directory of videos (`.mkv`, `.mp4`, `.mov`); replaces the config file's inputs, can be repeated |
+| `-i`, `--input <path or URL>` | an input video, a directory of videos (`.mkv`, `.mp4`, `.mov`), or an `http(s)://` URL of a video; replaces the config file's inputs, can be repeated. A URL is downloaded once into `<cache>/downloads` (the temp folder if the cache is off) and used from there, so large test videos need not be kept on the machine by hand: a later run asks the server whether the file changed (an `ETag` or `Last-Modified` check) and only downloads it again if it did, an interrupted download continues where it stopped, and with the server gone the copy from earlier is used. The result file records the `input_url`. There is no checksum check, so only use sources you trust. |
 | `-o`, `--output <dir>` | where the results go, `output` by default: the encoded stream of every run in `<dir>/<input name>/` (fragmented `.mp4`, numbered like the runs: the `moov` box comes first and every key frame starts a new fragment, so players and browsers can start right away; the frames carry the encoder's timing, shifted by the B-frame delay) and one result file `<dir>/<input name>.json` per input. `off` writes nothing, `--no-videos` skips the streams |
 | `-c`, `--cache <dir>` | where finished runs are kept (`cache`); `off` disables it |
 | `--low-memory` | take less memory, at the cost of speed (see below) |

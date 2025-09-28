@@ -25,6 +25,7 @@
 #include "formats.h"
 #include "gpu.h"
 #include "convert.h"
+#include "download.h"
 #include "json.h"
 #include "source.h"
 #include "mux.h"
@@ -66,6 +67,7 @@ struct Scenario {
 
 struct Config {
 	std::vector<std::string> inputs;
+	std::map<std::string, std::string> input_urls; // local copy -> the URL it was downloaded from
 	std::vector<Scenario> scenarios;
 	VmafOptions vo;
 	ScaleOptions scale;
@@ -158,6 +160,7 @@ static std::vector<Options> expand(const std::string& encoder, const std::vector
 }
 
 static void add_inputs(Config& cfg, const std::string& path) {
+	if (is_url(path)) { cfg.inputs.push_back(path); return; } // fetched once the cache folder is known, see main()
 	if (!fs::exists(path)) throw std::runtime_error("input '" + path + "' does not exist");
 	if (!fs::is_directory(path)) { cfg.inputs.push_back(path); return; }
 	std::vector<std::string> found;
@@ -572,6 +575,16 @@ int main(int argc, char** argv) {
 		else if (argc == 2 && !fs::is_directory(argv[1]) && (fs::path(argv[1]).extension() == ".json" || fs::path(argv[1]).extension() == ".jsonc")) load_config(argv[1], cfg);
 		else { print_help(stderr); return 1; }
 	} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
+	// Inputs given as URLs are downloaded once into the cache folder (or the temp folder if there is no cache) and used from there.
+	try {
+		const std::string downloads = (cfg.cache_dir.empty() ? fs::temp_directory_path() / "ves-downloads" : fs::path(cfg.cache_dir) / "downloads").string();
+		for (auto& in : cfg.inputs) {
+			if (!is_url(in)) continue;
+			const std::string url = in;
+			in = fetch_url(url, downloads);
+			cfg.input_urls[in] = url;
+		}
+	} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
 	if (cfg.inputs.empty() || cfg.scenarios.empty() || cfg.jobs.empty()) { fprintf(stderr, "error: need inputs, bitrates and at least one enabled encoder (see --help)\n"); return 1; }
 
 	if (cfg.low_memory && cfg.vo.threads <= 0) cfg.vo.threads = 2;
@@ -866,7 +879,7 @@ int main(int argc, char** argv) {
 		for (auto& input : cfg.inputs) {
 			const fs::path file = fs::path(cfg.output_dir) / (sanitize(fs::path(input).stem().string()) + ".json");
 			std::ofstream f(file);
-			f << "{\"tool\":\"ves\",\"version\":" << jq(VERSION) << ",\"input\":" << jq(input) << ",\"source_decoder\":" << jq(infos.count(input) ? infos.at(input).decoder : std::string()) << ",\"vmaf_model\":" << jq(cfg.vo.model) << ",\"over_penalty\":" << over_penalty << ",\"failed\":[";
+			f << "{\"tool\":\"ves\",\"version\":" << jq(VERSION) << ",\"input\":" << jq(input) << ",\"input_url\":" << (cfg.input_urls.count(input) ? jq(cfg.input_urls.at(input)) : std::string("null")) << ",\"source_decoder\":" << jq(infos.count(input) ? infos.at(input).decoder : std::string()) << ",\"vmaf_model\":" << jq(cfg.vo.model) << ",\"over_penalty\":" << over_penalty << ",\"failed\":[";
 			for (size_t i = 0; i < failed_runs[input].size(); i++) f << (i ? "," : "") << jq(failed_runs[input][i]);
 			f << "],\"ignored\":[";
 			for (size_t i = 0; i < ignored_runs[input].size(); i++) f << (i ? "," : "") << ignored_runs[input][i];
