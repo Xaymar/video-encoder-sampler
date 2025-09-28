@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 
 #include "gpu.h"
@@ -53,9 +54,14 @@ std::string cache_key(const std::string& input, const std::string& encoder, cons
 	// the scorer: library version, model, and the model file's contents when it is a path
 	k << "vmaf=" << vmaf_library_version() << ' ' << vmaf.model;
 	if (vmaf.model.rfind("path=", 0) == 0) {
-		std::ifstream f(vmaf.model.substr(5), std::ios::binary);
-		std::stringstream ss; ss << f.rdbuf();
-		k << ' ' << hex64(fnv1a(ss.str()));
+		static std::map<std::string, std::string> model_hash; // the model file does not change during a run
+		auto it = model_hash.find(vmaf.model);
+		if (it == model_hash.end()) {
+			std::ifstream f(vmaf.model.substr(5), std::ios::binary);
+			std::stringstream ss; ss << f.rdbuf();
+			it = model_hash.emplace(vmaf.model, hex64(fnv1a(ss.str()))).first;
+		}
+		k << ' ' << it->second;
 	}
 	k << '\n';
 	return k.str();
@@ -72,18 +78,26 @@ static std::string json_escape(const std::string& s) {
 	return o;
 }
 
-static fs::path cache_file(const std::string& dir, const std::string& key) { return fs::path(dir) / (hex64(fnv1a(key)) + ".json"); }
+std::string key_hash(const std::string& key) { return hex64(fnv1a(key)); }
 
-bool cache_load(const std::string& dir, const std::string& key, CachedRun& out) {
-	std::ifstream f(cache_file(dir, key));
+std::string result_name(const std::string& label, const std::string& key) {
+	std::string name;
+	for (unsigned char c : label) name += (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '=') ? (char)c : '_';
+	if (name.size() > 100) name.resize(100);
+	return name + "_" + key_hash(key).substr(0, 8);
+}
+
+bool result_load(const std::string& file, const std::string& key, CachedRun& out) {
+	std::ifstream f(file);
 	if (!f) return false;
 	try {
 		std::stringstream ss; ss << f.rdbuf();
 		Json j = Json::parse(ss.str());
 		auto* k = j.find("key");
 		auto* kbps = j.find("kbps");
-		auto* scores = j.find("scores");
-		if (!k || !kbps || !scores || k->text() != key) return false; // a hash collision or a damaged file counts as a miss
+		auto* vmaf = j.find("vmaf");
+		auto* scores = vmaf ? vmaf->find("scores") : j.find("scores");
+		if (!k || !kbps || !scores || k->text() != key) return false; // another configuration, a hash collision or a damaged file counts as a miss
 		out.kbps = atof(kbps->text().c_str());
 		out.scores.clear();
 		for (auto& s : scores->a) out.scores.push_back(atof(s.text().c_str()));
@@ -91,19 +105,21 @@ bool cache_load(const std::string& dir, const std::string& key, CachedRun& out) 
 	} catch (const std::exception&) { return false; }
 }
 
-void cache_store(const std::string& dir, const std::string& key, const CachedRun& run) {
+void result_store(const std::string& file, const std::string& key, const CachedRun& run, const std::string& details) {
 	std::error_code ec;
-	fs::create_directories(dir, ec);
-	fs::path file = cache_file(dir, key), tmp = file;
+	fs::create_directories(fs::path(file).parent_path(), ec);
+	fs::path tmp = file;
 	tmp += ".tmp";
 	{
 		std::ofstream f(tmp, std::ios::binary);
 		char b[32];
 		snprintf(b, sizeof b, "%.17g", run.kbps);
-		f << "{\"key\":\"" << json_escape(key) << "\",\"kbps\":" << b << ",\"scores\":[";
+		f << "{\"key\":\"" << json_escape(key) << "\",\"kbps\":" << b;
+		if (!details.empty()) f << "," << details;
+		f << ",\"vmaf\":{\"scores\":[";
 		for (size_t i = 0; i < run.scores.size(); i++) { snprintf(b, sizeof b, "%.17g", run.scores[i]); f << (i ? "," : "") << b; }
-		f << "]}\n";
+		f << "]}}\n";
 		if (!f) { fs::remove(tmp, ec); return; }
 	}
-	fs::rename(tmp, file, ec); // atomic, so an interrupted run never leaves a half-written entry
+	fs::rename(tmp, file, ec); // atomic, so an interrupted run never leaves a half-written file
 }

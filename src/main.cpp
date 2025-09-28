@@ -95,6 +95,7 @@ struct Run {
 	Options options;
 	std::string video;      // the saved stream, relative to the output directory; empty if none was saved
 	std::string video_file; // where run_one() writes it
+	std::string result;     // its result file (options, bitrates, per-frame VMAF), relative to the output directory; empty if none
 	std::string tag;        // "[run 12/240]", for the progress lines
 	bool ignored = false;   // incompatible with the input or the encoder, so it was not run
 	std::string reason;
@@ -599,7 +600,8 @@ int main(int argc, char** argv) {
 		Codec id;
 		Params p;
 		bool ok = false;
-		std::string key, pool; // result cache key; the pool it counts against
+		std::string key, pool; // what the run's outcome depends on (see cache_key); the pool it counts against
+		std::string result_file; // where its result is kept, and looked for when the same run comes up again; empty: not at all
 		Plan plan;
 	};
 	struct Pool {
@@ -635,14 +637,20 @@ int main(int argc, char** argv) {
 			for (auto& [k, v] : opts) t.r.label += " " + k + "=" + v;
 			t.p.codec = job.codec; t.p.bitrate = br * 1000; t.p.options = opts;
 			t.r.encoder = job.encoder; t.r.codec = job.codec; t.r.options = opts;
-			if (!cfg.output_dir.empty() && cfg.save_videos) {
-				char idx[16];
-				snprintf(idx, sizeof idx, "%04zu", tasks.size());
-				t.r.video = sanitize(fs::path(input).stem().string()) + "/" + idx + "_" + sanitize(t.r.label) + ".mp4";
-				t.r.video_file = (fs::path(cfg.output_dir) / t.r.video).string();
+			// The run's result (.json) and stream (.mp4) share a name made from the run and a hash of everything its outcome depends on, so a
+			// run that comes up again finds its result straight away. They go to the output folder; without one, results are kept in the cache.
+			t.key = cache_key(input, job.encoder, job.codec, opts, br, kf, shape, cfg.scale, cfg.vo);
+			if (!cfg.output_dir.empty()) {
+				const std::string folder = sanitize(fs::path(input).stem().string()), base = result_name(t.r.label + " " + std::to_string(br) + "k kf" + std::to_string((double)kf).substr(0, std::to_string((double)kf).find('.') + 2), t.key);
+				t.result_file = (fs::path(cfg.output_dir) / folder / (base + ".json")).string();
+				t.r.result = folder + "/" + base + ".json";
+				if (cfg.save_videos) {
+					t.r.video = folder + "/" + base + ".mp4";
+					t.r.video_file = (fs::path(cfg.output_dir) / t.r.video).string();
+				}
 				std::error_code ec;
-				fs::create_directories(fs::path(t.r.video_file).parent_path(), ec);
-			}
+				fs::create_directories(fs::path(cfg.output_dir) / folder, ec);
+			} else if (!cfg.cache_dir.empty()) t.result_file = (fs::path(cfg.cache_dir) / "results" / (key_hash(t.key) + ".json")).string();
 			// Every GPU is a pool of its own, so GPUs work in parallel; CPU encoders share one pool.
 			std::string gpu_index = opts.count("gpu") ? opts.at("gpu") : "0";
 			t.r.group = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|" + gpu_index;
@@ -702,13 +710,27 @@ int main(int argc, char** argv) {
 	std::atomic<int> finished{0};
 	const int total = (int)tasks.size();
 	ui::overall(0, total);
+	std::map<std::string, SourceInfo> infos;
+	// What goes into a run's result file besides its key, bitrate and scores.
+	auto run_details = [&](const Task& t) {
+		const Run& r = t.r;
+		std::ostringstream o;
+		o << "\"input\":" << jq(r.input) << ",\"input_url\":" << (cfg.input_urls.count(r.input) ? jq(cfg.input_urls.at(r.input)) : std::string("null"))
+		  << ",\"source_decoder\":" << jq(infos.count(r.input) ? infos.at(r.input).decoder : std::string()) << ",\"encoder\":" << jq(r.encoder) << ",\"codec\":" << jq(r.codec) << ",\"options\":{";
+		bool first = true;
+		for (auto& [k, v] : r.options) { o << (first ? "" : ",") << jq(k) << ":" << jq(v); first = false; }
+		o << "},\"width\":" << r.shape.w << ",\"height\":" << r.shape.h << ",\"fps\":" << (r.shape.fps.num ? r.shape.fps.value() : 0.0)
+		  << ",\"target_kbps\":" << r.bitrate << ",\"keyframe_interval_s\":" << r.kf << ",\"gpu\":" << (r.gpu.empty() ? std::string("null") : jq(r.gpu))
+		  << ",\"gpu_info\":" << r.gpu_json << ",\"encoder_caps\":" << r.caps_json << ",\"video\":" << (r.video.empty() ? std::string("null") : jq(r.video));
+		return o.str();
+	};
 	auto finish = [&](Task& t) {
 		Run& r = t.r;
 		ui::overall(++finished, total);
 		char line[1024];
 		if (r.ignored) { snprintf(line, sizeof line, "%s IGNORED  %s: %s", r.tag.c_str(), r.label.c_str(), r.reason.c_str()); ui::log(line); return; }
 		if (!t.ok) { snprintf(line, sizeof line, "%s FAILED  %s  (%s, %lld kbps)", r.tag.c_str(), r.label.c_str(), r.input.c_str(), (long long)r.bitrate); ui::log(line); return; }
-		if (!t.key.empty() && !r.cached) cache_store(cfg.cache_dir, t.key, CachedRun{r.kbps, r.scores});
+		if (!t.result_file.empty() && !r.cached) result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
 		r.penalty = std::max(0.0, r.kbps / r.bitrate - 1) * 100 * over_penalty;
 		std::vector<double> sc = r.scores;
 		std::sort(sc.begin(), sc.end());
@@ -720,7 +742,6 @@ int main(int argc, char** argv) {
 
 	// Whatever cannot work, or was done before, is finished right away. The rest is sorted by the frames it needs: runs with the
 	// same input, resolution, frame rate and pixel format share one decode.
-	std::map<std::string, SourceInfo> infos;
 	std::map<std::string, std::vector<Task*>> by_feed;
 	std::vector<std::string> feed_order;
 	for (size_t i = 0; i < tasks.size(); i++) {
@@ -730,10 +751,15 @@ int main(int argc, char** argv) {
 		snprintf(tag, sizeof tag, "[run %zu/%d]", i + 1, total);
 		r.tag = tag;
 		r.progress = std::make_shared<RunProgress>();
-		if (!cfg.cache_dir.empty()) {
-			t.key = cache_key(r.input, t.job->encoder, t.job->codec, t.p.options, r.bitrate, r.kf, r.shape, cfg.scale, cfg.vo);
+		if (!t.result_file.empty()) {
 			CachedRun hit;
-			if (cache_load(cfg.cache_dir, t.key, hit)) { r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.cached = t.ok = true; r.video.clear(); r.video_file.clear(); finish(t); continue; }
+			if (result_load(t.result_file, t.key, hit)) {
+				r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.cached = t.ok = true;
+				if (r.video_file.empty() || !fs::exists(r.video_file)) r.video.clear(); // the stream of the earlier run, if it is still there
+				r.video_file.clear();
+				finish(t);
+				continue;
+			}
 		}
 		auto info = infos.find(r.input);
 		if (info == infos.end()) {
@@ -866,7 +892,7 @@ int main(int argc, char** argv) {
 			  << ",\"kbps\":" << r.kbps << ",\"over_target_penalty\":" << r.penalty << ",\"best_frame_share\":" << r.best_share << ",\"winner\":" << (r.best_share >= BEST_FRAME_SHARE ? "true" : "false")
 			  << ",\"vmaf\":{\"mean\":" << std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size() << ",\"min\":" << sc.front() << ",\"p5\":" << sc[(size_t)(sc.size() * 0.05)] << "}"
 			  << ",\"gpu\":" << (r.gpu.empty() ? "null" : jq(r.gpu)) << ",\"gpu_info\":" << r.gpu_json << ",\"encoder_caps\":" << r.caps_json << ",\"cached\":" << (r.cached ? "true" : "false")
-			  << ",\"video\":" << (r.video.empty() ? "null" : jq(r.video)) << "}";
+			  << ",\"video\":" << (r.video.empty() ? "null" : jq(r.video)) << ",\"result\":" << (r.result.empty() ? "null" : jq(r.result)) << "}";
 		}
 		o << "]}";
 		group_json[runs[g].input].push_back(o.str());
