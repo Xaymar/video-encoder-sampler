@@ -17,7 +17,12 @@
 #include "gpu.h"
 #include "repack.h"
 
+#ifdef _WIN32
 #include <windows.h>
+constexpr bool ASYNC = true; // the encoder signals an event per finished picture; on Linux NVENC has no asynchronous mode
+#else
+constexpr bool ASYNC = false;
+#endif
 
 extern "C" {
 #include <ffnvcodec/dynlink_loader.h>
@@ -30,6 +35,7 @@ bool cuda_device_for(CudaFunctions* cu, int index, CUdevice& dev) {
 	auto gpus = list_gpus(VENDOR_NVIDIA);
 	int count = 0;
 	if (cu->cuDeviceGetCount(&count) || index < 0) return false;
+#ifdef _WIN32
 	if (index < (int)gpus.size() && cu->cuDeviceGetLuid) {
 		for (int i = 0; i < count; i++) {
 			CUdevice d;
@@ -41,6 +47,7 @@ bool cuda_device_for(CudaFunctions* cu, int index, CUdevice& dev) {
 			if (v == gpus[index].luid) { dev = d; return true; }
 		}
 	}
+#endif
 	return index < count && !cu->cuDeviceGet(&dev, index); // no LUID match: fall back to CUDA's own numbering
 }
 
@@ -163,8 +170,10 @@ public:
 				NV_ENC_EVENT_PARAMS ep{};
 				ep.version = NV_ENC_EVENT_PARAMS_VER;
 				ep.completionEvent = ev;
+#ifdef _WIN32
 				f.nvEncUnregisterAsyncEvent(enc, &ep);
 				CloseHandle((HANDLE)ev);
+#endif
 			};
 			unregister(eos_event);
 			for (auto& s : slots) unregister(s.ev);
@@ -288,7 +297,7 @@ public:
 		ip.frameRateNum = p.framerate.num;
 		ip.frameRateDen = p.framerate.den;
 		ip.enablePTD = 1;
-		ip.enableEncodeAsync = 1;
+		ip.enableEncodeAsync = ASYNC;
 		ip.encodeConfig = &cfg;
 		if ((st = f.nvEncInitializeEncoder(enc, &ip))) return fail(st, "initialize");
 
@@ -309,6 +318,7 @@ public:
 			sl.out = cb.bitstreamBuffer;
 			free_.push_back(&sl);
 		}
+#ifdef _WIN32
 		auto make_event = [&](void*& ev) {
 			ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
 			NV_ENC_EVENT_PARAMS ep{};
@@ -319,6 +329,7 @@ public:
 		for (auto& sl : slots) if (!make_event(sl.ev)) { fprintf(stderr, "nvenc: cannot register a completion event\n"); return false; }
 		if (!make_event(eos_event)) { fprintf(stderr, "nvenc: cannot register a completion event\n"); return false; }
 		rx = std::thread([this] { receive(); });
+#endif
 		return true;
 	}
 
@@ -334,6 +345,21 @@ public:
 		pack_uv(*fr, w, h, depth, dst + (size_t)pitch * h, pitch);
 	}
 
+	// Reads the finished output of a slot and hands it to the sink.
+	bool read_slot(Slot* s) {
+		NV_ENC_LOCK_BITSTREAM lb{};
+		lb.version = NV_ENC_LOCK_BITSTREAM_VER;
+		lb.outputBitstream = s->out;
+		NVENCSTATUS st = f.nvEncLockBitstream(enc, &lb);
+		if (st) return fail(st, "lock bitstream");
+		stats.packets++; stats.bytes += lb.bitstreamSizeInBytes;
+		if (sink) sink((const uint8_t*)lb.bitstreamBufferPtr, lb.bitstreamSizeInBytes, (int64_t)lb.outputTimeStamp,
+			lb.pictureType == NV_ENC_PIC_TYPE_IDR || lb.pictureType == NV_ENC_PIC_TYPE_I, NO_DTS);
+		f.nvEncUnlockBitstream(enc, s->out);
+		return true;
+	}
+
+#ifdef _WIN32
 	// Waits for the event, giving up when the encoder is being torn down.
 	bool wait(void* ev) {
 		for (;;) {
@@ -360,20 +386,7 @@ public:
 				cv.notify_all();
 				return;
 			}
-			bool ok = wait(s->ev);
-			if (ok) {
-				NV_ENC_LOCK_BITSTREAM lb{};
-				lb.version = NV_ENC_LOCK_BITSTREAM_VER;
-				lb.outputBitstream = s->out;
-				NVENCSTATUS st = f.nvEncLockBitstream(enc, &lb);
-				if (st) { fail(st, "lock bitstream"); ok = false; }
-				else {
-					stats.packets++; stats.bytes += lb.bitstreamSizeInBytes;
-					if (sink) sink((const uint8_t*)lb.bitstreamBufferPtr, lb.bitstreamSizeInBytes, (int64_t)lb.outputTimeStamp,
-						lb.pictureType == NV_ENC_PIC_TYPE_IDR || lb.pictureType == NV_ENC_PIC_TYPE_I, NO_DTS);
-					f.nvEncUnlockBitstream(enc, s->out);
-				}
-			}
+			bool ok = wait(s->ev) && read_slot(s);
 			std::lock_guard lock(m);
 			if (!ok) { rx_ok = false; finished = true; cv.notify_all(); return; }
 			pending_.pop_front();
@@ -381,6 +394,18 @@ public:
 			cv.notify_all();
 		}
 	}
+#else
+	// Synchronous mode: outputs are read in submission order, `count` of them, on the calling thread.
+	bool drain(size_t count) {
+		while (count-- && !pending_.empty()) {
+			Slot* s = pending_.front();
+			pending_.pop_front();
+			free_.push_back(s);
+			if (!read_slot(s)) return false;
+		}
+		return true;
+	}
+#endif
 
 	int reorder_delay() const override { return b_delay; }
 
@@ -392,11 +417,15 @@ public:
 			pp.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
 			pp.completionEvent = eos_event;
 			if ((st = f.nvEncEncodePicture(enc, &pp))) return fail(st, "flush");
+#ifndef _WIN32
+			return drain(pending_.size());
+#else
 			std::unique_lock lock(m);
 			flushing = true;
 			cv.notify_all();
 			cv.wait(lock, [&] { return finished; });
 			return rx_ok;
+#endif
 		}
 		Slot* s;
 		{
@@ -419,7 +448,7 @@ public:
 		pp.bufferFmt = buffer_fmt;
 		pp.inputWidth = w; pp.inputHeight = h; pp.inputPitch = li.pitch;
 		pp.outputBitstream = s->out;
-		pp.completionEvent = s->ev;
+		if (ASYNC) pp.completionEvent = s->ev;
 		pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
 		pp.inputTimeStamp = fr->pts;
 		{ // queue it before submitting: the event can fire as soon as the call is made
@@ -428,6 +457,9 @@ public:
 		}
 		cv.notify_all();
 		st = f.nvEncEncodePicture(enc, &pp);
+#ifndef _WIN32
+		if (st == NV_ENC_SUCCESS) return drain(1); // each success makes the oldest queued picture's output available
+#endif
 		if (st == NV_ENC_SUCCESS || st == NV_ENC_ERR_NEED_MORE_INPUT) return true;
 		return fail(st, "encode");
 	}

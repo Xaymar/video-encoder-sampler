@@ -1,5 +1,8 @@
 #include "gpu.h"
 
+#include <cstdio>
+
+#ifdef _WIN32
 #include <windows.h>
 #include <dxgi.h>
 #include <wrl/client.h>
@@ -33,6 +36,51 @@ std::vector<GpuInfo> list_gpus(unsigned vendor) {
 	}
 	return out;
 }
+
+#else
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+
+// Linux has no adapter list API without a graphics library; the kernel's DRM nodes in sysfs carry the PCI ids and the driver.
+static std::string sysfs_text(const std::filesystem::path& p) {
+	std::ifstream f(p);
+	std::string s;
+	std::getline(f, s);
+	return s;
+}
+
+std::vector<GpuInfo> list_gpus(unsigned vendor) {
+	namespace fs = std::filesystem;
+	std::vector<GpuInfo> out;
+	std::vector<fs::path> cards;
+	std::error_code ec;
+	for (auto& e : fs::directory_iterator("/sys/class/drm", ec)) {
+		const std::string n = e.path().filename().string();
+		if (n.rfind("card", 0) == 0 && n.find('-') == std::string::npos) cards.push_back(e.path() / "device");
+	}
+	std::sort(cards.begin(), cards.end());
+	for (auto& dev : cards) {
+		GpuInfo g;
+		g.vendor_id = (uint32_t)strtoul(sysfs_text(dev / "vendor").c_str(), nullptr, 16);
+		if (g.vendor_id != vendor) continue;
+		g.device_id = (uint32_t)strtoul(sysfs_text(dev / "device").c_str(), nullptr, 16);
+		g.sub_system_id = (uint32_t)strtoul(sysfs_text(dev / "subsystem_device").c_str(), nullptr, 16) | ((uint32_t)strtoul(sysfs_text(dev / "subsystem_vendor").c_str(), nullptr, 16) << 16);
+		g.revision = (uint32_t)strtoul(sysfs_text(dev / "revision").c_str(), nullptr, 16);
+		char name[64];
+		snprintf(name, sizeof name, "GPU %04x:%04x", g.vendor_id, g.device_id); // sysfs has no marketing name; the ids identify the model
+		g.name = name;
+		const std::string kernel = fs::path(fs::read_symlink(dev / "driver", ec)).filename().string();
+		g.driver = kernel.empty() ? "unknown" : kernel;
+		if (vendor == VENDOR_NVIDIA) {
+			const std::string version = sysfs_text("/sys/module/nvidia/version");
+			if (!version.empty()) g.driver = version;
+		}
+		out.push_back(std::move(g));
+	}
+	return out;
+}
+#endif
 
 static std::string json_string(const std::string& s) {
 	std::string o = "\"";

@@ -7,13 +7,25 @@
 #include <cstdio>
 #include <deque>
 #include <fcntl.h>
-#include <io.h>
 #include <map>
 #include <mutex>
 #include <thread>
 
+#ifdef _WIN32
+#include <io.h>
 #include <windows.h>
 #include <psapi.h>
+#define pipe_open(fds) _pipe(fds, 1 << 16, _O_BINARY)
+#else
+#include <sys/ioctl.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#define pipe_open(fds) pipe(fds)
+#define _dup dup
+#define _dup2 dup2
+#define _close close
+#define _read read
+#endif
 
 namespace {
 
@@ -43,6 +55,7 @@ std::string span(double sec) {
 	return b;
 }
 
+#ifdef _WIN32
 int console_width() {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)) return std::max(40, info.srWindow.Right - info.srWindow.Left + 1);
@@ -54,6 +67,17 @@ int console_height() {
 	if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)) return std::max(8, info.srWindow.Bottom - info.srWindow.Top + 1);
 	return 30;
 }
+#else
+int console_width() {
+	winsize ws;
+	return ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col ? std::max<int>(40, ws.ws_col) : 100;
+}
+
+int console_height() {
+	winsize ws;
+	return ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row ? std::max<int>(8, ws.ws_row) : 30;
+}
+#endif
 
 std::string fit(std::string s, int width) {
 	if ((int)s.size() > width) s.resize(width);
@@ -130,7 +154,7 @@ void render_loop() {
 // Everything the libraries write to stderr would tear the live area, so it goes through the permanent lines instead.
 void capture_stderr() {
 	int fds[2];
-	if (_pipe(fds, 1 << 16, _O_BINARY) != 0) return;
+	if (pipe_open(fds) != 0) return;
 	saved_stderr = _dup(2);
 	_dup2(fds[1], 2);
 	_close(fds[1]);
@@ -169,9 +193,14 @@ void start(bool plain) {
 	std::lock_guard lock(m);
 	t0 = Clock::now();
 	running = true;
+#ifdef _WIN32
 	HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
 	DWORD mode = 0;
-	if (!plain && GetConsoleMode(out, &mode) && SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+	const bool terminal = GetConsoleMode(out, &mode) && SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#else
+	const bool terminal = isatty(STDOUT_FILENO) != 0;
+#endif
+	if (!plain && terminal) {
 		is_live = true;
 		capture_stderr();
 	}
@@ -228,8 +257,13 @@ void log_plain(const std::string& line) {
 }
 
 long long peak_memory_mb() {
+#ifdef _WIN32
 	PROCESS_MEMORY_COUNTERS pmc{};
 	return K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? (long long)(pmc.PeakWorkingSetSize >> 20) : 0;
+#else
+	rusage ru{};
+	return getrusage(RUSAGE_SELF, &ru) == 0 ? (long long)(ru.ru_maxrss >> 10) : 0; // kilobytes on Linux
+#endif
 }
 
 void overall(int done, int total) {
