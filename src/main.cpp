@@ -764,7 +764,12 @@ int main(int argc, char** argv) {
 			CachedRun hit;
 			if (result_load(t.result_file, t.key, hit)) {
 				r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.video_sha256 = hit.video_sha256; r.cached = t.ok = true;
-				if (r.video_file.empty() || !fs::exists(r.video_file)) r.video.clear(); // the stream of the earlier run, if it is still there
+				const bool have_video = !r.video_file.empty() && fs::exists(r.video_file);
+				if (!have_video) r.video.clear(); // the stream of the earlier run, if it is still there
+				// Result files from before the hashes existed get them now, as far as the files they describe are still there.
+				const bool new_video_hash = r.video_sha256.empty() && have_video && !(r.video_sha256 = sha256_file(r.video_file)).empty();
+				if ((new_video_hash || hit.reference_sha256.empty()) && !reference_hash(r.input).empty())
+					result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
 				r.video_file.clear();
 				finish(t);
 				continue;
