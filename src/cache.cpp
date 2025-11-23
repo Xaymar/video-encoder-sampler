@@ -99,6 +99,8 @@ bool result_load(const std::string& file, const std::string& key, CachedRun& out
 		auto* scores = vmaf ? vmaf->find("scores") : j.find("scores");
 		if (!k || !kbps || !scores || k->text() != key) return false; // another configuration, a hash collision or a damaged file counts as a miss
 		out.kbps = atof(kbps->text().c_str());
+		auto* sha = j.find("video_sha256");
+		out.video_sha256 = sha && sha->type == Json::Str ? sha->text() : std::string();
 		out.scores.clear();
 		for (auto& s : scores->a) out.scores.push_back(atof(s.text().c_str()));
 		return !out.scores.empty();

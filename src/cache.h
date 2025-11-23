@@ -12,6 +12,7 @@
 struct CachedRun {
 	double kbps = 0;
 	std::vector<double> scores;
+	std::string video_sha256; // of the encoded stream; empty if the file predates it
 };
 
 // Everything a run's outcome depends on, as one string: the input file (name, size, modification time), the encoder

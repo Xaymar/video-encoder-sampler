@@ -21,6 +21,7 @@
 #include <tuple>
 
 #include "cache.h"
+#include "hash.h"
 #include "encoder.h"
 #include "formats.h"
 #include "gpu.h"
@@ -95,6 +96,7 @@ struct Run {
 	Options options;
 	std::string video;      // the saved stream, relative to the output directory; empty if none was saved
 	std::string video_file; // where run_one() writes it
+	std::string video_sha256; // SHA-256 of the encoded stream
 	std::string result;     // its result file (options, bitrates, per-frame VMAF), relative to the output directory; empty if none
 	std::string tag;        // "[run 12/240]", for the progress lines
 	bool ignored = false;   // incompatible with the input or the encoder, so it was not run
@@ -711,6 +713,12 @@ int main(int argc, char** argv) {
 	const int total = (int)tasks.size();
 	ui::overall(0, total);
 	std::map<std::string, SourceInfo> infos;
+	// SHA-256 of an input file, read once per input and only when a result needs it.
+	std::map<std::string, std::string> reference_hashes;
+	auto reference_hash = [&](const std::string& input) -> const std::string& {
+		auto it = reference_hashes.find(input);
+		return it != reference_hashes.end() ? it->second : reference_hashes.emplace(input, sha256_file(input)).first->second;
+	};
 	// What goes into a run's result file besides its key, bitrate and scores.
 	auto run_details = [&](const Task& t) {
 		const Run& r = t.r;
@@ -721,7 +729,8 @@ int main(int argc, char** argv) {
 		for (auto& [k, v] : r.options) { o << (first ? "" : ",") << jq(k) << ":" << jq(v); first = false; }
 		o << "},\"width\":" << r.shape.w << ",\"height\":" << r.shape.h << ",\"fps\":" << (r.shape.fps.num ? r.shape.fps.value() : 0.0)
 		  << ",\"target_kbps\":" << r.bitrate << ",\"keyframe_interval_s\":" << r.kf << ",\"gpu\":" << (r.gpu.empty() ? std::string("null") : jq(r.gpu))
-		  << ",\"gpu_info\":" << r.gpu_json << ",\"encoder_caps\":" << r.caps_json << ",\"video\":" << (r.video.empty() ? std::string("null") : jq(r.video));
+		  << ",\"gpu_info\":" << r.gpu_json << ",\"encoder_caps\":" << r.caps_json << ",\"video\":" << (r.video.empty() ? std::string("null") : jq(r.video))
+		  << ",\"video_sha256\":" << (r.video_sha256.empty() ? std::string("null") : jq(r.video_sha256)) << ",\"reference_sha256\":" << jq(reference_hash(r.input));
 		return o.str();
 	};
 	auto finish = [&](Task& t) {
@@ -754,7 +763,7 @@ int main(int argc, char** argv) {
 		if (!t.result_file.empty()) {
 			CachedRun hit;
 			if (result_load(t.result_file, t.key, hit)) {
-				r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.cached = t.ok = true;
+				r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.video_sha256 = hit.video_sha256; r.cached = t.ok = true;
 				if (r.video_file.empty() || !fs::exists(r.video_file)) r.video.clear(); // the stream of the earlier run, if it is still there
 				r.video_file.clear();
 				finish(t);
@@ -833,7 +842,8 @@ int main(int argc, char** argv) {
 					t.ok = true;
 				}
 				std::error_code ec;
-				if (r.video_file.empty()) fs::remove(wr[i].enc.file, ec); // a temporary file
+				if (t.ok) r.video_sha256 = sha256_file(wr[i].enc.file);
+					if (r.video_file.empty()) fs::remove(wr[i].enc.file, ec); // a temporary file
 				finish(t);
 			}
 		}
@@ -892,7 +902,7 @@ int main(int argc, char** argv) {
 			  << ",\"kbps\":" << r.kbps << ",\"over_target_penalty\":" << r.penalty << ",\"best_frame_share\":" << r.best_share << ",\"winner\":" << (r.best_share >= BEST_FRAME_SHARE ? "true" : "false")
 			  << ",\"vmaf\":{\"mean\":" << std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size() << ",\"min\":" << sc.front() << ",\"p5\":" << sc[(size_t)(sc.size() * 0.05)] << "}"
 			  << ",\"gpu\":" << (r.gpu.empty() ? "null" : jq(r.gpu)) << ",\"gpu_info\":" << r.gpu_json << ",\"encoder_caps\":" << r.caps_json << ",\"cached\":" << (r.cached ? "true" : "false")
-			  << ",\"video\":" << (r.video.empty() ? "null" : jq(r.video)) << ",\"result\":" << (r.result.empty() ? "null" : jq(r.result)) << "}";
+			  << ",\"video\":" << (r.video.empty() ? "null" : jq(r.video)) << ",\"video_sha256\":" << (r.video_sha256.empty() ? "null" : jq(r.video_sha256)) << ",\"result\":" << (r.result.empty() ? "null" : jq(r.result)) << "}";
 		}
 		o << "]}";
 		group_json[runs[g].input].push_back(o.str());
@@ -905,7 +915,7 @@ int main(int argc, char** argv) {
 		for (auto& input : cfg.inputs) {
 			const fs::path file = fs::path(cfg.output_dir) / (sanitize(fs::path(input).stem().string()) + ".json");
 			std::ofstream f(file);
-			f << "{\"tool\":\"ves\",\"version\":" << jq(VERSION) << ",\"input\":" << jq(input) << ",\"input_url\":" << (cfg.input_urls.count(input) ? jq(cfg.input_urls.at(input)) : std::string("null")) << ",\"source_decoder\":" << jq(infos.count(input) ? infos.at(input).decoder : std::string()) << ",\"vmaf_model\":" << jq(cfg.vo.model) << ",\"over_penalty\":" << over_penalty << ",\"failed\":[";
+			f << "{\"tool\":\"ves\",\"version\":" << jq(VERSION) << ",\"input\":" << jq(input) << ",\"input_url\":" << (cfg.input_urls.count(input) ? jq(cfg.input_urls.at(input)) : std::string("null")) << ",\"reference_sha256\":" << jq(reference_hash(input)) << ",\"source_decoder\":" << jq(infos.count(input) ? infos.at(input).decoder : std::string()) << ",\"vmaf_model\":" << jq(cfg.vo.model) << ",\"over_penalty\":" << over_penalty << ",\"failed\":[";
 			for (size_t i = 0; i < failed_runs[input].size(); i++) f << (i ? "," : "") << jq(failed_runs[input][i]);
 			f << "],\"ignored\":[";
 			for (size_t i = 0; i < ignored_runs[input].size(); i++) f << (i ? "," : "") << ignored_runs[input][i];
