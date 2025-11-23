@@ -16,7 +16,10 @@ extern "C" {
 
 std::string encoder_library_version(const std::string& encoder) {
 	if (encoder == "x264") return "x264 build " + std::to_string(X264_BUILD) + " " X264_VERSION;
-	if (encoder == "x265") return std::string("x265 ") + x265_version_str + " " + x265_build_info_str;
+	if (encoder == "x265") { // through the API table: the exported data variables do not link reliably as DLL imports
+		const x265_api* api = x265_api_get(0);
+		return std::string("x265 ") + (api ? api->version_str : "?") + " " + (api ? api->build_info_str : "");
+	}
 	if (encoder == "svtav1") return std::string("svt-av1 ") + svt_av1_get_version();
 	return encoder; // nvenc, amf and qsv: the GPU and driver matter there, see gpu_description()
 }
