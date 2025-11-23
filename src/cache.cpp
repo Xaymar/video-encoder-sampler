@@ -52,7 +52,11 @@ std::string cache_key(const std::string& input, const std::string& encoder, cons
 	k << "scaling=" << scale.upscaler << '/' << scale.downscaler << ' ' << scale.device << ' ' << scaler_library_version() << '\n';
 	k << "decoder=" << decoder_library_version() << '\n';
 	// the scorer: library version, model, and the model file's contents when it is a path
-	k << "vmaf=" << vmaf_library_version() << ' ' << vmaf.model;
+	// The key goes into the result files, so an absolute model path (the user's own folders) is reduced to the file name; the model's content
+	// hash below is what identifies it. Relative paths are kept as they are, which keeps the keys of earlier results valid.
+	std::string model_text = vmaf.model;
+	if (model_text.rfind("path=", 0) == 0 && fs::path(model_text.substr(5)).is_absolute()) model_text = "path=" + fs::path(model_text.substr(5)).filename().string();
+	k << "vmaf=" << vmaf_library_version() << ' ' << model_text;
 	if (vmaf.model.rfind("path=", 0) == 0) {
 		static std::map<std::string, std::string> model_hash; // the model file does not change during a run
 		auto it = model_hash.find(vmaf.model);
@@ -101,6 +105,8 @@ bool result_load(const std::string& file, const std::string& key, CachedRun& out
 		out.kbps = atof(kbps->text().c_str());
 		auto* sha = j.find("video_sha256");
 		out.video_sha256 = sha && sha->type == Json::Str ? sha->text() : std::string();
+		auto* in = j.find("input");
+		out.input = in && in->type == Json::Str ? in->text() : std::string();
 		auto* ref = j.find("reference_sha256");
 		out.reference_sha256 = ref && ref->type == Json::Str ? ref->text() : std::string();
 		out.scores.clear();

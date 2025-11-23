@@ -564,6 +564,10 @@ static std::string jq(const std::string& s) { // JSON string
 	return o + "\"";
 }
 
+// Result files name inputs and model files without the folders they sit in: the paths are the user's own, and results are matched by hash.
+static std::string file_name(const std::string& path) { return fs::path(path).filename().string(); }
+static std::string model_name(const std::string& model) { return model.rfind("path=", 0) == 0 ? "path=" + file_name(model.substr(5)) : model; }
+
 int main(int argc, char** argv) {
 	Config cfg;
 	try {
@@ -723,7 +727,7 @@ int main(int argc, char** argv) {
 	auto run_details = [&](const Task& t) {
 		const Run& r = t.r;
 		std::ostringstream o;
-		o << "\"input\":" << jq(r.input) << ",\"input_url\":" << (cfg.input_urls.count(r.input) ? jq(cfg.input_urls.at(r.input)) : std::string("null"))
+		o << "\"input\":" << jq(file_name(r.input)) << ",\"input_url\":" << (cfg.input_urls.count(r.input) ? jq(cfg.input_urls.at(r.input)) : std::string("null"))
 		  << ",\"source_decoder\":" << jq(infos.count(r.input) ? infos.at(r.input).decoder : std::string()) << ",\"encoder\":" << jq(r.encoder) << ",\"codec\":" << jq(r.codec) << ",\"options\":{";
 		bool first = true;
 		for (auto& [k, v] : r.options) { o << (first ? "" : ",") << jq(k) << ":" << jq(v); first = false; }
@@ -768,7 +772,7 @@ int main(int argc, char** argv) {
 				if (!have_video) r.video.clear(); // the stream of the earlier run, if it is still there
 				// Result files from before the hashes existed get them now, as far as the files they describe are still there.
 				const bool new_video_hash = r.video_sha256.empty() && have_video && !(r.video_sha256 = sha256_file(r.video_file)).empty();
-				if ((new_video_hash || hit.reference_sha256.empty()) && !reference_hash(r.input).empty())
+				if ((new_video_hash || hit.reference_sha256.empty() || hit.input != file_name(r.input)) && !reference_hash(r.input).empty())
 					result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
 				r.video_file.clear();
 				finish(t);
@@ -920,7 +924,7 @@ int main(int argc, char** argv) {
 		for (auto& input : cfg.inputs) {
 			const fs::path file = fs::path(cfg.output_dir) / (sanitize(fs::path(input).stem().string()) + ".json");
 			std::ofstream f(file);
-			f << "{\"tool\":\"ves\",\"version\":" << jq(VERSION) << ",\"input\":" << jq(input) << ",\"input_url\":" << (cfg.input_urls.count(input) ? jq(cfg.input_urls.at(input)) : std::string("null")) << ",\"reference_sha256\":" << jq(reference_hash(input)) << ",\"source_decoder\":" << jq(infos.count(input) ? infos.at(input).decoder : std::string()) << ",\"vmaf_model\":" << jq(cfg.vo.model) << ",\"over_penalty\":" << over_penalty << ",\"failed\":[";
+			f << "{\"tool\":\"ves\",\"version\":" << jq(VERSION) << ",\"input\":" << jq(file_name(input)) << ",\"input_url\":" << (cfg.input_urls.count(input) ? jq(cfg.input_urls.at(input)) : std::string("null")) << ",\"reference_sha256\":" << jq(reference_hash(input)) << ",\"source_decoder\":" << jq(infos.count(input) ? infos.at(input).decoder : std::string()) << ",\"vmaf_model\":" << jq(model_name(cfg.vo.model)) << ",\"over_penalty\":" << over_penalty << ",\"failed\":[";
 			for (size_t i = 0; i < failed_runs[input].size(); i++) f << (i ? "," : "") << jq(failed_runs[input][i]);
 			f << "],\"ignored\":[";
 			for (size_t i = 0; i < ignored_runs[input].size(); i++) f << (i ? "," : "") << ignored_runs[input][i];
