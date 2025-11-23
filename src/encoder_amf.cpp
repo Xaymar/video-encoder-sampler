@@ -223,8 +223,7 @@ bool amf_supports(const std::string& codec, int chroma, int depth) {
 
 namespace {
 struct AmfUnavailable : Encoder {
-	bool open(const Params&, Sink) override { fprintf(stderr, "amf: not supported on this platform
-"); return false; }
+	bool open(const Params&, Sink) override { fprintf(stderr, "amf: not supported on this platform\n"); return false; }
 	bool encode(const Picture*) override { return false; }
 };
 } // namespace

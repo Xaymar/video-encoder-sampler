@@ -28,6 +28,10 @@ extern "C" {
 #include <ffnvcodec/dynlink_loader.h>
 }
 
+#ifndef _WIN32
+inline bool operator==(const GUID& a, const GUID& b) { return memcmp(&a, &b, sizeof a) == 0; } // the Linux header has no comparison
+#endif
+
 namespace {
 
 // CUDA numbers its devices in its own order; find the one that is the same GPU as DXGI's n-th NVIDIA adapter.
