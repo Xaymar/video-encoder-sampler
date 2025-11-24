@@ -1,0 +1,263 @@
+// Every encoder option ves knows, with a few values for each. A reference, not a run: all encoders are disabled, and the combinations multiply (as listed
+// here: NVENC 10^5, x264 10^11, x265 10^14, QuickSync 10^16), so enable an encoder only after cutting its options down to the ones you want to compare.
+//
+// Notes:
+//  - An option with a list of values is swept; null leaves it at the encoder's default; [] ignores it.
+//  - Options that change nothing are left out of the sweep by pruning ("prune": true), but every remaining combination is still encoded.
+//  - "fixed" options are never pruned: presets and tunes set the defaults of everything else, so each of their values is screened by itself.
+//  - x264, x265 and SVT-AV1 take their command line names, so any option their CLI knows works, not only the ones listed here.
+//    NVENC's list is complete. QuickSync's are the fields of oneVPL's mfxInfoMFX and mfxExtCodingOption2/3. AMF's are AMF's own property
+//    names for the codec; the list leaves out the read-only, per-frame and feedback properties.
+//  - Run-tested with a short clip: every value of NVENC (H.264), x264, x265 and SVT-AV1. AMF and QuickSync need hardware this was not
+//    tested on: their names come from the SDK headers, and an unknown name fails the run with a message.
+//  - Every encoder also takes "chroma" (420, 444), "bitdepth" (8, 10) and, for GPU encoders, "gpu" (index, or "all").
+{
+	"output": "output",
+	"scenarios": [
+		{ "name": "sample", "bitrates": [4000], "resolutions": ["1920x1080"], "framerates": [30] },
+	],
+	"kfintervals": [2.0],
+	"vmaf": { "model": "path=models/vmaf_v0.6.1.json", "over_penalty": 0.025 },
+	"settings": { "cache": "cache", "prune": true },
+
+	"encoders": [
+		// NVIDIA; codec h264, hevc or av1 (b_ref_mode is for h264 and hevc only)
+		{
+			"enabled": false,
+			"encoder": "nvenc",
+			"codec": "h264",
+			"fixed": ["preset", "tune"],
+			"options": {
+				"preset": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],   // p1 fastest ... p7 slowest
+				"tune": ["hq", "ll", "ull"],   // hq | ll | ull | lossless
+				"rc": ["cbr", "vbr"],   // rate control
+				"bf": [null, 0, 1, 2, 3, 4],   // B-frames
+				"rc-lookahead": [0, 8, 16, 32],   // frames of lookahead
+				"b_ref_mode": [null, "none", "each", "middle"],   // B-frames as references (h264 and hevc)
+				"spatial-aq": [null, 0, 1],
+				"temporal-aq": [null, 0, 1],
+				"aq-strength": [null, 1, 8, 15],   // 1..15
+			},
+		},
+		// software
+		{
+			"enabled": false,
+			"encoder": "x264",
+			"fixed": ["preset", "tune"],
+			"options": {
+				"preset": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"],
+				"tune": [null, "film", "animation", "grain", "stillimage", "psnr", "ssim", "fastdecode", "zerolatency"],
+				"profile": [null, "main", "high"],   // high10 and high444 follow from bitdepth and chroma
+				"bframes": [0, 3, 8],
+				"b-adapt": [0, 1, 2],
+				"b-pyramid": ["none", "strict", "normal"],
+				"ref": [1, 3, 8],   // reference frames
+				"rc-lookahead": [10, 40, 60],
+				"subme": [2, 6, 10],   // sub-pixel motion estimation quality
+				"me": ["dia", "hex", "umh", "esa"],   // motion estimation method
+				"merange": [16, 24],
+				"trellis": [0, 1, 2],
+				"aq-mode": [0, 1, 2, 3],
+				"aq-strength": [0.8, 1.0, 1.3],
+				"weightp": [0, 1, 2],
+				"direct": ["spatial", "temporal", "auto"],
+				"deblock": ["0:0", "-1:-1"],   // alpha:beta
+				"cabac": [0, 1],
+				"8x8dct": [0, 1],
+				"mbtree": [0, 1],
+				"psy-rd": ["1.0:0.0", "0.0:0.0"],   // psy-rd:psy-trellis
+				"qcomp": [0.6, 0.8],
+				"nr": [0, 100],   // noise reduction
+				"fast-pskip": [0, 1],
+				"scenecut": [0, 40],
+				"open-gop": [0, 1],
+			},
+		},
+		// software; the profile also follows from "bitdepth"
+		{
+			"enabled": false,
+			"encoder": "x265",
+			"fixed": ["preset", "tune"],
+			"options": {
+				"preset": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"],
+				"tune": [null, "psnr", "ssim", "grain", "fastdecode", "zerolatency", "animation"],
+				"profile": [null, "main", "main10"],
+				"bframes": [0, 4, 8],
+				"b-adapt": [0, 1, 2],
+				"rc-lookahead": [15, 25, 40],
+				"ref": [1, 3, 5],
+				"rd": [1, 3, 4, 6],   // rate-distortion level
+				"subme": [1, 3, 5, 7],
+				"me": ["dia", "hex", "umh", "star", "sea", "full"],
+				"merange": [57, 92],
+				"aq-mode": [0, 1, 2, 3, 4],
+				"aq-strength": [0.8, 1.0, 1.4],
+				"sao": [0, 1],
+				"strong-intra-smoothing": [0, 1],
+				"weightp": [0, 1],
+				"weightb": [0, 1],
+				"ctu": [16, 32, 64],
+				"max-merge": [1, 3, 5],
+				"rect": [0, 1],
+				"amp": [0, 1],
+				"tskip": [0, 1],
+				"early-skip": [0, 1],
+				"psy-rd": [0.0, 2.0],
+				"psy-rdoq": [0.0, 1.0],
+				"cutree": [0, 1],
+				"limit-refs": [0, 1, 3],
+				"frame-threads": [1, 2, 4],
+				"wpp": [0, 1],
+				"open-gop": [0, 1],
+				"scenecut": [0, 40],
+				"deblock": ["0:0", "-1:-1"],   // tc:beta
+			},
+		},
+		// software. Runs as CBR with the low-delay prediction structure. Not deterministic, so never pruned
+		{
+			"enabled": false,
+			"encoder": "svtav1",
+			"fixed": ["preset"],
+			"options": {
+				"preset": [0, 2, 4, 6, 8, 10, 12, 13],   // 0 slowest ... 13 fastest
+				"tune": [0, 1],   // 0 visual quality, 1 PSNR (2, SSIM, needs CRF rate control)
+				// "rc": [0, 1, 2],   // needs a matching "pred-struct": rc 2 (CBR, the default here) with 1, rc 1 (VBR) with 2; rc 0 (CRF) has no target bitrate
+				// "pred-struct": [1, 2],   // see "rc": [1] with CBR, [2] with VBR
+				"lookahead": [0, 16, 60],
+				"enable-tf": [0, 1, 2],   // temporal filtering
+				"film-grain": [0, 8, 25],
+				"film-grain-denoise": [0, 1],
+				"enable-cdef": [0, 1],
+				"enable-restoration": [0, 1],
+				"aq-mode": [1, 2],   // 0 (off) is rejected with rate control
+				"scd": [0, 1],   // scene change detection
+				"fast-decode": [0, 1, 2],
+				"enable-qm": [0, 1],   // quantization matrices
+				"tile-rows": [0, 1],
+				"tile-columns": [0, 1],
+				"enable-dlf": [0, 1, 2],   // deblocking filter
+				"enable-variance-boost": [0, 1],
+				"variance-boost-strength": [1, 2, 3, 4],
+			},
+		},
+		// AMD, H.264; property names as AMF spells them, values numeric
+		{
+			"enabled": false,
+			"encoder": "amf",
+			"codec": "h264",
+			"fixed": ["QualityPreset"],
+			"options": {
+				"QualityPreset": [0, 1, 2, 3],   // 0 balanced, 1 speed, 2 quality, 3 high quality
+				"Profile": [66, 77, 100, 256, 257],   // 66 baseline, 77 main, 100 high, 256 constrained baseline, 257 constrained high
+				"BPicturesPattern": [0, 1, 2, 3],   // B-frames between P-frames
+				"BReferenceEnable": [0, 1],
+				"MaxNumRefFrames": [1, 2, 4],
+				"EnableVBAQ": [0, 1],
+				"HighMotionQualityBoostEnable": [0, 1],
+				"EnforceHRD": [0, 1],
+				"FillerDataEnable": [0, 1],
+				"VBVBufferSize": [null, 1000000, 4000000],   // bits
+				"DeBlockingFilter": [0, 1],
+				"CABACEnable": [0, 1],
+				"SlicesPerFrame": [1, 4],
+				"RateControlSkipFrameEnable": [0, 1],
+				"LowLatencyInternal": [0, 1],
+				"AdaptiveMiniGOP": [0, 1],
+				"QuarterPixel": [0, 1],
+				"HalfPixel": [0, 1],
+			},
+		},
+		// AMD, HEVC
+		{
+			"enabled": false,
+			"encoder": "amf",
+			"codec": "hevc",
+			"fixed": ["HevcQualityPreset"],
+			"options": {
+				"HevcQualityPreset": [0, 5, 10, 15],   // 0 quality, 5 balanced, 10 speed, 15 high quality
+				"HevcProfile": [1, 2],   // 1 main, 2 main 10
+				"HevcTier": [0, 1],   // 0 main, 1 high
+				"HevcMaxNumRefFrames": [1, 2, 4],
+				"HevcEnableVBAQ": [0, 1],
+				"HevcHighMotionQualityBoostEnable": [0, 1],
+				"HevcEnforceHRD": [0, 1],
+				"HevcFillerDataEnable": [0, 1],
+				"HevcVBVBufferSize": [null, 1000000, 4000000],   // bits
+				"HevcDeBlockingFilter": [0, 1],
+				"HevcSlicesPerFrame": [1, 4],
+				"HevcRateControlSkipFrameEnable": [0, 1],
+				"HevcHeaderInsertionMode": [0, 1, 2, 3],   // 0 none, 1 GOP aligned, 2 IDR aligned, 3 suppressed
+				"HevcHalfPixel": [0, 1],
+				"HevcQuarterPixel": [0, 1],
+			},
+		},
+		// AMD, AV1
+		{
+			"enabled": false,
+			"encoder": "amf",
+			"codec": "av1",
+			"fixed": ["Av1QualityPreset"],
+			"options": {
+				"Av1QualityPreset": [0, 30, 70, 100],   // 0 high quality, 30 quality, 70 balanced, 100 speed
+				"Av1AQMode": [0, 1],   // 0 none, 1 content adaptive
+				"Av1HighMotionQualityBoost": [0, 1],
+				"Av1NumTilesPerFrame": [1, 2, 4],
+				"Av1CdefMode": [0, 1],
+				"Av1ScreenContentTools": [0, 1],
+				"Av1PaletteMode": [0, 1],
+				"Av1CdfUpdate": [0, 1],
+				"Av1ErrorResilientMode": [0, 1],
+				"Av1EnforceHRD": [0, 1],
+				"Av1FillerData": [0, 1],
+				"Av1MaxNumRefFrames": [1, 2, 4],
+				"Av1VBVBufferSize": [null, 1000000, 4000000],   // bits
+				"Av1HeaderInsertionMode": [0, 1, 2, 3],   // 0 none, 1 GOP aligned, 2 key frame aligned, 3 suppressed
+			},
+		},
+		// Intel; codec h264, hevc or av1
+		{
+			"enabled": false,
+			"encoder": "qsv",
+			"codec": "hevc",
+			"fixed": ["TargetUsage"],
+			"options": {
+				"TargetUsage": [1, 4, 7],   // 1 best quality ... 7 fastest; or best_quality | balanced | best_speed
+				"GopRefDist": [1, 2, 4, 8],   // 1 = no B-frames
+				"NumRefFrame": [1, 2, 4],
+				"NumSlice": [0, 4],
+				"LowPower": [null, 0, 1],   // 1 fixed-function encoder, 0 shader based
+				"BufferSizeInKB": [null, 500, 2000],
+				"GopOptFlag": [null, 1, 2],   // 1 closed GOP, 2 strict GOP
+				"IntRefType": [null, 0, 1],   // intra refresh
+				"IntRefCycleSize": [null, 16],
+				"MBBRC": [null, "on", "off"],   // macroblock-level rate control
+				"ExtBRC": [null, "on", "off"],
+				"LookAheadDepth": [0, 20, 40],
+				"Trellis": [null, 0, 1],
+				"BRefType": [0, 1, 2],   // 0 unspecified, 1 off, 2 pyramid
+				"AdaptiveI": [null, "on", "off"],
+				"AdaptiveB": [null, "on", "off"],
+				"LookAheadDS": [null, 0, 1, 2],   // lookahead downscale
+				"MinQPI": [null, 10],
+				"MaxQPI": [null, 45],
+				"MinQPP": [null, 10],
+				"MaxQPP": [null, 45],
+				"MinQPB": [null, 10],
+				"MaxQPB": [null, 45],
+				"DisableDeblockingIdc": [null, 0, 1],
+				"WeightedPred": [null, 0, 1],
+				"WeightedBiPred": [null, 0, 1],
+				"ScenarioInfo": [null, 0, 1, 2, 3, 4],   // see mfxExtCodingOption3
+				"ContentInfo": [null, 0, 1, 2],
+				"PRefType": [null, 0, 1, 2],
+				"GPB": [null, "on", "off"],   // generalized P/B
+				"EnableQPOffset": [null, "on", "off"],
+				"LowDelayBRC": [null, "on", "off"],
+				"AdaptiveRef": [null, "on", "off"],
+				"AdaptiveLTR": [null, "on", "off"],
+				"AdaptiveCQM": [null, "on", "off"],
+				"FadeDetection": [null, "on", "off"],
+			},
+		},
+	],
+}

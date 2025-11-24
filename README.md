@@ -66,6 +66,8 @@ The short form (and the config file's `"output"` key) work too; the short form w
 
 ### config.jsonc
 
+`config.jsonc` is the example to start from; `config.all-options.jsonc` lists every option of every encoder, with a few values each, as a reference (all its encoders are disabled).
+
 The file may contain comments (`// ...` and `/* ... */`) and trailing commas, which is why it is `.jsonc`; a plain `.json` file works the same. The result files VES writes are plain `.json`, without comments.
 ```json
 {
