@@ -28,7 +28,6 @@ bool source_info(const std::string& path, SourceInfo& out) {
 	si.framerate = src->framerate;
 	si.color = src->color;
 	si.duration = src->duration();
-	si.decoder = src->decoder;
 	si.frame_count = src->frame_count();
 	out = known[path] = si;
 	return true;
@@ -126,47 +125,6 @@ public:
 	void cancel() { std::lock_guard lock(m); cancelled = closed = true; q.clear(); cv.notify_all(); }
 };
 
-// Encoded packets on their way to a scorer. Bounded by size, but always room for a few packets so that neither side can wait on the other.
-class PacketQueue {
-	static constexpr size_t MAX_BYTES = 64u << 20, MIN_PACKETS = 8;
-	std::mutex m;
-	std::condition_variable cv;
-	std::deque<std::vector<uint8_t>> q;
-	size_t bytes = 0;
-	bool closed = false, cancelled = false;
-
-public:
-	bool push(const uint8_t* d, size_t n) { // false once the scorer gave up
-		std::unique_lock lock(m);
-		cv.wait(lock, [&] { return cancelled || bytes < MAX_BYTES || q.size() < MIN_PACKETS; });
-		if (cancelled) return false;
-		q.emplace_back(d, d + n);
-		bytes += n;
-		cv.notify_all();
-		return true;
-	}
-	bool pop(std::vector<uint8_t>& out, RunProgress* rp = nullptr) { // false when no more will come
-		std::unique_lock lock(m);
-		if (q.empty() && !closed && !cancelled) {
-			const auto t = std::chrono::steady_clock::now();
-			if (rp) rp->state = 1;
-			cv.wait(lock, [&] { return !q.empty() || closed || cancelled; });
-			if (rp) {
-				rp->state = 0;
-				rp->starved_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
-			}
-		}
-		if (q.empty()) return false;
-		out = std::move(q.front());
-		q.pop_front();
-		bytes -= out.size();
-		cv.notify_all();
-		return true;
-	}
-	void close() { std::lock_guard lock(m); closed = true; cv.notify_all(); }
-	void cancel() { std::lock_guard lock(m); cancelled = closed = true; q.clear(); bytes = 0; cv.notify_all(); }
-};
-
 // One queue per consumer, so the producer is held back by the slowest of them. Frames are shared, not copied.
 class Broadcast {
 	std::vector<std::unique_ptr<FrameQueue>> qs;
@@ -188,7 +146,7 @@ public:
 // `shown[n]` records which encoded frame is on screen at source frame n, for scoring.
 void produce(const std::string& input, const SourceInfo& si, const Plan& pl, const ScaleOptions& so, Broadcast& bc, FeedResult& fr, RunProgress* rp) {
 	auto src = open_source(input);
-	if (!src) { fprintf(stderr, "cannot open %s\n", input.c_str()); fr.shown.finish(); bc.close(); return; }
+	if (!src) { fprintf(stderr, "cannot open %s\n", input.c_str()); bc.close(); return; }
 	const Shape& enc = pl.enc;
 	if (rp) rp->begin(3, pl.convert_rate ? std::max<long long>(1, std::llround(si.duration * enc.fps.value())) : std::max<long long>(1, si.frame_count));
 	auto scaler = make_converter();
@@ -218,7 +176,7 @@ void produce(const std::string& input, const SourceInfo& si, const Plan& pl, con
 				queue_scaled();
 			}
 		}
-		fr.shown.push((uint32_t)(kept - 1));
+		fr.shown.push_back((uint32_t)(kept - 1));
 	}
 	if (ok && src->frame_count() && src->frame_count() != fr.frames) {
 		fprintf(stderr, "the file lists %lld frames but %lld were decoded\n", src->frame_count(), fr.frames);
@@ -226,8 +184,6 @@ void produce(const std::string& input, const SourceInfo& si, const Plan& pl, con
 	}
 	if (ok && pl.rescale) { ok = scaler->push(nullptr); queue_scaled(); }
 	fr.ok = ok && r >= 0;
-	if (rp) rp->finish();
-	fr.shown.finish();
 	bc.close();
 }
 
@@ -249,7 +205,6 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
 	bool write_failed = false;
 	if (!codec || !codec->open(p, [&](const uint8_t* d, size_t n, int64_t pts, bool key, int64_t dts) {
 		job.output.add(d, n);
-		if (job.tee) job.tee(d, n);
 		if (!job.file.empty() && !mp4.add(d, n, pts, key, dts)) write_failed = true;
 	})) { q.cancel(); return; }
 	if (!job.file.empty() && !mp4.open(job.file, job.id, pl.enc, job.color, codec->reorder_delay())) { fprintf(stderr, "cannot write %s\n", job.file.c_str()); q.cancel(); return; }
@@ -265,7 +220,6 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
 	if (job.rp) job.rp->busy_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_flush).count();
 	if (!job.file.empty() && !(mp4.close() && !write_failed)) { fprintf(stderr, "cannot write %s\n", job.file.c_str()); ok = false; }
 	job.ok = ok;
-	if (job.rp) job.rp->finish();
 	job.kbps = codec->stats.bytes * 8 / si.duration / 1000;
 }
 
@@ -283,97 +237,59 @@ bool encode_wave(const std::string& input, const SourceInfo& si, std::vector<Enc
 	return fr.ok;
 }
 
-bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRun*>& runs, const ScaleOptions& so, const VmafOptions& vo, RunProgress* feed_rp, FeedResult& fr) {
-	const size_t n = runs.size();
-	Broadcast bc(n);
-	std::vector<std::unique_ptr<PacketQueue>> packets;
-	for (size_t i = 0; i < n; i++) {
-		packets.push_back(std::make_unique<PacketQueue>());
-		PacketQueue* pq = packets.back().get();
-		runs[i]->enc.tee = [pq](const uint8_t* d, size_t size) { return pq->push(d, size); };
-		if (runs[i]->enc.rp) runs[i]->enc.rp->begin(1, std::max<long long>(1, si.frame_count));
-	}
-
-	// Encoding: one decode feeds every encoder, as in encode_wave().
-	std::thread producer([&] { produce(input, si, *runs[0]->enc.plan, so, bc, fr, feed_rp); });
-	std::vector<std::thread> threads;
-	for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {
-		consume(runs[i]->enc, si, bc.at(i));
-		packets[i]->close(); // the scorer has all there is
-	});
-
-	// Scoring runs at the same time, following the encoders' output as it is written. Runs that compare in the same format share one decode of
-	// the original, which is read as far as the slowest scorer has got.
+void score_wave(const std::string& input, const SourceInfo& si, std::vector<ScoreJob*>& jobs, const VmafOptions& vo, const ScaleOptions& so) {
+	// Jobs that compare in the same format share one decode of the original.
 	std::vector<Fmt> formats;
-	for (auto* r : runs) if (std::find(formats.begin(), formats.end(), r->enc.plan->score_fmt) == formats.end()) formats.push_back(r->enc.plan->score_fmt);
-	struct Group {
-		Fmt fmt;
-		std::vector<size_t> members;
-		std::unique_ptr<Broadcast> bc;
+	for (auto* j : jobs) if (std::find(formats.begin(), formats.end(), j->encoded->plan->score_fmt) == formats.end()) formats.push_back(j->encoded->plan->score_fmt);
+	for (const Fmt& score_fmt : formats) {
+		std::vector<ScoreJob*> group;
+		for (auto* j : jobs) if (j->encoded->plan->score_fmt == score_fmt) group.push_back(j);
+		Broadcast bc(group.size());
 		RunProgress ref_rp;
-		int handle = 0;
-	};
-	std::vector<std::unique_ptr<Group>> groups;
-	for (const Fmt& f : formats) {
-		auto g = std::make_unique<Group>();
-		g->fmt = f;
-		for (size_t i = 0; i < n; i++) if (runs[i]->enc.plan->score_fmt == f) g->members.push_back(i);
-		g->bc = std::make_unique<Broadcast>(g->members.size());
-		g->ref_rp.begin(3, std::max<long long>(1, si.frame_count));
-		g->handle = ui::attach(&g->ref_rp, "reference decode " + std::to_string(si.width) + "x" + std::to_string(si.height), "decode");
-		groups.push_back(std::move(g));
-	}
-	RefInfo ref;
-	ref.width = si.width; ref.height = si.height; ref.framerate = si.framerate; ref.color = si.color; ref.frames = si.frame_count;
-	for (auto& gp : groups) {
-		Group& g = *gp;
-		threads.emplace_back([&, gptr = &g] {
-			Group& g = *gptr;
+		ref_rp.begin(3, std::max<long long>(1, si.frame_count));
+		const int ref_handle = ui::attach(&ref_rp, "reference decode " + std::to_string(si.width) + "x" + std::to_string(si.height), "decode");
+		std::thread ref_producer([&] {
 			auto src = open_source(input);
-			if (!src) { fprintf(stderr, "cannot open %s\n", input.c_str()); g.bc->close(); return; }
-			const bool convert = src->fmt != g.fmt;
+			if (!src) { fprintf(stderr, "cannot open %s\n", input.c_str()); bc.close(); return; }
+			const bool convert = src->fmt != score_fmt;
 			auto conv = make_converter();
 			Picture t, o;
 			bool ok = true, first = true;
 			int r;
 			auto flush_converted = [&] {
 				int got;
-				while (ok && (got = conv->pop(o)) == 1) ok = g.bc->push(o, &g.ref_rp);
+				while (ok && (got = conv->pop(o)) == 1) ok = bc.push(o, &ref_rp);
 				ok = ok && got >= 0;
 			};
 			while (ok && (r = src->next(t)) == 1) {
-				g.ref_rp.step();
-				if (!convert) { ok = g.bc->push(t, &g.ref_rp); continue; }
+				ref_rp.step();
+				if (!convert) { ok = bc.push(t, &ref_rp); continue; }
 				t.duration = 1;
-				if (first) { ok = conv->open(t, src->framerate.inverse(), src->width, src->height, g.fmt, so); first = false; }
+				if (first) { ok = conv->open(t, src->framerate.inverse(), src->width, src->height, score_fmt, so); first = false; }
 				ok = ok && conv->push(&t);
 				flush_converted();
 			}
 			if (ok && convert) { ok = conv->push(nullptr); flush_converted(); }
-			g.ref_rp.finish();
-			g.bc->close();
+			bc.close();
 		});
 		VmafOptions group_vo = vo;
-		if (group_vo.threads <= 0) group_vo.threads = std::max(2, (int)std::thread::hardware_concurrency() / (int)runs.size());
-		for (size_t m = 0; m < g.members.size(); m++) threads.emplace_back([&, gptr = &g, m, group_vo] {
-			Group& g = *gptr;
-			WaveRun& run = *runs[g.members[m]];
-			FrameQueue& rq = g.bc->at(m);
-			PacketQueue& pq = *packets[g.members[m]];
-			const FrameFeed feed = [&rq, rp = run.score_rp](Picture& out) { return rq.pop(out, rp) ? 1 : 0; };
-			const PacketFeed next_packet = [&pq, rp = run.score_rp](std::vector<uint8_t>& out) { return pq.pop(out, rp); };
-			const ShownFeed shown = [&fr](size_t k, uint32_t& v) { return fr.shown.get(k, v); };
-			run.score_ok = vmaf_score(ref, feed, run.codec, next_packet, {}, run.enc.plan->enc, shown, g.fmt, group_vo, so, run.scores, run.score_rp);
-			if (run.score_ok && (long long)run.scores.size() != fr.frames) { fprintf(stderr, "%zu scores for %lld frames\n", run.scores.size(), fr.frames); run.score_ok = false; }
-			if (run.score_rp) run.score_rp->finish();
-			rq.cancel(); // done with the original frames: do not hold the reference decode back
-			pq.cancel(); // and with the packets: do not hold the encoder back
+		if (group_vo.threads <= 0) group_vo.threads = std::max(2, (int)std::thread::hardware_concurrency() / (int)group.size());
+		RefInfo ref;
+		ref.width = si.width; ref.height = si.height; ref.framerate = si.framerate; ref.color = si.color;
+		std::vector<std::thread> scorers;
+		for (size_t i = 0; i < group.size(); i++) scorers.emplace_back([&, i] {
+			ScoreJob& j = *group[i];
+			FrameQueue& q = bc.at(i);
+			const FrameFeed feed = [&q, rp = j.rp](Picture& out) { return q.pop(out, rp) ? 1 : 0; };
+			Mp4Reader packets;
+			if (!packets.open(j.encoded->file)) { fprintf(stderr, "cannot read %s\n", j.encoded->file.c_str()); q.cancel(); return; }
+			const PacketFeed next_packet = [&packets](std::vector<uint8_t>& out) { return packets.next(out); };
+			j.ok = vmaf_score(ref, feed, j.codec, next_packet, packets.extradata(), j.encoded->plan->enc, j.feed->shown, score_fmt, group_vo, so, j.scores, j.rp);
+			if (j.ok && (long long)j.scores.size() != j.feed->frames) { fprintf(stderr, "%zu scores for %lld frames\n", j.scores.size(), j.feed->frames); j.ok = false; }
+			q.cancel(); // done with the original frames: do not hold the producer back
 		});
+		for (auto& s : scorers) s.join();
+		ref_producer.join();
+		ui::detach(ref_handle);
 	}
-
-	producer.join();
-	for (auto& t : threads) t.join();
-	for (auto& g : groups) ui::detach(g->handle);
-	for (auto* r : runs) r->enc.ok = r->enc.ok && fr.ok;
-	return fr.ok;
 }

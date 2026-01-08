@@ -21,12 +21,10 @@
 #include <tuple>
 
 #include "cache.h"
-#include "hash.h"
 #include "encoder.h"
 #include "formats.h"
 #include "gpu.h"
 #include "convert.h"
-#include "download.h"
 #include "json.h"
 #include "source.h"
 #include "mux.h"
@@ -68,7 +66,6 @@ struct Scenario {
 
 struct Config {
 	std::vector<std::string> inputs;
-	std::map<std::string, std::string> input_urls; // local copy -> the URL it was downloaded from
 	std::vector<Scenario> scenarios;
 	VmafOptions vo;
 	ScaleOptions scale;
@@ -76,7 +73,6 @@ struct Config {
 	std::string output_dir = "output"; // encoded streams and result files go here; empty: nothing is written
 	bool save_videos = true;
 	bool plain = false; // no live display, just lines
-	std::string hw_decode = "auto"; // "" software only, "auto", or a device type or decoder name: see set_hw_decode()
 	int decode_threads = 0;  // 0: as many as the cores allow within a memory budget
 	bool low_memory = false; // score a wave before encoding the next, and fewer VMAF threads
 	std::vector<Job> jobs;
@@ -96,16 +92,13 @@ struct Run {
 	Options options;
 	std::string video;      // the saved stream, relative to the output directory; empty if none was saved
 	std::string video_file; // where run_one() writes it
-	std::string video_sha256; // SHA-256 of the encoded stream
-	std::string result;     // its result file (options, bitrates, per-frame VMAF), relative to the output directory; empty if none
 	std::string tag;        // "[run 12/240]", for the progress lines
 	bool ignored = false;   // incompatible with the input or the encoder, so it was not run
 	std::string reason;
-	std::shared_ptr<RunProgress> progress, score_progress; // the encoding and the scoring of this run
+	std::shared_ptr<RunProgress> progress;
 	double encode_s = 0, score_s = 0; // wall time of the encoding wave this run was in, and of the scoring wave
 	double enc_busy_s = 0, enc_starved_s = 0, decode_blocked_s = 0, score_starved_s = 0; // where that time went
 	std::string gpu;        // name and driver of the GPU a GPU encoder ran on
-	std::string gpu_json = "null", caps_json = "null"; // its PCI ids, and what its encoder reports about itself (see encoder_caps_json)
 	double penalty = 0;     // VMAF points deducted for exceeding the target bitrate
 	double best_share = 0;  // share of frames where this run is at least as good as every other run of its group
 };
@@ -163,7 +156,6 @@ static std::vector<Options> expand(const std::string& encoder, const std::vector
 }
 
 static void add_inputs(Config& cfg, const std::string& path) {
-	if (is_url(path)) { cfg.inputs.push_back(path); return; } // fetched once the cache folder is known, see main()
 	if (!fs::exists(path)) throw std::runtime_error("input '" + path + "' does not exist");
 	if (!fs::is_directory(path)) { cfg.inputs.push_back(path); return; }
 	std::vector<std::string> found;
@@ -212,25 +204,18 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* d = v->find("downscaler")) cfg.scale.downscaler = d->text();
 		if (auto* g = v->find("gpu")) cfg.scale.device = g->text();
 	}
-	// These live in "settings"; older files have them at the top level, which still works.
-	auto setting = [&](const char* k) -> const Json* {
-		if (auto* g = root.find("settings")) if (auto* v = g->find(k)) return v;
-		return root.find(k);
-	};
-	if (auto* v = setting("cache")) cfg.cache_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "cache" : "") : v->text();
+	if (auto* v = root.find("cache")) cfg.cache_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "cache" : "") : v->text();
 	if (auto* v = root.find("output")) cfg.output_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "output" : "") : v->text();
-	if (auto* v = setting("hw_decode")) cfg.hw_decode = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "auto" : "") : v->text();
-	if (auto* v = setting("decode_threads")) cfg.decode_threads = atoi(v->text().c_str());
-	if (auto* v = setting("low_memory")) cfg.low_memory = v->text() == "1" || v->text() == "true";
-	if (auto* v = setting("videos")) cfg.save_videos = !(v->text() == "0" || v->text() == "false");
-	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str()); // where older files have it; it belongs in "vmaf" now
+	if (auto* v = root.find("decode_threads")) cfg.decode_threads = atoi(v->text().c_str());
+	if (auto* v = root.find("low_memory")) cfg.low_memory = v->text() == "1" || v->text() == "true";
+	if (auto* v = root.find("videos")) cfg.save_videos = !(v->text() == "0" || v->text() == "false");
+	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str());
 	if (auto* v = root.find("vmaf")) {
 		if (auto* m = v->find("model")) cfg.vo.model = m->text();
 		if (auto* t = v->find("threads")) cfg.vo.threads = atoi(t->text().c_str());
-		if (auto* p = v->find("over_penalty")) over_penalty = atof(p->text().c_str());
 	}
 	auto off = [](const Json* v) { return v && (v->text() == "0" || v->text() == "false"); };
-	const bool default_prune = !off(setting("prune"));
+	const bool default_prune = !off(root.find("prune"));
 	list("encoders", [&](const Json& e) {
 		if (off(e.find("enabled"))) return;
 		Job j;
@@ -255,27 +240,22 @@ static void load_config(const std::string& path, Config& cfg) {
 
 static const char* VERSION = "0.2.0";
 
-// The config file used when none is named: config.jsonc, or config.json if that is what there is.
-static std::string default_config() { return !fs::exists("config.jsonc") && fs::exists("config.json") ? "config.json" : "config.jsonc"; }
-
 static void print_help(FILE* f) {
 	fputs(R"HELP(ves - tries encoder option combinations, scores every frame with VMAF and reports the configurations
 that are the best in at least 95% of frames.
 
-usage: ves [options]                  run a config file (config.jsonc, or config.json, unless --config says otherwise)
+usage: ves [options]                  run a config file (config.json unless --config says otherwise)
        ves -enc <encoder> -br <kbps> -i <input> [--option key=a,b ...]    a quick run without a config file
        ves <input> <encoder> <codec> <kbps[,..]> [key=a,b ...]           the same, short form
 
 Paths
-  -cfg, --config <file>     config file, with comments allowed (default: config.jsonc, else config.json)
+  -cfg, --config <file>     config file (default: config.json)
   -i,   --input <path>      an input video or a directory with videos (.mkv, .mp4, .mov); replaces the
                             inputs of the config file; can be given more than once
   -o,   --output <dir>      where the results go (default: output): the encoded stream of every run in
                             <dir>/<input>/ (fragmented .mp4) and the result file <dir>/<input>.json;
                             "off" writes nothing
         --no-videos         write the result files but not the encoded streams
-        --hw-decode <auto|off|name>  decode the sources on the GPU when their first frames match a software decode exactly (default: auto);
-                            a name is a device type (cuda, d3d11va, d3d12va, dxva2, qsv, amf, vaapi, vulkan) or a hardware decoder (hevc_cuvid, h264_qsv, ...)
         --decode-threads <n> threads per decoder (default: all cores; 4 with --low-memory)
         --low-memory        score each wave before the next is encoded and use fewer VMAF threads: slower, takes much less memory
         --plain             plain lines instead of the live display (also used when stdout is not a terminal)
@@ -344,7 +324,7 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 }
 
 static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
-	std::string config_path = default_config();
+	std::string config_path = "config.json";
 	std::vector<std::string> inputs, bitrates, res, fps, kfs;
 	std::optional<std::string> output, cache, model;
 	std::optional<int> threads;
@@ -371,7 +351,6 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--plain") cfg.plain = true;
 		else if (a == "--low-memory") cfg.low_memory = true;
 		else if (a == "--decode-threads") cfg.decode_threads = atoi(value().c_str());
-		else if (a == "--hw-decode") cfg.hw_decode = value();
 		else if (a == "-c" || a == "--cache") cache = value();
 		else if (a == "--vmaf-model") model = value();
 		else if (a == "--vmaf-threads") threads = atoi(value().c_str());
@@ -431,6 +410,9 @@ static std::string sanitize(std::string s, size_t max = 100) {
 }
 
 
+// Runs whose encoders produced the very same bytes decode to the very same frames, so they share one set of scores.
+static std::mutex same_mutex;
+static std::map<std::string, std::vector<double>> same_output;
 
 // Which of the swept options change anything. The baseline has every option at its default (unset when its list has a null,
 // else its first value). Options are tested in groups, always moving the whole group away from the baseline: a group whose output
@@ -564,10 +546,6 @@ static std::string jq(const std::string& s) { // JSON string
 	return o + "\"";
 }
 
-// Result files name inputs and model files without the folders they sit in: the paths are the user's own, and results are matched by hash.
-static std::string file_name(const std::string& path) { return fs::path(path).filename().string(); }
-static std::string model_name(const std::string& model) { return model.rfind("path=", 0) == 0 ? "path=" + file_name(model.substr(5)) : model; }
-
 int main(int argc, char** argv) {
 	Config cfg;
 	try {
@@ -578,24 +556,13 @@ int main(int argc, char** argv) {
 			if (quit) return 0;
 		}
 		else if (argc >= 5) { if (!parse_cli(argc, argv, cfg)) return 1; }
-		else if (argc == 1) load_config(default_config(), cfg);
-		else if (argc == 2 && !fs::is_directory(argv[1]) && (fs::path(argv[1]).extension() == ".json" || fs::path(argv[1]).extension() == ".jsonc")) load_config(argv[1], cfg);
+		else if (argc == 1) load_config("config.json", cfg);
+		else if (argc == 2 && !fs::is_directory(argv[1]) && fs::path(argv[1]).extension() == ".json") load_config(argv[1], cfg);
 		else { print_help(stderr); return 1; }
-	} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
-	// Inputs given as URLs are downloaded once into the cache folder (or the temp folder if there is no cache) and used from there.
-	try {
-		const std::string downloads = (cfg.cache_dir.empty() ? fs::temp_directory_path() / "ves-downloads" : fs::path(cfg.cache_dir) / "downloads").string();
-		for (auto& in : cfg.inputs) {
-			if (!is_url(in)) continue;
-			const std::string url = in;
-			in = fetch_url(url, downloads);
-			cfg.input_urls[in] = url;
-		}
 	} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
 	if (cfg.inputs.empty() || cfg.scenarios.empty() || cfg.jobs.empty()) { fprintf(stderr, "error: need inputs, bitrates and at least one enabled encoder (see --help)\n"); return 1; }
 
 	if (cfg.low_memory && cfg.vo.threads <= 0) cfg.vo.threads = 2;
-	set_hw_decode(cfg.hw_decode);
 	set_decode_threads(cfg.decode_threads > 0 ? cfg.decode_threads : cfg.low_memory ? 4 : 0);
 	ui::start(cfg.plain);
 	struct UiGuard { ~UiGuard() { ui::stop(); } } ui_guard; // the live display is cleared on every way out
@@ -606,8 +573,7 @@ int main(int argc, char** argv) {
 		Codec id;
 		Params p;
 		bool ok = false;
-		std::string key, pool; // what the run's outcome depends on (see cache_key); the pool it counts against
-		std::string result_file; // where its result is kept, and looked for when the same run comes up again; empty: not at all
+		std::string key, pool; // result cache key; the pool it counts against
 		Plan plan;
 	};
 	struct Pool {
@@ -643,32 +609,18 @@ int main(int argc, char** argv) {
 			for (auto& [k, v] : opts) t.r.label += " " + k + "=" + v;
 			t.p.codec = job.codec; t.p.bitrate = br * 1000; t.p.options = opts;
 			t.r.encoder = job.encoder; t.r.codec = job.codec; t.r.options = opts;
-			// The run's result (.json) and stream (.mp4) share a name made from the run and a hash of everything its outcome depends on, so a
-			// run that comes up again finds its result straight away. They go to the output folder; without one, results are kept in the cache.
-			t.key = cache_key(input, job.encoder, job.codec, opts, br, kf, shape, cfg.scale, cfg.vo);
-			if (!cfg.output_dir.empty()) {
-				const std::string folder = sanitize(fs::path(input).stem().string()), base = result_name(t.r.label + " " + std::to_string(br) + "k kf" + std::to_string((double)kf).substr(0, std::to_string((double)kf).find('.') + 2), t.key);
-				t.result_file = (fs::path(cfg.output_dir) / folder / (base + ".json")).string();
-				t.r.result = folder + "/" + base + ".json";
-				if (cfg.save_videos) {
-					t.r.video = folder + "/" + base + ".mp4";
-					t.r.video_file = (fs::path(cfg.output_dir) / t.r.video).string();
-				}
+			if (!cfg.output_dir.empty() && cfg.save_videos) {
+				char idx[16];
+				snprintf(idx, sizeof idx, "%04zu", tasks.size());
+				t.r.video = sanitize(fs::path(input).stem().string()) + "/" + idx + "_" + sanitize(t.r.label) + ".mp4";
+				t.r.video_file = (fs::path(cfg.output_dir) / t.r.video).string();
 				std::error_code ec;
-				fs::create_directories(fs::path(cfg.output_dir) / folder, ec);
-			} else if (!cfg.cache_dir.empty()) t.result_file = (fs::path(cfg.cache_dir) / "results" / (key_hash(t.key) + ".json")).string();
+				fs::create_directories(fs::path(t.r.video_file).parent_path(), ec);
+			}
 			// Every GPU is a pool of its own, so GPUs work in parallel; CPU encoders share one pool.
 			std::string gpu_index = opts.count("gpu") ? opts.at("gpu") : "0";
 			t.r.group = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|" + gpu_index;
-			if (is_gpu_encoder(job.encoder)) {
-				t.r.gpu = gpu_description(encoder_vendor(job.encoder), atoi(gpu_index.c_str()));
-				t.r.gpu_json = gpu_json(encoder_vendor(job.encoder), atoi(gpu_index.c_str()));
-				static std::map<std::string, std::string> caps_known; // asked once per encoder, codec and GPU
-				const std::string caps_key = job.encoder + "/" + job.codec + "/" + gpu_index;
-				auto known = caps_known.find(caps_key);
-				if (known == caps_known.end()) known = caps_known.emplace(caps_key, encoder_caps_json(job.encoder, job.codec, atoi(gpu_index.c_str()))).first;
-				t.r.caps_json = known->second;
-			}
+			if (is_gpu_encoder(job.encoder)) t.r.gpu = gpu_description(encoder_vendor(job.encoder), atoi(gpu_index.c_str()));
 			std::string pool = !job.pool.empty() ? job.pool : is_gpu_encoder(job.encoder) ? job.encoder + ":" + gpu_index : "cpu";
 			t.pool = pool;
 			Pool& pl = pools[pool];
@@ -716,45 +668,25 @@ int main(int argc, char** argv) {
 	std::atomic<int> finished{0};
 	const int total = (int)tasks.size();
 	ui::overall(0, total);
-	std::map<std::string, SourceInfo> infos;
-	// SHA-256 of an input file, read once per input and only when a result needs it.
-	std::map<std::string, std::string> reference_hashes;
-	auto reference_hash = [&](const std::string& input) -> const std::string& {
-		auto it = reference_hashes.find(input);
-		return it != reference_hashes.end() ? it->second : reference_hashes.emplace(input, sha256_file(input)).first->second;
-	};
-	// What goes into a run's result file besides its key, bitrate and scores.
-	auto run_details = [&](const Task& t) {
-		const Run& r = t.r;
-		std::ostringstream o;
-		o << "\"input\":" << jq(file_name(r.input)) << ",\"input_url\":" << (cfg.input_urls.count(r.input) ? jq(cfg.input_urls.at(r.input)) : std::string("null"))
-		  << ",\"source_decoder\":" << jq(infos.count(r.input) ? infos.at(r.input).decoder : std::string()) << ",\"encoder\":" << jq(r.encoder) << ",\"codec\":" << jq(r.codec) << ",\"options\":{";
-		bool first = true;
-		for (auto& [k, v] : r.options) { o << (first ? "" : ",") << jq(k) << ":" << jq(v); first = false; }
-		o << "},\"width\":" << r.shape.w << ",\"height\":" << r.shape.h << ",\"fps\":" << (r.shape.fps.num ? r.shape.fps.value() : 0.0)
-		  << ",\"target_kbps\":" << r.bitrate << ",\"keyframe_interval_s\":" << r.kf << ",\"gpu\":" << (r.gpu.empty() ? std::string("null") : jq(r.gpu))
-		  << ",\"gpu_info\":" << r.gpu_json << ",\"encoder_caps\":" << r.caps_json << ",\"video\":" << (r.video.empty() ? std::string("null") : jq(r.video))
-		  << ",\"video_sha256\":" << (r.video_sha256.empty() ? std::string("null") : jq(r.video_sha256)) << ",\"reference_sha256\":" << jq(reference_hash(r.input));
-		return o.str();
-	};
 	auto finish = [&](Task& t) {
 		Run& r = t.r;
 		ui::overall(++finished, total);
 		char line[1024];
 		if (r.ignored) { snprintf(line, sizeof line, "%s IGNORED  %s: %s", r.tag.c_str(), r.label.c_str(), r.reason.c_str()); ui::log(line); return; }
 		if (!t.ok) { snprintf(line, sizeof line, "%s FAILED  %s  (%s, %lld kbps)", r.tag.c_str(), r.label.c_str(), r.input.c_str(), (long long)r.bitrate); ui::log(line); return; }
-		if (!t.result_file.empty() && !r.cached) result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
+		if (!t.key.empty() && !r.cached) cache_store(cfg.cache_dir, t.key, CachedRun{r.kbps, r.scores});
 		r.penalty = std::max(0.0, r.kbps / r.bitrate - 1) * 100 * over_penalty;
 		std::vector<double> sc = r.scores;
 		std::sort(sc.begin(), sc.end());
-		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s  [wave %.1fs: encoder busy %.1f, starved %.1f; decoder backed up %.1f; scorer starved %.1f]", r.tag.c_str(), r.label.c_str(), r.kbps,
-		         std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size(), sc.front(), sc[(size_t)(sc.size() * 0.05)], r.cached ? " (cached)" : "",
-		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.enc_busy_s, r.enc_starved_s, r.decode_blocked_s, r.score_starved_s);
+		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s  [encode %.1fs: encoder busy %.1f, starved %.1f, decoder backed up %.1f | score %.1fs: scorer starved %.1f]", r.tag.c_str(), r.label.c_str(), r.kbps,
+		         std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size(), sc.front(), sc[(size_t)(sc.size() * 0.05)], r.cached ? " (cached)" : r.same ? " (same output as an earlier run)" : "",
+		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.enc_busy_s, r.enc_starved_s, r.decode_blocked_s, r.score_s, r.score_starved_s);
 		ui::log(line);
 	};
 
 	// Whatever cannot work, or was done before, is finished right away. The rest is sorted by the frames it needs: runs with the
 	// same input, resolution, frame rate and pixel format share one decode.
+	std::map<std::string, SourceInfo> infos;
 	std::map<std::string, std::vector<Task*>> by_feed;
 	std::vector<std::string> feed_order;
 	for (size_t i = 0; i < tasks.size(); i++) {
@@ -764,27 +696,16 @@ int main(int argc, char** argv) {
 		snprintf(tag, sizeof tag, "[run %zu/%d]", i + 1, total);
 		r.tag = tag;
 		r.progress = std::make_shared<RunProgress>();
-		if (!t.result_file.empty()) {
+		if (!cfg.cache_dir.empty()) {
+			t.key = cache_key(r.input, t.job->encoder, t.job->codec, t.p.options, r.bitrate, r.kf, r.shape, cfg.scale, cfg.vo);
 			CachedRun hit;
-			if (result_load(t.result_file, t.key, hit)) {
-				r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.video_sha256 = hit.video_sha256; r.cached = t.ok = true;
-				const bool have_video = !r.video_file.empty() && fs::exists(r.video_file);
-				if (!have_video) r.video.clear(); // the stream of the earlier run, if it is still there
-				// Result files from before the hashes existed get them now, as far as the files they describe are still there.
-				const bool new_video_hash = r.video_sha256.empty() && have_video && !(r.video_sha256 = sha256_file(r.video_file)).empty();
-				if ((new_video_hash || hit.reference_sha256.empty() || hit.input != file_name(r.input)) && !reference_hash(r.input).empty())
-					result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
-				r.video_file.clear();
-				finish(t);
-				continue;
-			}
+			if (cache_load(cfg.cache_dir, t.key, hit)) { r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.cached = t.ok = true; r.video.clear(); r.video_file.clear(); finish(t); continue; }
 		}
 		auto info = infos.find(r.input);
 		if (info == infos.end()) {
 			SourceInfo si;
 			if (!source_info(r.input, si)) { finish(t); continue; }
 			info = infos.emplace(r.input, si).first;
-			ui::log("Source " + fs::path(r.input).filename().string() + ": " + std::to_string(si.width) + "x" + std::to_string(si.height) + " decoded by " + si.decoder);
 		}
 		t.plan = make_plan(info->second, t.job->encoder, t.job->codec, t.p.options, r.shape);
 		if (t.plan.ignored) { r.ignored = true; r.reason = t.plan.reason; finish(t); continue; }
@@ -793,70 +714,114 @@ int main(int argc, char** argv) {
 		by_feed[fk].push_back(&t);
 	}
 
-	// A wave is the runs that are encoded at the same time from one decode: up to `parallel` of each pool. Each run is scored while it is
-	// being encoded, from the packets as they come out, so a wave is done when its slowest encoder and scorer are.
-	// Encoded packets are muxed to disk as they arrive; scratch files go next to the results if there are any, else in the temp folder.
+	// A wave is the runs that are encoded at the same time from one decode: up to `parallel` of each pool. Scoring of one wave
+	// goes on while the next is being encoded.
+	struct Wave {
+		std::vector<Task*> tasks;
+		std::vector<EncodeJob> jobs;
+		std::vector<int> handles;
+		FeedResult fr;
+		RunProgress feed_rp;
+	};
+	auto score_and_finish = [&](std::shared_ptr<Wave> w) {
+		const SourceInfo& si = infos.at(w->tasks[0]->r.input);
+		std::vector<ScoreJob> sjobs(w->tasks.size());
+		std::vector<ScoreJob*> to_score;
+		std::map<std::string, size_t> leader;  // output bytes -> the job that is scored for it
+		std::vector<long long> follows(w->tasks.size(), -1);
+		std::vector<std::string> keys(w->tasks.size());
+		for (size_t i = 0; i < w->tasks.size(); i++) {
+			Task& t = *w->tasks[i];
+			Run& r = t.r;
+			EncodeJob& ej = w->jobs[i];
+			if (!ej.ok) continue;
+			r.kbps = ej.kbps;
+			char hex[17];
+			snprintf(hex, sizeof hex, "%016llx", (unsigned long long)ej.output.hash);
+			const std::string same_key = keys[i] = r.group + "|" + hex;
+			{
+				std::lock_guard lock(same_mutex);
+				if (auto it = same_output.find(same_key); it != same_output.end()) { r.scores = it->second; r.same = true; t.ok = true; continue; }
+			}
+			if (auto it = leader.find(same_key); it != leader.end()) { follows[i] = (long long)it->second; continue; }
+			leader[same_key] = i;
+			sjobs[i].encoded = &ej; sjobs[i].feed = &w->fr; sjobs[i].codec = t.id; sjobs[i].rp = r.progress.get();
+			ui::log_plain(r.tag + " scoring   " + r.label);
+			to_score.push_back(&sjobs[i]);
+		}
+		const auto t_score = std::chrono::steady_clock::now();
+		if (!to_score.empty()) score_wave(w->tasks[0]->r.input, si, to_score, cfg.vo, cfg.scale);
+		const double score_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_score).count();
+		for (Task* t : w->tasks) {
+			t->r.score_s = score_s;
+			t->r.score_starved_s = t->r.progress->starved_ms / 1000.0;
+		}
+		for (size_t i = 0; i < w->tasks.size(); i++) {
+			Task& t = *w->tasks[i];
+			Run& r = t.r;
+			if (sjobs[i].encoded && sjobs[i].ok) {
+				r.scores = sjobs[i].scores;
+				t.ok = true;
+				std::lock_guard lock(same_mutex);
+				same_output[keys[i]] = r.scores;
+			} else if (follows[i] >= 0 && sjobs[follows[i]].ok) {
+				r.scores = sjobs[follows[i]].scores;
+				r.same = true;
+				t.ok = true;
+			}
+			ui::detach(w->handles[i]);
+			std::error_code ec;
+			if (t.r.video_file.empty()) fs::remove(w->jobs[i].file, ec); // a temporary file for scoring
+			finish(t);
+		}
+	};
+
+	// Encoded packets are muxed to disk as they arrive and scored from there, not kept in memory; scratch files go next to the results if there are any, else in the temp folder.
 	const fs::path spool_dir = (cfg.output_dir.empty() ? fs::temp_directory_path() : fs::path(cfg.output_dir)) / (".ves-tmp-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 	{ std::error_code ec; fs::create_directories(spool_dir, ec); }
+	std::thread scoring;
 	for (auto& fk : feed_order) {
 		std::map<std::string, std::vector<Task*>> by_pool;
 		for (Task* t : by_feed[fk]) by_pool[t->pool].push_back(t);
 		std::map<std::string, size_t> taken;
 		for (;;) {
-			std::vector<Task*> wave;
+			auto w = std::make_shared<Wave>();
 			for (auto& [pool, list] : by_pool) {
-				for (int k = 0; k < pools[pool].parallel && taken[pool] < list.size(); k++) wave.push_back(list[taken[pool]++]);
+				for (int k = 0; k < pools[pool].parallel && taken[pool] < list.size(); k++) w->tasks.push_back(list[taken[pool]++]);
 			}
-			if (wave.empty()) break;
-			const std::string& input = wave[0]->r.input;
+			if (w->tasks.empty()) break;
+			const std::string& input = w->tasks[0]->r.input;
 			const SourceInfo& si = infos.at(input);
-			std::vector<WaveRun> wr(wave.size());
-			std::vector<WaveRun*> ptrs;
-			std::vector<int> handles;
-			for (size_t i = 0; i < wave.size(); i++) {
-				Task& t = *wave[i];
-				WaveRun& run = wr[i];
-				EncodeJob& ej = run.enc;
-				t.r.score_progress = std::make_shared<RunProgress>();
+			w->jobs.resize(w->tasks.size());
+			std::vector<EncodeJob*> ptrs;
+			for (size_t i = 0; i < w->tasks.size(); i++) {
+				Task& t = *w->tasks[i];
+				EncodeJob& ej = w->jobs[i];
 				ej.encoder = t.job->encoder; ej.codec = t.job->codec; ej.plan = &t.plan;
 				ej.bitrate = t.r.bitrate * 1000; ej.kf = t.r.kf; ej.rp = t.r.progress.get();
 				ej.file = !t.r.video_file.empty() ? t.r.video_file : (spool_dir / ("run" + std::to_string(&t - tasks.data()) + ".mp4")).string();
 				ej.id = t.id; ej.color = si.color;
-				run.codec = t.id; run.score_rp = t.r.score_progress.get();
-				ptrs.push_back(&run);
-				ui::log_plain(t.r.tag + " encoding and scoring  " + t.r.label + "  (" + fs::path(input).filename().string() + ", " + std::to_string(t.r.bitrate) + " kbps, pool " + t.pool + ")");
-				handles.push_back(ui::attach(t.r.progress.get(), t.r.label, t.pool));
-				handles.push_back(ui::attach(t.r.score_progress.get(), t.r.label, t.pool));
+				ptrs.push_back(&ej);
+				ui::log_plain(t.r.tag + " encoding  " + t.r.label + "  (" + fs::path(input).filename().string() + ", " + std::to_string(t.r.bitrate) + " kbps, pool " + t.pool + ")");
+				w->handles.push_back(ui::attach(t.r.progress.get(), t.r.label, t.pool));
 			}
-			RunProgress feed_rp;
-			feed_rp.begin(3, 1);
-			const int feed_handle = ui::attach(&feed_rp, "decode+convert " + fs::path(input).filename().string() + " to " + std::to_string(wave[0]->plan.enc.w) + "x" + std::to_string(wave[0]->plan.enc.h), "decode");
-			FeedResult fr;
-			const auto t_wave = std::chrono::steady_clock::now();
-			run_wave(input, si, ptrs, cfg.scale, cfg.vo, &feed_rp, fr);
-			const double wave_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_wave).count();
+			const int feed_handle = ui::attach(&w->feed_rp, "decode+convert " + fs::path(input).filename().string() + " to " + std::to_string(w->tasks[0]->plan.enc.w) + "x" + std::to_string(w->tasks[0]->plan.enc.h), "decode");
+			const auto t_enc = std::chrono::steady_clock::now();
+			encode_wave(input, si, ptrs, cfg.scale, &w->feed_rp, w->fr);
+			const double enc_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_enc).count();
+			for (Task* t : w->tasks) {
+				t->r.encode_s = enc_s;
+				t->r.enc_busy_s = t->r.progress->busy_ms / 1000.0;
+				t->r.enc_starved_s = t->r.progress->starved_ms / 1000.0;
+				t->r.decode_blocked_s = w->feed_rp.blocked_ms / 1000.0;
+			}
 			ui::detach(feed_handle);
-			for (int h : handles) ui::detach(h);
-			for (size_t i = 0; i < wave.size(); i++) {
-				Task& t = *wave[i];
-				Run& r = t.r;
-				r.encode_s = wave_s;
-				r.enc_busy_s = r.progress->busy_ms / 1000.0;
-				r.enc_starved_s = r.progress->starved_ms / 1000.0;
-				r.decode_blocked_s = feed_rp.blocked_ms / 1000.0;
-				r.score_starved_s = r.score_progress->starved_ms / 1000.0;
-				if (wr[i].enc.ok && wr[i].score_ok) {
-					r.kbps = wr[i].enc.kbps;
-					r.scores = std::move(wr[i].scores);
-					t.ok = true;
-				}
-				std::error_code ec;
-				if (t.ok) r.video_sha256 = sha256_file(wr[i].enc.file);
-					if (r.video_file.empty()) fs::remove(wr[i].enc.file, ec); // a temporary file
-				finish(t);
-			}
+			if (scoring.joinable()) scoring.join();
+			scoring = std::thread([&, w] { score_and_finish(w); });
+			if (cfg.low_memory) scoring.join();
 		}
 	}
+	if (scoring.joinable()) scoring.join();
 	{ std::error_code ec; fs::remove_all(spool_dir, ec); }
 	ui::stop();
 
@@ -910,8 +875,8 @@ int main(int argc, char** argv) {
 			o << "},\"width\":" << r.shape.w << ",\"height\":" << r.shape.h << ",\"fps\":" << (r.shape.fps.num ? r.shape.fps.value() : 0.0)
 			  << ",\"kbps\":" << r.kbps << ",\"over_target_penalty\":" << r.penalty << ",\"best_frame_share\":" << r.best_share << ",\"winner\":" << (r.best_share >= BEST_FRAME_SHARE ? "true" : "false")
 			  << ",\"vmaf\":{\"mean\":" << std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size() << ",\"min\":" << sc.front() << ",\"p5\":" << sc[(size_t)(sc.size() * 0.05)] << "}"
-			  << ",\"gpu\":" << (r.gpu.empty() ? "null" : jq(r.gpu)) << ",\"gpu_info\":" << r.gpu_json << ",\"encoder_caps\":" << r.caps_json << ",\"cached\":" << (r.cached ? "true" : "false")
-			  << ",\"video\":" << (r.video.empty() ? "null" : jq(r.video)) << ",\"video_sha256\":" << (r.video_sha256.empty() ? "null" : jq(r.video_sha256)) << ",\"result\":" << (r.result.empty() ? "null" : jq(r.result)) << "}";
+			  << ",\"gpu\":" << (r.gpu.empty() ? "null" : jq(r.gpu)) << ",\"cached\":" << (r.cached ? "true" : "false") << ",\"same_output_as_earlier_run\":" << (r.same ? "true" : "false")
+			  << ",\"video\":" << (r.video.empty() ? "null" : jq(r.video)) << "}";
 		}
 		o << "]}";
 		group_json[runs[g].input].push_back(o.str());
@@ -924,7 +889,7 @@ int main(int argc, char** argv) {
 		for (auto& input : cfg.inputs) {
 			const fs::path file = fs::path(cfg.output_dir) / (sanitize(fs::path(input).stem().string()) + ".json");
 			std::ofstream f(file);
-			f << "{\"tool\":\"ves\",\"version\":" << jq(VERSION) << ",\"input\":" << jq(file_name(input)) << ",\"input_url\":" << (cfg.input_urls.count(input) ? jq(cfg.input_urls.at(input)) : std::string("null")) << ",\"reference_sha256\":" << jq(reference_hash(input)) << ",\"source_decoder\":" << jq(infos.count(input) ? infos.at(input).decoder : std::string()) << ",\"vmaf_model\":" << jq(model_name(cfg.vo.model)) << ",\"over_penalty\":" << over_penalty << ",\"failed\":[";
+			f << "{\"tool\":\"ves\",\"version\":" << jq(VERSION) << ",\"input\":" << jq(input) << ",\"vmaf_model\":" << jq(cfg.vo.model) << ",\"over_penalty\":" << over_penalty << ",\"failed\":[";
 			for (size_t i = 0; i < failed_runs[input].size(); i++) f << (i ? "," : "") << jq(failed_runs[input][i]);
 			f << "],\"ignored\":[";
 			for (size_t i = 0; i < ignored_runs[input].size(); i++) f << (i ? "," : "") << ignored_runs[input][i];

@@ -3,8 +3,6 @@
 // HevcQualityPreset for HEVC) so every property AMF exposes can be swept. Enums are numeric.
 #include "encoder.h"
 
-#ifdef _WIN32
-
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -216,18 +214,3 @@ bool amf_supports(const std::string& codec, int chroma, int depth) {
 	}
 	return it->second;
 }
-
-#else
-// AMF's Linux runtime needs a Vulkan context (AMFContext::InitVulkan); not implemented, so the encoder reports itself as unavailable.
-#include <cstdio>
-
-namespace {
-struct AmfUnavailable : Encoder {
-	bool open(const Params&, Sink) override { fprintf(stderr, "amf: not supported on this platform\n"); return false; }
-	bool encode(const Picture*) override { return false; }
-};
-} // namespace
-
-std::unique_ptr<Encoder> make_encoder_amf() { return std::make_unique<AmfUnavailable>(); }
-bool amf_supports(const std::string&, int, int) { return false; }
-#endif

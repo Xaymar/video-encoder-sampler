@@ -47,12 +47,6 @@ std::unique_ptr<Encoder> make_encoder_x265();
 std::unique_ptr<Encoder> make_encoder_svtav1();
 
 bool nvenc_supports(const std::string& codec, int chroma, int depth);
-
-// What the encoder block of the n-th GPU reports about itself for a codec, as a JSON object (NVENC: all of its capability values), or "null"
-// if the encoder cannot tell. Together with the PCI ids of the GPU this identifies the encoder generation: the CUDA generation of a GPU says
-// nothing about it, since a newer GPU can carry an older encoder block.
-std::string nvenc_caps_json(const std::string& codec, int gpu);
-inline std::string encoder_caps_json(const std::string& encoder, const std::string& codec, int gpu) { return encoder == "nvenc" ? nvenc_caps_json(codec, gpu) : "null"; }
 bool amf_supports(const std::string& codec, int chroma, int depth);
 bool qsv_supports(const std::string& codec, int chroma, int depth);
 
