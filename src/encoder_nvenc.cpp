@@ -352,7 +352,7 @@ public:
 			}
 			it->second(n);
 		}
-		if (rcp.lookaheadLevel != 0 && !rcp.enableLookahead) { // the driver crashes on this instead of failing
+		if (rcp.lookaheadLevel != 0 && !rcp.enableLookahead) { // NVIDIA's user-mode library aborts the process on this (fast-fail) instead of returning an error
 			fprintf(stderr, "nvenc: lookaheadLevel needs lookahead (rc-lookahead above 0)\n");
 			return false;
 		}
