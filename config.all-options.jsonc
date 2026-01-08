@@ -1,14 +1,14 @@
-// Every encoder option ves knows, with a few values for each. A reference, not a run: all encoders are disabled, and the combinations multiply (as listed
-// here: NVENC 10^5, x264 10^11, x265 10^14, QuickSync 10^16), so enable an encoder only after cutting its options down to the ones you want to compare.
+// Every encoder option ves knows, with a few values for each. A reference, not a run: all encoders are disabled, and the combinations multiply (x264's list
+// alone is about 10^11 runs, x265's 10^14), so enable an encoder only after cutting its options down to the ones you want to compare.
 //
 // Notes:
 //  - An option with a list of values is swept; null leaves it at the encoder's default; [] ignores it.
 //  - Options that change nothing are left out of the sweep by pruning ("prune": true), but every remaining combination is still encoded.
 //  - "fixed" options are never pruned: presets and tunes set the defaults of everything else, so each of their values is screened by itself.
 //  - x264, x265 and SVT-AV1 take their command line names, so any option their CLI knows works, not only the ones listed here.
-//    NVENC's list is complete. QuickSync's are the fields of oneVPL's mfxInfoMFX and mfxExtCodingOption2/3. AMF's are AMF's own property
+//    NVENC takes the scalar fields of its rate control, config and per-codec structures by their SDK names. QuickSync's are the fields of oneVPL's mfxInfoMFX and mfxExtCodingOption2/3. AMF's are AMF's own property
 //    names for the codec; the list leaves out the read-only, per-frame and feedback properties.
-//  - Run-tested with a short clip: every value of NVENC (H.264), x264, x265 and SVT-AV1. AMF and QuickSync need hardware this was not
+//  - Run-tested with a short clip: every value of NVENC (H.264, HEVC, AV1), x264, x265 and SVT-AV1. AMF and QuickSync need hardware this was not
 //    tested on: their names come from the SDK headers, and an unknown name fails the run with a message.
 //  - Every encoder also takes "chroma" (420, 444), "bitdepth" (8, 10) and, for GPU encoders, "gpu" (index, or "all").
 {
@@ -21,7 +21,7 @@
 	"settings": { "cache": "cache", "prune": true },
 
 	"encoders": [
-		// NVIDIA; codec h264, hevc or av1 (b_ref_mode is for h264 and hevc only)
+		// NVIDIA, H.264. The first block of options is shared by all three codecs; the names are NVENC's own fields (nvEncodeAPI.h), numeric
 		{
 			"enabled": false,
 			"encoder": "nvenc",
@@ -33,10 +33,154 @@
 				"rc": ["cbr", "vbr"],   // rate control
 				"bf": [null, 0, 1, 2, 3, 4],   // B-frames
 				"rc-lookahead": [0, 8, 16, 32],   // frames of lookahead
-				"b_ref_mode": [null, "none", "each", "middle"],   // B-frames as references (h264 and hevc)
 				"spatial-aq": [null, 0, 1],
 				"temporal-aq": [null, 0, 1],
 				"aq-strength": [null, 1, 8, 15],   // 1..15
+				"vbvBufferSize": [0, 500000, 2000000],   // bits; 0 is the encoder's default
+				"vbvInitialDelay": [0, 250000],   // bits
+				"minQP": [null, 10, 20],   // also switches the minimum QP on
+				"maxQP": [null, 40, 51],   // also switches the maximum QP on
+				"initialRCQP": [null, 26],   // also switches the initial QP on
+				// "zeroReorderDelay": [null, 0, 1],   // only without B-frames: use it with "bf": [0]
+				"enableNonRefP": [null, 0, 1],
+				"strictGOPTarget": [null, 0, 1],
+				"disableIadapt": [null, 0, 1],   // adaptive I-frames at scene cuts (lookahead only)
+				"disableBadapt": [null, 0, 1],   // adaptive B-frame decision (lookahead only)
+				"targetQuality": [null, 20, 30],   // constant quality level for VBR
+				"lowDelayKeyFrameScale": [null, 1, 2, 4],   // ratio of I-frame to P-frame bits
+				"multiPass": [0, 1, 2],   // 0 off, 1 two passes (quarter resolution first), 2 two passes (full resolution first)
+				// "lookaheadLevel": [0, 1, 2, 3],   // needs lookahead on: use it with "rc-lookahead" values above 0
+				"mvPrecision": [0, 1, 2, 3],   // 0 default, 1 full pel, 2 half pel, 3 quarter pel
+				// "enableWeightedPrediction": [null, 0, 1],   // only without B-frames: use it with "bf": [0]
+				"numRefL0": [null, 1, 2, 4],   // 0 = automatic, up to 7
+				"intraRefreshPeriod": [null, 60],
+				"intraRefreshCnt": [null, 15],
+				"enableIntraRefresh": [null, 0, 1],
+				"sliceMode": [null, 0, 3],   // 0 = whole frame, 3 = number of slices
+				"sliceModeData": [null, 1, 4],   // slices per frame with sliceMode 3
+				// "enableLTR": [null, 0, 1],   // long-term references; needs ltrNumFrames above 0, so switch both on together
+				"ltrNumFrames": [null, 1, 2],
+				"enableFillerDataInsertion": [null, 0, 1],   // pads CBR streams up to the bitrate
+				"outputAUD": [null, 0, 1],
+				"outputPictureTimingSEI": [null, 0, 1],
+				"outputBufferingPeriodSEI": [null, 0, 1],
+				"b_ref_mode": [null, "none", "each", "middle"],   // B-frames as references
+				"maxNumRefFrames": [null, 3, 4],   // B-frames as references need at least 3
+				"entropyCodingMode": [null, 1, 2],   // 1 CABAC, 2 CAVLC
+				"adaptiveTransformMode": [null, 1, 2],   // 8x8 transform: 1 off, 2 on
+				"bdirectMode": [null, 1, 2, 3],   // 1 off, 2 temporal, 3 spatial
+				"disableDeblockingFilterIDC": [null, 0, 1],   // 1 disables the filter
+				"hierarchicalPFrames": [null, 0, 1],
+				"hierarchicalBFrames": [null, 0, 1],
+				"useConstrainedIntraPred": [null, 0, 1],
+				"repeatSPSPPS": [null, 0, 1],
+			},
+		},
+		// NVIDIA, HEVC (the shared options as for H.264, then the HEVC ones)
+		{
+			"enabled": false,
+			"encoder": "nvenc",
+			"codec": "hevc",
+			"fixed": ["preset", "tune"],
+			"options": {
+				"preset": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],   // p1 fastest ... p7 slowest
+				"tune": ["hq", "ll", "ull"],   // hq | ll | ull | lossless
+				"rc": ["cbr", "vbr"],   // rate control
+				"bf": [null, 0, 1, 2, 3, 4],   // B-frames
+				"rc-lookahead": [0, 8, 16, 32],   // frames of lookahead
+				"spatial-aq": [null, 0, 1],
+				"temporal-aq": [null, 0, 1],
+				"aq-strength": [null, 1, 8, 15],   // 1..15
+				"vbvBufferSize": [0, 500000, 2000000],   // bits; 0 is the encoder's default
+				"vbvInitialDelay": [0, 250000],   // bits
+				"minQP": [null, 10, 20],   // also switches the minimum QP on
+				"maxQP": [null, 40, 51],   // also switches the maximum QP on
+				"initialRCQP": [null, 26],   // also switches the initial QP on
+				// "zeroReorderDelay": [null, 0, 1],   // only without B-frames: use it with "bf": [0]
+				"enableNonRefP": [null, 0, 1],
+				"strictGOPTarget": [null, 0, 1],
+				"disableIadapt": [null, 0, 1],   // adaptive I-frames at scene cuts (lookahead only)
+				"disableBadapt": [null, 0, 1],   // adaptive B-frame decision (lookahead only)
+				"targetQuality": [null, 20, 30],   // constant quality level for VBR
+				"lowDelayKeyFrameScale": [null, 1, 2, 4],   // ratio of I-frame to P-frame bits
+				"multiPass": [0, 1, 2],   // 0 off, 1 two passes (quarter resolution first), 2 two passes (full resolution first)
+				// "lookaheadLevel": [0, 1, 2, 3],   // needs lookahead on: use it with "rc-lookahead" values above 0
+				"mvPrecision": [0, 1, 2, 3],   // 0 default, 1 full pel, 2 half pel, 3 quarter pel
+				// "enableWeightedPrediction": [null, 0, 1],   // only without B-frames: use it with "bf": [0]
+				"numRefL0": [null, 1, 2, 4],   // 0 = automatic, up to 7
+				"intraRefreshPeriod": [null, 60],
+				"intraRefreshCnt": [null, 15],
+				"enableIntraRefresh": [null, 0, 1],
+				"sliceMode": [null, 0, 3],   // 0 = whole frame, 3 = number of slices
+				"sliceModeData": [null, 1, 4],   // slices per frame with sliceMode 3
+				// "enableLTR": [null, 0, 1],   // long-term references; needs ltrNumFrames above 0, so switch both on together
+				"ltrNumFrames": [null, 1, 2],
+				"enableFillerDataInsertion": [null, 0, 1],   // pads CBR streams up to the bitrate
+				"outputAUD": [null, 0, 1],
+				"outputPictureTimingSEI": [null, 0, 1],
+				"outputBufferingPeriodSEI": [null, 0, 1],
+				"b_ref_mode": [null, "none", "each", "middle"],   // B-frames as references
+				"maxNumRefFramesInDPB": [null, 2, 4],
+				"minCUSize": [null, 1, 2, 3],   // 1 = 8x8 ... 4 = 64x64
+				"maxCUSize": [null, 3, 4],
+				"tier": [null, 0, 1],   // 0 main, 1 high
+				"disableDeblockingFilterIDC": [null, 0, 1],
+				"splitEncodeMode": [null, 0, 1, 2, 3],   // encodes on two NVENC engines where the GPU has them
+				"useConstrainedIntraPred": [null, 0, 1],
+			},
+		},
+		// NVIDIA, AV1 (the shared options as for H.264, then the AV1 ones)
+		{
+			"enabled": false,
+			"encoder": "nvenc",
+			"codec": "av1",
+			"fixed": ["preset", "tune"],
+			"options": {
+				"preset": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],   // p1 fastest ... p7 slowest
+				"tune": ["hq", "ll", "ull"],   // hq | ll | ull | lossless
+				"rc": ["cbr", "vbr"],   // rate control
+				"bf": [null, 0, 1, 2, 3, 4],   // B-frames
+				"rc-lookahead": [0, 8, 16, 32],   // frames of lookahead
+				"spatial-aq": [null, 0, 1],
+				"temporal-aq": [null, 0, 1],
+				"aq-strength": [null, 1, 8, 15],   // 1..15
+				"vbvBufferSize": [0, 500000, 2000000],   // bits; 0 is the encoder's default
+				"vbvInitialDelay": [0, 250000],   // bits
+				"minQP": [null, 10, 20],   // also switches the minimum QP on
+				"maxQP": [null, 40, 51],   // also switches the maximum QP on
+				"initialRCQP": [null, 26],   // also switches the initial QP on
+				// "zeroReorderDelay": [null, 0, 1],   // only without B-frames: use it with "bf": [0]
+				"enableNonRefP": [null, 0, 1],
+				"strictGOPTarget": [null, 0, 1],
+				"disableIadapt": [null, 0, 1],   // adaptive I-frames at scene cuts (lookahead only)
+				"disableBadapt": [null, 0, 1],   // adaptive B-frame decision (lookahead only)
+				"targetQuality": [null, 20, 30],   // constant quality level for VBR
+				"lowDelayKeyFrameScale": [null, 1, 2, 4],   // ratio of I-frame to P-frame bits
+				"multiPass": [0, 1, 2],   // 0 off, 1 two passes (quarter resolution first), 2 two passes (full resolution first)
+				// "lookaheadLevel": [0, 1, 2, 3],   // needs lookahead on: use it with "rc-lookahead" values above 0
+				"mvPrecision": [0, 1, 2, 3],   // 0 default, 1 full pel, 2 half pel, 3 quarter pel
+				// "enableWeightedPrediction": [null, 0, 1],   // only without B-frames: use it with "bf": [0]
+				"tfLevel": [null, 0, 4],   // temporal filtering; needs the GPU's support
+				"numFwdRefs": [null, 1, 2, 4],
+				"numBwdRefs": [null, 1, 2],
+				"maxNumRefFramesInDPB": [null, 2, 4],
+				"minPartSize": [null, 2, 3],   // 1 = 4x4 ... 5 = 64x64
+				"maxPartSize": [null, 4, 5],
+				"tier": [null, 0, 1],
+				"numTileColumns": [null, 1, 2],
+				"numTileRows": [null, 1, 2],
+				"enableCustomTileConfig": [null, 0, 1],
+				"enableFilmGrainParams": [null, 0, 1],
+				"enableBitstreamPadding": [null, 0, 1],
+				"enableIntraRefresh": [null, 0, 1],
+				"intraRefreshPeriod": [null, 60],
+				"intraRefreshCnt": [null, 15],
+				// "enableLTR": [null, 0, 1],   // long-term references; needs ltrNumFrames above 0, so switch both on together
+				"ltrNumFrames": [null, 1, 2],
+				"splitEncodeMode": [null, 0, 1, 2, 3],
+				"yDcQPIndexOffset": [null, -4, 4],   // also uDcQPIndexOffset, vDcQPIndexOffset
+				"repeatSeqHdr": [null, 0, 1],
+				"enableTimingInfo": [null, 0, 1],
 			},
 		},
 		// software
