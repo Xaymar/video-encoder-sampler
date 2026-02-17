@@ -1,0 +1,92 @@
+name: windows-x64
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  FFMPEG_URL: https://github.com/GyanD/codexffmpeg/releases/download/8.1/ffmpeg-8.1-full_build-shared.7z
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # The encoder and scaler libraries come from MSYS2's UCRT64 repository, FFmpeg's headers and import libraries from gyan.dev's shared build.
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: false
+          install: >-
+            mingw-w64-ucrt-x86_64-libx264
+            mingw-w64-ucrt-x86_64-x265
+            mingw-w64-ucrt-x86_64-svt-av1
+            mingw-w64-ucrt-x86_64-vmaf
+            mingw-w64-ucrt-x86_64-libplacebo
+            mingw-w64-ucrt-x86_64-libvpl
+            mingw-w64-ucrt-x86_64-lcms2
+            mingw-w64-ucrt-x86_64-libdovi
+            mingw-w64-ucrt-x86_64-shaderc
+            mingw-w64-ucrt-x86_64-spirv-cross
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-libgcc
+            mingw-w64-ucrt-x86_64-libstdc++
+            mingw-w64-ucrt-x86_64-libwinpthread
+
+      - name: Stage the MSYS2 libraries
+        shell: msys2 {0}
+        run: bash scripts/stage-msys2.sh third-party
+
+      - name: Fetch FFmpeg
+        shell: pwsh
+        run: |
+          curl.exe -fsSL -o ffmpeg.7z $env:FFMPEG_URL
+          7z x ffmpeg.7z -offmpeg-extract -y | Out-Null
+          Move-Item (Get-ChildItem ffmpeg-extract -Directory | Select-Object -First 1).FullName third-party/ffmpeg-dev
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
+          cmake --build build
+          cmake --install build --prefix dist/ves-windows-x64
+
+      # A generated clip through the software path: no GPU is needed, but the whole chain (decode, encode, mux, VMAF) runs.
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          third-party/ffmpeg-dev/bin/ffmpeg.exe -v error -f lavfi -i testsrc2=size=640x360:rate=30:duration=2 -pix_fmt yuv420p -c:v libx264 -qp 18 clip.mp4
+          Push-Location dist/ves-windows-x64
+          ./ves.exe --plain --hw-decode off -c off -o off -i ../../clip.mp4 -enc x264 -br 500
+          Pop-Location
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ves-windows-x64
+          path: dist/ves-windows-x64
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ves-windows-x64
+          path: ves-windows-x64
+      - run: zip -r ves-windows-x64.zip ves-windows-x64
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ves-windows-x64.zip

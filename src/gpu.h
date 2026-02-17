@@ -12,11 +12,15 @@ struct GpuInfo {
 	std::string name;
 	std::string driver; // "a.b.c.d" of the user mode driver
 	uint64_t luid = 0;  // adapter LUID (low part | high part << 32), identifies the same GPU to CUDA and Vulkan
+	uint32_t vendor_id = 0, device_id = 0, sub_system_id = 0, revision = 0; // PCI identity: what tells GPU models, and so encoder generations, apart
 	std::string describe() const { return name + " (driver " + driver + ")"; }
 };
 
 // All adapters of a vendor in DXGI order; the n-th one is what `gpu=n` means for that vendor's encoder.
 std::vector<GpuInfo> list_gpus(unsigned vendor);
+
+// The n-th adapter of a vendor as a JSON object (name, driver and PCI ids), or "null".
+std::string gpu_json(unsigned vendor, int index);
 
 // "<name> (driver <version>)" of the n-th adapter of a vendor, or "none".
 std::string gpu_description(unsigned vendor, int index);

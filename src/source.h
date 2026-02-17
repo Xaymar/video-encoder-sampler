@@ -20,6 +20,7 @@ public:
 	Rational framerate{30, 1};   // constant frame rate files: the file's; variable frame rate files: the measured average
 	bool vfr = false;            // the timestamps do not follow `framerate`
 	Color color;                 // as tagged in the file
+	std::string decoder;         // what decodes it, e.g. "hevc (software)" or "hevc (cuda hardware)"
 
 	virtual ~Source() = default;
 	virtual bool open(const std::string& path) = 0;
@@ -32,6 +33,11 @@ public:
 };
 
 std::unique_ptr<Source> open_source(const std::string& path); // nullptr if it cannot be opened
+
+// Hardware decoding of the sources: "" or "off" for software only, "auto" for the first that works, or one device type ("cuda", "d3d11va",
+// "d3d12va", "dxva2", "qsv", "amf", "vaapi", "vulkan") or dedicated hardware decoder ("hevc_cuvid", "h264_qsv", ...). A source is only decoded by hardware after its first frames matched a software decode
+// exactly; otherwise it is decoded in software. Encoded streams that are scored are always decoded in software.
+void set_hw_decode(const std::string& type);
 
 // Threads per decoder: 0 for as many as there are cores. Each decodes a frame of its own, which is what makes high bitrate sources fast.
 void set_decode_threads(int threads);

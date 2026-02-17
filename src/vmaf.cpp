@@ -1,5 +1,6 @@
 #include "vmaf.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -72,8 +73,8 @@ public:
 } // namespace
 
 bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const PacketFeed& next_packet, const std::vector<uint8_t>& extradata, const Shape& enc,
-                const std::vector<uint32_t>& shown_map, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp) {
-	if (rp) rp->begin(2, (long long)shown_map.size());
+                const ShownFeed& shown, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp) {
+	if (rp) rp->begin(2, std::max<long long>(1, ref.frames));
 	auto decoder = make_decoder();
 	if (!decoder->open(codec, extradata)) return false;
 
@@ -87,7 +88,8 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 
 	// Hold `shown` (decoded frame number mi, at the original resolution) for every original frame up to the next one.
 	auto show = [&](const Picture& pic, int64_t mi) {
-		while (ok && k < (long long)shown_map.size() && shown_map[k] == mi) {
+		uint32_t on_screen;
+		while (ok && shown((size_t)k, on_screen) && on_screen == mi) {
 			int rr = next_ref(r);
 			if (rr < 0) { ok = false; break; }
 			if (rr == 0) break;
@@ -131,6 +133,7 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 	if (ok) { decoder->flush(); pump(); }
 	if (ok && convert_dis) { ok = up->push(nullptr); collect_converted(); }
 	if (ok && k == 0) { fprintf(stderr, "no frames were decoded\n"); ok = false; }
-	if (ok && (k != (long long)shown_map.size() || next_ref(r) == 1)) { fprintf(stderr, "encoded stream does not cover the reference frames\n"); ok = false; }
+	uint32_t extra;
+	if (ok && (shown((size_t)k, extra) || next_ref(r) == 1)) { fprintf(stderr, "encoded stream does not cover the reference frames\n"); ok = false; }
 	return ok && scorer.finish(scores);
 }

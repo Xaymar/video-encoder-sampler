@@ -7,8 +7,15 @@
 #include <cstring>
 #include <memory>
 
+#ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include "ff.h"
 
@@ -80,6 +87,7 @@ namespace {
 constexpr int IO_BUFFER = 1 << 20;
 constexpr uint64_t CHUNK = 64ull << 20; // size of a mapped window, a multiple of the allocation granularity; the file grows by this much
 
+#ifdef _WIN32
 std::wstring wide(const std::string& s) {
 	const int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
 	std::wstring w((size_t)std::max(n, 1), L'\0');
@@ -192,6 +200,101 @@ public:
 		file = INVALID_HANDLE_VALUE;
 	}
 };
+
+#else
+class Mapped {
+	int file = -1;
+	uint8_t* view = nullptr;
+	uint64_t view_off = 0, view_len = 0;
+	uint64_t pos = 0, size = 0, capacity = 0;
+	bool writing = false;
+
+	void unmap_view() {
+		if (view) munmap(view, (size_t)view_len);
+		view = nullptr;
+		view_len = 0;
+	}
+
+	bool window(uint64_t at) {
+		if (view && at >= view_off && at < view_off + view_len) return true;
+		unmap_view();
+		view_off = at / CHUNK * CHUNK;
+		view_len = std::min<uint64_t>(CHUNK, capacity - view_off);
+		void* v = mmap(nullptr, (size_t)view_len, writing ? PROT_READ | PROT_WRITE : PROT_READ, MAP_SHARED, file, (off_t)view_off);
+		if (v == MAP_FAILED) { view_len = 0; return false; }
+		view = (uint8_t*)v;
+		return true;
+	}
+
+	bool grow(uint64_t need) {
+		const uint64_t cap = (need + CHUNK - 1) / CHUNK * CHUNK;
+		unmap_view();
+		if (ftruncate(file, (off_t)cap) != 0) return false;
+		capacity = cap;
+		return true;
+	}
+
+public:
+	~Mapped() { close(); }
+
+	bool open(const std::string& path, bool write) {
+		writing = write;
+		file = ::open(path.c_str(), write ? O_RDWR | O_CREAT | O_TRUNC : O_RDONLY, 0644);
+		if (file < 0) return false;
+		if (write) return true; // mapped when the first bytes arrive
+		struct stat st;
+		if (fstat(file, &st) != 0 || st.st_size == 0) return false;
+		size = capacity = (uint64_t)st.st_size;
+		return true;
+	}
+
+	int write_bytes(const uint8_t* b, int n) {
+		if (pos + (uint64_t)n > capacity && !grow(pos + (uint64_t)n)) return AVERROR(EIO);
+		int left = n;
+		while (left > 0) {
+			if (!window(pos)) return AVERROR(EIO);
+			const uint64_t here = std::min<uint64_t>((uint64_t)left, view_off + view_len - pos);
+			memcpy(view + (pos - view_off), b, (size_t)here);
+			b += here; pos += here; left -= (int)here;
+		}
+		size = std::max(size, pos);
+		return n;
+	}
+
+	int read_bytes(uint8_t* b, int n) {
+		if (pos >= size) return AVERROR_EOF;
+		const int total = (int)std::min<uint64_t>((uint64_t)n, size - pos);
+		int left = total;
+		while (left > 0) {
+			if (!window(pos)) return AVERROR(EIO);
+			const uint64_t here = std::min<uint64_t>((uint64_t)left, view_off + view_len - pos);
+			memcpy(b, view + (pos - view_off), (size_t)here);
+			b += here; pos += here; left -= (int)here;
+		}
+		return total;
+	}
+
+	int64_t seek(int64_t off, int whence) {
+		if (whence & AVSEEK_SIZE) return (int64_t)size;
+		switch (whence & 3) {
+		case SEEK_SET: pos = (uint64_t)off; break;
+		case SEEK_CUR: pos = (uint64_t)((int64_t)pos + off); break;
+		case SEEK_END: pos = (uint64_t)((int64_t)size + off); break;
+		default: return AVERROR(EINVAL);
+		}
+		return (int64_t)pos;
+	}
+
+	void close() {
+		unmap_view();
+		if (file >= 0) {
+			if (writing && ftruncate(file, (off_t)size) != 0) {} // cut back to what was written
+			::close(file);
+		}
+		file = -1;
+	}
+};
+#endif
 
 int io_write(void* o, const uint8_t* b, int n) { return ((Mapped*)o)->write_bytes(b, n); }
 int io_read(void* o, uint8_t* b, int n) { return ((Mapped*)o)->read_bytes(b, n); }
@@ -346,44 +449,5 @@ bool Mp4Writer::close() {
 		oc = nullptr;
 	}
 	impl->io.reset(); // flushes nothing more: the trailer went through avio already; closes the file
-	return ok;
-}
-
-struct Mp4Reader::Impl {
-	std::unique_ptr<Io> io;
-};
-
-Mp4Reader::Mp4Reader() : impl(new Impl) {}
-
-Mp4Reader::~Mp4Reader() {
-	if (ic) {
-		ic->pb = nullptr;
-		avformat_close_input(&ic);
-	}
-	delete impl;
-}
-
-bool Mp4Reader::open(const std::string& path) {
-	impl->io = std::make_unique<Io>();
-	if (!impl->io->open(path, false)) return false;
-	ic = avformat_alloc_context();
-	if (!ic) return false;
-	ic->pb = impl->io->ctx;
-	ic->flags |= AVFMT_FLAG_CUSTOM_IO;
-	if (avformat_open_input(&ic, path.c_str(), nullptr, nullptr) < 0) { ic = nullptr; return false; }
-	if (avformat_find_stream_info(ic, nullptr) < 0 || ic->nb_streams < 1) return false;
-	const AVCodecParameters* cp = ic->streams[0]->codecpar;
-	if (cp->extradata && cp->extradata_size > 0) extra_.assign(cp->extradata, cp->extradata + cp->extradata_size);
-	return true;
-}
-
-bool Mp4Reader::next(std::vector<uint8_t>& out) {
-	AVPacket* pkt = av_packet_alloc();
-	bool ok = false;
-	while (pkt && av_read_frame(ic, pkt) >= 0) {
-		if (pkt->stream_index == 0) { out.assign(pkt->data, pkt->data + pkt->size); ok = true; av_packet_unref(pkt); break; }
-		av_packet_unref(pkt);
-	}
-	av_packet_free(&pkt);
 	return ok;
 }

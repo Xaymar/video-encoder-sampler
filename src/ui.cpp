@@ -7,13 +7,25 @@
 #include <cstdio>
 #include <deque>
 #include <fcntl.h>
-#include <io.h>
 #include <map>
 #include <mutex>
 #include <thread>
 
+#ifdef _WIN32
+#include <io.h>
 #include <windows.h>
 #include <psapi.h>
+#define pipe_open(fds) _pipe(fds, 1 << 16, _O_BINARY)
+#else
+#include <sys/ioctl.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#define pipe_open(fds) pipe(fds)
+#define _dup dup
+#define _dup2 dup2
+#define _close close
+#define _read read
+#endif
 
 namespace {
 
@@ -43,6 +55,7 @@ std::string span(double sec) {
 	return b;
 }
 
+#ifdef _WIN32
 int console_width() {
 	CONSOLE_SCREEN_BUFFER_INFO info;
 	if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)) return std::max(40, info.srWindow.Right - info.srWindow.Left + 1);
@@ -54,6 +67,17 @@ int console_height() {
 	if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &info)) return std::max(8, info.srWindow.Bottom - info.srWindow.Top + 1);
 	return 30;
 }
+#else
+int console_width() {
+	winsize ws;
+	return ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col ? std::max<int>(40, ws.ws_col) : 100;
+}
+
+int console_height() {
+	winsize ws;
+	return ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row ? std::max<int>(8, ws.ws_row) : 30;
+}
+#endif
 
 std::string fit(std::string s, int width) {
 	if ((int)s.size() > width) s.resize(width);
@@ -65,14 +89,15 @@ std::string run_line(const Entry& e, int width) {
 	static const char* names[] = {"wait ", "encode", "score ", "decode"};
 	const int st = e.p->stage;
 	const long long done = e.p->done, total = e.p->total;
-	const double secs = std::max(0.001, (now_ms() - e.p->since_ms) / 1000.0);
+	const int64_t end = e.p->end_ms;
+	const double secs = std::max(0.001, ((end ? end : now_ms()) - e.p->since_ms) / 1000.0);
 	char head[96];
 	const int pct = total > 0 ? (int)std::min<long long>(100, done * 100 / total) : 0;
 	std::string bar(20, '-');
 	for (int i = 0; i < pct / 5; i++) bar[i] = '#';
 	static const char* waits[] = {"", "starved", "backed up"};
 	const int ws = e.p->state;
-	snprintf(head, sizeof head, "%-9.9s %-6s [%s] %3d%% %5lld/%-5lld %6.1f fps %-9s ", e.pool.c_str(), names[st >= 0 && st < 4 ? st : 0], bar.c_str(), pct, done, total, done / secs, waits[ws >= 0 && ws < 3 ? ws : 0]);
+	snprintf(head, sizeof head, "%-9.9s %-6s [%s] %3d%% %5lld/%-5lld %6.1f fps %-9s ", e.pool.c_str(), names[st >= 0 && st < 4 ? st : 0], bar.c_str(), pct, done, total, done / secs, end ? "done" : waits[ws >= 0 && ws < 3 ? ws : 0]);
 	return fit(head + e.label, width);
 }
 
@@ -109,7 +134,7 @@ void plain_status() {
 	last = now_ms();
 	for (auto& [h, e] : entries) {
 		const long long total = e.p->total, done = e.p->done;
-		if (e.p->stage == 0 || total <= 0) continue;
+		if (e.p->stage == 0 || total <= 0 || e.p->end_ms) continue; // not started, or already finished
 		static const char* waits[] = {"", " [starved: waiting for frames]", " [backed up: waiting for room downstream]"};
 		const int ws = e.p->state;
 		printf("  %s %s: %lld%% (%lld/%lld frames)%s  %s\n", e.p->stage == 1 ? "encoding" : e.p->stage == 3 ? "decoding" : "scoring", e.pool.c_str(), done * 100 / total, done, total, waits[ws >= 0 && ws < 3 ? ws : 0], e.label.c_str());
@@ -129,7 +154,7 @@ void render_loop() {
 // Everything the libraries write to stderr would tear the live area, so it goes through the permanent lines instead.
 void capture_stderr() {
 	int fds[2];
-	if (_pipe(fds, 1 << 16, _O_BINARY) != 0) return;
+	if (pipe_open(fds) != 0) return;
 	saved_stderr = _dup(2);
 	_dup2(fds[1], 2);
 	_close(fds[1]);
@@ -150,7 +175,10 @@ void capture_stderr() {
 
 } // namespace
 
+void RunProgress::finish() { end_ms = now_ms(); }
+
 void RunProgress::begin(int st, long long tot) {
+	end_ms = 0;
 	busy_ms = starved_ms = blocked_ms = 0;
 	state = 0;
 	done = 0;
@@ -165,9 +193,14 @@ void start(bool plain) {
 	std::lock_guard lock(m);
 	t0 = Clock::now();
 	running = true;
+#ifdef _WIN32
 	HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
 	DWORD mode = 0;
-	if (!plain && GetConsoleMode(out, &mode) && SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)) {
+	const bool terminal = GetConsoleMode(out, &mode) && SetConsoleMode(out, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+#else
+	const bool terminal = isatty(STDOUT_FILENO) != 0;
+#endif
+	if (!plain && terminal) {
 		is_live = true;
 		capture_stderr();
 	}
@@ -224,8 +257,13 @@ void log_plain(const std::string& line) {
 }
 
 long long peak_memory_mb() {
+#ifdef _WIN32
 	PROCESS_MEMORY_COUNTERS pmc{};
 	return K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc) ? (long long)(pmc.PeakWorkingSetSize >> 20) : 0;
+#else
+	rusage ru{};
+	return getrusage(RUSAGE_SELF, &ru) == 0 ? (long long)(ru.ru_maxrss >> 10) : 0; // kilobytes on Linux
+#endif
 }
 
 void overall(int done, int total) {

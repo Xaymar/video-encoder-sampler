@@ -1,0 +1,148 @@
+# Flatpak build of VES (app id com.xaymar.ves). Build locally with:
+#   flatpak-builder --user --install-deps-from=flathub --force-clean build-flatpak flatpak/com.xaymar.ves.yml
+# NVENC and CUDA come from the host's NVIDIA driver through the org.freedesktop.Platform.GL.nvidia extension that Flatpak mounts by itself.
+# Not part of the build: AMF (Windows only) and QuickSync (libvpl is loaded at run time and is not in the runtime).
+app-id: com.xaymar.ves
+runtime: org.freedesktop.Platform
+runtime-version: '25.08'
+sdk: org.freedesktop.Sdk
+command: ves
+
+finish-args:
+  - --share=network        # URL inputs
+  - --device=dri           # GPU access: NVENC, VA-API decoding, Vulkan scaling
+  - --filesystem=home      # inputs, output and cache folders
+
+cleanup:
+  - /include
+  - /lib/pkgconfig
+  - /lib/*.a
+  - /share/man
+  - /share/doc
+
+modules:
+  - name: nasm
+    buildsystem: autotools
+    sources:
+      - type: archive
+        url: https://www.nasm.us/pub/nasm/releasebuilds/2.16.03/nasm-2.16.03.tar.xz
+        sha256: 1412a1c760bbd05db026b6c0d1657affd6631cd0a63cddb6f73cc6d4aa616148
+
+  - name: nv-codec-headers
+    buildsystem: simple
+    build-commands:
+      - make install PREFIX=/app
+    sources:
+      - type: git
+        url: https://github.com/FFmpeg/nv-codec-headers.git
+        tag: n13.0.19.0
+
+  - name: x264
+    config-opts:
+      - --enable-shared
+      - --disable-cli
+    sources:
+      - type: git
+        url: https://code.videolan.org/videolan/x264.git
+        branch: stable
+
+  # x265 with 8, 10 and 12 bit in one library: the 10 and 12 bit encoders are built static and linked into the 8 bit one.
+  - name: x265
+    buildsystem: simple
+    build-commands:
+      - mkdir -p b12 b10 b8
+      - cd b12 && cmake -G Ninja ../source -DCMAKE_BUILD_TYPE=Release -DHIGH_BIT_DEPTH=ON -DMAIN12=ON -DEXPORT_C_API=OFF -DENABLE_SHARED=OFF -DENABLE_CLI=OFF && ninja
+      - cd b10 && cmake -G Ninja ../source -DCMAKE_BUILD_TYPE=Release -DHIGH_BIT_DEPTH=ON -DEXPORT_C_API=OFF -DENABLE_SHARED=OFF -DENABLE_CLI=OFF && ninja
+      - ln -s ../b10/libx265.a b8/libx265_main10.a
+      - ln -s ../b12/libx265.a b8/libx265_main12.a
+      - cd b8 && cmake -G Ninja ../source -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/app -DCMAKE_INSTALL_LIBDIR=lib -DENABLE_SHARED=ON -DENABLE_CLI=OFF -DEXTRA_LIB='x265_main10.a;x265_main12.a' -DEXTRA_LINK_FLAGS=-L. -DLINKED_10BIT=ON -DLINKED_12BIT=ON && ninja && ninja install
+    sources:
+      - type: git
+        url: https://bitbucket.org/multicoreware/x265_git.git
+        tag: '4.2'
+
+  - name: svt-av1
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DCMAKE_INSTALL_LIBDIR=lib
+      - -DBUILD_APPS=OFF
+      - -DBUILD_DEC=OFF
+      - -DBUILD_TESTING=OFF
+    sources:
+      - type: git
+        url: https://gitlab.com/AOMediaCodec/SVT-AV1.git
+        tag: v4.2.0
+
+  - name: libvmaf
+    buildsystem: meson
+    subdir: libvmaf
+    config-opts:
+      - --libdir=lib
+      - -Dbuilt_in_models=false
+      - -Denable_tests=false
+      - -Denable_docs=false
+    sources:
+      - type: git
+        url: https://github.com/Netflix/vmaf.git
+        tag: v3.2.0
+
+  # shortcut: shaderc is taken from the SDK; if it is missing there, add a shaderc (or glslang) module before this one
+  - name: libplacebo
+    buildsystem: meson
+    config-opts:
+      - --libdir=lib
+      - -Ddemos=false
+      - -Dtests=false
+      - -Ddovi=disabled
+      - -Dd3d11=disabled
+      - -Dopengl=disabled
+    sources:
+      - type: git
+        url: https://github.com/haasn/libplacebo.git
+        tag: v7.387.0
+
+  - name: ffmpeg
+    config-opts:
+      - --enable-shared
+      - --disable-static
+      - --disable-programs
+      - --disable-doc
+      - --enable-gpl
+      - --enable-libdav1d
+      - --enable-vaapi
+      - --enable-ffnvcodec
+      - --enable-nvdec
+    sources:
+      - type: git
+        url: https://github.com/FFmpeg/FFmpeg.git
+        tag: n8.1.3
+
+  # Headers for the QuickSync backend, which loads libvpl at run time.
+  - name: libvpl
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+      - -DCMAKE_INSTALL_LIBDIR=lib
+      - -DBUILD_TOOLS=OFF
+      - -DBUILD_EXAMPLES=OFF
+      - -DBUILD_TESTS=OFF
+      - -DINSTALL_EXAMPLE_CODE=OFF
+      - -DBUILD_DISPATCHER_ONLY=ON
+    sources:
+      - type: git
+        url: https://github.com/intel/libvpl.git
+        tag: v2.17.0
+
+  - name: ves
+    buildsystem: cmake-ninja
+    config-opts:
+      - -DCMAKE_BUILD_TYPE=Release
+    sources:
+      - type: dir
+        path: ..
+        skip:
+          - build
+          - build2
+          - build-flatpak
+          - .flatpak-builder

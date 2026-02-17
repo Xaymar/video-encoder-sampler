@@ -1,4 +1,4 @@
-// Native Intel QuickSync backend: talks to oneVPL (libvpl-2.dll, loaded at runtime) directly, no libavcodec.
+// Native Intel QuickSync backend: talks to oneVPL (libvpl, loaded at runtime) directly, no libavcodec.
 // Encoder options are the raw oneVPL field names (TargetUsage, GopRefDist, LookAheadDepth, BRefType, ...) of
 // mfxInfoMFX, mfxExtCodingOption2 and mfxExtCodingOption3, so everything those expose can be swept.
 // Values are numbers (the enum values of the headers), or the words on / off / adaptive for the MFX_CODINGOPTION_* toggles,
@@ -20,13 +20,23 @@
 #include "gpu.h"
 #include "repack.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#define LIB_HANDLE HMODULE
+#define LIB_OPEN(n) LoadLibraryA(n)
+#define LIB_SYM(h, n) GetProcAddress(h, n)
+#else
+#include <dlfcn.h>
+#define LIB_HANDLE void*
+#define LIB_OPEN(n) dlopen(n, RTLD_NOW)
+#define LIB_SYM(h, n) dlsym(h, n)
+#endif
 #include <vpl/mfx.h>
 
 namespace {
 
 struct Api {
-	HMODULE dll = nullptr;
+	LIB_HANDLE dll = nullptr;
 	bool ok = false;
 #define QSV_FUNCS(X) X(MFXLoad) X(MFXUnload) X(MFXCreateConfig) X(MFXSetConfigFilterProperty) X(MFXCreateSession) X(MFXClose) \
 	X(MFXVideoENCODE_Query) X(MFXVideoENCODE_QueryIOSurf) X(MFXVideoENCODE_Init) X(MFXVideoENCODE_GetVideoParam) \
@@ -36,16 +46,20 @@ struct Api {
 #undef X
 
 	bool load() {
-		for (const char* name : {"libvpl-2.dll", "libvpl.dll"}) if ((dll = LoadLibraryA(name))) break;
+#ifdef _WIN32
+		for (const char* name : {"libvpl-2.dll", "libvpl.dll"}) if ((dll = LIB_OPEN(name))) break;
+#else
+		for (const char* name : {"libvpl.so.2", "libvpl.so"}) if ((dll = LIB_OPEN(name))) break;
+#endif
 		if (!dll) return false;
-#define X(f) if (!(f = (decltype(&::f))GetProcAddress(dll, #f))) return false;
+#define X(f) if (!(f = (decltype(&::f))LIB_SYM(dll, #f))) return false;
 		QSV_FUNCS(X)
 #undef X
 		return ok = true;
 	}
 };
 
-// shortcut: the DLL stays loaded for the life of the process, like amfrt64.dll
+// shortcut: the DLL stays loaded for the life of the process, like the AMF runtime
 const Api& shared_api() { static Api a = [] { Api x; x.load(); return x; }(); return a; }
 
 struct Surface {
@@ -184,7 +198,7 @@ public:
 
 		if (list_gpus(VENDOR_INTEL).size() <= (size_t)gpu) { fprintf(stderr, "qsv: no Intel GPU with index %d\n", gpu); return false; }
 		a = shared_api();
-		if (!a.ok) { fprintf(stderr, "qsv: libvpl-2.dll not found\n"); return false; }
+		if (!a.ok) { fprintf(stderr, "qsv: libvpl not found\n"); return false; }
 
 		// Only Intel hardware implementations that can encode this codec; the gpu option picks among those.
 		if (!(loader = a.MFXLoad())) { fprintf(stderr, "qsv: cannot create the oneVPL loader\n"); return false; }

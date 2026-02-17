@@ -11,6 +11,7 @@ struct RunProgress {
 	std::atomic<int> stage{0};            // 0 waiting, 1 encoding, 2 scoring, 3 decoding (the shared decode feeding several runs)
 	std::atomic<long long> done{0}, total{0};
 	std::atomic<int64_t> since_ms{0};     // when the stage began, steady clock
+	std::atomic<int64_t> end_ms{0};       // when it finished (0: still going), so that its speed stops changing
 	// What the stage is doing when it is not working: 0 working, 1 starved (waiting for frames from upstream), 2 backed up (waiting for
 	// room downstream). The times add up over the stage; "busy" is time spent in the encoder or scorer itself.
 	std::atomic<int> state{0};
@@ -18,6 +19,7 @@ struct RunProgress {
 
 	void begin(int st, long long tot);
 	void step() { done++; }
+	void finish();
 };
 
 namespace ui {
