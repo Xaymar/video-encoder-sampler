@@ -22,6 +22,7 @@
 
 #include "cache.h"
 #include "hash.h"
+#include "upload.h"
 #include "encoder.h"
 #include "formats.h"
 #include "gpu.h"
@@ -75,6 +76,7 @@ struct Config {
 	std::string cache_dir = "cache"; // finished runs are kept here and not repeated; empty turns it off
 	std::string output_dir = "output"; // encoded streams and result files go here; empty: nothing is written
 	bool save_videos = true;
+	UploadOptions upload; // where the results go after a sweep; no address: nowhere
 	bool plain = false; // no live display, just lines
 	std::string hw_decode = "auto"; // "" software only, "auto", or a device type or decoder name: see set_hw_decode()
 	int decode_threads = 0;  // 0: as many as the cores allow within a memory budget
@@ -222,6 +224,11 @@ static void load_config(const std::string& path, Config& cfg) {
 	if (auto* v = setting("hw_decode")) cfg.hw_decode = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "auto" : "") : v->text();
 	if (auto* v = setting("decode_threads")) cfg.decode_threads = atoi(v->text().c_str());
 	if (auto* v = setting("low_memory")) cfg.low_memory = v->text() == "1" || v->text() == "true";
+	if (auto* u = root.find("upload")) {
+		if (auto* x = u->find("url")) cfg.upload.url = x->text();
+		if (auto* x = u->find("key")) cfg.upload.key = x->text();
+		if (auto* x = u->find("videos")) cfg.upload.videos = !(x->text() == "0" || x->text() == "false");
+	}
 	if (auto* v = setting("videos")) cfg.save_videos = !(v->text() == "0" || v->text() == "false");
 	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str()); // where older files have it; it belongs in "vmaf" now
 	if (auto* v = root.find("vmaf")) {
@@ -274,6 +281,9 @@ Paths
                             <dir>/<input>/ (fragmented .mp4) and the result file <dir>/<input>.json;
                             "off" writes nothing
         --no-videos         write the result files but not the encoded streams
+        --upload <url>      after the sweep, upload the results (and videos) to this VES website, e.g. https://ves.example.com ("off" disables it)
+        --upload-key <key>  the API key from the website's account page; better in the config ("upload": {"key": ...}) or the VES_API_KEY environment variable
+        --no-upload-videos  upload the results but not the encoded videos
         --hw-decode <auto|off|name>  decode the sources on the GPU when their first frames match a software decode exactly (default: auto);
                             a name is a device type (cuda, d3d11va, d3d12va, dxva2, qsv, amf, vaapi, vulkan) or a hardware decoder (hevc_cuvid, h264_qsv, ...)
         --decode-threads <n> threads per decoder (default: all cores; 4 with --low-memory)
@@ -346,10 +356,10 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	std::string config_path = default_config();
 	std::vector<std::string> inputs, bitrates, res, fps, kfs;
-	std::optional<std::string> output, cache, model;
+	std::optional<std::string> output, cache, model, upload_url, upload_key;
 	std::optional<int> threads;
 	std::optional<double> penalty;
-	bool videos = true, quick = false, upscale = false;
+	bool videos = true, upload_videos = true, quick = false, upscale = false;
 	Job job;
 	for (int i = 1; i < argc; i++) {
 		std::string a = argv[i], v;
@@ -368,6 +378,9 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "-i" || a == "--input") inputs.push_back(value());
 		else if (a == "-o" || a == "--output") output = value();
 		else if (a == "--no-videos") videos = false;
+		else if (a == "--upload") upload_url = value();
+		else if (a == "--upload-key") upload_key = value();
+		else if (a == "--no-upload-videos") upload_videos = false;
 		else if (a == "--plain") cfg.plain = true;
 		else if (a == "--low-memory") cfg.low_memory = true;
 		else if (a == "--decode-threads") cfg.decode_threads = atoi(value().c_str());
@@ -410,6 +423,9 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	if (!inputs.empty()) { cfg.inputs.clear(); for (auto& i : inputs) add_inputs(cfg, i); }
 	if (output) cfg.output_dir = *output == "off" ? "" : *output;
 	cfg.save_videos = cfg.save_videos && videos;
+	if (upload_url) cfg.upload.url = *upload_url == "off" ? "" : *upload_url;
+	if (upload_key) cfg.upload.key = *upload_key;
+	cfg.upload.videos = cfg.upload.videos && upload_videos;
 	if (cache) cfg.cache_dir = *cache == "off" ? "" : *cache;
 	if (model) cfg.vo.model = *model;
 	if (threads) cfg.vo.threads = *threads;
@@ -753,6 +769,20 @@ int main(int argc, char** argv) {
 		ui::log(line);
 	};
 
+	// The source files, probed once each. A run that asks for no particular resolution or frame rate gets the source's, which is what its result records.
+	auto source_of = [&](const std::string& input) -> const SourceInfo* {
+		auto it = infos.find(input);
+		if (it != infos.end()) return &it->second;
+		SourceInfo si;
+		if (!source_info(input, si)) return nullptr;
+		it = infos.emplace(input, si).first;
+		ui::log("Source " + fs::path(input).filename().string() + ": " + std::to_string(si.width) + "x" + std::to_string(si.height) + " decoded by " + si.decoder);
+		return &it->second;
+	};
+	auto fit_shape = [](Task& t) {
+		if (!t.r.shape.w) { t.r.shape.w = t.plan.enc.w; t.r.shape.h = t.plan.enc.h; }
+		if (!t.r.shape.fps.num) t.r.shape.fps = t.plan.enc.fps;
+	};
 	// Whatever cannot work, or was done before, is finished right away. The rest is sorted by the frames it needs: runs with the
 	// same input, resolution, frame rate and pixel format share one decode.
 	std::map<std::string, std::vector<Task*>> by_feed;
@@ -768,26 +798,26 @@ int main(int argc, char** argv) {
 			CachedRun hit;
 			if (result_load(t.result_file, t.key, hit)) {
 				r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.video_sha256 = hit.video_sha256; r.cached = t.ok = true;
+				if (const SourceInfo* src = source_of(r.input)) { // the geometry the run was encoded at, for its result and the summary
+					t.plan = make_plan(*src, t.job->encoder, t.job->codec, t.p.options, r.shape);
+					fit_shape(t);
+				}
 				const bool have_video = !r.video_file.empty() && fs::exists(r.video_file);
 				if (!have_video) r.video.clear(); // the stream of the earlier run, if it is still there
 				// Result files from before the hashes existed get them now, as far as the files they describe are still there.
 				const bool new_video_hash = r.video_sha256.empty() && have_video && !(r.video_sha256 = sha256_file(r.video_file)).empty();
-				if ((new_video_hash || hit.reference_sha256.empty() || hit.input != file_name(r.input)) && !reference_hash(r.input).empty())
+				if ((new_video_hash || hit.reference_sha256.empty() || hit.input != file_name(r.input) || (hit.width <= 0 && r.shape.w > 0)) && !reference_hash(r.input).empty())
 					result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
 				r.video_file.clear();
 				finish(t);
 				continue;
 			}
 		}
-		auto info = infos.find(r.input);
-		if (info == infos.end()) {
-			SourceInfo si;
-			if (!source_info(r.input, si)) { finish(t); continue; }
-			info = infos.emplace(r.input, si).first;
-			ui::log("Source " + fs::path(r.input).filename().string() + ": " + std::to_string(si.width) + "x" + std::to_string(si.height) + " decoded by " + si.decoder);
-		}
-		t.plan = make_plan(info->second, t.job->encoder, t.job->codec, t.p.options, r.shape);
+		const SourceInfo* src = source_of(r.input);
+		if (!src) { finish(t); continue; }
+		t.plan = make_plan(*src, t.job->encoder, t.job->codec, t.p.options, r.shape);
 		if (t.plan.ignored) { r.ignored = true; r.reason = t.plan.reason; finish(t); continue; }
+		fit_shape(t);
 		const std::string fk = r.input + "|" + t.plan.feed_key();
 		if (!by_feed.count(fk)) feed_order.push_back(fk);
 		by_feed[fk].push_back(&t);
@@ -934,6 +964,21 @@ int main(int argc, char** argv) {
 			if (f) printf("%sResults: %s\n", &input == &cfg.inputs.front() ? "\n" : "", file.string().c_str());
 			else fprintf(stderr, "cannot write %s\n", file.string().c_str());
 		}
+	}
+	if (!cfg.upload.url.empty()) {
+		UploadOptions up = cfg.upload;
+		if (up.key.empty()) if (const char* k = getenv("VES_API_KEY")) up.key = k;
+		std::vector<UploadItem> items; // the runs whose result files are in the output folder (results kept only in the cache are not uploaded)
+		for (auto& r : runs) {
+			if (r.result.empty() || cfg.output_dir.empty()) continue;
+			UploadItem it;
+			it.result_file = (fs::path(cfg.output_dir) / r.result).string();
+			it.label = r.label;
+			if (!r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) it.video_file = (fs::path(cfg.output_dir) / r.video).string();
+			items.push_back(std::move(it));
+		}
+		printf("\n");
+		upload_results(up, items, [](const std::string& line) { printf("%s\n", line.c_str()); fflush(stdout); });
 	}
 	printf("\nPeak memory use: %lld MB\n", ui::peak_memory_mb());
 	if (ignored) printf("\n%d runs were ignored: they cannot work with the input or the encoder (see the result files)\n", ignored);

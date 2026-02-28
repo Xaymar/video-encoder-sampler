@@ -105,6 +105,8 @@ bool result_load(const std::string& file, const std::string& key, CachedRun& out
 		out.kbps = atof(kbps->text().c_str());
 		auto* sha = j.find("video_sha256");
 		out.video_sha256 = sha && sha->type == Json::Str ? sha->text() : std::string();
+		auto* wd = j.find("width");
+		out.width = wd && wd->type == Json::Num ? atoi(wd->s.c_str()) : 0;
 		auto* in = j.find("input");
 		out.input = in && in->type == Json::Str ? in->text() : std::string();
 		auto* ref = j.find("reference_sha256");

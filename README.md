@@ -52,6 +52,7 @@ ves <input> <encoder> <codec> <bitrate-kbps[,..]> [key=value[,value..] ...]
 | `-cfg`, `--config <file>` | config file, `config.jsonc` by default (`config.json` if that is what there is) |
 | `-i`, `--input <path or URL>` | an input video, a directory of videos (`.mkv`, `.mp4`, `.mov`), or an `http(s)://` URL of a video; replaces the config file's inputs, can be repeated. A URL is downloaded once into `<cache>/downloads` (the temp folder if the cache is off) and used from there, so large test videos need not be kept on the machine by hand: a later run asks the server whether the file changed (an `ETag` or `Last-Modified` check) and only downloads it again if it did, an interrupted download continues where it stopped, and with the server gone the copy from earlier is used. The result file records the `input_url`. There is no checksum check, so only use sources you trust. |
 | `-o`, `--output <dir>` | where the results go, `output` by default: the encoded stream of every run in `<dir>/<input name>/` (fragmented `.mp4`, named `<run>_<bitrate>_<key frame interval>_<hash>`: the `moov` box comes first and every key frame starts a new fragment, so players and browsers can start right away; the frames carry the encoder's timing, shifted by the B-frame delay) a result file of the same name next to each stream (`.json`: the run's options, bitrates, GPU and the VMAF score of every frame), and one summary `<dir>/<input name>.json` per input that links to them. `off` writes nothing, `--no-videos` skips the streams |
+| `--upload <url>`, `--upload-key <key>`, `--no-upload-videos` | after the sweep, upload the results and their videos to a VES website (see below) |
 | `-c`, `--cache <dir>` | the cache folder (`cache`): downloaded inputs, and the results of finished runs when there is no output folder; `off` disables it |
 | `--low-memory` | take less memory, at the cost of speed (see below) |
 | `--vmaf-model`, `--vmaf-threads`, `--over-penalty` | scoring; `--vmaf-threads` defaults to 0, all cores shared between the runs scored at the same time |
@@ -63,6 +64,12 @@ In a terminal VES shows a live display at the bottom: the number of finished run
 
 The short form (and the config file's `"output"` key) work too; the short form writes no files unless `output=<dir>` is given. `kf=<seconds>`, `res=WxH,..`, `fps=..`, `pool=`, `parallel=`, `prune=off`, `fixed=`, `cache=`, `vmaf.model=`, `vmaf.threads=` and `over.penalty=` are understood there.
 
+
+### Uploading results
+
+With an address and an API key, ves uploads what a sweep produced once it is done: each run's result file, and its encoded video where the site allows it. Make the key on the website under *Account → API key*; it belongs in the config (`"upload": {"url": "https://ves.example.com", "key": "ves_..."}`) or in the `VES_API_KEY` environment variable rather than on the command line, where other users of the machine can see it. The address must be `https://` (the key goes with every request; `http://` is accepted for `localhost` only).
+
+For every run, ves first asks the site what it wants (`/api/v1/check`), so nothing is sent that the site already has or would refuse, and then sends the files in chunks; an interrupted upload is picked up where it stopped. A run whose result is already stored is not stored twice, so running the same sweep again is harmless, and uploads that failed are simply tried again. Videos are only taken for runs whose reference video the site knows, and only from accounts that may upload them; `--no-upload-videos` (or `"videos": false`) sends the results only. Only runs with a result file in the output folder are uploaded, so `-o off` uploads nothing. An upload that fails never fails the sweep.
 
 ### config.jsonc
 

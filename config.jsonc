@@ -65,6 +65,13 @@
 		"threads": 0,
 	},
 
+	// ---- Uploading results to a VES website, after the sweep ----------------------------------------------------------------------
+	// "upload": {
+	//   "url": "https://ves.example.com",
+	//   "key": "ves_...",    // from the website's account page; or leave it out and set the VES_API_KEY environment variable
+	//   "videos": true,      // false: upload the results but not the encoded videos
+	// },
+
 	// ---- Settings: caching, saved streams, decoding, memory and pruning ------------------------------------------------------------
 	"settings": {
 		// The cache folder: downloaded inputs go here (and so do the results of finished runs, but only when there is no "output" folder; with
