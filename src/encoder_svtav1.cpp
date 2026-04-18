@@ -3,6 +3,7 @@
 // svt_av1_enc_parse_parameter, so everything the SvtAv1EncApp CLI accepts can be swept.
 // Rate control is CBR at the target bitrate unless "rc" says otherwise.
 #include "encoder.h"
+#include "options.h"
 
 #include <atomic>
 #include <chrono>
@@ -91,7 +92,10 @@ public:
 		cfg.rate_control_mode = SVT_AV1_RC_MODE_CBR; // streaming target, like the other encoders; "rc" overrides
 		cfg.pred_structure = LOW_DELAY; // CBR requires it; "pred-struct" overrides
 		cfg.target_bit_rate = (uint32_t)p.bitrate;
-		for (auto& [k, v] : p.options) {
+		NativeOptions native;
+		std::string why;
+		if (!resolve_options("svtav1", p.codec, p.options, kebab_case, native, why)) { fprintf(stderr, "svtav1: %s\n", why.c_str()); return false; }
+		for (auto& [k, v] : native) {
 			if (svt_av1_enc_parse_parameter(&cfg, k.c_str(), v.c_str()) != EB_ErrorNone) { fprintf(stderr, "svtav1: bad option %s=%s\n", k.c_str(), v.c_str()); return false; }
 		}
 		if (svt_av1_enc_set_parameter(h, &cfg) != EB_ErrorNone) { fprintf(stderr, "svtav1: set_parameter rejected the configuration\n"); return false; }

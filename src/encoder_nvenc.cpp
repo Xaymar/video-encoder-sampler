@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "formats.h"
+#include "options.h"
 #include "gpu.h"
 #include "repack.h"
 
@@ -271,74 +272,75 @@ public:
 		rc.rateControlMode = NV_ENC_PARAMS_RC_CBR;
 		rc.averageBitRate = rc.maxBitRate = (uint32_t)p.bitrate;
 
-		if (take("rc", v)) {
+		if (take("rate_control", v)) {
 			if (v == "cbr") rc.rateControlMode = NV_ENC_PARAMS_RC_CBR;
 			else if (v == "vbr") rc.rateControlMode = NV_ENC_PARAMS_RC_VBR;
-			else { fprintf(stderr, "nvenc: bad rc '%s'\n", v.c_str()); return false; }
+			else { fprintf(stderr, "nvenc: bad rate_control '%s'\n", v.c_str()); return false; }
 		}
-		if (take("bf", v)) cfg.frameIntervalP = atoi(v.c_str()) + 1;
-		if (take("rc-lookahead", v)) { rc.lookaheadDepth = (uint16_t)atoi(v.c_str()); rc.enableLookahead = rc.lookaheadDepth > 0; }
-		if (take("spatial-aq", v)) rc.enableAQ = atoi(v.c_str()) != 0;
-		if (take("temporal-aq", v)) rc.enableTemporalAQ = atoi(v.c_str()) != 0;
-		if (take("aq-strength", v)) rc.aqStrength = atoi(v.c_str());
-		if (take("b_ref_mode", v)) {
+		if (take("max_b_frames", v)) cfg.frameIntervalP = atoi(v.c_str()) + 1;
+		if (take("lookahead_frames", v)) { rc.lookaheadDepth = (uint16_t)atoi(v.c_str()); rc.enableLookahead = rc.lookaheadDepth > 0; }
+		if (take("spatial_aq", v)) rc.enableAQ = atoi(v.c_str()) != 0;
+		if (take("temporal_aq", v)) rc.enableTemporalAQ = atoi(v.c_str()) != 0;
+		if (take("aq_strength", v)) rc.aqStrength = atoi(v.c_str());
+		if (take("b_reference_mode", v)) {
 			NV_ENC_BFRAME_REF_MODE m = v == "each" ? NV_ENC_BFRAME_REF_MODE_EACH : v == "middle" ? NV_ENC_BFRAME_REF_MODE_MIDDLE : NV_ENC_BFRAME_REF_MODE_DISABLED;
 			if (codec == NV_ENC_CODEC_H264_GUID) cfg.encodeCodecConfig.h264Config.useBFramesAsRef = m;
 			else if (codec == NV_ENC_CODEC_HEVC_GUID) cfg.encodeCodecConfig.hevcConfig.useBFramesAsRef = m;
 			else { fprintf(stderr, "nvenc: b_ref_mode not supported for %s\n", p.codec.c_str()); return false; }
 		}
+		if (take("max_ref_frames", v)) {
+			if (codec == NV_ENC_CODEC_H264_GUID) cfg.encodeCodecConfig.h264Config.maxNumRefFrames = atoi(v.c_str());
+			else if (codec == NV_ENC_CODEC_HEVC_GUID) cfg.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB = atoi(v.c_str());
+			else cfg.encodeCodecConfig.av1Config.maxNumRefFramesInDPB = atoi(v.c_str());
+		}
+		if (take("num_ltr_frames", v)) { // long-term references: 0 switches them off, above 0 switches them on with that many frames
+			const uint32_t n = (uint32_t)atoi(v.c_str());
+			if (codec == NV_ENC_CODEC_H264_GUID) { auto& c = cfg.encodeCodecConfig.h264Config; c.enableLTR = c.ltrTrustMode = n > 0; c.ltrNumFrames = n; }
+			else if (codec == NV_ENC_CODEC_HEVC_GUID) { auto& c = cfg.encodeCodecConfig.hevcConfig; c.enableLTR = c.ltrTrustMode = n > 0; c.ltrNumFrames = n; }
+			else { auto& c = cfg.encodeCodecConfig.av1Config; c.enableLTR = n > 0; c.ltrNumFrames = n; }
+		}
+
 		NV_ENC_INITIALIZE_PARAMS ip{};
 
 		// Every other option is a field of NVENC's own structures, under the field's name (see the SDK's nvEncodeAPI.h), set to a number (or
 		// true/false); enums are their numeric values. Fields of the codec being used only. A QP option sets all three QPs of NV_ENC_QP.
 		std::map<std::string, std::function<void(long long)>> fields;
 		NV_ENC_RC_PARAMS& rcp = cfg.rcParams;
-#define RC(f) fields[#f] = [&](long long v) { rcp.f = (decltype(rcp.f))v; };
-		RC(maxBitRate) RC(vbvBufferSize) RC(vbvInitialDelay) RC(enableMinQP) RC(enableMaxQP) RC(enableInitialRCQP) RC(enableAQ) RC(enableLookahead)
-		RC(disableIadapt) RC(disableBadapt) RC(enableTemporalAQ) RC(zeroReorderDelay) RC(enableNonRefP) RC(strictGOPTarget) RC(aqStrength)
-		RC(targetQuality) RC(targetQualityLSB) RC(lookaheadDepth) RC(lowDelayKeyFrameScale) RC(yDcQPIndexOffset) RC(uDcQPIndexOffset)
-		RC(vDcQPIndexOffset) RC(qpMapMode) RC(multiPass) RC(cbQPIndexOffset) RC(crQPIndexOffset) RC(lookaheadLevel)
+#define RC(f) fields[snake_case(#f)] = [&](long long v) { rcp.f = (decltype(rcp.f))v; };
+		RC(maxBitRate) RC(vbvBufferSize) RC(vbvInitialDelay) RC(disableIadapt) RC(disableBadapt) RC(zeroReorderDelay) RC(enableNonRefP) RC(strictGOPTarget)
+		RC(targetQuality) RC(targetQualityLSB) RC(lowDelayKeyFrameScale) RC(yDcQPIndexOffset) RC(uDcQPIndexOffset) RC(vDcQPIndexOffset) RC(multiPass)
+		RC(cbQPIndexOffset) RC(crQPIndexOffset) RC(lookaheadLevel)
 #undef RC
 		auto qp = [](NV_ENC_QP& q, long long v) { q.qpInterP = q.qpInterB = q.qpIntra = (uint32_t)v; };
-		fields["constQP"] = [&](long long v) { qp(rcp.constQP, v); };
-		fields["minQP"] = [&](long long v) { qp(rcp.minQP, v); rcp.enableMinQP = 1; };
-		fields["maxQP"] = [&](long long v) { qp(rcp.maxQP, v); rcp.enableMaxQP = 1; };
-		fields["initialRCQP"] = [&](long long v) { qp(rcp.initialRCQP, v); rcp.enableInitialRCQP = 1; };
-#define CF(f) fields[#f] = [&](long long v) { cfg.f = (decltype(cfg.f))v; };
-		CF(monoChromeEncoding) CF(frameFieldMode) CF(mvPrecision)
-#undef CF
-#define IP(f) fields[#f] = [&](long long v) { ip.f = (decltype(ip.f))v; };
+		fields["const_qp"] = [&](long long v) { qp(rcp.constQP, v); };
+		fields["min_qp"] = [&](long long v) { qp(rcp.minQP, v); rcp.enableMinQP = 1; };
+		fields["max_qp"] = [&](long long v) { qp(rcp.maxQP, v); rcp.enableMaxQP = 1; };
+		fields["initial_rc_qp"] = [&](long long v) { qp(rcp.initialRCQP, v); rcp.enableInitialRCQP = 1; };
+		fields["mv_precision"] = [&](long long v) { cfg.mvPrecision = (decltype(cfg.mvPrecision))v; };
+#define IP(f) fields[snake_case(#f)] = [&](long long v) { ip.f = (decltype(ip.f))v; };
 		IP(enableWeightedPrediction) IP(splitEncodeMode) IP(enableUniDirectionalB)
 #undef IP
 		if (codec == NV_ENC_CODEC_H264_GUID) {
 			auto& c = cfg.encodeCodecConfig.h264Config;
-#define C(f) fields[#f] = [&](long long v) { c.f = (decltype(c.f))v; };
-			C(hierarchicalPFrames) C(hierarchicalBFrames) C(outputBufferingPeriodSEI) C(outputPictureTimingSEI) C(outputAUD) C(disableSPSPPS)
-			C(outputRecoveryPointSEI) C(enableIntraRefresh) C(enableConstrainedEncoding) C(repeatSPSPPS) C(enableVFR) C(enableLTR)
-			C(useConstrainedIntraPred) C(enableFillerDataInsertion) C(singleSliceIntraRefresh) C(qpPrimeYZeroTransformBypassFlag) C(level)
-			C(disableDeblockingFilterIDC) C(adaptiveTransformMode) C(bdirectMode) C(entropyCodingMode) C(intraRefreshPeriod) C(intraRefreshCnt)
-			C(maxNumRefFrames) C(sliceMode) C(sliceModeData) C(ltrNumFrames) C(ltrTrustMode) C(maxTemporalLayers) C(numTemporalLayers)
-			C(enableTemporalSVC) C(numRefL0) C(numRefL1) C(tfLevel)
+#define C(f) fields[snake_case(#f)] = [&](long long v) { c.f = (decltype(c.f))v; };
+#define CN(name, f) fields[name] = [&](long long v) { c.f = (decltype(c.f))v; };
+			C(hierarchicalBFrames) C(enableFillerDataInsertion) C(level) C(disableDeblockingFilterIDC) C(adaptiveTransformMode) C(bdirectMode)
+			C(entropyCodingMode) C(tfLevel) CN("max_ref_frames_l0", numRefL0) CN("max_ref_frames_l1", numRefL1)
 #undef C
 		} else if (codec == NV_ENC_CODEC_HEVC_GUID) {
 			auto& c = cfg.encodeCodecConfig.hevcConfig;
-#define C(f) fields[#f] = [&](long long v) { c.f = (decltype(c.f))v; };
-			C(level) C(tier) C(minCUSize) C(maxCUSize) C(useConstrainedIntraPred) C(disableDeblockAcrossSliceBoundary) C(outputBufferingPeriodSEI)
-			C(outputPictureTimingSEI) C(outputAUD) C(enableLTR) C(disableSPSPPS) C(repeatSPSPPS) C(enableIntraRefresh) C(enableFillerDataInsertion)
-			C(enableConstrainedEncoding) C(singleSliceIntraRefresh) C(outputRecoveryPointSEI) C(enableTemporalSVC) C(intraRefreshPeriod)
-			C(intraRefreshCnt) C(maxNumRefFramesInDPB) C(ltrNumFrames) C(sliceMode) C(sliceModeData) C(maxTemporalLayersMinus1) C(ltrTrustMode)
-			C(numRefL0) C(numRefL1) C(tfLevel) C(disableDeblockingFilterIDC) C(numTemporalLayers)
+#define C(f) fields[snake_case(#f)] = [&](long long v) { c.f = (decltype(c.f))v; };
+			C(level) C(tier) C(minCUSize) C(maxCUSize) C(enableFillerDataInsertion) C(tfLevel) C(disableDeblockingFilterIDC)
+			CN("max_ref_frames_l0", numRefL0) CN("max_ref_frames_l1", numRefL1)
 #undef C
 		} else {
 			auto& c = cfg.encodeCodecConfig.av1Config;
-#define C(f) fields[#f] = [&](long long v) { c.f = (decltype(c.f))v; };
-			C(level) C(tier) C(minPartSize) C(maxPartSize) C(outputAnnexBFormat) C(enableTimingInfo) C(enableDecoderModelInfo) C(enableFrameIdNumbers)
-			C(disableSeqHdr) C(repeatSeqHdr) C(enableIntraRefresh) C(enableBitstreamPadding) C(enableCustomTileConfig) C(enableFilmGrainParams)
-			C(enableLTR) C(enableTemporalSVC) C(intraRefreshPeriod) C(intraRefreshCnt) C(maxNumRefFramesInDPB) C(numTileColumns) C(numTileRows)
-			C(maxTemporalLayersMinus1) C(colorPrimaries) C(transferCharacteristics) C(matrixCoefficients) C(colorRange) C(chromaSamplePosition)
-			C(numFwdRefs) C(numBwdRefs) C(ltrNumFrames) C(numTemporalLayers) C(tfLevel)
+#define C(f) fields[snake_case(#f)] = [&](long long v) { c.f = (decltype(c.f))v; };
+			C(level) C(tier) C(minPartSize) C(maxPartSize) C(enableCustomTileConfig) C(numTileColumns) C(numTileRows) C(enableFilmGrainParams) C(tfLevel)
+			CN("max_ref_frames_forward", numFwdRefs) CN("max_ref_frames_backward", numBwdRefs)
 #undef C
 		}
+#undef CN
 		for (auto& [k, val] : o) {
 			auto it = fields.find(k);
 			if (it == fields.end()) { fprintf(stderr, "nvenc: unsupported option '%s'\n", k.c_str()); return false; }

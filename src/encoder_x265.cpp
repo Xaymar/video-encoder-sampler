@@ -3,6 +3,7 @@
 // param_parse, so everything the x265 CLI accepts can be swept. "preset", "tune" and "profile"
 // are handled up front. Rate control is ABR at the target bitrate unless vbv-maxrate/vbv-bufsize are given.
 #include "encoder.h"
+#include "options.h"
 
 #include <cstdio>
 
@@ -68,7 +69,10 @@ public:
 		par->rc.rateControlMode = X265_RC_ABR;
 		par->rc.bitrate = (int)(p.bitrate / 1000);
 		par->logLevel = X265_LOG_WARNING;
-		for (auto& [k, v] : o) {
+		NativeOptions native;
+		std::string why;
+		if (!resolve_options("x265", p.codec, o, kebab_case, native, why)) { fprintf(stderr, "x265: %s\n", why.c_str()); return false; }
+		for (auto& [k, v] : native) {
 			if (api->param_parse(par, k.c_str(), v.c_str()) != 0) { fprintf(stderr, "x265: bad option %s=%s\n", k.c_str(), v.c_str()); return false; }
 		}
 		if (!profile.empty() && api->param_apply_profile(par, profile.c_str()) < 0) { fprintf(stderr, "x265: bad profile '%s'\n", profile.c_str()); return false; }

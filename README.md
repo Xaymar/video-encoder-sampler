@@ -65,6 +65,20 @@ In a terminal VES shows a live display at the bottom: the number of finished run
 The short form (and the config file's `"output"` key) work too; the short form writes no files unless `output=<dir>` is given. `kf=<seconds>`, `res=WxH,..`, `fps=..`, `pool=`, `parallel=`, `prune=off`, `fixed=`, `cache=`, `vmaf.model=`, `vmaf.threads=` and `over.penalty=` are understood there.
 
 
+### Option names
+
+Every option name is snake_case. These common options mean the same on every encoder that supports them, and an encoder that does not fails the run with a message saying so:
+
+| Option | Meaning | x264 / x265 | NVENC | SVT-AV1 | QuickSync | AMF |
+|---|---|---|---|---|---|---|
+| `max_b_frames` | most B-frames in a row, 0 for none | yes | yes | no | yes | H.264 |
+| `lookahead_frames` | frames of lookahead for rate control | yes | yes | yes | yes | no |
+| `max_ref_frames` | most reference frames | yes | yes | no | yes | yes |
+| `b_reference_mode` | B-frames as references: `none`, `middle`, `each` | `none`, `middle` | all | no | `none`, `middle` | H.264: `none`, `middle`/`each` |
+| `rate_control` | `cbr` or `vbr` | no | yes | yes | yes | no |
+
+`preset`, `tune` and `profile` keep their names on every encoder that has them, with the values each encoder defines. `chroma`, `bitdepth` and `gpu` work everywhere. The other options use each library's own name, converted to snake_case (`aq-mode` is `aq_mode`, NVENC's `enableLTR` is `enable_ltr`); `config.all-options.jsonc` lists them.
+
 ### Uploading results
 
 With an address and an API key, ves uploads what a sweep produced once it is done: each run's result file, and its encoded video where the site allows it. Make the key on the website under *Account → API key*; it belongs in the config (`"upload": {"url": "https://ves.example.com", "key": "ves_..."}`) or in the `VES_API_KEY` environment variable rather than on the command line, where other users of the machine can see it. The address must be `https://` (the key goes with every request; `http://` is accepted for `localhost` only).
@@ -98,8 +112,8 @@ The file may contain comments (`// ...` and `/* ... */`) and trailing commas, wh
 			"parallel": 2,
 			"options": {
 				"preset": ["p7"],
-				"bf": [null, 0, 2],
-				"rc-lookahead": [32, 0]
+				"max_b_frames": [null, 0, 2],
+				"lookahead_frames": [32, 0]
 			}
 		}
 	]
@@ -134,12 +148,12 @@ Formats currently supported by each backend: `x264` 4:2:0 and 4:4:4 at 8 and 10 
 ### Encoders
 | `encoder` | Backend | Options |
 |---|---|---|
-| `nvenc` | NVENC API (`codec`: h264, hevc, av1) | `preset` p1-p7, `tune` hq/ll/ull/lossless, `rc` cbr/vbr, `bf`, `rc-lookahead`, `spatial-aq`, `temporal-aq`, `aq-strength`, `b_ref_mode` none/each/middle, `gpu` |
-| `amf` | AMF API (`codec`: h264, hevc, av1) | Raw AMF property names, e.g. `QualityPreset`, `BPicturesPattern` (H.264) or `HevcQualityPreset` (HEVC). Values are numeric. `gpu` selects the n-th AMD adapter |
-| `qsv` | oneVPL (`codec`: h264, hevc, av1) | Raw oneVPL field names of `mfxInfoMFX`, `mfxExtCodingOption2` and `mfxExtCodingOption3`, e.g. `TargetUsage`, `GopRefDist`, `LookAheadDepth`, `BRefType`, `MBBRC`. Values are numbers, or `on`/`off`/`adaptive` for the toggles, `best_quality`/`balanced`/`best_speed` for `TargetUsage`, `cbr`/`vbr`/`icq`/... for `RateControlMethod`. `gpu` selects the n-th Intel adapter. **Written against the headers and never run: no Intel GPU was available.** |
-| `x264` | libx264 | `preset`, `tune`, `profile`, plus any x264 long option (`bframes`, `rc-lookahead`, `aq-mode`, ...) |
-| `x265` | libx265 | `preset`, `tune`, `profile`, plus any x265 long option |
-| `svtav1` | libSvtAv1Enc | any `SvtAv1EncApp` long option (`preset`, `lookahead`, `enable-tf`, ...). Runs as CBR with the low-delay prediction structure, which CBR requires; `rc=1 pred-struct=2` gives VBR with the random-access structure |
+| `nvenc` | NVENC API (`codec`: h264, hevc, av1) | `preset` p1-p7, `tune` hq/ll/ull/lossless, the common options (below) and `spatial_aq`, `temporal_aq`, `aq_strength`, `num_ltr_frames` (long-term references: 0 off, above 0 on with that many frames), `max_ref_frames_l0`/`_l1` (`_forward`/`_backward` for AV1), plus the other quality-relevant fields of NVENC's rate control, config and per-codec structures by their SDK names in snake_case (`multi_pass`, `min_cu_size`, `target_quality`, ...; numeric values). Not offered: slicing, intra refresh, temporal layers, stereo, colour signalling and other loss-resilience and packaging switches, `gpu` |
+| `amf` | AMF API (`codec`: h264, hevc, av1) | AMF property names in snake_case without the codec prefix, e.g. `quality_preset` (AMF's `QualityPreset`, `HevcQualityPreset` or `Av1QualityPreset`), `enable_vbaq`. Values are numeric. `gpu` selects the n-th AMD adapter |
+| `qsv` | oneVPL (`codec`: h264, hevc, av1) | The oneVPL fields of `mfxInfoMFX`, `mfxExtCodingOption2` and `mfxExtCodingOption3` in snake_case, e.g. `target_usage`, `gop_ref_dist`, `look_ahead_depth`, `b_ref_type`, `mbbrc`. Values are numbers, or `on`/`off`/`adaptive` for the toggles, `best_quality`/`balanced`/`best_speed` for `target_usage`, `cbr`/`vbr`/`icq`/... for `rate_control_method`. `gpu` selects the n-th Intel adapter. **Written against the headers and never run: no Intel GPU was available.** |
+| `x264` | libx264 | `preset`, `tune`, `profile`, plus any x264 long option with underscores for hyphens (`aq_mode`, `psy_rd`, `b_adapt`, ...) |
+| `x265` | libx265 | `preset`, `tune`, `profile`, plus any x265 long option, underscores for hyphens |
+| `svtav1` | libSvtAv1Enc | any `SvtAv1EncApp` long option with underscores for hyphens (`preset`, `enable_tf`, `film_grain`, ...). Runs as CBR with the low-delay prediction structure, which CBR requires; `rate_control=vbr` gives VBR with the random-access structure |
 
 An unknown option makes that run fail with a message instead of being ignored.
 

@@ -15,6 +15,7 @@
 #include <thread>
 
 #include "formats.h"
+#include "options.h"
 #include "repack.h"
 
 #include <d3d11.h>
@@ -161,7 +162,28 @@ public:
 		enc->SetProperty(n->rate, AMFConstructRate(p.framerate.num, p.framerate.den));
 		enc->SetProperty(n->gop, (amf_int64)p.gop);
 		enc->SetProperty(n->bitdepth, (amf_int64)(depth > 8 ? 10 : 8));
-		for (auto& [k, v] : o) if (!set(k, v)) return false;
+		// Property names are written snake_case without the codec's prefix (QualityPreset, HevcQualityPreset and Av1QualityPreset are all quality_preset).
+		std::map<std::string, std::string> names;
+		for (amf_size i = 0; i < enc->GetPropertiesInfoCount(); i++) {
+			const amf::AMFPropertyInfo* pi = nullptr;
+			if (enc->GetPropertyInfo(i, &pi) != AMF_OK || !pi || !pi->name) continue;
+			std::string native, bare;
+			for (const wchar_t* w = pi->name; *w; w++) native += (char)*w;
+			bare = native;
+			for (const char* prefix : {"Hevc", "Av1", "AV1"}) {
+				const size_t n = strlen(prefix);
+				if (bare.size() > n && bare.compare(0, n, prefix) == 0 && isupper((unsigned char)bare[n])) { bare.erase(0, n); break; }
+			}
+			names.emplace(snake_case(bare), native);
+		}
+		NativeOptions native_opts;
+		std::string why;
+		if (!resolve_options("amf", p.codec, o, [](const std::string& k) { return k; }, native_opts, why)) { fprintf(stderr, "amf: %s\n", why.c_str()); return false; }
+		for (auto& [k, v] : native_opts) {
+			auto it = names.find(k);
+			if (it == names.end()) { fprintf(stderr, "amf: unknown property '%s'\n", k.c_str()); return false; }
+			if (!set(it->second, v)) return false;
+		}
 
 		if ((r = enc->Init(depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init");
 		amf::AMFVariant bp;

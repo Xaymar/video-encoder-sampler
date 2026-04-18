@@ -5,8 +5,11 @@
 //  - An option with a list of values is swept; null leaves it at the encoder's default; [] ignores it.
 //  - Options that change nothing are left out of the sweep by pruning ("prune": true), but every remaining combination is still encoded.
 //  - "fixed" options are never pruned: presets and tunes set the defaults of everything else, so each of their values is screened by itself.
+//  - Names are snake_case. max_b_frames, lookahead_frames, max_ref_frames, b_reference_mode and rate_control are common: the same name and
+//    meaning on every encoder that supports them. The rest are each library's own, converted (aq-mode is aq_mode, NVENC's enableLTR is enable_ltr).
 //  - x264, x265 and SVT-AV1 take their command line names, so any option their CLI knows works, not only the ones listed here.
-//    NVENC takes the scalar fields of its rate control, config and per-codec structures by their SDK names. QuickSync's are the fields of oneVPL's mfxInfoMFX and mfxExtCodingOption2/3. AMF's are AMF's own property
+//    NVENC takes the quality-relevant scalar fields of its rate control, config and per-codec structures by their SDK names (no slicing, intra refresh,
+//    temporal layers, stereo or colour signalling). QuickSync's are the fields of oneVPL's mfxInfoMFX and mfxExtCodingOption2/3. AMF's are AMF's own property
 //    names for the codec; the list leaves out the read-only, per-frame and feedback properties.
 //  - Run-tested with a short clip: every value of NVENC (H.264, HEVC, AV1), x264, x265 and SVT-AV1. AMF and QuickSync need hardware this was not
 //    tested on: their names come from the SDK headers, and an unknown name fails the run with a message.
@@ -30,50 +33,39 @@
 			"options": {
 				"preset": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],   // p1 fastest ... p7 slowest
 				"tune": ["hq", "ll", "ull"],   // hq | ll | ull | lossless
-				"rc": ["cbr", "vbr"],   // rate control
-				"bf": [null, 0, 1, 2, 3, 4],   // B-frames
-				"rc-lookahead": [0, 8, 16, 32],   // frames of lookahead
-				"spatial-aq": [null, 0, 1],
-				"temporal-aq": [null, 0, 1],
-				"aq-strength": [null, 1, 8, 15],   // 1..15
-				"vbvBufferSize": [0, 500000, 2000000],   // bits; 0 is the encoder's default
-				"vbvInitialDelay": [0, 250000],   // bits
-				"minQP": [null, 10, 20],   // also switches the minimum QP on
-				"maxQP": [null, 40, 51],   // also switches the maximum QP on
-				"initialRCQP": [null, 26],   // also switches the initial QP on
-				// "zeroReorderDelay": [null, 0, 1],   // only without B-frames: use it with "bf": [0]
-				"enableNonRefP": [null, 0, 1],
-				"strictGOPTarget": [null, 0, 1],
-				"disableIadapt": [null, 0, 1],   // adaptive I-frames at scene cuts (lookahead only)
-				"disableBadapt": [null, 0, 1],   // adaptive B-frame decision (lookahead only)
-				"targetQuality": [null, 20, 30],   // constant quality level for VBR
-				"lowDelayKeyFrameScale": [null, 1, 2, 4],   // ratio of I-frame to P-frame bits
-				"multiPass": [0, 1, 2],   // 0 off, 1 two passes (quarter resolution first), 2 two passes (full resolution first)
-				// "lookaheadLevel": [0, 1, 2, 3],   // needs lookahead on: use it with "rc-lookahead" values above 0
-				"mvPrecision": [0, 1, 2, 3],   // 0 default, 1 full pel, 2 half pel, 3 quarter pel
-				// "enableWeightedPrediction": [null, 0, 1],   // only without B-frames: use it with "bf": [0]
-				"numRefL0": [null, 1, 2, 4],   // 0 = automatic, up to 7
-				"intraRefreshPeriod": [null, 60],
-				"intraRefreshCnt": [null, 15],
-				"enableIntraRefresh": [null, 0, 1],
-				"sliceMode": [null, 0, 3],   // 0 = whole frame, 3 = number of slices
-				"sliceModeData": [null, 1, 4],   // slices per frame with sliceMode 3
-				// "enableLTR": [null, 0, 1],   // long-term references; needs ltrNumFrames above 0, so switch both on together
-				"ltrNumFrames": [null, 1, 2],
-				"enableFillerDataInsertion": [null, 0, 1],   // pads CBR streams up to the bitrate
-				"outputAUD": [null, 0, 1],
-				"outputPictureTimingSEI": [null, 0, 1],
-				"outputBufferingPeriodSEI": [null, 0, 1],
-				"b_ref_mode": [null, "none", "each", "middle"],   // B-frames as references
-				"maxNumRefFrames": [null, 3, 4],   // B-frames as references need at least 3
-				"entropyCodingMode": [null, 1, 2],   // 1 CABAC, 2 CAVLC
-				"adaptiveTransformMode": [null, 1, 2],   // 8x8 transform: 1 off, 2 on
-				"bdirectMode": [null, 1, 2, 3],   // 1 off, 2 temporal, 3 spatial
-				"disableDeblockingFilterIDC": [null, 0, 1],   // 1 disables the filter
-				"hierarchicalPFrames": [null, 0, 1],
-				"hierarchicalBFrames": [null, 0, 1],
-				"useConstrainedIntraPred": [null, 0, 1],
-				"repeatSPSPPS": [null, 0, 1],
+				"rate_control": ["cbr", "vbr"],   // rate control
+				"max_b_frames": [null, 0, 1, 2, 3, 4],   // B-frames
+				"lookahead_frames": [0, 8, 16, 32],   // frames of lookahead
+				"spatial_aq": [null, 0, 1],
+				"temporal_aq": [null, 0, 1],
+				"aq_strength": [null, 1, 8, 15],   // 1..15
+				"vbv_buffer_size": [0, 500000, 2000000],   // bits; 0 is the encoder's default
+				"vbv_initial_delay": [0, 250000],   // bits
+				"min_qp": [null, 10, 20],   // also switches the minimum QP on
+				"max_qp": [null, 40, 51],   // also switches the maximum QP on
+				"initial_rc_qp": [null, 26],   // also switches the initial QP on
+				// "zero_reorder_delay": [null, 0, 1],   // only without B-frames: use it with "max_b_frames": [0]
+				"enable_non_ref_p": [null, 0, 1],
+				"strict_gop_target": [null, 0, 1],
+				"disable_iadapt": [null, 0, 1],   // adaptive I-frames at scene cuts (lookahead only)
+				"disable_badapt": [null, 0, 1],   // adaptive B-frame decision (lookahead only)
+				"target_quality": [null, 20, 30],   // constant quality level for VBR
+				"low_delay_key_frame_scale": [null, 1, 2, 4],   // ratio of I-frame to P-frame bits
+				"multi_pass": [0, 1, 2],   // 0 off, 1 two passes (quarter resolution first), 2 two passes (full resolution first)
+				// "lookahead_level": [0, 1, 2, 3],   // needs lookahead on: use it with "lookahead_frames" values above 0
+				"mv_precision": [0, 1, 2, 3],   // 0 default, 1 full pel, 2 half pel, 3 quarter pel
+				// "enable_weighted_prediction": [null, 0, 1],   // only without B-frames: use it with "max_b_frames": [0]
+				"max_ref_frames_l0": [null, 1, 2, 4],   // 0 = automatic, up to 7
+				"enable_filler_data_insertion": [null, 0, 1],   // pads CBR streams up to the bitrate
+				"b_reference_mode": ["none", "middle", "each"],   // B-frames as references
+				"entropy_coding_mode": [null, 1, 2],   // 1 CABAC, 2 CAVLC
+				"adaptive_transform_mode": [null, 1, 2],   // 8x8 transform: 1 off, 2 on
+				"bdirect_mode": [null, 1, 2, 3],   // 1 off, 2 temporal, 3 spatial
+				"disable_deblocking_filter_idc": [null, 0, 1],   // 1 disables the filter
+				"hierarchical_b_frames": [null, 0, 1],
+				"max_ref_frames": [null, 3, 4],   // most reference frames
+				// "num_ltr_frames": [null, 0, 1, 2, 4],   // long-term references exclude B-frames: use them with "max_b_frames": [0]
+				"max_ref_frames_l1": [null, 1, 2],   // 0 = automatic, up to 7
 			},
 		},
 		// NVIDIA, HEVC (the shared options as for H.264, then the HEVC ones)
@@ -85,48 +77,39 @@
 			"options": {
 				"preset": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],   // p1 fastest ... p7 slowest
 				"tune": ["hq", "ll", "ull"],   // hq | ll | ull | lossless
-				"rc": ["cbr", "vbr"],   // rate control
-				"bf": [null, 0, 1, 2, 3, 4],   // B-frames
-				"rc-lookahead": [0, 8, 16, 32],   // frames of lookahead
-				"spatial-aq": [null, 0, 1],
-				"temporal-aq": [null, 0, 1],
-				"aq-strength": [null, 1, 8, 15],   // 1..15
-				"vbvBufferSize": [0, 500000, 2000000],   // bits; 0 is the encoder's default
-				"vbvInitialDelay": [0, 250000],   // bits
-				"minQP": [null, 10, 20],   // also switches the minimum QP on
-				"maxQP": [null, 40, 51],   // also switches the maximum QP on
-				"initialRCQP": [null, 26],   // also switches the initial QP on
-				// "zeroReorderDelay": [null, 0, 1],   // only without B-frames: use it with "bf": [0]
-				"enableNonRefP": [null, 0, 1],
-				"strictGOPTarget": [null, 0, 1],
-				"disableIadapt": [null, 0, 1],   // adaptive I-frames at scene cuts (lookahead only)
-				"disableBadapt": [null, 0, 1],   // adaptive B-frame decision (lookahead only)
-				"targetQuality": [null, 20, 30],   // constant quality level for VBR
-				"lowDelayKeyFrameScale": [null, 1, 2, 4],   // ratio of I-frame to P-frame bits
-				"multiPass": [0, 1, 2],   // 0 off, 1 two passes (quarter resolution first), 2 two passes (full resolution first)
-				// "lookaheadLevel": [0, 1, 2, 3],   // needs lookahead on: use it with "rc-lookahead" values above 0
-				"mvPrecision": [0, 1, 2, 3],   // 0 default, 1 full pel, 2 half pel, 3 quarter pel
-				// "enableWeightedPrediction": [null, 0, 1],   // only without B-frames: use it with "bf": [0]
-				"numRefL0": [null, 1, 2, 4],   // 0 = automatic, up to 7
-				"intraRefreshPeriod": [null, 60],
-				"intraRefreshCnt": [null, 15],
-				"enableIntraRefresh": [null, 0, 1],
-				"sliceMode": [null, 0, 3],   // 0 = whole frame, 3 = number of slices
-				"sliceModeData": [null, 1, 4],   // slices per frame with sliceMode 3
-				// "enableLTR": [null, 0, 1],   // long-term references; needs ltrNumFrames above 0, so switch both on together
-				"ltrNumFrames": [null, 1, 2],
-				"enableFillerDataInsertion": [null, 0, 1],   // pads CBR streams up to the bitrate
-				"outputAUD": [null, 0, 1],
-				"outputPictureTimingSEI": [null, 0, 1],
-				"outputBufferingPeriodSEI": [null, 0, 1],
-				"b_ref_mode": [null, "none", "each", "middle"],   // B-frames as references
-				"maxNumRefFramesInDPB": [null, 2, 4],
-				"minCUSize": [null, 1, 2, 3],   // 1 = 8x8 ... 4 = 64x64
-				"maxCUSize": [null, 3, 4],
+				"rate_control": ["cbr", "vbr"],   // rate control
+				"max_b_frames": [null, 0, 1, 2, 3, 4],   // B-frames
+				"lookahead_frames": [0, 8, 16, 32],   // frames of lookahead
+				"spatial_aq": [null, 0, 1],
+				"temporal_aq": [null, 0, 1],
+				"aq_strength": [null, 1, 8, 15],   // 1..15
+				"vbv_buffer_size": [0, 500000, 2000000],   // bits; 0 is the encoder's default
+				"vbv_initial_delay": [0, 250000],   // bits
+				"min_qp": [null, 10, 20],   // also switches the minimum QP on
+				"max_qp": [null, 40, 51],   // also switches the maximum QP on
+				"initial_rc_qp": [null, 26],   // also switches the initial QP on
+				// "zero_reorder_delay": [null, 0, 1],   // only without B-frames: use it with "max_b_frames": [0]
+				"enable_non_ref_p": [null, 0, 1],
+				"strict_gop_target": [null, 0, 1],
+				"disable_iadapt": [null, 0, 1],   // adaptive I-frames at scene cuts (lookahead only)
+				"disable_badapt": [null, 0, 1],   // adaptive B-frame decision (lookahead only)
+				"target_quality": [null, 20, 30],   // constant quality level for VBR
+				"low_delay_key_frame_scale": [null, 1, 2, 4],   // ratio of I-frame to P-frame bits
+				"multi_pass": [0, 1, 2],   // 0 off, 1 two passes (quarter resolution first), 2 two passes (full resolution first)
+				// "lookahead_level": [0, 1, 2, 3],   // needs lookahead on: use it with "lookahead_frames" values above 0
+				"mv_precision": [0, 1, 2, 3],   // 0 default, 1 full pel, 2 half pel, 3 quarter pel
+				// "enable_weighted_prediction": [null, 0, 1],   // only without B-frames: use it with "max_b_frames": [0]
+				"max_ref_frames_l0": [null, 1, 2, 4],   // 0 = automatic, up to 7
+				"enable_filler_data_insertion": [null, 0, 1],   // pads CBR streams up to the bitrate
+				"b_reference_mode": ["none", "middle", "each"],   // B-frames as references
+				"min_cu_size": [null, 1, 2, 3],   // 1 = 8x8 ... 4 = 64x64
+				"max_cu_size": [null, 3, 4],
 				"tier": [null, 0, 1],   // 0 main, 1 high
-				"disableDeblockingFilterIDC": [null, 0, 1],
-				"splitEncodeMode": [null, 0, 1, 2, 3],   // encodes on two NVENC engines where the GPU has them
-				"useConstrainedIntraPred": [null, 0, 1],
+				"disable_deblocking_filter_idc": [null, 0, 1],
+				"split_encode_mode": [null, 0, 1, 2, 3],   // encodes on two NVENC engines where the GPU has them
+				// "num_ltr_frames": [null, 0, 1, 2, 4],   // long-term references exclude B-frames: use them with "max_b_frames": [0]
+				"max_ref_frames_l1": [null, 1, 2],   // 0 = automatic, up to 7
+				"max_ref_frames": [null, 3, 4],   // B-frames as references need at least 3
 			},
 		},
 		// NVIDIA, AV1 (the shared options as for H.264, then the AV1 ones)
@@ -138,49 +121,42 @@
 			"options": {
 				"preset": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],   // p1 fastest ... p7 slowest
 				"tune": ["hq", "ll", "ull"],   // hq | ll | ull | lossless
-				"rc": ["cbr", "vbr"],   // rate control
-				"bf": [null, 0, 1, 2, 3, 4],   // B-frames
-				"rc-lookahead": [0, 8, 16, 32],   // frames of lookahead
-				"spatial-aq": [null, 0, 1],
-				"temporal-aq": [null, 0, 1],
-				"aq-strength": [null, 1, 8, 15],   // 1..15
-				"vbvBufferSize": [0, 500000, 2000000],   // bits; 0 is the encoder's default
-				"vbvInitialDelay": [0, 250000],   // bits
-				"minQP": [null, 10, 20],   // also switches the minimum QP on
-				"maxQP": [null, 40, 51],   // also switches the maximum QP on
-				"initialRCQP": [null, 26],   // also switches the initial QP on
-				// "zeroReorderDelay": [null, 0, 1],   // only without B-frames: use it with "bf": [0]
-				"enableNonRefP": [null, 0, 1],
-				"strictGOPTarget": [null, 0, 1],
-				"disableIadapt": [null, 0, 1],   // adaptive I-frames at scene cuts (lookahead only)
-				"disableBadapt": [null, 0, 1],   // adaptive B-frame decision (lookahead only)
-				"targetQuality": [null, 20, 30],   // constant quality level for VBR
-				"lowDelayKeyFrameScale": [null, 1, 2, 4],   // ratio of I-frame to P-frame bits
-				"multiPass": [0, 1, 2],   // 0 off, 1 two passes (quarter resolution first), 2 two passes (full resolution first)
-				// "lookaheadLevel": [0, 1, 2, 3],   // needs lookahead on: use it with "rc-lookahead" values above 0
-				"mvPrecision": [0, 1, 2, 3],   // 0 default, 1 full pel, 2 half pel, 3 quarter pel
-				// "enableWeightedPrediction": [null, 0, 1],   // only without B-frames: use it with "bf": [0]
-				"tfLevel": [null, 0, 4],   // temporal filtering; needs the GPU's support
-				"numFwdRefs": [null, 1, 2, 4],
-				"numBwdRefs": [null, 1, 2],
-				"maxNumRefFramesInDPB": [null, 2, 4],
-				"minPartSize": [null, 2, 3],   // 1 = 4x4 ... 5 = 64x64
-				"maxPartSize": [null, 4, 5],
+				"rate_control": ["cbr", "vbr"],   // rate control
+				"max_b_frames": [null, 0, 1, 2, 3, 4],   // B-frames
+				"lookahead_frames": [0, 8, 16, 32],   // frames of lookahead
+				"spatial_aq": [null, 0, 1],
+				"temporal_aq": [null, 0, 1],
+				"aq_strength": [null, 1, 8, 15],   // 1..15
+				"vbv_buffer_size": [0, 500000, 2000000],   // bits; 0 is the encoder's default
+				"vbv_initial_delay": [0, 250000],   // bits
+				"min_qp": [null, 10, 20],   // also switches the minimum QP on
+				"max_qp": [null, 40, 51],   // also switches the maximum QP on
+				"initial_rc_qp": [null, 26],   // also switches the initial QP on
+				// "zero_reorder_delay": [null, 0, 1],   // only without B-frames: use it with "max_b_frames": [0]
+				"enable_non_ref_p": [null, 0, 1],
+				"strict_gop_target": [null, 0, 1],
+				"disable_iadapt": [null, 0, 1],   // adaptive I-frames at scene cuts (lookahead only)
+				"disable_badapt": [null, 0, 1],   // adaptive B-frame decision (lookahead only)
+				"target_quality": [null, 20, 30],   // constant quality level for VBR
+				"low_delay_key_frame_scale": [null, 1, 2, 4],   // ratio of I-frame to P-frame bits
+				"multi_pass": [0, 1, 2],   // 0 off, 1 two passes (quarter resolution first), 2 two passes (full resolution first)
+				// "lookahead_level": [0, 1, 2, 3],   // needs lookahead on: use it with "lookahead_frames" values above 0
+				"mv_precision": [0, 1, 2, 3],   // 0 default, 1 full pel, 2 half pel, 3 quarter pel
+				// "enable_weighted_prediction": [null, 0, 1],   // only without B-frames: use it with "max_b_frames": [0]
+				"tf_level": [null, 0, 4],   // temporal filtering; needs the GPU's support
+				"max_ref_frames_forward": [null, 1, 2, 4],
+				"max_ref_frames_backward": [null, 1, 2],
+				"min_part_size": [null, 2, 3],   // 1 = 4x4 ... 5 = 64x64
+				"max_part_size": [null, 4, 5],
 				"tier": [null, 0, 1],
-				"numTileColumns": [null, 1, 2],
-				"numTileRows": [null, 1, 2],
-				"enableCustomTileConfig": [null, 0, 1],
-				"enableFilmGrainParams": [null, 0, 1],
-				"enableBitstreamPadding": [null, 0, 1],
-				"enableIntraRefresh": [null, 0, 1],
-				"intraRefreshPeriod": [null, 60],
-				"intraRefreshCnt": [null, 15],
-				// "enableLTR": [null, 0, 1],   // long-term references; needs ltrNumFrames above 0, so switch both on together
-				"ltrNumFrames": [null, 1, 2],
-				"splitEncodeMode": [null, 0, 1, 2, 3],
-				"yDcQPIndexOffset": [null, -4, 4],   // also uDcQPIndexOffset, vDcQPIndexOffset
-				"repeatSeqHdr": [null, 0, 1],
-				"enableTimingInfo": [null, 0, 1],
+				"num_tile_columns": [null, 1, 2],
+				"num_tile_rows": [null, 1, 2],
+				"enable_custom_tile_config": [null, 0, 1],
+				"enable_film_grain_params": [null, 0, 1],
+				"split_encode_mode": [null, 0, 1, 2, 3],
+				"y_dc_qp_index_offset": [null, -4, 4],   // also uDcQPIndexOffset, vDcQPIndexOffset
+				// "num_ltr_frames": [null, 0, 1, 2, 4],   // long-term references exclude B-frames: use them with "max_b_frames": [0]
+				"max_ref_frames": [null, 3, 4],   // B-frames as references need at least 3
 			},
 		},
 		// software
@@ -192,29 +168,29 @@
 				"preset": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"],
 				"tune": [null, "film", "animation", "grain", "stillimage", "psnr", "ssim", "fastdecode", "zerolatency"],
 				"profile": [null, "main", "high"],   // high10 and high444 follow from bitdepth and chroma
-				"bframes": [0, 3, 8],
-				"b-adapt": [0, 1, 2],
-				"b-pyramid": ["none", "strict", "normal"],
-				"ref": [1, 3, 8],   // reference frames
-				"rc-lookahead": [10, 40, 60],
+				"max_b_frames": [0, 3, 8],
+				"b_adapt": [0, 1, 2],
+				"b_reference_mode": ["none", "middle"],
+				"max_ref_frames": [1, 3, 8],   // reference frames
+				"lookahead_frames": [10, 40, 60],
 				"subme": [2, 6, 10],   // sub-pixel motion estimation quality
 				"me": ["dia", "hex", "umh", "esa"],   // motion estimation method
 				"merange": [16, 24],
 				"trellis": [0, 1, 2],
-				"aq-mode": [0, 1, 2, 3],
-				"aq-strength": [0.8, 1.0, 1.3],
+				"aq_mode": [0, 1, 2, 3],
+				"aq_strength": [0.8, 1.0, 1.3],
 				"weightp": [0, 1, 2],
 				"direct": ["spatial", "temporal", "auto"],
 				"deblock": ["0:0", "-1:-1"],   // alpha:beta
 				"cabac": [0, 1],
 				"8x8dct": [0, 1],
 				"mbtree": [0, 1],
-				"psy-rd": ["1.0:0.0", "0.0:0.0"],   // psy-rd:psy-trellis
+				"psy_rd": ["1.0:0.0", "0.0:0.0"],   // psy-rd:psy-trellis
 				"qcomp": [0.6, 0.8],
 				"nr": [0, 100],   // noise reduction
-				"fast-pskip": [0, 1],
+				"fast_pskip": [0, 1],
 				"scenecut": [0, 40],
-				"open-gop": [0, 1],
+				"open_gop": [0, 1],
 			},
 		},
 		// software; the profile also follows from "bitdepth"
@@ -226,35 +202,36 @@
 				"preset": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"],
 				"tune": [null, "psnr", "ssim", "grain", "fastdecode", "zerolatency", "animation"],
 				"profile": [null, "main", "main10"],
-				"bframes": [0, 4, 8],
-				"b-adapt": [0, 1, 2],
-				"rc-lookahead": [15, 25, 40],
-				"ref": [1, 3, 5],
+				"max_b_frames": [0, 4, 8],
+				"b_adapt": [0, 1, 2],
+				"lookahead_frames": [15, 25, 40],
+				"max_ref_frames": [1, 3, 5],
 				"rd": [1, 3, 4, 6],   // rate-distortion level
 				"subme": [1, 3, 5, 7],
 				"me": ["dia", "hex", "umh", "star", "sea", "full"],
 				"merange": [57, 92],
-				"aq-mode": [0, 1, 2, 3, 4],
-				"aq-strength": [0.8, 1.0, 1.4],
+				"aq_mode": [0, 1, 2, 3, 4],
+				"aq_strength": [0.8, 1.0, 1.4],
 				"sao": [0, 1],
-				"strong-intra-smoothing": [0, 1],
+				"strong_intra_smoothing": [0, 1],
 				"weightp": [0, 1],
 				"weightb": [0, 1],
 				"ctu": [16, 32, 64],
-				"max-merge": [1, 3, 5],
+				"max_merge": [1, 3, 5],
 				"rect": [0, 1],
 				"amp": [0, 1],
 				"tskip": [0, 1],
-				"early-skip": [0, 1],
-				"psy-rd": [0.0, 2.0],
-				"psy-rdoq": [0.0, 1.0],
+				"early_skip": [0, 1],
+				"psy_rd": [0.0, 2.0],
+				"psy_rdoq": [0.0, 1.0],
 				"cutree": [0, 1],
-				"limit-refs": [0, 1, 3],
-				"frame-threads": [1, 2, 4],
+				"limit_refs": [0, 1, 3],
+				"frame_threads": [1, 2, 4],
 				"wpp": [0, 1],
-				"open-gop": [0, 1],
+				"open_gop": [0, 1],
 				"scenecut": [0, 40],
 				"deblock": ["0:0", "-1:-1"],   // tc:beta
+				"b_reference_mode": ["none", "middle"],   // B-frames as references
 			},
 		},
 		// software. Runs as CBR with the low-delay prediction structure. Not deterministic, so never pruned
@@ -265,23 +242,22 @@
 			"options": {
 				"preset": [0, 2, 4, 6, 8, 10, 12, 13],   // 0 slowest ... 13 fastest
 				"tune": [0, 1],   // 0 visual quality, 1 PSNR (2, SSIM, needs CRF rate control)
-				// "rc": [0, 1, 2],   // needs a matching "pred-struct": rc 2 (CBR, the default here) with 1, rc 1 (VBR) with 2; rc 0 (CRF) has no target bitrate
-				// "pred-struct": [1, 2],   // see "rc": [1] with CBR, [2] with VBR
-				"lookahead": [0, 16, 60],
-				"enable-tf": [0, 1, 2],   // temporal filtering
-				"film-grain": [0, 8, 25],
-				"film-grain-denoise": [0, 1],
-				"enable-cdef": [0, 1],
-				"enable-restoration": [0, 1],
-				"aq-mode": [1, 2],   // 0 (off) is rejected with rate control
+				"lookahead_frames": [0, 16, 60],
+				"enable_tf": [0, 1, 2],   // temporal filtering
+				"film_grain": [0, 8, 25],
+				"film_grain_denoise": [0, 1],
+				"enable_cdef": [0, 1],
+				"enable_restoration": [0, 1],
+				"aq_mode": [1, 2],   // 0 (off) is rejected with rate control, so it is left out
 				"scd": [0, 1],   // scene change detection
-				"fast-decode": [0, 1, 2],
-				"enable-qm": [0, 1],   // quantization matrices
-				"tile-rows": [0, 1],
-				"tile-columns": [0, 1],
-				"enable-dlf": [0, 1, 2],   // deblocking filter
-				"enable-variance-boost": [0, 1],
-				"variance-boost-strength": [1, 2, 3, 4],
+				"fast_decode": [0, 1, 2],
+				"enable_qm": [0, 1],   // quantization matrices
+				"tile_rows": [0, 1],
+				"tile_columns": [0, 1],
+				"enable_dlf": [0, 1, 2],   // deblocking filter
+				"enable_variance_boost": [0, 1],
+				"variance_boost_strength": [1, 2, 3, 4],
+				"rate_control": ["cbr", "vbr"],   // cbr runs with the low-delay prediction structure, vbr with random access
 			},
 		},
 		// AMD, H.264; property names as AMF spells them, values numeric
@@ -291,24 +267,23 @@
 			"codec": "h264",
 			"fixed": ["QualityPreset"],
 			"options": {
-				"QualityPreset": [0, 1, 2, 3],   // 0 balanced, 1 speed, 2 quality, 3 high quality
-				"Profile": [66, 77, 100, 256, 257],   // 66 baseline, 77 main, 100 high, 256 constrained baseline, 257 constrained high
-				"BPicturesPattern": [0, 1, 2, 3],   // B-frames between P-frames
-				"BReferenceEnable": [0, 1],
-				"MaxNumRefFrames": [1, 2, 4],
-				"EnableVBAQ": [0, 1],
-				"HighMotionQualityBoostEnable": [0, 1],
-				"EnforceHRD": [0, 1],
-				"FillerDataEnable": [0, 1],
-				"VBVBufferSize": [null, 1000000, 4000000],   // bits
-				"DeBlockingFilter": [0, 1],
-				"CABACEnable": [0, 1],
-				"SlicesPerFrame": [1, 4],
-				"RateControlSkipFrameEnable": [0, 1],
-				"LowLatencyInternal": [0, 1],
-				"AdaptiveMiniGOP": [0, 1],
-				"QuarterPixel": [0, 1],
-				"HalfPixel": [0, 1],
+				"quality_preset": [0, 1, 2, 3],   // 0 balanced, 1 speed, 2 quality, 3 high quality
+				"profile": [66, 77, 100, 256, 257],   // 66 baseline, 77 main, 100 high, 256 constrained baseline, 257 constrained high
+				"max_b_frames": [0, 1, 2, 3],   // B-frames between P-frames
+				"b_reference_mode": ["none", "middle"],
+				"max_ref_frames": [1, 2, 4],
+				"enable_vbaq": [0, 1],
+				"high_motion_quality_boost_enable": [0, 1],
+				"enforce_hrd": [0, 1],
+				"filler_data_enable": [0, 1],
+				"vbv_buffer_size": [null, 1000000, 4000000],   // bits
+				"de_blocking_filter": [0, 1],
+				"cabac_enable": [0, 1],
+				"rate_control_skip_frame_enable": [0, 1],
+				"low_latency_internal": [0, 1],
+				"adaptive_mini_gop": [0, 1],
+				"quarter_pixel": [0, 1],
+				"half_pixel": [0, 1],
 			},
 		},
 		// AMD, HEVC
@@ -318,21 +293,19 @@
 			"codec": "hevc",
 			"fixed": ["HevcQualityPreset"],
 			"options": {
-				"HevcQualityPreset": [0, 5, 10, 15],   // 0 quality, 5 balanced, 10 speed, 15 high quality
-				"HevcProfile": [1, 2],   // 1 main, 2 main 10
-				"HevcTier": [0, 1],   // 0 main, 1 high
-				"HevcMaxNumRefFrames": [1, 2, 4],
-				"HevcEnableVBAQ": [0, 1],
-				"HevcHighMotionQualityBoostEnable": [0, 1],
-				"HevcEnforceHRD": [0, 1],
-				"HevcFillerDataEnable": [0, 1],
-				"HevcVBVBufferSize": [null, 1000000, 4000000],   // bits
-				"HevcDeBlockingFilter": [0, 1],
-				"HevcSlicesPerFrame": [1, 4],
-				"HevcRateControlSkipFrameEnable": [0, 1],
-				"HevcHeaderInsertionMode": [0, 1, 2, 3],   // 0 none, 1 GOP aligned, 2 IDR aligned, 3 suppressed
-				"HevcHalfPixel": [0, 1],
-				"HevcQuarterPixel": [0, 1],
+				"quality_preset": [0, 5, 10, 15],   // 0 quality, 5 balanced, 10 speed, 15 high quality
+				"profile": [1, 2],   // 1 main, 2 main 10
+				"tier": [0, 1],   // 0 main, 1 high
+				"max_ref_frames": [1, 2, 4],
+				"enable_vbaq": [0, 1],
+				"high_motion_quality_boost_enable": [0, 1],
+				"enforce_hrd": [0, 1],
+				"filler_data_enable": [0, 1],
+				"vbv_buffer_size": [null, 1000000, 4000000],   // bits
+				"de_blocking_filter": [0, 1],
+				"rate_control_skip_frame_enable": [0, 1],
+				"half_pixel": [0, 1],
+				"quarter_pixel": [0, 1],
 			},
 		},
 		// AMD, AV1
@@ -342,20 +315,18 @@
 			"codec": "av1",
 			"fixed": ["Av1QualityPreset"],
 			"options": {
-				"Av1QualityPreset": [0, 30, 70, 100],   // 0 high quality, 30 quality, 70 balanced, 100 speed
-				"Av1AQMode": [0, 1],   // 0 none, 1 content adaptive
-				"Av1HighMotionQualityBoost": [0, 1],
-				"Av1NumTilesPerFrame": [1, 2, 4],
-				"Av1CdefMode": [0, 1],
-				"Av1ScreenContentTools": [0, 1],
-				"Av1PaletteMode": [0, 1],
-				"Av1CdfUpdate": [0, 1],
-				"Av1ErrorResilientMode": [0, 1],
-				"Av1EnforceHRD": [0, 1],
-				"Av1FillerData": [0, 1],
-				"Av1MaxNumRefFrames": [1, 2, 4],
-				"Av1VBVBufferSize": [null, 1000000, 4000000],   // bits
-				"Av1HeaderInsertionMode": [0, 1, 2, 3],   // 0 none, 1 GOP aligned, 2 key frame aligned, 3 suppressed
+				"quality_preset": [0, 30, 70, 100],   // 0 high quality, 30 quality, 70 balanced, 100 speed
+				"aq_mode": [0, 1],   // 0 none, 1 content adaptive
+				"high_motion_quality_boost": [0, 1],
+				"num_tiles_per_frame": [1, 2, 4],
+				"cdef_mode": [0, 1],
+				"screen_content_tools": [0, 1],
+				"palette_mode": [0, 1],
+				"cdf_update": [0, 1],
+				"enforce_hrd": [0, 1],
+				"filler_data": [0, 1],
+				"max_ref_frames": [1, 2, 4],
+				"vbv_buffer_size": [null, 1000000, 4000000],   // bits
 			},
 		},
 		// Intel; codec h264, hevc or av1
@@ -365,42 +336,40 @@
 			"codec": "hevc",
 			"fixed": ["TargetUsage"],
 			"options": {
-				"TargetUsage": [1, 4, 7],   // 1 best quality ... 7 fastest; or best_quality | balanced | best_speed
-				"GopRefDist": [1, 2, 4, 8],   // 1 = no B-frames
-				"NumRefFrame": [1, 2, 4],
-				"NumSlice": [0, 4],
-				"LowPower": [null, 0, 1],   // 1 fixed-function encoder, 0 shader based
-				"BufferSizeInKB": [null, 500, 2000],
-				"GopOptFlag": [null, 1, 2],   // 1 closed GOP, 2 strict GOP
-				"IntRefType": [null, 0, 1],   // intra refresh
-				"IntRefCycleSize": [null, 16],
-				"MBBRC": [null, "on", "off"],   // macroblock-level rate control
-				"ExtBRC": [null, "on", "off"],
-				"LookAheadDepth": [0, 20, 40],
-				"Trellis": [null, 0, 1],
-				"BRefType": [0, 1, 2],   // 0 unspecified, 1 off, 2 pyramid
-				"AdaptiveI": [null, "on", "off"],
-				"AdaptiveB": [null, "on", "off"],
-				"LookAheadDS": [null, 0, 1, 2],   // lookahead downscale
-				"MinQPI": [null, 10],
-				"MaxQPI": [null, 45],
-				"MinQPP": [null, 10],
-				"MaxQPP": [null, 45],
-				"MinQPB": [null, 10],
-				"MaxQPB": [null, 45],
-				"DisableDeblockingIdc": [null, 0, 1],
-				"WeightedPred": [null, 0, 1],
-				"WeightedBiPred": [null, 0, 1],
-				"ScenarioInfo": [null, 0, 1, 2, 3, 4],   // see mfxExtCodingOption3
-				"ContentInfo": [null, 0, 1, 2],
-				"PRefType": [null, 0, 1, 2],
-				"GPB": [null, "on", "off"],   // generalized P/B
-				"EnableQPOffset": [null, "on", "off"],
-				"LowDelayBRC": [null, "on", "off"],
-				"AdaptiveRef": [null, "on", "off"],
-				"AdaptiveLTR": [null, "on", "off"],
-				"AdaptiveCQM": [null, "on", "off"],
-				"FadeDetection": [null, "on", "off"],
+				"target_usage": [1, 4, 7],   // 1 best quality ... 7 fastest; or best_quality | balanced | best_speed
+				"max_b_frames": [0, 1, 3, 7],   // 1 = no B-frames
+				"max_ref_frames": [1, 2, 4],
+				"low_power": [null, 0, 1],   // 1 fixed-function encoder, 0 shader based
+				"buffer_size_in_kb": [null, 500, 2000],
+				"gop_opt_flag": [null, 1, 2],   // 1 closed GOP, 2 strict GOP
+				"mbbrc": [null, "on", "off"],   // macroblock-level rate control
+				"ext_brc": [null, "on", "off"],
+				"lookahead_frames": [0, 20, 40],
+				"trellis": [null, 0, 1],
+				"b_reference_mode": ["none", "middle"],   // 0 unspecified, 1 off, 2 pyramid
+				"adaptive_i": [null, "on", "off"],
+				"adaptive_b": [null, "on", "off"],
+				"look_ahead_ds": [null, 0, 1, 2],   // lookahead downscale
+				"min_qpi": [null, 10],
+				"max_qpi": [null, 45],
+				"min_qpp": [null, 10],
+				"max_qpp": [null, 45],
+				"min_qpb": [null, 10],
+				"max_qpb": [null, 45],
+				"disable_deblocking_idc": [null, 0, 1],
+				"weighted_pred": [null, 0, 1],
+				"weighted_bi_pred": [null, 0, 1],
+				"scenario_info": [null, 0, 1, 2, 3, 4],   // see mfxExtCodingOption3
+				"content_info": [null, 0, 1, 2],
+				"p_ref_type": [null, 0, 1, 2],
+				"gpb": [null, "on", "off"],   // generalized P/B
+				"enable_qp_offset": [null, "on", "off"],
+				"low_delay_brc": [null, "on", "off"],
+				"adaptive_ref": [null, "on", "off"],
+				"adaptive_ltr": [null, "on", "off"],
+				"adaptive_cqm": [null, "on", "off"],
+				"fade_detection": [null, "on", "off"],
+				"rate_control": ["cbr", "vbr"],
 			},
 		},
 	],

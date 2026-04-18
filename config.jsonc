@@ -95,8 +95,11 @@
 	// Every option is a list of values and every combination is tested. Special values:
 	//   null  leaves the option unset (the encoder's default), so [null, 1, 2] tests the default as well
 	//   []    ignores the option (as if it were not there), handy for switching one off without deleting it
-	// Option names are the encoder's own (x264, x265 and SVT-AV1 command line names; NVENC as below; AMF property names; QuickSync
-	// field names), and an unknown name fails the run. "chroma" (420, 444) and "bitdepth" (8, 10) work for every encoder.
+	// Option names are snake_case. Some are common: the same name and meaning for every encoder that can do them (an encoder that cannot fails the
+	// run with a message): max_b_frames, lookahead_frames, max_ref_frames, b_reference_mode (none | middle | each) and rate_control (cbr | vbr).
+	// The rest are the encoder's own, written snake_case: x264, x265 and SVT-AV1 command line names (aq-mode is aq_mode), NVENC's structure fields
+	// (enable_ltr), AMF's property names without the codec prefix (QualityPreset is quality_preset), QuickSync's field names (target_usage).
+	// An unknown name fails the run. config.all-options.jsonc lists them all.
 	"encoders": [
 		{
 			"enabled": true,
@@ -106,12 +109,12 @@
 			"options": {
 				"preset": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
 				"tune": ["hq"],             // hq | ll | ull | lossless
-				// "rc": ["cbr", "vbr"],
-				// "bf": [null, 0, 1, 2, 3, 4],                   // B-frames
-				// "rc-lookahead": [32, 16, 8, 0],
-				// "b_ref_mode": [null, "none", "middle"],       // B-frames as references (h264 and hevc)
-				// "spatial-aq": [null, 0, 1],
-				// "aq-strength": [],
+				// "rate_control": ["cbr", "vbr"],
+				// "max_b_frames": [null, 0, 1, 2, 3, 4],
+				// "lookahead_frames": [32, 16, 8, 0],
+				// "b_reference_mode": [null, "none", "middle"],  // B-frames as references
+				// "spatial_aq": [null, 0, 1],
+				// "aq_strength": [],
 				// "bitdepth": [8, 10],
 				// "gpu": [0],                                    // which NVIDIA GPU; ["all"] uses every one, each in a pool of its own
 			},
@@ -128,9 +131,9 @@
 			"options": {
 				"preset": ["veryfast", "fast", "medium", "slow", "veryslow"],
 				"tune": [null, "film", "animation"],
-				// "bframes": [0, 3],
-				// "rc-lookahead": [20, 40],
-				// "ref": [3, 5],
+				// "max_b_frames": [0, 3],
+				// "lookahead_frames": [20, 40],
+				// "max_ref_frames": [3, 5],
 			},
 		},
 		{
@@ -141,7 +144,7 @@
 			"options": {
 				"preset": ["superfast", "veryfast", "fast", "medium"],
 				"tune": [null],
-				// "bframes": [2, 4],
+				// "max_b_frames": [2, 4],
 				// "bitdepth": [8, 10],
 			},
 		},
@@ -150,33 +153,33 @@
 			"encoder": "svtav1",
 			"fixed": ["preset"],
 			"options": {
-				// Runs as CBR with the low-delay prediction structure; "rc": [1], "pred-struct": [2] gives VBR instead.
+				// Runs as CBR with the low-delay prediction structure; "rate_control": ["vbr"] gives VBR with the random-access structure instead.
 				// SVT-AV1 is not deterministic, so its results vary a little between runs and it is never pruned.
 				"preset": [6, 8, 10],
-				// "lookahead": [0, 16],
-				// "enable-tf": [0, 1],
+				// "lookahead_frames": [0, 16],
+				// "enable_tf": [0, 1],
 			},
 		},
 		{
 			"enabled": false,
 			"encoder": "amf",                // AMD GPUs; the property names are AMF's, values numeric
 			"codec": "h264",
-			"fixed": ["QualityPreset"],
+			"fixed": ["quality_preset"],
 			"options": {
-				"QualityPreset": [0, 1, 2],   // H.264: 0 balanced, 1 speed, 2 quality
-				// "BPicturesPattern": [0, 1, 2],
+				"quality_preset": [0, 1, 2],   // H.264: 0 balanced, 1 speed, 2 quality
+				// "max_b_frames": [0, 1, 2],
 			},
 		},
 		{
 			"enabled": false,
 			"encoder": "qsv",                // Intel GPUs; field names of oneVPL's mfxInfoMFX and extension buffers
 			"codec": "hevc",
-			"fixed": ["TargetUsage"],
+			"fixed": ["target_usage"],
 			"options": {
-				"TargetUsage": [1, 4, 7],     // 1 best quality ... 7 fastest, or best_quality | balanced | best_speed
-				// "GopRefDist": [1, 4],
-				// "LookAheadDepth": [0, 40],
-				// "BRefType": [0, 2],
+				"target_usage": [1, 4, 7],     // 1 best quality ... 7 fastest, or best_quality | balanced | best_speed
+				// "max_b_frames": [0, 3],
+				// "lookahead_frames": [0, 40],
+				// "b_reference_mode": ["none", "middle"],
 			},
 		},
 	],
