@@ -54,8 +54,6 @@ struct Job {
 	std::vector<std::string> scenarios; // names of the scenarios this encoder takes part in; empty: all of them
 	int parallel = 0;  // 0: default for the pool (NVENC 2, everything else 1 since CPU encoders use every core)
 	std::vector<Axis> axes;
-	bool prune = true;                 // leave out options that change nothing, found by comparing output bytes
-	std::set<std::string> fixed;       // options that are never left out, and every combination of them is screened on its own (preset, ...)
 };
 
 // One sub-sweep: every combination of its lists is tested with every encoder. Several scenarios let a setup
@@ -84,6 +82,8 @@ struct Config {
 	std::vector<Job> jobs;
 };
 
+static const std::string NULL_JSON = "null";
+
 struct Run {
 	std::string input, label;
 	int64_t bitrate;        // target, kbps
@@ -92,7 +92,7 @@ struct Run {
 	double kbps = 0;        // actual
 	std::vector<double> scores; // per frame, display order
 	bool cached = false;    // taken from the result cache instead of being run
-	bool same = false;      // its encoder produced the same bytes as an earlier run, so that run's scores were reused
+	std::vector<std::string> identical; // labels of the runs that produced exactly the same stream (left out of the ranking, see below)
 	std::string group;      // what runs must share for identical output to mean identical scores
 	std::string encoder, codec;
 	Options options;
@@ -107,7 +107,7 @@ struct Run {
 	double encode_s = 0, score_s = 0; // wall time of the encoding wave this run was in, and of the scoring wave
 	double enc_busy_s = 0, enc_starved_s = 0, decode_blocked_s = 0, score_starved_s = 0; // where that time went
 	std::string gpu;        // name and driver of the GPU a GPU encoder ran on
-	std::string gpu_json = "null", caps_json = "null"; // its PCI ids, and what its encoder reports about itself (see encoder_caps_json)
+	const std::string *gpu_json = &NULL_JSON, *caps_json = &NULL_JSON; // its PCI ids, and what its encoder reports about itself (see encoder_caps_json); shared by all runs on the GPU
 	double penalty = 0;     // VMAF points deducted for exceeding the target bitrate
 	double best_share = 0;  // share of frames where this run is at least as good as every other run of its group
 };
@@ -237,12 +237,9 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* p = v->find("over_penalty")) over_penalty = atof(p->text().c_str());
 	}
 	auto off = [](const Json* v) { return v && (v->text() == "0" || v->text() == "false"); };
-	const bool default_prune = !off(setting("prune"));
 	list("encoders", [&](const Json& e) {
 		if (off(e.find("enabled"))) return;
 		Job j;
-		j.prune = default_prune && !off(e.find("prune"));
-		if (auto* f = e.find("fixed")) for (auto& x : f->a) j.fixed.insert(x.text());
 		auto* name = e.find("encoder");
 		if (!name) throw std::runtime_error("encoder entry without 'encoder'");
 		j.encoder = name->text();
@@ -303,8 +300,6 @@ Quick run (replaces the encoders and scenarios of the config file)
   -res, --resolution <WxH[,..]>    -fps, --framerate <n[,..]>    --kf <seconds[,..]>
         --option <key=a,b>  an encoder option, can be given more than once; comma separated values are swept
                             and every combination is tested; "null" leaves the option unset
-        --fixed <key[,..]>  options that are never left out when pruning
-        --no-prune          test options even when they change nothing
         --upscale           allow encoding above the source's resolution, chroma layout and bit depth
         --pool <name>  --parallel <n>
 
@@ -336,8 +331,6 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 		else if (k == "over.penalty") over_penalty = atof(v.c_str());
 		else if (k == "cache") cfg.cache_dir = v == "off" ? "" : v;
 		else if (k == "output") cfg.output_dir = v;
-		else if (k == "prune") j.prune = v != "off";
-		else if (k == "fixed") { for (auto& x : split(v)) j.fixed.insert(x); }
 		else if (k == "pool") j.pool = v;
 		else if (k == "parallel") j.parallel = atoi(v.c_str());
 		else if (k == "kf") { sc.kfs.clear(); for (auto& x : split(v)) sc.kfs.push_back(atof(x.c_str())); }
@@ -403,8 +396,6 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 			for (auto& x : split(o.substr(eq + 1))) ax.values.push_back(x == "null" ? std::nullopt : std::optional<std::string>(x));
 			job.axes.push_back(std::move(ax));
 		}
-		else if (a == "--fixed") { for (auto& x : split(value())) job.fixed.insert(x); }
-		else if (a == "--no-prune") job.prune = false;
 		else if (a == "--upscale") upscale = true;
 		else if (a == "--pool") job.pool = value();
 		else if (a == "--parallel") job.parallel = atoi(value().c_str());
@@ -447,128 +438,6 @@ static std::string sanitize(std::string s, size_t max = 100) {
 }
 
 
-
-// Which of the swept options change anything. The baseline has every option at its default (unset when its list has a null,
-// else its first value). Options are tested in groups, always moving the whole group away from the baseline: a group whose output
-// bytes stay identical does nothing, so all of it is left out; otherwise the group is split in half and each half is tested again.
-// If both halves do nothing alone but the group does something, its options only matter together and all of them stay.
-// Whatever was left out is then tested again with the options found so far switched on.
-// The encoders are deterministic, so identical bytes mean the options did nothing in this setup. A run that fails counts as a difference.
-using Probe = std::function<std::optional<uint64_t>(const Options&)>; // hash of the output bytes; nullopt when the run failed
-
-static std::vector<Axis> screen(const std::vector<Axis>& axes, const Options& base, const Probe& probe, std::string& dropped) {
-	struct Info { std::optional<std::string> base; std::vector<std::optional<std::string>> alts; };
-	std::vector<Info> info(axes.size());
-	std::vector<size_t> swept;
-	size_t rounds = 0;
-	for (size_t i = 0; i < axes.size(); i++) {
-		auto& v = axes[i].values;
-		if (!v.empty() && std::find(v.begin(), v.end(), std::nullopt) == v.end()) info[i].base = v[0];
-		for (auto& x : v) if (x != info[i].base) info[i].alts.push_back(x);
-		if (!info[i].alts.empty()) { swept.push_back(i); rounds = std::max(rounds, info[i].alts.size()); }
-	}
-	std::map<std::string, std::optional<uint64_t>> seen;
-	auto hash_with = [&](const std::vector<size_t>& set, size_t round) {
-		Options o = base;
-		for (size_t i = 0; i < axes.size(); i++) {
-			const std::optional<std::string>* v = &info[i].base;
-			if (std::find(set.begin(), set.end(), i) != set.end()) v = &info[i].alts[std::min(round, info[i].alts.size() - 1)];
-			if (*v) o[axes[i].key] = **v;
-		}
-		std::string k;
-		for (auto& [a, b] : o) k += a + "=" + b + ";";
-		auto it = seen.find(k);
-		if (it == seen.end()) it = seen.emplace(k, probe(o)).first;
-		return it->second;
-	};
-	if (!hash_with({}, 0)) return axes; // nothing to compare against
-	// Whether moving `set` away from its defaults changes the output, with the options in `ctx` already moved.
-	auto inert = [&](std::vector<size_t> set, const std::vector<size_t>& ctx) {
-		const auto base_set = ctx;
-		set.insert(set.end(), ctx.begin(), ctx.end());
-		for (size_t j = 0; j < rounds; j++) {
-			auto h = hash_with(set, j), h0 = hash_with(base_set, j);
-			if (!h || !h0 || *h != *h0) return false;
-		}
-		return true;
-	};
-	std::function<std::vector<size_t>(const std::vector<size_t>&, const std::vector<size_t>&)> solve =
-	    [&](const std::vector<size_t>& set, const std::vector<size_t>& ctx) -> std::vector<size_t> {
-		if (inert(set, ctx)) return {};
-		if (set.size() == 1) return set;
-		std::vector<size_t> a(set.begin(), set.begin() + set.size() / 2), b(set.begin() + set.size() / 2, set.end());
-		std::vector<size_t> ka = solve(a, ctx), kb = solve(b, ctx);
-		if (ka.empty() && kb.empty()) return set;
-		ka.insert(ka.end(), kb.begin(), kb.end());
-		return ka;
-	};
-	// An option that did nothing next to the defaults may still do something once another one is on (weightb needs b-frames),
-	// so what was left out is tried again with everything found so far moved, until nothing new turns up.
-	std::vector<size_t> keep;
-	for (;;) {
-		std::vector<size_t> rest;
-		for (size_t i : swept) if (std::find(keep.begin(), keep.end(), i) == keep.end()) rest.push_back(i);
-		std::vector<size_t> found = rest.empty() ? rest : solve(rest, keep);
-		if (found.empty()) break;
-		keep.insert(keep.end(), found.begin(), found.end());
-	}
-	std::vector<Axis> out = axes;
-	for (size_t i : swept) {
-		if (std::find(keep.begin(), keep.end(), i) != keep.end()) continue;
-		out[i].values = {info[i].base}; // left out: stays at its default
-		dropped += (dropped.empty() ? "" : ", ") + axes[i].key;
-	}
-	return out;
-}
-
-// The option combinations to run for one input and scenario. Pruning is judged at the scenario's first bitrate, key frame interval
-// and shape, once for every combination of the `fixed` options (preset, ...), since those change what the others do.
-// shortcut: an option that only matters at another bitrate or shape, or only together with one in a different group, can be missed; use prune=off then.
-static std::vector<Options> option_sets(const Config& cfg, const std::string& input, const Job& job, const Scenario& sc) {
-	if (!job.prune || !is_deterministic(job.encoder)) return expand(job.encoder, job.axes);
-	std::vector<Axis> fixed, free;
-	bool any = false;
-	for (auto& ax : job.axes) {
-		const bool pinned = job.fixed.count(ax.key) || ax.key == "gpu"; // gpu does not change the bytes, but is exactly what is being swept
-		(pinned ? fixed : free).push_back(ax);
-		any |= !pinned && ax.values.size() > 1;
-	}
-	if (!any) return expand(job.encoder, job.axes);
-	std::vector<Options> out;
-	for (auto& base : expand(job.encoder, fixed)) {
-		const Probe probe = [&](const Options& o) -> std::optional<uint64_t> {
-			SourceInfo si;
-			if (!source_info(input, si)) return std::nullopt;
-			const Plan pl = make_plan(si, job.encoder, job.codec, o, sc.shapes[0]);
-			if (pl.ignored) return std::nullopt;
-			EncodeJob ej;
-			ej.encoder = job.encoder; ej.codec = job.codec; ej.plan = &pl;
-			ej.bitrate = sc.bitrates[0] * 1000; ej.kf = sc.kfs[0];
-			std::string what = "screening " + job.encoder + "/" + job.codec;
-			for (auto& [k, v] : o) what += " " + k + "=" + v;
-			RunProgress rp, feed;
-			ej.rp = &rp;
-			const int h1 = ui::attach(&rp, what, "prepare"), h2 = ui::attach(&feed, "decode+convert", "prepare");
-			std::vector<EncodeJob*> jobs{&ej};
-			FeedResult fr;
-			encode_wave(input, si, jobs, cfg.scale, &feed, fr);
-			ui::detach(h1);
-			ui::detach(h2);
-			if (!ej.ok) return std::nullopt;
-			return ej.output.hash;
-		};
-		std::string dropped;
-		auto kept = screen(free, base, probe, dropped);
-		if (!dropped.empty()) {
-			std::string ctx;
-			for (auto& [k, v] : base) ctx += " " + k + "=" + v;
-			ui::log("[" + sc.name + "] " + job.encoder + "/" + job.codec + ctx + ": no effect on the output, left out: " + dropped);
-		}
-		auto sets = expand(job.encoder, kept, base);
-		out.insert(out.end(), sets.begin(), sets.end());
-	}
-	return out;
-}
 
 static std::string jq(const std::string& s) { // JSON string
 	std::string o = "\"";
@@ -648,7 +517,7 @@ int main(int argc, char** argv) {
 		if (id == Codec::None) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", job.encoder.c_str(), job.codec.c_str()); failed++; continue; }
 			for (auto& sc : cfg.scenarios) if (takes_part(job, sc)) {
 				ui::log("Preparing " + job.encoder + "/" + job.codec + ", scenario " + (sc.name.empty() ? "(unnamed)" : sc.name) + ", " + fs::path(input).filename().string());
-				const std::vector<Options> sets = option_sets(cfg, input, job, sc);
+				const std::vector<Options> sets = expand(job.encoder, job.axes);
 			for (int64_t br : sc.bitrates) for (double kf : sc.kfs) for (auto& shape : sc.shapes) for (auto& opts : sets) {
 			Task t;
 			t.job = &job; t.id = id;
@@ -670,20 +539,24 @@ int main(int argc, char** argv) {
 					t.r.video = folder + "/" + base + ".mp4";
 					t.r.video_file = (fs::path(cfg.output_dir) / t.r.video).string();
 				}
-				std::error_code ec;
-				fs::create_directories(fs::path(cfg.output_dir) / folder, ec);
+				static std::set<std::string> made; // creating a folder for every one of many thousand runs is slow
+				if (made.insert(folder).second) { std::error_code ec; fs::create_directories(fs::path(cfg.output_dir) / folder, ec); }
 			} else if (!cfg.cache_dir.empty()) t.result_file = (fs::path(cfg.cache_dir) / "results" / (key_hash(t.key) + ".json")).string();
 			// Every GPU is a pool of its own, so GPUs work in parallel; CPU encoders share one pool.
 			std::string gpu_index = opts.count("gpu") ? opts.at("gpu") : "0";
 			t.r.group = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|" + gpu_index;
 			if (is_gpu_encoder(job.encoder)) {
 				t.r.gpu = gpu_description(encoder_vendor(job.encoder), atoi(gpu_index.c_str()));
-				t.r.gpu_json = gpu_json(encoder_vendor(job.encoder), atoi(gpu_index.c_str()));
+				static std::map<std::string, std::string> gpu_known; // asked once per vendor and GPU; the runs only point at the text
+				const std::string gpu_key = job.encoder + "/" + gpu_index;
+				auto gpu_at = gpu_known.find(gpu_key);
+				if (gpu_at == gpu_known.end()) gpu_at = gpu_known.emplace(gpu_key, gpu_json(encoder_vendor(job.encoder), atoi(gpu_index.c_str()))).first;
+				t.r.gpu_json = &gpu_at->second;
 				static std::map<std::string, std::string> caps_known; // asked once per encoder, codec and GPU
 				const std::string caps_key = job.encoder + "/" + job.codec + "/" + gpu_index;
 				auto known = caps_known.find(caps_key);
 				if (known == caps_known.end()) known = caps_known.emplace(caps_key, encoder_caps_json(job.encoder, job.codec, atoi(gpu_index.c_str()))).first;
-				t.r.caps_json = known->second;
+				t.r.caps_json = &known->second;
 			}
 			std::string pool = !job.pool.empty() ? job.pool : is_gpu_encoder(job.encoder) ? job.encoder + ":" + gpu_index : "cpu";
 			t.pool = pool;
@@ -719,7 +592,7 @@ int main(int argc, char** argv) {
 		for (auto& job : cfg.jobs) {
 			size_t runs_here = 0;
 			for (auto& t : tasks) runs_here += t.job == &job;
-			put("  %s%s%s: %zu runs%s\n", job.encoder.c_str(), is_gpu_encoder(job.encoder) ? "/" : "", is_gpu_encoder(job.encoder) ? job.codec.c_str() : "", runs_here, job.prune ? "" : " (pruning off)");
+			put("  %s%s%s: %zu runs\n", job.encoder.c_str(), is_gpu_encoder(job.encoder) ? "/" : "", is_gpu_encoder(job.encoder) ? job.codec.c_str() : "", runs_here);
 		}
 		put("Pools:");
 		for (auto& [name, pl] : pools) put(" %s x%d (%zu runs)", name.c_str(), pl.parallel, pl.tasks.size());
@@ -749,7 +622,7 @@ int main(int argc, char** argv) {
 		for (auto& [k, v] : r.options) { o << (first ? "" : ",") << jq(k) << ":" << jq(v); first = false; }
 		o << "},\"width\":" << r.shape.w << ",\"height\":" << r.shape.h << ",\"fps\":" << (r.shape.fps.num ? r.shape.fps.value() : 0.0)
 		  << ",\"target_kbps\":" << r.bitrate << ",\"keyframe_interval_s\":" << r.kf << ",\"gpu\":" << (r.gpu.empty() ? std::string("null") : jq(r.gpu))
-		  << ",\"gpu_info\":" << r.gpu_json << ",\"encoder_caps\":" << r.caps_json << ",\"video\":" << (r.video.empty() ? std::string("null") : jq(r.video))
+		  << ",\"gpu_info\":" << *r.gpu_json << ",\"encoder_caps\":" << *r.caps_json << ",\"video\":" << (r.video.empty() ? std::string("null") : jq(r.video))
 		  << ",\"video_sha256\":" << (r.video_sha256.empty() ? std::string("null") : jq(r.video_sha256)) << ",\"reference_sha256\":" << jq(reference_hash(r.input));
 		return o.str();
 	};
@@ -894,11 +767,23 @@ int main(int argc, char** argv) {
 	std::vector<Run> runs;
 	std::map<std::string, std::vector<std::string>> failed_runs, ignored_runs, group_json; // by input
 	int ignored = 0;
+	std::map<std::string, size_t> first_with; // group and stream hash -> the run that has it
+	int identical = 0;
 	for (auto& t : tasks) {
-		if (t.ok) runs.push_back(std::move(t.r));
+		if (t.ok) {
+			// Options that changed nothing show up here, after encoding: the stream is byte for byte the same as another run's of this group, so it
+			// has the same scores and would only tie with it. It stays out of the ranking; its result file is still written.
+			if (!t.r.video_sha256.empty()) {
+				auto [at, fresh] = first_with.emplace(t.r.group + "|" + t.r.video_sha256, runs.size());
+				if (!fresh) { runs[at->second].identical.push_back(t.r.label); identical++; continue; }
+			}
+			runs.push_back(std::move(t.r));
+		}
 		else if (t.r.ignored) { ignored++; ignored_runs[t.r.input].push_back("{\"label\":" + jq(t.r.label) + ",\"reason\":" + jq(t.r.reason) + "}"); }
 		else { failed++; failed_runs[t.r.input].push_back(t.r.label); }
 	}
+
+	if (identical) printf("\n%d runs produced exactly the same stream as another run of their group and are left out of the ranking (listed as identical_runs in the result files)\n", identical);
 
 	// A group is every run that shares input, bitrate target and key frame interval.
 	auto key = [](const Run& r) { return std::make_tuple(r.input, -r.bitrate, r.kf); };
@@ -940,8 +825,8 @@ int main(int argc, char** argv) {
 			o << "},\"width\":" << r.shape.w << ",\"height\":" << r.shape.h << ",\"fps\":" << (r.shape.fps.num ? r.shape.fps.value() : 0.0)
 			  << ",\"kbps\":" << r.kbps << ",\"over_target_penalty\":" << r.penalty << ",\"best_frame_share\":" << r.best_share << ",\"winner\":" << (r.best_share >= BEST_FRAME_SHARE ? "true" : "false")
 			  << ",\"vmaf\":{\"mean\":" << std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size() << ",\"min\":" << sc.front() << ",\"p5\":" << sc[(size_t)(sc.size() * 0.05)] << "}"
-			  << ",\"gpu\":" << (r.gpu.empty() ? "null" : jq(r.gpu)) << ",\"gpu_info\":" << r.gpu_json << ",\"encoder_caps\":" << r.caps_json << ",\"cached\":" << (r.cached ? "true" : "false")
-			  << ",\"video\":" << (r.video.empty() ? "null" : jq(r.video)) << ",\"video_sha256\":" << (r.video_sha256.empty() ? "null" : jq(r.video_sha256)) << ",\"result\":" << (r.result.empty() ? "null" : jq(r.result)) << "}";
+			  << ",\"gpu\":" << (r.gpu.empty() ? "null" : jq(r.gpu)) << ",\"gpu_info\":" << *r.gpu_json << ",\"encoder_caps\":" << *r.caps_json << ",\"cached\":" << (r.cached ? "true" : "false")
+			  << ",\"video\":" << (r.video.empty() ? "null" : jq(r.video)) << ",\"video_sha256\":" << (r.video_sha256.empty() ? "null" : jq(r.video_sha256)) << ",\"identical_runs\":[" << [&] { std::string l; for (auto& x : r.identical) l += (l.empty() ? "" : ",") + jq(x); return l; }() << "],\"result\":" << (r.result.empty() ? "null" : jq(r.result)) << "}";
 		}
 		o << "]}";
 		group_json[runs[g].input].push_back(o.str());

@@ -72,7 +72,7 @@
 	//   "videos": true,      // false: upload the results but not the encoded videos
 	// },
 
-	// ---- Settings: caching, saved streams, decoding, memory and pruning ------------------------------------------------------------
+	// ---- Settings: caching, saved streams, decoding and memory ------------------------------------------------------------
 	"settings": {
 		// The cache folder: downloaded inputs go here (and so do the results of finished runs, but only when there is no "output" folder; with
 		// one, each run's result file is kept next to its stream there, and a run whose result file exists is not repeated). "" / false (or
@@ -85,10 +85,6 @@
 		"hw_decode": "auto",
 		"decode_threads": 0,   // threads per decoder; 0 uses every core
 		"low_memory": false,   // true: fewer VMAF and decoder threads, much less memory, a bit slower
-		// Options that change nothing (alone or together with the others) are found by comparing output bytes and left out of the sweep.
-		// Set to false to test every combination regardless. Per encoder, "fixed" lists options that are never pruned (presets and tunes
-		// set the defaults of everything else, so each of their combinations is screened separately).
-		"prune": true,
 	},
 
 	// ---- Encoders -----------------------------------------------------------------------------------------------------------------
@@ -105,7 +101,6 @@
 			"enabled": true,
 			"encoder": "nvenc",             // nvenc | amf | qsv | x264 | x265 | svtav1
 			"codec": "h264",                // h264 | hevc | av1, for the GPU encoders
-			"fixed": ["preset", "tune"],
 			"options": {
 				"preset": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
 				"tune": ["hq"],             // hq | ll | ull | lossless
@@ -121,13 +116,11 @@
 			// "scenarios": ["mid", "low"],  // only these scenarios; left out, the encoder takes part in all of them
 			// "pool": "nvenc",              // runs in one pool share a device; at most "parallel" of them run at the same time
 			// "parallel": 2,                // runs of this pool in one wave (default 2 for GPU encoders, 1 for the CPU ones)
-			// "prune": false,               // this encoder only: test every combination
 		},
 		{
 			"enabled": false,
 			"encoder": "x264",
 			"scenarios": ["mid", "low"],
-			"fixed": ["preset", "tune"],
 			"options": {
 				"preset": ["veryfast", "fast", "medium", "slow", "veryslow"],
 				"tune": [null, "film", "animation"],
@@ -140,7 +133,6 @@
 			"enabled": false,
 			"encoder": "x265",
 			"scenarios": ["mid", "low"],
-			"fixed": ["preset", "tune"],
 			"options": {
 				"preset": ["superfast", "veryfast", "fast", "medium"],
 				"tune": [null],
@@ -151,10 +143,9 @@
 		{
 			"enabled": false,
 			"encoder": "svtav1",
-			"fixed": ["preset"],
 			"options": {
 				// Runs as CBR with the low-delay prediction structure; "rate_control": ["vbr"] gives VBR with the random-access structure instead.
-				// SVT-AV1 is not deterministic, so its results vary a little between runs and it is never pruned.
+				// SVT-AV1 is not deterministic, so its results vary a little between runs.
 				"preset": [6, 8, 10],
 				// "lookahead_frames": [0, 16],
 				// "enable_tf": [0, 1],
@@ -164,7 +155,6 @@
 			"enabled": false,
 			"encoder": "amf",                // AMD GPUs; the property names are AMF's, values numeric
 			"codec": "h264",
-			"fixed": ["quality_preset"],
 			"options": {
 				"quality_preset": [0, 1, 2],   // H.264: 0 balanced, 1 speed, 2 quality
 				// "max_b_frames": [0, 1, 2],
@@ -174,7 +164,6 @@
 			"enabled": false,
 			"encoder": "qsv",                // Intel GPUs; field names of oneVPL's mfxInfoMFX and extension buffers
 			"codec": "hevc",
-			"fixed": ["target_usage"],
 			"options": {
 				"target_usage": [1, 4, 7],     // 1 best quality ... 7 fastest, or best_quality | balanced | best_speed
 				// "max_b_frames": [0, 3],

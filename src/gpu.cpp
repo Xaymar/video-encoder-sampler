@@ -1,13 +1,15 @@
 #include "gpu.h"
 
 #include <cstdio>
+#include <map>
+#include <mutex>
 
 #ifdef _WIN32
 #include <windows.h>
 #include <dxgi.h>
 #include <wrl/client.h>
 
-std::vector<GpuInfo> list_gpus(unsigned vendor) {
+static std::vector<GpuInfo> enumerate_gpus(unsigned vendor) {
 	std::vector<GpuInfo> out;
 	Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
 	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return out;
@@ -50,7 +52,7 @@ static std::string sysfs_text(const std::filesystem::path& p) {
 	return s;
 }
 
-std::vector<GpuInfo> list_gpus(unsigned vendor) {
+static std::vector<GpuInfo> enumerate_gpus(unsigned vendor) {
 	namespace fs = std::filesystem;
 	std::vector<GpuInfo> out;
 	std::vector<fs::path> cards;
@@ -81,6 +83,15 @@ std::vector<GpuInfo> list_gpus(unsigned vendor) {
 	return out;
 }
 #endif
+
+std::vector<GpuInfo> list_gpus(unsigned vendor) {
+	static std::mutex m;
+	static std::map<unsigned, std::vector<GpuInfo>> known;
+	std::lock_guard<std::mutex> lock(m);
+	auto it = known.find(vendor);
+	if (it == known.end()) it = known.emplace(vendor, enumerate_gpus(vendor)).first;
+	return it->second;
+}
 
 static std::string json_string(const std::string& s) {
 	std::string o = "\"";
