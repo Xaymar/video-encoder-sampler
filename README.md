@@ -77,7 +77,7 @@ Every option name is snake_case. These common options mean the same on every enc
 | `b_reference_mode` | B-frames as references: `none`, `middle`, `each` | `none`, `middle` | all | no | `none`, `middle` | H.264: `none`, `middle`/`each` |
 | `rate_control` | `cbr` or `vbr` | no | yes | yes | yes | no |
 
-`preset`, `tune`, `profile` and `tier` have the same names on every encoder that has them. `preset` takes each encoder's own values (x264 and x265 names, NVENC `p1`-`p7`, SVT-AV1 `0`-`13`, QuickSync `best_quality`/`balanced`/`best_speed`, AMF `speed`/`balanced`/`quality`/`high_quality`). `profile` and `tier` use standard names, whichever encoder runs them:
+`preset`, `tune`, `profile`, `tier` and `level` have the same names on every encoder that has them. `preset` takes each encoder's own values (x264 and x265 names, NVENC `p1`-`p7`, SVT-AV1 `0`-`13`, QuickSync `best_quality`/`balanced`/`best_speed`, AMF `speed`/`balanced`/`quality`/`high_quality`). `profile` and `tier` use standard names, whichever encoder runs them:
 
 | Codec | `profile` | `tier` |
 |---|---|---|
@@ -85,7 +85,11 @@ Every option name is snake_case. These common options mean the same on every enc
 | hevc | `main`, `main10`, `rext` (x265 also takes its own, written `main444_10` for `main444-10`) | `main`, `high` |
 | av1 | `main`, `high`, `professional` | `main`, `high` |
 
-An encoder offers the profiles its library has (x264 has no `constrained_*`, NVENC no `constrained_baseline`, SVT-AV1 `main` for 4:2:0 and `high` for 4:4:4); asking for one it lacks fails the run with a message. Numbers are the encoder's own value and pass through. `chroma`, `bitdepth` and `gpu` work everywhere. The other options use each library's own name, converted to snake_case (`aq-mode` is `aq_mode`, NVENC's `enableLTR` is `enable_ltr`); `config.all-options.jsonc` lists them.
+An encoder offers the profiles its library has (x264 has no `constrained_*`, NVENC no `constrained_baseline`, SVT-AV1 `main` for 4:2:0 and `high` for 4:4:4); asking for one it lacks fails the run with a message. Numbers are the encoder's own value and pass through. x265 cannot force the high tier (its switch only allows it, and it is used when the bitrate needs it), so it takes `tier` `main` (never) and `auto`.
+
+`level` is written as the standards write it: `4.1`, `5`, `1b` (H.264 only), `6.2`, up to `7.3` for AV1. ves turns it into the number each library wants (x264 and x265 read the name; NVENC and AMF take 10 x level for H.264, 30 x level for HEVC and an index counted from 2.0 for AV1; QuickSync and SVT-AV1 take 10 x level), so there is no table to look up. `auto` and an unset value (`null`) both leave the choice to the encoder. A level the codec does not have is an error; one the GPU does not support (NVENC: H.264 `1b`, AV1 `7.3` on some GPUs) is refused by the driver with its own message. The result files and the encoded streams carry the level that was set.
+
+`chroma`, `bitdepth` and `gpu` work everywhere. The other options use each library's own name, converted to snake_case (`aq-mode` is `aq_mode`, NVENC's `enableLTR` is `enable_ltr`); `config.all-options.jsonc` lists them.
 
 ### Uploading results
 

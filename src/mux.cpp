@@ -115,7 +115,7 @@ class Mapped {
 		view_off = at / CHUNK * CHUNK;
 		view_len = std::min<uint64_t>(CHUNK, capacity - view_off);
 		view = (uint8_t*)MapViewOfFile(map, writing ? FILE_MAP_WRITE : FILE_MAP_READ, (DWORD)(view_off >> 32), (DWORD)view_off, (SIZE_T)view_len);
-		if (!view) view_len = 0;
+		if (!view) { view_len = 0; fprintf(stderr, "mux: cannot map %llu bytes of the file (Windows error %lu)\n", (unsigned long long)CHUNK, GetLastError()); }
 		return view != nullptr;
 	}
 
@@ -125,9 +125,10 @@ class Mapped {
 		if (map) { CloseHandle(map); map = nullptr; }
 		LARGE_INTEGER to;
 		to.QuadPart = (LONGLONG)cap;
-		if (!SetFilePointerEx(file, to, nullptr, FILE_BEGIN) || !SetEndOfFile(file)) return false;
+		if (!SetFilePointerEx(file, to, nullptr, FILE_BEGIN) || !SetEndOfFile(file)) { fprintf(stderr, "mux: cannot extend the file to %llu bytes (Windows error %lu)\n", (unsigned long long)cap, GetLastError()); return false; }
 		capacity = cap;
 		map = CreateFileMappingW(file, nullptr, PAGE_READWRITE, 0, 0, nullptr);
+		if (!map) fprintf(stderr, "mux: cannot map the file (Windows error %lu)\n", GetLastError());
 		return map != nullptr;
 	}
 
@@ -370,13 +371,14 @@ bool Mp4Writer::start(const uint8_t* first, size_t size) {
 	st->time_base = AVRational{enc_.fps.den, enc_.fps.num}; // one tick per frame
 	st->avg_frame_rate = AVRational{enc_.fps.num, enc_.fps.den};
 	impl->io = std::make_unique<Io>();
-	if (!impl->io->open(path_, true)) return false;
+	if (!impl->io->open(path_, true)) { fprintf(stderr, "mp4: cannot open %s for writing\n", path_.c_str()); return false; }
 	oc->pb = impl->io->ctx;
 	oc->flags |= AVFMT_FLAG_CUSTOM_IO;
 	AVDictionary* opts = nullptr;
 	av_dict_set(&opts, "movflags", "frag_keyframe+empty_moov+default_base_moof", 0);
 	const int r = avformat_write_header(oc, &opts);
 	av_dict_free(&opts);
+	if (r < 0) { char e[128]; av_strerror(r, e, sizeof e); fprintf(stderr, "mp4: cannot write the header: %s\n", e); }
 	return r >= 0;
 }
 
@@ -405,9 +407,10 @@ bool Mp4Writer::write(const Item& it) {
 	pkt->duration = 1;
 	if (it.key) pkt->flags |= AV_PKT_FLAG_KEY;
 	av_packet_rescale_ts(pkt, AVRational{enc_.fps.den, enc_.fps.num}, st->time_base);
-	const bool ok = av_interleaved_write_frame(oc, pkt) >= 0;
+	const int wr = av_interleaved_write_frame(oc, pkt);
+	if (wr < 0) { char e[128]; av_strerror(wr, e, sizeof e); fprintf(stderr, "mp4: cannot write a packet: %s\n", e); }
 	av_packet_free(&pkt);
-	return ok;
+	return wr >= 0;
 }
 
 // The thread that does the muxing, so the encoder never waits for the disk: packets queue up to MAX_QUEUED bytes.
@@ -443,6 +446,7 @@ bool Mp4Writer::close() {
 	cv.notify_all();
 	th.join();
 	bool ok = !failed && started && oc && av_write_trailer(oc) >= 0;
+	if (!ok) fprintf(stderr, "mp4: closing failed (%s)\n", failed ? "an earlier write failed" : !started ? "no packet was ever written" : "the trailer could not be written");
 	if (oc) {
 		oc->pb = nullptr;
 		avformat_free_context(oc);

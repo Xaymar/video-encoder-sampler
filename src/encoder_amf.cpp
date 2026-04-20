@@ -176,6 +176,7 @@ public:
 			}
 			std::string name = snake_case(bare);
 			if (name == "quality_preset") name = "preset"; // AMF's QualityPreset, HevcQualityPreset and Av1QualityPreset
+			if (name == "profile_level") name = "level";  // ProfileLevel and HevcProfileLevel; the AV1 one is Av1Level already
 			names.emplace(name, native);
 		}
 		NativeOptions native_opts;

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <map>
+#include <cstdio>
 #include <set>
 
 std::string snake_case(const std::string& s) {
@@ -118,9 +119,46 @@ const std::map<std::string, Names>& presets() {
 	return t;
 }
 
+// Levels are written as the standards write them ("4.1"). The libraries number them differently: x264 and x265 read the name, the others take
+// 10 x level (30 x level for HEVC in NVENC and AMF), AV1 in NVENC and AMF an index counted from 2.0.
+bool translate_level(const std::string& enc, const std::string& codec, std::string& value, std::string& error) {
+	if (!value.empty() && value.find_first_not_of("0123456789") == std::string::npos) return true; // the encoder's own number
+	const bool av1 = codec == "av1";
+	if (value == "auto") {
+		if (enc == "x264" || enc == "x265" || enc == "amf") value.clear();      // their default already is automatic
+		else value = enc == "nvenc" && av1 ? "24" : "0";                        // NVENC's AV1 auto-select value follows level 7.3
+		return true;
+	}
+	auto bad = [&] { error = "level '" + value + "' is not available for " + enc + "/" + codec; return false; };
+	if (value == "1b") { // H.264 only
+		if (codec != "h264") return bad();
+		if (enc == "x264") return true;
+		if (enc == "svtav1" || enc == "amf") return bad(); // neither has a level 1b
+		value = "9";
+		return true;
+	}
+	int major = 0, minor = 0;
+	char extra = 0;
+	if (sscanf(value.c_str(), "%d.%d%c", &major, &minor, &extra) < 2 && (sscanf(value.c_str(), "%d%c", &major, &extra) != 1)) return bad();
+	if (extra) return bad();
+	if (value.find('.') == std::string::npos) minor = 0;
+	const int n = major * 10 + minor;
+	static const std::set<int> h264 = {10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52, 60, 61, 62};
+	static const std::set<int> hevc = {10, 20, 21, 30, 31, 40, 41, 50, 51, 52, 60, 61, 62};
+	if (av1) {
+		if (major < 2 || major > 7 || minor < 0 || minor > 3) return bad();
+	} else if (!(codec == "hevc" ? hevc : h264).count(n)) return bad();
+	if (enc == "x264" || enc == "x265") { value = std::to_string(major) + "." + std::to_string(minor); if (minor == 0) value = std::to_string(major); return true; }
+	if (av1 && (enc == "nvenc" || enc == "amf")) value = std::to_string((major - 2) * 4 + minor);
+	else if (codec == "hevc" && (enc == "nvenc" || enc == "amf")) value = std::to_string(n * 3);
+	else value = std::to_string(n);
+	return true;
+}
+
 } // namespace
 
 bool translate_named_value(const std::string& enc, const std::string& codec, const std::string& key, std::string& value, std::string& error) {
+	if (key == "level") return translate_level(enc, codec, value, error);
 	if (key == "profile" && enc == "x265") { value = kebab_case(value); return true; } // main444_10 -> main444-10; x265 knows its own list
 	if (key != "preset" && key != "profile" && key != "tier") return true;
 	const auto& table = key == "preset" ? presets() : key == "tier" ? tiers() : profiles();
@@ -139,13 +177,15 @@ bool resolve_options(const std::string& encoder, const std::string& codec, const
                      const std::function<std::string(const std::string&)>& native_name, NativeOptions& out, std::string& error) {
 	for (auto& [k, v] : options) {
 		if (is_common_option(k)) { if (!translate(encoder, codec, k, v, out, error)) return false; }
-		else if (k == "tier" && encoder == "x265") { // x265 has a switch for the high tier instead of a tier option
-			if (v != "main" && v != "high") { error = "tier '" + v + "' is not available for x265/" + codec; return false; }
-			out.push_back({"high-tier", v == "high" ? "1" : "0"});
+		else if (k == "tier" && encoder == "x265") { // x265 cannot force the high tier: "high-tier" only allows it, and it is used when the bitrate needs it
+			if (v == "high") { error = "x265 cannot force tier 'high': it uses it by itself when the bitrate needs it (tier=auto), or never with tier=main"; return false; }
+			if (v != "main" && v != "auto") { error = "tier '" + v + "' is not available for x265/" + codec; return false; }
+			out.push_back({"high-tier", v == "auto" ? "1" : "0"});
 		} else {
 			std::string value = v;
 			if (!translate_named_value(encoder, codec, k, value, error)) return false;
-			out.push_back({native_name(k), value});
+			if (value.empty()) continue; // "auto" where the encoder's default already is
+			out.push_back({encoder == "x265" && k == "level" ? "level-idc" : native_name(k), value});
 		}
 	}
 	return true;

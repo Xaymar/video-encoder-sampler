@@ -14,6 +14,7 @@
 #include <mutex>
 #include <numeric>
 #include <optional>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -699,8 +700,20 @@ int main(int argc, char** argv) {
 	// A wave is the runs that are encoded at the same time from one decode: up to `parallel` of each pool. Each run is scored while it is
 	// being encoded, from the packets as they come out, so a wave is done when its slowest encoder and scorer are.
 	// Encoded packets are muxed to disk as they arrive; scratch files go next to the results if there are any, else in the temp folder.
-	const fs::path spool_dir = (cfg.output_dir.empty() ? fs::temp_directory_path() : fs::path(cfg.output_dir)) / (".ves-tmp-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
-	{ std::error_code ec; fs::create_directories(spool_dir, ec); }
+	// A folder of its own for the scratch streams. Several ves processes can run at once (and start in the same moment), so the name is random and the
+	// folder is created in one step that fails when the name is taken: a clock value as the name gave two processes the same folder now and then.
+	const fs::path spool_dir = [&] {
+		const fs::path parent = cfg.output_dir.empty() ? fs::temp_directory_path() : fs::path(cfg.output_dir);
+		std::error_code ec;
+		fs::create_directories(parent, ec);
+		std::random_device rd;
+		for (int attempt = 0; attempt < 100; attempt++) {
+			char name[40];
+			snprintf(name, sizeof name, ".ves-tmp-%08x%08x", rd(), rd());
+			if (fs::create_directory(parent / name, ec)) return parent / name;
+		}
+		return parent / ".ves-tmp";
+	}();
 	for (auto& fk : feed_order) {
 		std::map<std::string, std::vector<Task*>> by_pool;
 		for (Task* t : by_feed[fk]) by_pool[t->pool].push_back(t);

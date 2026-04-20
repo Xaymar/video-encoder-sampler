@@ -36,10 +36,10 @@
 
 namespace {
 
-// The oneVPL field names in snake_case; the two that every encoder has under the same name are called that: TargetUsage is preset, CodecProfile is profile.
+// The oneVPL field names in snake_case; the two that every encoder has under the same name are called that: TargetUsage is preset, CodecProfile is profile, CodecLevel is level.
 std::string qsv_name(const char* field) {
 	const std::string n = snake_case(field);
-	return n == "target_usage" ? "preset" : n == "codec_profile" ? "profile" : n;
+	return n == "target_usage" ? "preset" : n == "codec_profile" ? "profile" : n == "codec_level" ? "level" : n;
 }
 
 struct Api {

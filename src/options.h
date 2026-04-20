@@ -22,10 +22,10 @@ std::string kebab_case(const std::string& snake);
 // An encoder that cannot do one fails the run with a message.
 bool is_common_option(const std::string& key);
 
-// Standard names for the values of "preset", "profile" and "tier" (main | high, for HEVC and AV1), turned into what the encoder's library takes. A profile has the same name for every
+// Standard names for the values of "preset", "profile", "tier" (main | high, for HEVC and AV1) and "level" ("4.1", "auto"; null leaves it to the encoder), turned into what the encoder's library takes. A profile has the same name for every
 // encoder that offers it (h264: baseline, constrained_baseline, main, high, constrained_high, high10, high422, high444; hevc: main, main10, rext;
 // av1: main, high, professional); AMF's presets are speed, balanced, quality and high_quality. Anything else is passed on as it is, so the
-// encoder's own spellings (numbers, x265's main444_10, ...) still work. Returns false with `error` set for a name the encoder lacks.
+// encoder's own spellings (numbers, x265's main444_10, ...) still work. `value` comes back empty when the option is to stay unset. Returns false with `error` set for a name the encoder lacks.
 bool translate_named_value(const std::string& encoder, const std::string& codec, const std::string& key, std::string& value, std::string& error);
 
 using NativeOptions = std::vector<std::pair<std::string, std::string>>;

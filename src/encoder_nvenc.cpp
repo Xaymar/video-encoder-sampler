@@ -359,7 +359,13 @@ public:
 			auto it = fields.find(k);
 			if (it == fields.end()) { fprintf(stderr, "nvenc: unsupported option '%s'\n", k.c_str()); return false; }
 			long long n;
+			std::string level = val;
+			if (k == "level") { // "4.1", "auto": see options.h
+				std::string why;
+				if (!translate_named_value("nvenc", p.codec, "level", level, why)) { fprintf(stderr, "nvenc: %s\n", why.c_str()); return false; }
+			}
 			if (k == "tier" && (val == "main" || val == "high")) n = val == "high"; // the standard names, see options.h
+			else if (k == "level") n = atoll(level.c_str());
 			else if (val == "true" || val == "on") n = 1;
 			else if (val == "false" || val == "off") n = 0;
 			else {
