@@ -36,6 +36,12 @@
 
 namespace {
 
+// The oneVPL field names in snake_case; the two that every encoder has under the same name are called that: TargetUsage is preset, CodecProfile is profile.
+std::string qsv_name(const char* field) {
+	const std::string n = snake_case(field);
+	return n == "target_usage" ? "preset" : n == "codec_profile" ? "profile" : n;
+}
+
 struct Api {
 	LIB_HANDLE dll = nullptr;
 	bool ok = false;
@@ -117,15 +123,15 @@ class Qsv : public Encoder {
 	}
 
 	void make_fields() {
-#define M(n) fields[snake_case(#n)] = {&par.mfx.n, (int)sizeof(par.mfx.n)};
+#define M(n) fields[qsv_name(#n)] = {&par.mfx.n, (int)sizeof(par.mfx.n)};
 		M(TargetUsage) M(GopRefDist) M(NumRefFrame) M(IdrInterval) M(NumSlice) M(RateControlMethod) M(MaxKbps) M(InitialDelayInKB)
 		M(BufferSizeInKB) M(CodecProfile) M(CodecLevel) M(LowPower) M(QPI) M(QPP) M(QPB) M(ICQQuality) M(Convergence) M(Accuracy) M(GopOptFlag)
 #undef M
-#define M(n) fields[snake_case(#n)] = {&co2.n, (int)sizeof(co2.n)};
+#define M(n) fields[qsv_name(#n)] = {&co2.n, (int)sizeof(co2.n)};
 		M(IntRefType) M(IntRefCycleSize) M(MaxFrameSize) M(MBBRC) M(ExtBRC) M(LookAheadDepth) M(Trellis) M(BRefType) M(AdaptiveI) M(AdaptiveB)
 		M(LookAheadDS) M(MinQPI) M(MaxQPI) M(MinQPP) M(MaxQPP) M(MinQPB) M(MaxQPB) M(DisableDeblockingIdc)
 #undef M
-#define M(n) fields[snake_case(#n)] = {&co3.n, (int)sizeof(co3.n)};
+#define M(n) fields[qsv_name(#n)] = {&co3.n, (int)sizeof(co3.n)};
 		M(WinBRCMaxAvgKbps) M(WinBRCSize) M(QVBRQuality) M(WeightedPred) M(WeightedBiPred) M(ScenarioInfo) M(ContentInfo) M(PRefType) M(GPB)
 		M(EnableQPOffset) M(LowDelayBRC) M(AdaptiveRef) M(AdaptiveLTR) M(AdaptiveCQM) M(FadeDetection) M(MaxFrameSizeI) M(MaxFrameSizeP)
 #undef M

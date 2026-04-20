@@ -94,7 +94,7 @@
 	// Option names are snake_case. Some are common: the same name and meaning for every encoder that can do them (an encoder that cannot fails the
 	// run with a message): max_b_frames, lookahead_frames, max_ref_frames, b_reference_mode (none | middle | each) and rate_control (cbr | vbr).
 	// The rest are the encoder's own, written snake_case: x264, x265 and SVT-AV1 command line names (aq-mode is aq_mode), NVENC's structure fields
-	// (enable_ltr), AMF's property names without the codec prefix (QualityPreset is quality_preset), QuickSync's field names (target_usage).
+	// (enable_ltr), AMF's property names without the codec prefix (QualityPreset is preset), QuickSync's field names (TargetUsage is preset, CodecProfile is profile).
 	// An unknown name fails the run. config.all-options.jsonc lists them all.
 	"encoders": [
 		{
@@ -156,7 +156,7 @@
 			"encoder": "amf",                // AMD GPUs; the property names are AMF's, values numeric
 			"codec": "h264",
 			"options": {
-				"quality_preset": [0, 1, 2],   // H.264: 0 balanced, 1 speed, 2 quality
+				"preset": ["speed", "balanced", "quality"],   // speed | balanced | quality | high_quality
 				// "max_b_frames": [0, 1, 2],
 			},
 		},
@@ -165,7 +165,7 @@
 			"encoder": "qsv",                // Intel GPUs; field names of oneVPL's mfxInfoMFX and extension buffers
 			"codec": "hevc",
 			"options": {
-				"target_usage": [1, 4, 7],     // 1 best quality ... 7 fastest, or best_quality | balanced | best_speed
+				"preset": ["best_quality", "balanced", "best_speed"],   // QuickSync's target usage; 1 ... 7 also work
 				// "max_b_frames": [0, 3],
 				// "lookahead_frames": [0, 40],
 				// "b_reference_mode": ["none", "middle"],

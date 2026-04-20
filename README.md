@@ -77,7 +77,15 @@ Every option name is snake_case. These common options mean the same on every enc
 | `b_reference_mode` | B-frames as references: `none`, `middle`, `each` | `none`, `middle` | all | no | `none`, `middle` | H.264: `none`, `middle`/`each` |
 | `rate_control` | `cbr` or `vbr` | no | yes | yes | yes | no |
 
-`preset`, `tune` and `profile` keep their names on every encoder that has them, with the values each encoder defines. `chroma`, `bitdepth` and `gpu` work everywhere. The other options use each library's own name, converted to snake_case (`aq-mode` is `aq_mode`, NVENC's `enableLTR` is `enable_ltr`); `config.all-options.jsonc` lists them.
+`preset`, `tune`, `profile` and `tier` have the same names on every encoder that has them. `preset` takes each encoder's own values (x264 and x265 names, NVENC `p1`-`p7`, SVT-AV1 `0`-`13`, QuickSync `best_quality`/`balanced`/`best_speed`, AMF `speed`/`balanced`/`quality`/`high_quality`). `profile` and `tier` use standard names, whichever encoder runs them:
+
+| Codec | `profile` | `tier` |
+|---|---|---|
+| h264 | `baseline`, `constrained_baseline`, `main`, `high`, `constrained_high`, `high10`, `high422`, `high444` | |
+| hevc | `main`, `main10`, `rext` (x265 also takes its own, written `main444_10` for `main444-10`) | `main`, `high` |
+| av1 | `main`, `high`, `professional` | `main`, `high` |
+
+An encoder offers the profiles its library has (x264 has no `constrained_*`, NVENC no `constrained_baseline`, SVT-AV1 `main` for 4:2:0 and `high` for 4:4:4); asking for one it lacks fails the run with a message. Numbers are the encoder's own value and pass through. `chroma`, `bitdepth` and `gpu` work everywhere. The other options use each library's own name, converted to snake_case (`aq-mode` is `aq_mode`, NVENC's `enableLTR` is `enable_ltr`); `config.all-options.jsonc` lists them.
 
 ### Uploading results
 
@@ -149,8 +157,8 @@ Formats currently supported by each backend: `x264` 4:2:0 and 4:4:4 at 8 and 10 
 | `encoder` | Backend | Options |
 |---|---|---|
 | `nvenc` | NVENC API (`codec`: h264, hevc, av1) | `preset` p1-p7, `tune` hq/ll/ull/lossless, the common options (below) and `spatial_aq`, `temporal_aq`, `aq_strength`, `num_ltr_frames` (long-term references: 0 off, above 0 on with that many frames), `max_ref_frames_l0`/`_l1` (`_forward`/`_backward` for AV1), plus the other quality-relevant fields of NVENC's rate control, config and per-codec structures by their SDK names in snake_case (`multi_pass`, `min_cu_size`, `target_quality`, ...; numeric values). Not offered: slicing, intra refresh, temporal layers, stereo, colour signalling and other loss-resilience and packaging switches, `gpu` |
-| `amf` | AMF API (`codec`: h264, hevc, av1) | AMF property names in snake_case without the codec prefix, e.g. `quality_preset` (AMF's `QualityPreset`, `HevcQualityPreset` or `Av1QualityPreset`), `enable_vbaq`. Values are numeric. `gpu` selects the n-th AMD adapter |
-| `qsv` | oneVPL (`codec`: h264, hevc, av1) | The oneVPL fields of `mfxInfoMFX`, `mfxExtCodingOption2` and `mfxExtCodingOption3` in snake_case, e.g. `target_usage`, `gop_ref_dist`, `look_ahead_depth`, `b_ref_type`, `mbbrc`. Values are numbers, or `on`/`off`/`adaptive` for the toggles, `best_quality`/`balanced`/`best_speed` for `target_usage`, `cbr`/`vbr`/`icq`/... for `rate_control_method`. `gpu` selects the n-th Intel adapter. **Written against the headers and never run: no Intel GPU was available.** |
+| `amf` | AMF API (`codec`: h264, hevc, av1) | AMF property names in snake_case without the codec prefix, e.g. `preset` (AMF's `QualityPreset`, `HevcQualityPreset` or `Av1QualityPreset`: `speed`, `balanced`, `quality`, `high_quality`), `profile`, `tier`, `enable_vbaq`. Other values are numeric. `gpu` selects the n-th AMD adapter |
+| `qsv` | oneVPL (`codec`: h264, hevc, av1) | The oneVPL fields of `mfxInfoMFX`, `mfxExtCodingOption2` and `mfxExtCodingOption3` in snake_case, e.g. `preset` (oneVPL's `TargetUsage`), `profile` (`CodecProfile`), `gop_ref_dist`, `look_ahead_depth`, `b_ref_type`, `mbbrc`. Values are numbers, or `on`/`off`/`adaptive` for the toggles, `best_quality`/`balanced`/`best_speed` for `preset`, `cbr`/`vbr`/`icq`/... for `rate_control_method`. `gpu` selects the n-th Intel adapter. **Written against the headers and never run: no Intel GPU was available.** |
 | `x264` | libx264 | `preset`, `tune`, `profile`, plus any x264 long option with underscores for hyphens (`aq_mode`, `psy_rd`, `b_adapt`, ...) |
 | `x265` | libx265 | `preset`, `tune`, `profile`, plus any x265 long option, underscores for hyphens |
 | `svtav1` | libSvtAv1Enc | any `SvtAv1EncApp` long option with underscores for hyphens (`preset`, `enable_tf`, `film_grain`, ...). Runs as CBR with the low-delay prediction structure, which CBR requires; `rate_control=vbr` gives VBR with the random-access structure |

@@ -56,6 +56,11 @@ public:
 		std::string preset = "medium", tune, profile;
 		take("preset", preset); take("tune", tune); take("profile", profile);
 
+		if (!profile.empty()) {
+			std::string why;
+			translate_named_value("x265", p.codec, "profile", profile, why);
+		}
+
 		par = api->param_alloc();
 		if (api->param_default_preset(par, preset.c_str(), tune.empty() ? nullptr : tune.c_str()) < 0) {
 			fprintf(stderr, "x265: bad preset '%s' or tune '%s'\n", preset.c_str(), tune.c_str());

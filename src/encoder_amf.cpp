@@ -75,8 +75,8 @@ class Amf : public Encoder {
 		amf::AMFVariant v;
 		switch (info->type) {
 		case amf::AMF_VARIANT_BOOL: v = (val == "1" || val == "true"); break;
-		case amf::AMF_VARIANT_INT64: v = (amf_int64)strtoll(val.c_str(), nullptr, 10); break;
-		case amf::AMF_VARIANT_DOUBLE: v = strtod(val.c_str(), nullptr); break;
+		case amf::AMF_VARIANT_INT64: { char* end = nullptr; const long long n = strtoll(val.c_str(), &end, 10); if (end == val.c_str() || *end) { fprintf(stderr, "amf: '%s' is not a number or a known name for '%s'\n", val.c_str(), key.c_str()); return false; } v = (amf_int64)n; break; }
+		case amf::AMF_VARIANT_DOUBLE: { char* end = nullptr; const double d = strtod(val.c_str(), &end); if (end == val.c_str() || *end) { fprintf(stderr, "amf: '%s' is not a number for '%s'\n", val.c_str(), key.c_str()); return false; } v = d; break; }
 		case amf::AMF_VARIANT_RATE: { unsigned n = 0, d = 1; sscanf(val.c_str(), "%u/%u", &n, &d); v = AMFConstructRate(n, d); break; }
 		case amf::AMF_VARIANT_SIZE: { int a = 0, b = 0; sscanf(val.c_str(), "%dx%d", &a, &b); v = AMFConstructSize(a, b); break; }
 		default: fprintf(stderr, "amf: property '%s' has an unsupported type\n", key.c_str()); return false;
@@ -174,7 +174,9 @@ public:
 				const size_t n = strlen(prefix);
 				if (bare.size() > n && bare.compare(0, n, prefix) == 0 && isupper((unsigned char)bare[n])) { bare.erase(0, n); break; }
 			}
-			names.emplace(snake_case(bare), native);
+			std::string name = snake_case(bare);
+			if (name == "quality_preset") name = "preset"; // AMF's QualityPreset, HevcQualityPreset and Av1QualityPreset
+			names.emplace(name, native);
 		}
 		NativeOptions native_opts;
 		std::string why;

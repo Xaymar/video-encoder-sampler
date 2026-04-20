@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <map>
 #include <set>
 
 std::string snake_case(const std::string& s) {
@@ -83,11 +84,69 @@ bool translate(const std::string& enc, const std::string& codec, const std::stri
 
 } // namespace
 
+namespace {
+
+using Names = std::map<std::string, std::string>;
+
+// Values by "encoder/codec". An encoder that is missing from a profile table for a codec does not offer that profile.
+const std::map<std::string, Names>& profiles() {
+	static const std::map<std::string, Names> t = {
+		{"x264/h264", {{"baseline", "baseline"}, {"main", "main"}, {"high", "high"}, {"high10", "high10"}, {"high422", "high422"}, {"high444", "high444"}}},
+		{"amf/h264", {{"baseline", "66"}, {"constrained_baseline", "256"}, {"main", "77"}, {"high", "100"}, {"constrained_high", "257"}}},
+		{"qsv/h264", {{"baseline", "66"}, {"constrained_baseline", "578"}, {"main", "77"}, {"high", "100"}, {"constrained_high", "12388"}, {"high10", "110"}, {"high422", "122"}}},
+		{"amf/hevc", {{"main", "1"}, {"main10", "2"}}},
+		{"qsv/hevc", {{"main", "1"}, {"main10", "2"}, {"rext", "4"}}},
+		{"svtav1/av1", {{"main", "0"}, {"high", "1"}, {"professional", "2"}}},
+		{"amf/av1", {{"main", "1"}}},
+		{"qsv/av1", {{"main", "1"}, {"high", "2"}, {"professional", "3"}}},
+	};
+	return t;
+}
+
+// "tier" is main or high everywhere; AMF takes 0 and 1.
+const std::map<std::string, Names>& tiers() {
+	static const std::map<std::string, Names> t = {{"amf/hevc", {{"main", "0"}, {"high", "1"}}}};
+	return t;
+}
+
+const std::map<std::string, Names>& presets() {
+	static const std::map<std::string, Names> t = {
+		{"amf/h264", {{"balanced", "0"}, {"speed", "1"}, {"quality", "2"}, {"high_quality", "3"}}},
+		{"amf/hevc", {{"quality", "0"}, {"balanced", "5"}, {"speed", "10"}, {"high_quality", "15"}}},
+		{"amf/av1", {{"high_quality", "0"}, {"quality", "30"}, {"balanced", "70"}, {"speed", "100"}}},
+	};
+	return t;
+}
+
+} // namespace
+
+bool translate_named_value(const std::string& enc, const std::string& codec, const std::string& key, std::string& value, std::string& error) {
+	if (key == "profile" && enc == "x265") { value = kebab_case(value); return true; } // main444_10 -> main444-10; x265 knows its own list
+	if (key != "preset" && key != "profile" && key != "tier") return true;
+	const auto& table = key == "preset" ? presets() : key == "tier" ? tiers() : profiles();
+	auto t = table.find(enc + "/" + codec);
+	if (t == table.end()) return true; // this encoder takes its own spelling (or does not use the standard names at all)
+	auto v = t->second.find(value);
+	if (v != t->second.end()) { value = v->second; return true; }
+	// a number is the encoder's own value, anything else is a name this encoder does not have
+	if (!value.empty() && value.find_first_not_of("0123456789") == std::string::npos) return true;
+	if (enc == "qsv" && key == "preset") return true; // QuickSync reads best_quality / balanced / best_speed itself
+	error = key + " '" + value + "' is not available for " + enc + "/" + codec;
+	return false;
+}
+
 bool resolve_options(const std::string& encoder, const std::string& codec, const Options& options,
                      const std::function<std::string(const std::string&)>& native_name, NativeOptions& out, std::string& error) {
 	for (auto& [k, v] : options) {
 		if (is_common_option(k)) { if (!translate(encoder, codec, k, v, out, error)) return false; }
-		else out.push_back({native_name(k), v});
+		else if (k == "tier" && encoder == "x265") { // x265 has a switch for the high tier instead of a tier option
+			if (v != "main" && v != "high") { error = "tier '" + v + "' is not available for x265/" + codec; return false; }
+			out.push_back({"high-tier", v == "high" ? "1" : "0"});
+		} else {
+			std::string value = v;
+			if (!translate_named_value(encoder, codec, k, value, error)) return false;
+			out.push_back({native_name(k), value});
+		}
 	}
 	return true;
 }

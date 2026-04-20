@@ -49,6 +49,11 @@ public:
 		if (auto* v = take("tune")) tune = v;
 		if (auto* v = take("profile")) profile = v;
 
+		if (!profile.empty()) {
+			std::string why;
+			if (!translate_named_value("x264", p.codec, "profile", profile, why)) { fprintf(stderr, "x264: %s\n", why.c_str()); return false; }
+		}
+
 		x264_param_t par;
 		if (x264_param_default_preset(&par, preset.c_str(), tune.empty() ? nullptr : tune.c_str()) < 0) {
 			fprintf(stderr, "x264: bad preset '%s' or tune '%s'\n", preset.c_str(), tune.c_str());

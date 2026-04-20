@@ -251,11 +251,25 @@ public:
 			else { fprintf(stderr, "nvenc: bad tune '%s'\n", v.c_str()); return false; }
 		}
 
+		std::string profile;
+		const bool has_profile = take("profile", profile);
+
 		NV_ENC_PRESET_CONFIG pc{};
 		pc.version = NV_ENC_PRESET_CONFIG_VER;
 		pc.presetCfg.version = NV_ENC_CONFIG_VER;
 		if ((st = f.nvEncGetEncodePresetConfigEx(enc, codec, *PRESETS[preset - 1], tune, &pc))) return fail(st, "get preset config");
 		NV_ENC_CONFIG cfg = pc.presetCfg;
+		if (has_profile) { // the standard names, see options.h; left alone, the encoder picks the profile that fits the chroma layout and bit depth
+			static const std::map<std::string, const GUID*> h264 = {{"baseline", &NV_ENC_H264_PROFILE_BASELINE_GUID}, {"main", &NV_ENC_H264_PROFILE_MAIN_GUID},
+				{"high", &NV_ENC_H264_PROFILE_HIGH_GUID}, {"constrained_high", &NV_ENC_H264_PROFILE_CONSTRAINED_HIGH_GUID}, {"high10", &NV_ENC_H264_PROFILE_HIGH_10_GUID},
+				{"high422", &NV_ENC_H264_PROFILE_HIGH_422_GUID}, {"high444", &NV_ENC_H264_PROFILE_HIGH_444_GUID}};
+			static const std::map<std::string, const GUID*> hevc = {{"main", &NV_ENC_HEVC_PROFILE_MAIN_GUID}, {"main10", &NV_ENC_HEVC_PROFILE_MAIN10_GUID}, {"rext", &NV_ENC_HEVC_PROFILE_FREXT_GUID}};
+			static const std::map<std::string, const GUID*> av1 = {{"main", &NV_ENC_AV1_PROFILE_MAIN_GUID}};
+			const auto& table = p.codec == "h264" ? h264 : p.codec == "hevc" ? hevc : av1;
+			auto it = table.find(profile);
+			if (it == table.end()) { fprintf(stderr, "nvenc: profile '%s' is not available for nvenc/%s\n", profile.c_str(), p.codec.c_str()); return false; }
+			cfg.profileGUID = *it->second;
+		}
 
 		cfg.gopLength = p.gop;
 		{ // chroma layout and bit depth; the input and output depth are kept equal
@@ -345,7 +359,8 @@ public:
 			auto it = fields.find(k);
 			if (it == fields.end()) { fprintf(stderr, "nvenc: unsupported option '%s'\n", k.c_str()); return false; }
 			long long n;
-			if (val == "true" || val == "on") n = 1;
+			if (k == "tier" && (val == "main" || val == "high")) n = val == "high"; // the standard names, see options.h
+			else if (val == "true" || val == "on") n = 1;
 			else if (val == "false" || val == "off") n = 0;
 			else {
 				char* end = nullptr;
