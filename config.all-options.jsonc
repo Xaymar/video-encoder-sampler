@@ -285,7 +285,6 @@
 				"cabac_enable": [0, 1],
 				"rate_control_skip_frame_enable": [0, 1],
 				"low_latency_internal": [0, 1],
-				"adaptive_mini_gop": [0, 1],
 			},
 		},
 		// AMD, HEVC
