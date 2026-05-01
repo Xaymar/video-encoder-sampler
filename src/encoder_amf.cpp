@@ -170,6 +170,7 @@ public:
 			std::string native, bare;
 			for (const wchar_t* w = pi->name; *w; w++) native += (char)*w;
 			bare = native;
+			if (native.find("HalfPixel") != std::string::npos || native.find("QuarterPixel") != std::string::npos) continue; // GCN4 and older only, which AMD no longer supports
 			// Rate control settings are scoped per temporal layer and quality layer ("TL0.QL0.EnforceHRD"); ves uses the base layer only.
 			if (native.compare(0, 8, "TL0.QL0.") == 0) bare = native.substr(8);
 			else if (native.compare(0, 2, "TL") == 0 && native.find(".QL") != std::string::npos) continue;
