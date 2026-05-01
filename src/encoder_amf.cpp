@@ -170,6 +170,9 @@ public:
 			std::string native, bare;
 			for (const wchar_t* w = pi->name; *w; w++) native += (char)*w;
 			bare = native;
+			// Rate control settings are scoped per temporal layer and quality layer ("TL0.QL0.EnforceHRD"); ves uses the base layer only.
+			if (native.compare(0, 8, "TL0.QL0.") == 0) bare = native.substr(8);
+			else if (native.compare(0, 2, "TL") == 0 && native.find(".QL") != std::string::npos) continue;
 			for (const char* prefix : {"Hevc", "Av1", "AV1"}) {
 				const size_t n = strlen(prefix);
 				if (bare.size() > n && bare.compare(0, n, prefix) == 0 && isupper((unsigned char)bare[n])) { bare.erase(0, n); break; }
@@ -184,7 +187,12 @@ public:
 		if (!resolve_options("amf", p.codec, o, [](const std::string& k) { return k; }, native_opts, why)) { fprintf(stderr, "amf: %s\n", why.c_str()); return false; }
 		for (auto& [k, v] : native_opts) {
 			auto it = names.find(k);
-			if (it == names.end()) { fprintf(stderr, "amf: unknown property '%s'\n", k.c_str()); return false; }
+			if (it == names.end()) {
+				std::string known;
+				for (auto& [n, native] : names) known += (known.empty() ? "" : ", ") + n;
+				fprintf(stderr, "amf: unknown property '%s'; this encoder has: %s\n", k.c_str(), known.c_str());
+				return false;
+			}
 			if (!set(it->second, v)) return false;
 		}
 

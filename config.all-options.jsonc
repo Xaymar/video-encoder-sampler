@@ -286,8 +286,6 @@
 				"rate_control_skip_frame_enable": [0, 1],
 				"low_latency_internal": [0, 1],
 				"adaptive_mini_gop": [0, 1],
-				"quarter_pixel": [0, 1],
-				"half_pixel": [0, 1],
 			},
 		},
 		// AMD, HEVC
@@ -308,8 +306,6 @@
 				"vbv_buffer_size": [null, 1000000, 4000000],   // bits
 				"de_blocking_filter": [0, 1],
 				"rate_control_skip_frame_enable": [0, 1],
-				"half_pixel": [0, 1],
-				"quarter_pixel": [0, 1],
 			},
 		},
 		// AMD, AV1
