@@ -5,9 +5,15 @@
 #include <windows.h>
 
 bool set_low_priority() {
-	// Background mode lowers the CPU priority to idle and the I/O priority to very low (and the memory priority) for the whole process.
-	if (SetPriorityClass(GetCurrentProcess(), PROCESS_MODE_BACKGROUND_BEGIN)) return true;
-	return SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS) != 0; // no I/O part, but the CPU part
+	// Not PROCESS_MODE_BACKGROUND_BEGIN: besides the CPU and disk priorities it lowers the memory priority, and with that ves made no progress at all
+	// on a busy machine. The two priorities asked for are set on their own. The disk one has no documented call for a whole process, so this is
+	// NtSetInformationProcess(ProcessIoPriority), which Windows has had since Vista; if it is missing only the CPU part applies.
+	const bool cpu = SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS) != 0;
+	using SetInfo = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG);
+	const SetInfo set_info = (SetInfo)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtSetInformationProcess");
+	ULONG very_low = 0;
+	const bool io = set_info && set_info(GetCurrentProcess(), 33 /* ProcessIoPriority */, &very_low, sizeof very_low) == 0;
+	return cpu && io;
 }
 #else
 #include <sys/resource.h>
