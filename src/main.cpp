@@ -24,6 +24,7 @@
 #include "cache.h"
 #include "hash.h"
 #include "upload.h"
+#include "priority.h"
 #include "encoder.h"
 #include "formats.h"
 #include "gpu.h"
@@ -79,6 +80,7 @@ struct Config {
 	bool plain = false; // no live display, just lines
 	std::string hw_decode = "auto"; // "" software only, "auto", or a device type or decoder name: see set_hw_decode()
 	int decode_threads = 0;  // 0: as many as the cores allow within a memory budget
+	std::string priority = "low"; // "low": idle CPU and lowest disk priority, see priority.h; "normal" leaves the system's default
 	bool low_memory = false; // score a wave before encoding the next, and fewer VMAF threads
 	std::vector<Job> jobs;
 };
@@ -224,6 +226,7 @@ static void load_config(const std::string& path, Config& cfg) {
 	if (auto* v = root.find("output")) cfg.output_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "output" : "") : v->text();
 	if (auto* v = setting("hw_decode")) cfg.hw_decode = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "auto" : "") : v->text();
 	if (auto* v = setting("decode_threads")) cfg.decode_threads = atoi(v->text().c_str());
+	if (auto* v = setting("priority")) cfg.priority = v->text();
 	if (auto* v = setting("low_memory")) cfg.low_memory = v->text() == "1" || v->text() == "true";
 	if (auto* u = root.find("upload")) {
 		if (auto* x = u->find("url")) cfg.upload.url = x->text();
@@ -284,6 +287,7 @@ Paths
         --no-upload-videos  upload the results but not the encoded videos
         --hw-decode <auto|off|name>  decode the sources on the GPU when their first frames match a software decode exactly (default: auto);
                             a name is a device type (cuda, d3d11va, d3d12va, dxva2, qsv, amf, vaapi, vulkan) or a hardware decoder (hevc_cuvid, h264_qsv, ...)
+        --priority <low|normal>  low (default): idle CPU priority and the lowest disk priority, so ves never gets in the way of other programs; normal: the system default
         --decode-threads <n> threads per decoder (default: all cores; 4 with --low-memory)
         --low-memory        score each wave before the next is encoded and use fewer VMAF threads: slower, takes much less memory
         --plain             plain lines instead of the live display (also used when stdout is not a terminal)
@@ -379,6 +383,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--low-memory") cfg.low_memory = true;
 		else if (a == "--decode-threads") cfg.decode_threads = atoi(value().c_str());
 		else if (a == "--hw-decode") cfg.hw_decode = value();
+		else if (a == "--priority") cfg.priority = value();
 		else if (a == "-c" || a == "--cache") cache = value();
 		else if (a == "--vmaf-model") model = value();
 		else if (a == "--vmaf-threads") threads = atoi(value().c_str());
@@ -481,6 +486,8 @@ int main(int argc, char** argv) {
 	if (cfg.inputs.empty() || cfg.scenarios.empty() || cfg.jobs.empty()) { fprintf(stderr, "error: need inputs, bitrates and at least one enabled encoder (see --help)\n"); return 1; }
 
 	if (cfg.low_memory && cfg.vo.threads <= 0) cfg.vo.threads = 2;
+	if (cfg.priority != "low" && cfg.priority != "normal") { fprintf(stderr, "error: priority must be low or normal\n"); return 1; }
+	if (cfg.priority == "low" && !set_low_priority()) fprintf(stderr, "warning: could not lower the process priority\n");
 	set_hw_decode(cfg.hw_decode);
 	set_decode_threads(cfg.decode_threads > 0 ? cfg.decode_threads : cfg.low_memory ? 4 : 0);
 	ui::start(cfg.plain);
@@ -627,6 +634,14 @@ int main(int argc, char** argv) {
 		  << ",\"video_sha256\":" << (r.video_sha256.empty() ? std::string("null") : jq(r.video_sha256)) << ",\"reference_sha256\":" << jq(reference_hash(r.input));
 		return o.str();
 	};
+	// Results go out as the runs are scored, from a thread of their own. Runs whose streams are identical to one already sent are one result (see below).
+	std::unique_ptr<Uploader> uploader;
+	std::set<std::string> sent_streams;
+	if (!cfg.upload.url.empty() && !cfg.output_dir.empty()) {
+		UploadOptions up = cfg.upload;
+		if (up.key.empty()) if (const char* k = getenv("VES_API_KEY")) up.key = k;
+		uploader = std::make_unique<Uploader>(up, [](const std::string& line) { ui::log(line); });
+	}
 	auto finish = [&](Task& t) {
 		Run& r = t.r;
 		ui::overall(++finished, total);
@@ -634,6 +649,13 @@ int main(int argc, char** argv) {
 		if (r.ignored) { snprintf(line, sizeof line, "%s IGNORED  %s: %s", r.tag.c_str(), r.label.c_str(), r.reason.c_str()); ui::log(line); return; }
 		if (!t.ok) { snprintf(line, sizeof line, "%s FAILED  %s  (%s, %lld kbps)", r.tag.c_str(), r.label.c_str(), r.input.c_str(), (long long)r.bitrate); ui::log(line); return; }
 		if (!t.result_file.empty() && !r.cached) result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
+		if (uploader && !r.result.empty() && (r.video_sha256.empty() || sent_streams.insert(r.group + "|" + r.video_sha256).second)) {
+			UploadItem it;
+			it.result_file = (fs::path(cfg.output_dir) / r.result).string();
+			it.label = r.label;
+			if (!r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) it.video_file = (fs::path(cfg.output_dir) / r.video).string();
+			uploader->add(std::move(it));
+		}
 		r.penalty = std::max(0.0, r.kbps / r.bitrate - 1) * 100 * over_penalty;
 		std::vector<double> sc = r.scores;
 		std::sort(sc.begin(), sc.end());
@@ -863,21 +885,7 @@ int main(int argc, char** argv) {
 			else fprintf(stderr, "cannot write %s\n", file.string().c_str());
 		}
 	}
-	if (!cfg.upload.url.empty()) {
-		UploadOptions up = cfg.upload;
-		if (up.key.empty()) if (const char* k = getenv("VES_API_KEY")) up.key = k;
-		std::vector<UploadItem> items; // the runs whose result files are in the output folder (results kept only in the cache are not uploaded)
-		for (auto& r : runs) {
-			if (r.result.empty() || cfg.output_dir.empty()) continue;
-			UploadItem it;
-			it.result_file = (fs::path(cfg.output_dir) / r.result).string();
-			it.label = r.label;
-			if (!r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) it.video_file = (fs::path(cfg.output_dir) / r.video).string();
-			items.push_back(std::move(it));
-		}
-		printf("\n");
-		upload_results(up, items, [](const std::string& line) { printf("%s\n", line.c_str()); fflush(stdout); });
-	}
+	if (uploader) { printf("\n"); uploader->finish(); }
 	printf("\nPeak memory use: %lld MB\n", ui::peak_memory_mb());
 	if (ignored) printf("\n%d runs were ignored: they cannot work with the input or the encoder (see the result files)\n", ignored);
 	return failed ? 2 : 0;

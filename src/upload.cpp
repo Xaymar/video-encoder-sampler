@@ -2,11 +2,17 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <atomic>
+#include <condition_variable>
 #include <cstdio>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <mutex>
 #include <random>
 #include <sstream>
+#include <thread>
 
 #include <curl/curl.h>
 
@@ -158,28 +164,47 @@ bool is_local_host(const std::string& url) {
 
 } // namespace
 
-void upload_results(const UploadOptions& options, const std::vector<UploadItem>& items, const std::function<void(const std::string&)>& log) {
-	if (items.empty()) return;
-	if (options.key.empty()) { log("Upload: no API key (settings.upload.key, --upload-key or the VES_API_KEY environment variable)"); return; }
-	if (options.url.rfind("https://", 0) != 0 && !(options.url.rfind("http://", 0) == 0 && is_local_host(options.url))) {
-		log("Upload: the address must be https:// (the key is sent with every request)");
-		return;
+struct Uploader::Impl {
+	UploadOptions options;
+	std::function<void(const std::string&)> log;
+	std::mutex m;
+	std::condition_variable cv;
+	std::deque<UploadItem> queue;
+	std::thread worker;
+	bool closing = false;
+	std::atomic<bool> disabled{false};                 // the key was refused, the site is out of reach or the account may not upload: the rest is skipped
+	bool announced = false;
+	int scores_new = 0, scores_known = 0, videos_sent = 0, problems = 0, skipped = 0;
+
+	// What /me said, once it has been asked.
+	bool ready = false, may_scores = false, may_videos = false;
+	uint64_t chunk = 0;
+	std::unique_ptr<Site> site;
+
+	// Asks the site who we are, once. False when nothing can be uploaded.
+	bool connect() {
+		if (ready) return true;
+		if (options.key.empty()) { log("Upload: no API key (settings.upload.key, --upload-key or the VES_API_KEY environment variable)"); return false; }
+		if (options.url.rfind("https://", 0) != 0 && !(options.url.rfind("http://", 0) == 0 && is_local_host(options.url))) {
+			log("Upload: the address must be https:// (the key is sent with every request)");
+			return false;
+		}
+		static const bool curl_ready = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
+		if (!curl_ready) { log("Upload: cannot start libcurl"); return false; }
+		site = std::make_unique<Site>(options);
+		const Reply me = site->request(false, "/api/v1/me", nullptr, nullptr, 0, 60);
+		if (me.status == 401) { log("Upload: the site refused the API key (it was replaced or mistyped)"); return false; }
+		if (me.status != 200) { log("Upload: cannot reach the site (" + Site::why(me) + ")"); return false; }
+		const Json* can = me.json.find("can");
+		may_scores = can && flag_of(*can, "upload_scores");
+		may_videos = can && flag_of(*can, "upload_videos");
+		chunk = std::max<uint64_t>(64 << 10, (uint64_t)strtoull(text_of(me.json, "chunk_bytes").c_str(), nullptr, 10));
+		if (!may_scores && !(may_videos && options.videos)) { log("Upload: this account may not upload anything"); return false; }
+		log("Upload: sending results to " + options.url + (may_videos && options.videos ? " (with videos)" : ""));
+		return ready = true;
 	}
-	static const bool curl_ready = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
-	if (!curl_ready) { log("Upload: cannot start libcurl"); return; }
 
-	Site site(options);
-	const Reply me = site.request(false, "/api/v1/me", nullptr, nullptr, 0, 60);
-	if (me.status == 401) { log("Upload: the site refused the API key (it was replaced or mistyped)"); return; }
-	if (me.status != 200) { log("Upload: cannot reach the site (" + Site::why(me) + ")"); return; }
-	const Json* can = me.json.find("can");
-	const bool may_scores = can && flag_of(*can, "upload_scores"), may_videos = can && flag_of(*can, "upload_videos");
-	const uint64_t chunk = std::max<uint64_t>(64 << 10, (uint64_t)strtoull(text_of(me.json, "chunk_bytes").c_str(), nullptr, 10));
-	if (!may_scores && !(may_videos && options.videos)) { log("Upload: this account may not upload anything"); return; }
-	log("Upload: " + std::to_string(items.size()) + " results to " + options.url + (may_videos && options.videos ? " (with videos)" : ""));
-
-	int scores_new = 0, scores_known = 0, videos_sent = 0, problems = 0;
-	for (auto& item : items) {
+	void process(const UploadItem& item) {
 		const std::string who = "Upload " + item.label + ": ";
 		try {
 			const Json result = Json::parse(read_text(item.result_file));
@@ -198,20 +223,20 @@ void upload_results(const UploadOptions& options, const std::vector<UploadItem>&
 				body += ",\"video_size\":" + std::to_string(video_size);
 			}
 			body += "}";
-			const Reply check = site.request(true, "/api/v1/check", "application/json", body.data(), body.size(), 120);
-			if (check.status != 200) { log(who + "check failed (" + Site::why(check) + ")"); problems++; continue; }
+			const Reply check = site->request(true, "/api/v1/check", "application/json", body.data(), body.size(), 120);
+			if (check.status != 200) { log(who + "check failed (" + Site::why(check) + ")"); problems++; return; }
 			const Json* score = check.json.find("score");
 			const Json* video = check.json.find("video");
 			std::string run = video ? text_of(*video, "run") : std::string();
 			std::string done;
 
 			if (score && flag_of(*score, "can_upload") && may_scores) {
-				const Reply up = site.upload_file("score", item.result_file, "", chunk, nullptr);
+				const Reply up = site->upload_file("score", item.result_file, "", chunk, nullptr);
 				if (up.status == 200 || up.status == 201) {
 					run = text_of(up.json, "uuid");
 					(flag_of(up.json, "new") ? scores_new : scores_known)++;
 					done = "score stored";
-				} else { log(who + "the score was refused (" + Site::why(up) + ")"); problems++; continue; }
+				} else { log(who + "the score was refused (" + Site::why(up) + ")"); problems++; return; }
 			} else if (score && text_of(*score, "status") == "exists") {
 				scores_known++;
 				done = "score already there";
@@ -220,8 +245,8 @@ void upload_results(const UploadOptions& options, const std::vector<UploadItem>&
 			if (video && with_video) {
 				const std::string status = text_of(*video, "status");
 				if (flag_of(*video, "can_upload") && !run.empty()) {
-					const Reply up = site.upload_file("video", item.video_file, "&run=" + run + "&name=" + escape(fs::path(item.video_file).filename().string()), chunk,
-					                                  [&](int pct) { log(who + "video " + std::to_string(pct) + "%"); });
+					const Reply up = site->upload_file("video", item.video_file, "&run=" + run + "&name=" + escape(fs::path(item.video_file).filename().string()), chunk,
+					                                   [&](int pct) { log(who + "video " + std::to_string(pct) + "%"); });
 					if (up.status == 200 || up.status == 201) { videos_sent++; done += ", video stored"; }
 					else { log(who + "the video was refused (" + Site::why(up) + ")"); problems++; }
 				} else if (status == "exists") done += ", video already there";
@@ -236,6 +261,45 @@ void upload_results(const UploadOptions& options, const std::vector<UploadItem>&
 			problems++;
 		}
 	}
-	log("Upload finished: " + std::to_string(scores_new) + " new scores, " + std::to_string(scores_known) + " already known, " + std::to_string(videos_sent) + " videos" +
-	    (problems ? ", " + std::to_string(problems) + " problems (they are tried again next time)" : ""));
+
+	void run() {
+		for (;;) {
+			UploadItem item;
+			{
+				std::unique_lock lock(m);
+				cv.wait(lock, [&] { return !queue.empty() || closing; });
+				if (queue.empty()) return;
+				item = std::move(queue.front());
+				queue.pop_front();
+			}
+			if (disabled) { skipped++; continue; }
+			if (!connect()) { disabled = true; skipped++; continue; }
+			process(item);
+		}
+	}
+};
+
+Uploader::Uploader(const UploadOptions& options, std::function<void(const std::string&)> log) : impl(new Impl) {
+	impl->options = options;
+	impl->log = std::move(log);
+	impl->worker = std::thread([this] { impl->run(); });
+}
+
+Uploader::~Uploader() { finish(); }
+
+void Uploader::add(UploadItem item) {
+	{ std::lock_guard lock(impl->m); impl->queue.push_back(std::move(item)); }
+	impl->cv.notify_all();
+}
+
+void Uploader::finish() {
+	if (!impl->worker.joinable()) return;
+	size_t waiting;
+	{ std::lock_guard lock(impl->m); waiting = impl->queue.size(); impl->closing = true; }
+	if (waiting && !impl->disabled) impl->log("Upload: " + std::to_string(waiting) + " still to send");
+	impl->cv.notify_all();
+	impl->worker.join();
+	if (!impl->ready) return; // said why in connect(), or nothing was ever queued
+	impl->log("Upload finished: " + std::to_string(impl->scores_new) + " new scores, " + std::to_string(impl->scores_known) + " already known, " + std::to_string(impl->videos_sent) + " videos" +
+	          (impl->problems ? ", " + std::to_string(impl->problems) + " problems (they are tried again next time)" : ""));
 }

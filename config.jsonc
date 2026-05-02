@@ -65,7 +65,7 @@
 		"threads": 0,
 	},
 
-	// ---- Uploading results to a VES website, after the sweep ----------------------------------------------------------------------
+	// ---- Uploading results to a VES website, as the runs are scored ----------------------------------------------------------------------
 	// "upload": {
 	//   "url": "https://ves.example.com",
 	//   "key": "ves_...",    // from the website's account page; or leave it out and set the VES_API_KEY environment variable
@@ -84,6 +84,7 @@
 		// ("hevc_cuvid"). The encoded streams that are scored are always decoded in software.
 		"hw_decode": "auto",
 		"decode_threads": 0,   // threads per decoder; 0 uses every core
+		"priority": "low",     // "low": idle CPU priority and the lowest disk priority, so ves never slows down other programs; "normal": the system default
 		"low_memory": false,   // true: fewer VMAF and decoder threads, much less memory, a bit slower
 	},
 

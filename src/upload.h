@@ -2,6 +2,7 @@
 // Uploads results (and their encoded videos) to the VES website, see docs/api.md of that project: GET /api/v1/me, POST /api/v1/check and
 // POST /api/v1/upload in chunks. Nothing here stops a sweep: whatever cannot be uploaded is reported and left for the next run.
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -17,5 +18,17 @@ struct UploadItem {
 	std::string label;       // for the messages
 };
 
-// `log` receives one line at a time.
-void upload_results(const UploadOptions& options, const std::vector<UploadItem>& items, const std::function<void(const std::string&)>& log);
+// Sends results to the site on a thread of its own, one after the other, as they are added: a run goes out right after it was scored, while the
+// next ones are still being encoded. `log` receives one line at a time (from that thread). Nothing here fails a sweep: what cannot be sent is
+// reported and left for the next run, and once the key is refused or the site cannot be reached the rest is skipped.
+class Uploader {
+public:
+	Uploader(const UploadOptions& options, std::function<void(const std::string&)> log);
+	~Uploader(); // waits like finish()
+	void add(UploadItem item);
+	void finish(); // waits until everything added is sent or given up on, and says how it went
+
+private:
+	struct Impl;
+	std::unique_ptr<Impl> impl;
+};
