@@ -796,6 +796,7 @@ int main(int argc, char** argv) {
 		}
 	}
 	{ std::error_code ec; fs::remove_all(spool_dir, ec); }
+	if (uploader) uploader->finish(); // the live display stays up while the last uploads go out
 	ui::stop();
 
 	// Collect in task order so the ranking below does not depend on which run finished first.
@@ -885,7 +886,6 @@ int main(int argc, char** argv) {
 			else fprintf(stderr, "cannot write %s\n", file.string().c_str());
 		}
 	}
-	if (uploader) { printf("\n"); uploader->finish(); }
 	printf("\nPeak memory use: %lld MB\n", ui::peak_memory_mb());
 	if (ignored) printf("\n%d runs were ignored: they cannot work with the input or the encoder (see the result files)\n", ignored);
 	return failed ? 2 : 0;

@@ -17,6 +17,7 @@
 #include <curl/curl.h>
 
 #include "hash.h"
+#include "ui.h"
 #include "json.h"
 
 namespace fs = std::filesystem;
@@ -60,6 +61,18 @@ bool flag_of(const Json& j, const char* key) {
 	return v && v->type == Json::Bool && v->s == "1";
 }
 
+// What libcurl tells while a chunk goes out, for the progress of the file: bytes before this chunk plus what has been sent of it.
+struct Transfer {
+	RunProgress* rp;
+	long long base;
+};
+
+int on_transfer(void* user, curl_off_t, curl_off_t, curl_off_t, curl_off_t sent) {
+	auto* t = (Transfer*)user;
+	t->rp->done = t->base + (long long)sent;
+	return 0;
+}
+
 class Site {
 	std::string base, key;
 
@@ -70,7 +83,7 @@ public:
 
 	// One request. `body` is sent as a POST body when `post` is set. The timeout is generous because the last chunk of a video is answered only
 	// after the server has hashed the whole file.
-	Reply request(bool post, const std::string& path, const char* content_type, const char* data, size_t size, long timeout) const {
+	Reply request(bool post, const std::string& path, const char* content_type, const char* data, size_t size, long timeout, Transfer* progress = nullptr) const {
 		Reply r;
 		CURL* c = curl_easy_init();
 		if (!c) { r.error = "cannot start libcurl"; return r; }
@@ -84,6 +97,11 @@ public:
 		curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
 		curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, on_body);
 		curl_easy_setopt(c, CURLOPT_WRITEDATA, &r.body);
+		if (progress) {
+			curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
+			curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, on_transfer);
+			curl_easy_setopt(c, CURLOPT_XFERINFODATA, progress);
+		}
 		if (post) {
 			curl_easy_setopt(c, CURLOPT_POST, 1L);
 			curl_easy_setopt(c, CURLOPT_POSTFIELDS, data);
@@ -105,7 +123,7 @@ public:
 	}
 
 	// Sends a file in chunks; returns the final reply (status 200 or 201 with "done"), or a reply that says what went wrong.
-	Reply upload_file(const std::string& kind, const std::string& file, const std::string& extra_query, uint64_t chunk, const std::function<void(int)>& progress) const {
+	Reply upload_file(const std::string& kind, const std::string& file, const std::string& extra_query, uint64_t chunk, RunProgress* rp, long long base) const {
 		Reply last;
 		std::error_code ec;
 		const uint64_t total = fs::file_size(file, ec);
@@ -114,7 +132,7 @@ public:
 		const std::string id = random_id();
 		std::vector<char> buf((size_t)std::min<uint64_t>(chunk, total));
 		uint64_t offset = 0;
-		int failures = 0, shown = -1;
+		int failures = 0;
 		while (offset < total) {
 			const size_t n = (size_t)std::min<uint64_t>(chunk, total - offset);
 			in.clear();
@@ -122,7 +140,8 @@ public:
 			in.read(buf.data(), (std::streamsize)n);
 			if ((size_t)in.gcount() != n) { last.error = "cannot read " + file; last.status = 0; return last; }
 			const std::string path = "/api/v1/upload?kind=" + kind + "&upload=" + id + "&offset=" + std::to_string(offset) + "&total=" + std::to_string(total) + extra_query;
-			last = request(true, path, "application/octet-stream", buf.data(), n, offset + n == total ? 3600 : 300);
+			Transfer progress{rp, base + (long long)offset};
+			last = request(true, path, "application/octet-stream", buf.data(), n, offset + n == total ? 3600 : 300, rp ? &progress : nullptr);
 			if (last.status == 409) { // the server holds another amount: continue where it says
 				const uint64_t held = (uint64_t)strtoull(text_of(last.json, "size").c_str(), nullptr, 10);
 				if (held == offset || held > total || ++failures > 3) return last;
@@ -137,10 +156,7 @@ public:
 			failures = 0;
 			if (flag_of(last.json, "done")) return last;
 			offset += n;
-			if (progress) {
-				const int pct = (int)(offset * 100 / total);
-				if (pct / 25 != shown / 25) { shown = pct; progress(pct); }
-			}
+			if (rp) rp->done = base + (long long)offset;
 		}
 		last.error = "the server did not confirm the upload";
 		last.status = 0;
@@ -175,6 +191,7 @@ struct Uploader::Impl {
 	std::atomic<bool> disabled{false};                 // the key was refused, the site is out of reach or the account may not upload: the rest is skipped
 	bool announced = false;
 	int scores_new = 0, scores_known = 0, videos_sent = 0, problems = 0, skipped = 0;
+	std::atomic<int> added{0}, handled{0}; // for the count in the live display
 
 	// What /me said, once it has been asked.
 	bool ready = false, may_scores = false, may_videos = false;
@@ -230,8 +247,19 @@ struct Uploader::Impl {
 			std::string run = video ? text_of(*video, "run") : std::string();
 			std::string done;
 
-			if (score && flag_of(*score, "can_upload") && may_scores) {
-				const Reply up = site->upload_file("score", item.result_file, "", chunk, nullptr);
+			const bool send_score = score && flag_of(*score, "can_upload") && may_scores;
+			const bool send_video = with_video && video && flag_of(*video, "can_upload") && (send_score || !run.empty());
+			const long long score_bytes = send_score ? (long long)fs::file_size(item.result_file, ec) : 0;
+			RunProgress rp; // shown in the live display while the files go out
+			int handle = 0;
+			if (score_bytes + (send_video ? (long long)video_size : 0) > 0) {
+				rp.begin(4, score_bytes + (send_video ? (long long)video_size : 0));
+				handle = ui::attach(&rp, item.label, "server");
+			}
+			struct Detach { RunProgress& rp; int handle; ~Detach() { if (handle) { rp.finish(); ui::detach(handle); } } } detach{rp, handle};
+
+			if (send_score) {
+				const Reply up = site->upload_file("score", item.result_file, "", chunk, &rp, 0);
 				if (up.status == 200 || up.status == 201) {
 					run = text_of(up.json, "uuid");
 					(flag_of(up.json, "new") ? scores_new : scores_known)++;
@@ -245,8 +273,7 @@ struct Uploader::Impl {
 			if (video && with_video) {
 				const std::string status = text_of(*video, "status");
 				if (flag_of(*video, "can_upload") && !run.empty()) {
-					const Reply up = site->upload_file("video", item.video_file, "&run=" + run + "&name=" + escape(fs::path(item.video_file).filename().string()), chunk,
-					                                   [&](int pct) { log(who + "video " + std::to_string(pct) + "%"); });
+					const Reply up = site->upload_file("video", item.video_file, "&run=" + run + "&name=" + escape(fs::path(item.video_file).filename().string()), chunk, &rp, score_bytes);
 					if (up.status == 200 || up.status == 201) { videos_sent++; done += ", video stored"; }
 					else { log(who + "the video was refused (" + Site::why(up) + ")"); problems++; }
 				} else if (status == "exists") done += ", video already there";
@@ -255,7 +282,7 @@ struct Uploader::Impl {
 					if (!reason.empty()) done += ", no video: " + reason;
 				}
 			}
-			if (!done.empty()) log(who + done);
+			if (!done.empty() && !ui::live()) log(who + done); // the live display shows what is going out; plain output says what happened to each
 		} catch (const std::exception& e) {
 			log(who + e.what());
 			problems++;
@@ -272,9 +299,10 @@ struct Uploader::Impl {
 				item = std::move(queue.front());
 				queue.pop_front();
 			}
-			if (disabled) { skipped++; continue; }
-			if (!connect()) { disabled = true; skipped++; continue; }
-			process(item);
+			if (disabled) skipped++;
+			else if (!connect()) { disabled = true; skipped++; }
+			else process(item);
+			ui::uploads(++handled, added);
 		}
 	}
 };
@@ -288,6 +316,7 @@ Uploader::Uploader(const UploadOptions& options, std::function<void(const std::s
 Uploader::~Uploader() { finish(); }
 
 void Uploader::add(UploadItem item) {
+	ui::uploads(impl->handled, ++impl->added);
 	{ std::lock_guard lock(impl->m); impl->queue.push_back(std::move(item)); }
 	impl->cv.notify_all();
 }

@@ -41,7 +41,7 @@ struct Entry {
 std::mutex m;
 std::map<int, Entry> entries;
 std::deque<std::string> pending; // permanent lines not printed yet
-int next_handle = 1, live_lines = 0, runs_done = 0, runs_total = 0;
+int next_handle = 1, live_lines = 0, runs_done = 0, runs_total = 0, uploads_done = 0, uploads_total = 0;
 bool is_live = false, running = false;
 Clock::time_point t0;
 std::thread renderer, stderr_reader;
@@ -95,6 +95,11 @@ std::string run_line(const Entry& e, int width) {
 	const int pct = total > 0 ? (int)std::min<long long>(100, done * 100 / total) : 0;
 	std::string bar(20, '-');
 	for (int i = 0; i < pct / 5; i++) bar[i] = '#';
+	if (st == 4) { // an upload: bytes sent, and the rate since it began
+		const double mb = 1048576.0;
+		snprintf(head, sizeof head, "%-9.9s upload [%s] %3d%% %7.1f/%-7.1f MB %6.2f MB/s ", e.pool.c_str(), bar.c_str(), pct, done / mb, total / mb, done / secs / mb);
+		return fit(head + e.label, width);
+	}
 	static const char* waits[] = {"", "starved", "backed up"};
 	const int ws = e.p->state;
 	snprintf(head, sizeof head, "%-9.9s %-6s [%s] %3d%% %5lld/%-5lld %6.1f fps %-9s ", e.pool.c_str(), names[st >= 0 && st < 4 ? st : 0], bar.c_str(), pct, done, total, done / secs, end ? "done" : waits[ws >= 0 && ws < 3 ? ws : 0]);
@@ -110,11 +115,15 @@ void render() {
 	const int width = console_width() - 1;
 	const double elapsed = std::chrono::duration<double>(Clock::now() - t0).count();
 	char head[160];
-	if (runs_total > 0) {
+	if (runs_total > 0 && runs_done >= runs_total) {
+		snprintf(head, sizeof head, "ves  %d/%d runs finished  %s elapsed", runs_done, runs_total, span(elapsed).c_str());
+	} else if (runs_total > 0) {
 		snprintf(head, sizeof head, "ves  %d/%d runs finished  %s elapsed  ~%s left", runs_done, runs_total, span(elapsed).c_str(),
 		         runs_done ? span(elapsed / runs_done * (runs_total - runs_done)).c_str() : "?");
 	} else snprintf(head, sizeof head, "ves  preparing  %s elapsed", span(elapsed).c_str());
-	out += fit(head, width) + "\x1b[K\n";
+	std::string top = head;
+	if (uploads_total > 0) top += "  |  uploads " + std::to_string(uploads_done) + "/" + std::to_string(uploads_total);
+	out += fit(top, width) + "\x1b[K\n";
 	int lines = 1;
 	const int room = console_height() - 3;
 	for (auto& [h, e] : entries) {
@@ -135,6 +144,7 @@ void plain_status() {
 	for (auto& [h, e] : entries) {
 		const long long total = e.p->total, done = e.p->done;
 		if (e.p->stage == 0 || total <= 0 || e.p->end_ms) continue; // not started, or already finished
+		if (e.p->stage == 4) { printf("  uploading: %lld%% (%.1f/%.1f MB)  %s\n", done * 100 / total, done / 1048576.0, total / 1048576.0, e.label.c_str()); continue; }
 		static const char* waits[] = {"", " [starved: waiting for frames]", " [backed up: waiting for room downstream]"};
 		const int ws = e.p->state;
 		printf("  %s %s: %lld%% (%lld/%lld frames)%s  %s\n", e.p->stage == 1 ? "encoding" : e.p->stage == 3 ? "decoding" : "scoring", e.pool.c_str(), done * 100 / total, done, total, waits[ws >= 0 && ws < 3 ? ws : 0], e.label.c_str());
@@ -264,6 +274,12 @@ long long peak_memory_mb() {
 	rusage ru{};
 	return getrusage(RUSAGE_SELF, &ru) == 0 ? (long long)(ru.ru_maxrss >> 10) : 0; // kilobytes on Linux
 #endif
+}
+
+void uploads(int sent, int queued) {
+	std::lock_guard lock(m);
+	uploads_done = sent;
+	uploads_total = queued;
 }
 
 void overall(int done, int total) {
