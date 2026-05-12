@@ -82,7 +82,8 @@ class Qsv : public Encoder {
 	mfxVideoParam par{};
 	mfxExtCodingOption2 co2{};
 	mfxExtCodingOption3 co3{};
-	mfxExtBuffer* ext[2]{};
+	mfxExtVideoSignalInfo vsi{};
+	mfxExtBuffer* ext[3]{};
 	std::vector<uint8_t> bits;
 	mfxBitstream bs{};
 	std::deque<Surface> pool; // stable addresses; a surface is free when the runtime no longer holds a lock on it
@@ -250,6 +251,16 @@ public:
 		co3.Header.BufferId = MFX_EXTBUFF_CODING_OPTION3; co3.Header.BufferSz = sizeof co3;
 		ext[0] = &co2.Header; ext[1] = &co3.Header;
 		par.ExtParam = ext; par.NumExtParam = 2;
+		if (color_full(p.color) || color_described(p.color)) { // the colour of the pictures, written into the stream
+			vsi.Header.BufferId = MFX_EXTBUFF_VIDEO_SIGNAL_INFO; vsi.Header.BufferSz = sizeof vsi;
+			vsi.VideoFormat = 5; // unspecified
+			vsi.VideoFullRange = color_full(p.color);
+			if (color_described(p.color)) {
+				vsi.ColourDescriptionPresent = 1;
+				vsi.ColourPrimaries = (mfxU16)p.color.primaries; vsi.TransferCharacteristics = (mfxU16)p.color.trc; vsi.MatrixCoefficients = (mfxU16)p.color.space;
+			}
+			ext[2] = &vsi.Header; par.NumExtParam = 3;
+		}
 
 		make_fields();
 		NativeOptions native;

@@ -259,6 +259,30 @@ public:
 		pc.presetCfg.version = NV_ENC_CONFIG_VER;
 		if ((st = f.nvEncGetEncodePresetConfigEx(enc, codec, *PRESETS[preset - 1], tune, &pc))) return fail(st, "get preset config");
 		NV_ENC_CONFIG cfg = pc.presetCfg;
+		if (color_full(p.color) || color_described(p.color)) { // the colour of the pictures, as the stream's VUI (sequence header for AV1) says it
+			auto vui = [&](NV_ENC_CONFIG_H264_VUI_PARAMETERS& v) {
+				v.videoSignalTypePresentFlag = 1;
+				v.videoFormat = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+				v.videoFullRangeFlag = color_full(p.color);
+				if (color_described(p.color)) {
+					v.colourDescriptionPresentFlag = 1;
+					v.colourPrimaries = (NV_ENC_VUI_COLOR_PRIMARIES)p.color.primaries;
+					v.transferCharacteristics = (NV_ENC_VUI_TRANSFER_CHARACTERISTIC)p.color.trc;
+					v.colourMatrix = (NV_ENC_VUI_MATRIX_COEFFS)p.color.space;
+				}
+			};
+			if (p.codec == "h264") vui(cfg.encodeCodecConfig.h264Config.h264VUIParameters);
+			else if (p.codec == "hevc") vui(cfg.encodeCodecConfig.hevcConfig.hevcVUIParameters);
+			else {
+				auto& c = cfg.encodeCodecConfig.av1Config;
+				c.colorRange = color_full(p.color);
+				if (color_described(p.color)) {
+					c.colorPrimaries = (NV_ENC_VUI_COLOR_PRIMARIES)p.color.primaries;
+					c.transferCharacteristics = (NV_ENC_VUI_TRANSFER_CHARACTERISTIC)p.color.trc;
+					c.matrixCoefficients = (NV_ENC_VUI_MATRIX_COEFFS)p.color.space;
+				}
+			}
+		}
 		if (has_profile) { // the standard names, see options.h; left alone, the encoder picks the profile that fits the chroma layout and bit depth
 			static const std::map<std::string, const GUID*> h264 = {{"baseline", &NV_ENC_H264_PROFILE_BASELINE_GUID}, {"main", &NV_ENC_H264_PROFILE_MAIN_GUID},
 				{"high", &NV_ENC_H264_PROFILE_HIGH_GUID}, {"constrained_high", &NV_ENC_H264_PROFILE_CONSTRAINED_HIGH_GUID}, {"high10", &NV_ENC_H264_PROFILE_HIGH_10_GUID},

@@ -74,6 +74,15 @@ public:
 		par->rc.rateControlMode = X265_RC_ABR;
 		par->rc.bitrate = (int)(p.bitrate / 1000);
 		par->logLevel = X265_LOG_WARNING;
+		if (color_full(p.color) || color_described(p.color)) {
+			par->vui.bEnableVideoSignalTypePresentFlag = 1;
+			par->vui.videoFormat = 5; // unspecified
+			par->vui.bEnableVideoFullRangeFlag = color_full(p.color);
+			if (color_described(p.color)) {
+				par->vui.bEnableColorDescriptionPresentFlag = 1;
+				par->vui.colorPrimaries = p.color.primaries; par->vui.transferCharacteristics = p.color.trc; par->vui.matrixCoeffs = p.color.space;
+			}
+		}
 		NativeOptions native;
 		std::string why;
 		if (!resolve_options("x265", p.codec, o, kebab_case, native, why)) { fprintf(stderr, "x265: %s\n", why.c_str()); return false; }

@@ -117,6 +117,41 @@ public:
 		// shortcut: amfrt64.dll stays loaded; unloading it while AMF's worker threads wind down has been unreliable
 	}
 
+
+	// The colour of the pictures goes to the encoder as input and as output description, so that the stream says what the pictures are. AMF's
+	// defaults are studio range and "unknown", which makes a full range source come out wrong. The properties are named differently per codec.
+	void set_color(const Color& c) {
+		auto first = [&](std::initializer_list<const wchar_t*> names, const amf::AMFVariant& v) {
+			for (const wchar_t* name : names) {
+				const amf::AMFPropertyInfo* info = nullptr;
+				if (enc->GetPropertyInfo(name, &info) != AMF_OK || !info) continue;
+				if (info->type == amf::AMF_VARIANT_BOOL) { amf::AMFVariant b((bool)v.ToInt64()); enc->SetProperty(name, b); }
+				else enc->SetProperty(name, v);
+				return;
+			}
+		};
+		const bool full = color_full(c);
+		first({L"InputFullRangeColor", L"HevcInputFullRangeColor", L"Av1InputFullRangeColor"}, amf::AMFVariant((amf_int64)full));
+		first({L"FullRangeColor", L"HevcNominalRange", L"Av1NominalRange"}, amf::AMFVariant((amf_int64)full));
+		// Without a description in the source AMF would write its own (BT.709); the stream should say nothing instead, as the others do.
+		const amf_int64 primaries = c.primaries ? c.primaries : 2, trc = c.trc ? c.trc : 2, matrix = c.space ? c.space : 2;
+		// the converter profile names matrix and range together
+		amf_int64 profile = -1;
+		if (c.space == 1) profile = full ? 7 : 1;                      // BT.709
+		else if (c.space == 5 || c.space == 6) profile = full ? 3 : 0; // BT.601
+		else if (c.space == 9 || c.space == 10) profile = full ? 8 : 2; // BT.2020
+		if (profile >= 0) {
+			first({L"InColorProfile", L"HevcInColorProfile", L"Av1InputColorProfile"}, amf::AMFVariant(profile));
+			first({L"OutColorProfile", L"HevcOutColorProfile", L"Av1OutputColorProfile"}, amf::AMFVariant(profile));
+		}
+		first({L"InColorPrimaries", L"HevcInColorPrimaries", L"Av1InputColorPrimaries"}, amf::AMFVariant(primaries));
+		first({L"OutColorPrimaries", L"HevcOutColorPrimaries", L"Av1OutputColorPrimaries"}, amf::AMFVariant(primaries));
+		first({L"InColorTransferChar", L"HevcInColorTransferChar", L"Av1InputColorTransferChar"}, amf::AMFVariant(trc));
+		first({L"OutColorTransferChar", L"HevcOutColorTransferChar", L"Av1OutputColorTransferChar"}, amf::AMFVariant(trc));
+		first({L"InMatrixCoeff", L"HevcInMatrixCoeff", L"Av1InMatrixCoeff"}, amf::AMFVariant(matrix));
+		first({L"OutMatrixCoeff", L"HevcOutMatrixCoeff", L"Av1OutMatrixCoeff"}, amf::AMFVariant(matrix));
+	}
+
 	bool open(const Params& p, Sink s) override {
 		sink = std::move(s);
 		w = p.width; h = p.height;
@@ -162,6 +197,7 @@ public:
 		enc->SetProperty(n->rate, AMFConstructRate(p.framerate.num, p.framerate.den));
 		enc->SetProperty(n->gop, (amf_int64)p.gop);
 		enc->SetProperty(n->bitdepth, (amf_int64)(depth > 8 ? 10 : 8));
+		set_color(p.color);
 		// Property names are written snake_case without the codec's prefix (QualityPreset, HevcQualityPreset and Av1QualityPreset are all quality_preset).
 		std::map<std::string, std::string> names;
 		for (amf_size i = 0; i < enc->GetPropertiesInfoCount(); i++) {

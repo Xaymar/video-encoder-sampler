@@ -25,6 +25,9 @@ struct Fmt {
 struct Color {
 	int range = 0, space = 2, primaries = 2, trc = 2;
 };
+// Whether the file says anything about primaries, transfer or matrix (0 and 2 mean it does not), and whether the range is full.
+inline bool color_described(const Color& c) { return (c.primaries != 2 && c.primaries != 0) || (c.trc != 2 && c.trc != 0) || (c.space != 2 && c.space != 0); }
+inline bool color_full(const Color& c) { return c.range == 2; }
 
 // How a picture stores its samples, in neutral terms, so the converter can read whatever layout a source has: planar,
 // semi-planar (NV12, P010), packed RGB, with padding bytes or alpha. Component 0..3 are Y/R, U/G, V/B and alpha.

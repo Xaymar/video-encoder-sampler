@@ -236,6 +236,7 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
 	const Plan& pl = *job.plan;
 	Params p;
 	p.codec = job.codec;
+	p.color = job.color;
 	p.width = pl.enc.w; p.height = pl.enc.h;
 	p.framerate = pl.enc.fps;
 	p.pix = pl.enc.pix;

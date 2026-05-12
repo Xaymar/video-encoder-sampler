@@ -72,6 +72,8 @@ public:
 		par.rc.i_rc_method = X264_RC_ABR;
 		par.rc.i_bitrate = (int)(p.bitrate / 1000);
 		par.i_log_level = X264_LOG_WARNING;
+		if (color_full(p.color)) par.vui.b_fullrange = 1;
+		if (color_described(p.color)) { par.vui.i_colorprim = p.color.primaries; par.vui.i_transfer = p.color.trc; par.vui.i_colmatrix = p.color.space; }
 		NativeOptions native;
 		std::string why;
 		if (!resolve_options("x264", p.codec, o, kebab_case, native, why)) { fprintf(stderr, "x264: %s\n", why.c_str()); return false; }

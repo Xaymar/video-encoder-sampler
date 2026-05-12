@@ -16,6 +16,7 @@ struct Params {
 	int64_t bitrate = 0;         // bits per second
 	int gop = 0;                 // frames
 	std::string codec = "h264";  // used by native backends
+	Color color;                 // how the pictures are to be read; written into the stream (VUI, sequence header), where the encoder also decides by it
 	Options options;             // backend specific, applied verbatim; unknown keys are an error
 };
 

@@ -92,6 +92,12 @@ public:
 		cfg.rate_control_mode = SVT_AV1_RC_MODE_CBR; // streaming target, like the other encoders; "rc" overrides
 		cfg.pred_structure = LOW_DELAY; // CBR requires it; "pred-struct" overrides
 		cfg.target_bit_rate = (uint32_t)p.bitrate;
+		if (p.color.range != 0) cfg.color_range = color_full(p.color) ? EB_CR_FULL_RANGE : EB_CR_STUDIO_RANGE;
+		if (color_described(p.color)) {
+			cfg.color_primaries = (EbColorPrimaries)p.color.primaries;
+			cfg.transfer_characteristics = (EbTransferCharacteristics)p.color.trc;
+			cfg.matrix_coefficients = (EbMatrixCoefficients)p.color.space;
+		}
 		NativeOptions native;
 		std::string why;
 		if (!resolve_options("svtav1", p.codec, p.options, kebab_case, native, why)) { fprintf(stderr, "svtav1: %s\n", why.c_str()); return false; }

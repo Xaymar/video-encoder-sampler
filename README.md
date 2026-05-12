@@ -6,7 +6,7 @@ How it works:
 
 * **One decode, many encodes.** A source is decoded once and fed to all encoders at the same time; each result is scored while it is still being encoded. FFmpeg only reads and decodes video, everything else is native.
 * **Per-frame winners.** For each input, bitrate and key frame interval, a configuration counts a frame when its VMAF is at least as high as every other configuration's. Those that count 95% of the frames or more are marked `*`. A run that overshoots its target bitrate loses points (`vmaf.over_penalty`), undershooting is free.
-* **Fair inputs.** Scaling and frame rate changes use libplacebo, scoring happens in the source's chroma layout and bit depth, and GPU decoding of sources is only used when it is proven to give exactly the same samples as software.
+* **Fair inputs.** Scaling and frame rate changes use libplacebo, scoring happens in the source's chroma layout and bit depth, and GPU decoding of sources is only used when it is proven to give exactly the same samples as software. The source's colour range, matrix, primaries and transfer are given to every encoder and end up in the stream, the same for all of them.
 * **Everything is kept.** Each run writes its encoded stream (fragmented MP4) and a result file with all per-frame scores; a run that was done before is not repeated.
 * **Sharing.** Results can be uploaded to a [VES website](#uploading-results) as they are produced.
 
