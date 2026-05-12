@@ -20,6 +20,7 @@ struct RefInfo {
 	long long frames = 0; // expected number of original frames, for the progress display only
 	Rational framerate;
 	Color color;
+	int score_range = 1; // the range of the reference frames (1 limited, 2 full); the decoded stream is converted to it
 };
 using FrameFeed = std::function<int(Picture&)>; // 1: a frame, 0: no more, <0: error
 // shown(k, n): the encoded frame that is on screen at original frame k; waits until that is known, false once k is past the last frame.
@@ -29,7 +30,7 @@ using PacketFeed = std::function<bool(std::vector<uint8_t>&)>; // the next encod
 // Decodes the encoded packets, scales them back to the original resolution, holds frames up to the original
 // frame rate and scores them against the original frames (delivered by `next_ref`, already in `score_fmt`) with libvmaf, in-process.
 // `enc` is the geometry and pixel format the packets were encoded at; `shown(k)` is the number of the encoded frame
-// that is on screen at original frame k (dropped frames are held). Decoded frames are converted to `score_fmt` as well.
+// that is on screen at original frame k; `decoded_color` is the colour the encoder was given (the stream may not say) (dropped frames are held). Decoded frames are converted to `score_fmt` as well.
 // `scores` receives one VMAF value per original frame.
 bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const PacketFeed& next_packet, const std::vector<uint8_t>& extradata, const Shape& enc,
-                const ShownFeed& shown, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp = nullptr);
+                const Color& decoded_color, const ShownFeed& shown, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp = nullptr);

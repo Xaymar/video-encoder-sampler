@@ -12,11 +12,12 @@ struct ScaleOptions {
 
 // Scales and converts planar frames (YUV or GBR) to a planar YUV format. One frame in, one frame out in order; a converter
 // may hold frames back, so feed it and collect with pop(). RGB input converted to YUV uses
-// BT.709 limited range, the only choice that needs one; everything else keeps its tags.
+// BT.709 limited range, the only choice that needs one; everything else keeps its tags. `range` (0 keep, 1 limited, 2 full) converts the sample
+// values to that range, which is a real change of the values and not a tag.
 class Converter {
 public:
 	virtual ~Converter() = default;
-	virtual bool open(const Picture& first, Rational time_base, int w, int h, Fmt out, const ScaleOptions& opt) = 0;
+	virtual bool open(const Picture& first, Rational time_base, int w, int h, Fmt out, const ScaleOptions& opt, int range = 0) = 0;
 	virtual bool push(const Picture* p) = 0; // nullptr flushes
 	virtual int pop(Picture& out) = 0;       // 1: frame produced, 0: nothing ready (or end of stream), <0: error
 };

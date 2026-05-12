@@ -50,6 +50,8 @@ struct Plan {
 	Shape enc;            // resolution, frame rate and pixel format the frames are encoded at
 	Fmt score_fmt;        // both sides are scored in this format
 	bool convert_rate = false, rescale = false;
+	int range = 0;        // the range the encoder gets: 0 the source's, 1 limited, 2 full (the "range" option)
+	Color color;          // the colour of the frames the encoder gets: what the stream is tagged with
 	Options options;      // the encoder's options, without chroma and bitdepth
 	std::string feed_key() const; // runs with equal keys (and the same input) can share one decode
 };

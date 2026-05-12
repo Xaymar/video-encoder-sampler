@@ -36,7 +36,7 @@ bool source_info(const std::string& path, SourceInfo& out) {
 
 std::string Plan::feed_key() const {
 	char b[160];
-	snprintf(b, sizeof b, "%dx%d@%d/%d rate=%d fmt=%d/%d", enc.w, enc.h, enc.fps.num, enc.fps.den, convert_rate, enc.pix.chroma, enc.pix.depth);
+	snprintf(b, sizeof b, "%dx%d@%d/%d rate=%d fmt=%d/%d range=%d", enc.w, enc.h, enc.fps.num, enc.fps.den, convert_rate, enc.pix.chroma, enc.pix.depth, range);
 	return b;
 }
 
@@ -69,6 +69,21 @@ Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::str
 	if (!chroma) return ignore(encoder + " cannot encode " + std::to_string(depths[0]) + "-bit " + std::to_string(chromas[0]) + " here");
 	if (!want.upscale && (depth > sf.depth || chroma > sf.chroma))
 		return ignore("upsampling to " + std::to_string(depth) + "-bit " + std::to_string(chroma) + " is off for this scenario (source: " + std::to_string(sf.depth) + "-bit " + std::to_string(sf.chroma) + ")");
+	// "range": limited (TV) or full (PC) samples for the encoder, whatever the source has; the values are converted, not just tagged, and the
+	// decoded stream is converted back to the source's range for scoring. RGB sources become limited BT.709 unless asked for full.
+	if (auto it = o.find("range"); it != o.end()) {
+		const std::string& v = it->second;
+		if (v == "source") pl.range = 0;
+		else if (v == "limited") pl.range = 1;
+		else if (v == "full") pl.range = 2;
+		else return ignore("range '" + v + "' is not source, limited or full");
+		o.erase(it);
+	}
+	pl.color = src.color;
+	if (src.fmt.rgb) pl.color.space = 1; // the converter makes BT.709 from RGB
+	const int source_range = src.fmt.rgb ? 1 : (src.color.range ? src.color.range : 1);
+	if (pl.range) pl.color.range = pl.range;
+	else if (src.fmt.rgb) pl.color.range = 1;
 	enc.pix = planar_fmt(chroma, depth);
 	enc.has_pix = true;
 	// Both sides are scored in the source's chroma layout at the higher of the two bit depths.
@@ -76,7 +91,7 @@ Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::str
 	pl.score_fmt = planar_fmt(sf.chroma == 422 ? 444 : sf.chroma, std::max(sf.depth, depth));
 	if (!valid(enc.pix) || !valid(pl.score_fmt)) return ignore("unsupported chroma " + std::to_string(chroma) + " / bit depth " + std::to_string(depth));
 	pl.convert_rate = want.fps.num != 0 && !same_rate;
-	pl.rescale = enc.w != src.width || enc.h != src.height || enc.pix != src.fmt; // scale and/or convert
+	pl.rescale = enc.w != src.width || enc.h != src.height || enc.pix != src.fmt || (pl.range && pl.range != source_range); // scale, convert and/or change the range
 	pl.options = std::move(o);
 	return pl;
 }
@@ -213,7 +228,7 @@ void produce(const std::string& input, const SourceInfo& si, const Plan& pl, con
 			frame.duration = 1; // one tick of the 1/enc.fps time base
 			if (!pl.rescale) ok = bc.push(frame, rp);
 			else {
-				if (frame.pts == 0) ok = scaler->open(frame, enc.fps.inverse(), enc.w, enc.h, enc.pix, so);
+				if (frame.pts == 0) ok = scaler->open(frame, enc.fps.inverse(), enc.w, enc.h, enc.pix, so, pl.range);
 				ok = ok && scaler->push(&frame);
 				queue_scaled();
 			}
@@ -314,6 +329,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 	}
 	RefInfo ref;
 	ref.width = si.width; ref.height = si.height; ref.framerate = si.framerate; ref.color = si.color; ref.frames = si.frame_count;
+	ref.score_range = si.fmt.rgb ? 1 : (si.color.range ? si.color.range : 1); // the reference side is converted to YUV without changing the range (RGB: limited)
 	for (auto& gp : groups) {
 		Group& g = *gp;
 		threads.emplace_back([&, gptr = &g] {
@@ -352,7 +368,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 			const FrameFeed feed = [&rq, rp = run.score_rp](Picture& out) { return rq.pop(out, rp) ? 1 : 0; };
 			const PacketFeed next_packet = [&pq, rp = run.score_rp](std::vector<uint8_t>& out) { return pq.pop(out, rp); };
 			const ShownFeed shown = [&fr](size_t k, uint32_t& v) { return fr.shown.get(k, v); };
-			run.score_ok = vmaf_score(ref, feed, run.codec, next_packet, {}, run.enc.plan->enc, shown, g.fmt, group_vo, so, run.scores, run.score_rp);
+			run.score_ok = vmaf_score(ref, feed, run.codec, next_packet, {}, run.enc.plan->enc, run.enc.plan->color, shown, g.fmt, group_vo, so, run.scores, run.score_rp);
 			if (run.score_ok && (long long)run.scores.size() != fr.frames) { fprintf(stderr, "%zu scores for %lld frames\n", run.scores.size(), fr.frames); run.score_ok = false; }
 			if (run.score_rp) run.score_rp->finish();
 			rq.cancel(); // done with the original frames: do not hold the reference decode back

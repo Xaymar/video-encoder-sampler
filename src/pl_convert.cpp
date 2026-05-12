@@ -93,7 +93,9 @@ public:
 		pl_log_destroy(&log);
 	}
 
-	bool open(const Picture&, Rational, int w, int h, Fmt out, const ScaleOptions& opt) override {
+	int target_range = 0; // 0: as the input (RGB: limited), 1 limited, 2 full
+	bool open(const Picture&, Rational, int w, int h, Fmt out, const ScaleOptions& opt, int range) override {
+		target_range = range;
 		out_w = w; out_h = h; out_fmt = out;
 		struct pl_log_params lp = {};
 		lp.log_cb = log_cb;
@@ -187,7 +189,7 @@ public:
 		}
 		// RGB has no matrix of its own, so converting it to YUV needs a choice: BT.709, limited range
 		target.repr.sys = p->fmt.rgb ? PL_COLOR_SYSTEM_BT_709 : sys;
-		target.repr.levels = p->fmt.rgb ? PL_COLOR_LEVELS_LIMITED : image.repr.levels;
+		target.repr.levels = target_range ? (target_range == 2 ? PL_COLOR_LEVELS_FULL : PL_COLOR_LEVELS_LIMITED) : p->fmt.rgb ? PL_COLOR_LEVELS_LIMITED : image.repr.levels;
 		target.repr.alpha = PL_ALPHA_NONE;
 		target.repr.bits.sample_depth = obytes * 8; target.repr.bits.color_depth = out_fmt.depth; target.repr.bits.bit_shift = 0;
 		target.color = image.color;
@@ -218,7 +220,9 @@ public:
 		out.pts = p->pts;
 		out.duration = p->duration;
 		out.color = p->color;
-		if (p->fmt.rgb) { out.color.space = 1; out.color.range = 1; }
+		if (p->fmt.rgb) out.color.space = 1;
+		if (target_range) out.color.range = target_range;
+		else if (p->fmt.rgb) out.color.range = 1;
 		out.owner = planes;
 		ready.push_back(std::move(out));
 		return true;

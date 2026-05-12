@@ -73,12 +73,12 @@ public:
 } // namespace
 
 bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const PacketFeed& next_packet, const std::vector<uint8_t>& extradata, const Shape& enc,
-                const ShownFeed& shown, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp) {
+                const Color& decoded_color, const ShownFeed& shown, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp) {
 	if (rp) rp->begin(2, std::max<long long>(1, ref.frames));
 	auto decoder = make_decoder();
 	if (!decoder->open(codec, extradata)) return false;
 
-	const bool convert_dis = enc.w != ref.width || enc.h != ref.height || enc.pix != score_fmt; // scale back, change format
+	const bool convert_dis = enc.w != ref.width || enc.h != ref.height || enc.pix != score_fmt || (decoded_color.range ? decoded_color.range : 1) != ref.score_range; // scale back, change format, change range back
 
 	Scorer scorer;
 	auto up = make_converter();
@@ -111,13 +111,13 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 				fprintf(stderr, "decoded stream is %dx%d %d-bit %d, expected %dx%d %d-bit %d\n", d.width, d.height, d.fmt.depth, d.fmt.chroma, enc.w, enc.h, enc.pix.depth, enc.pix.chroma);
 				ok = false; break;
 			}
-			// Encoders do not necessarily write the colour description, so restore the source's before converting.
-			d.color = ref.color;
+			// Encoders do not necessarily write the colour description, so use the one the encoder was given before converting.
+			d.color = decoded_color;
 			if (!convert_dis) show(d, m);
 			else {
 				d.pts = m;
 				d.duration = 1; // libplacebo needs it to know when the last frame ends; the packets carry none
-				if (m == 0 && !up->open(d, enc.fps.inverse(), ref.width, ref.height, score_fmt, scale)) { ok = false; break; }
+				if (m == 0 && !up->open(d, enc.fps.inverse(), ref.width, ref.height, score_fmt, scale, ref.score_range)) { ok = false; break; }
 				if (!up->push(&d)) { fprintf(stderr, "scaling the decoded frame back failed\n"); ok = false; break; }
 				collect_converted();
 			}
