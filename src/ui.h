@@ -8,7 +8,7 @@
 
 // How far one run has got. Written by the run's threads, read by the UI.
 struct RunProgress {
-	std::atomic<int> stage{0};            // 0 waiting, 1 encoding, 2 scoring, 3 decoding (the shared decode feeding several runs), 4 uploading (done and total are bytes)
+	std::atomic<int> stage{0};            // 0 waiting, 1 encoding, 2 scoring, 3 decoding (the shared decode feeding several runs), 4 uploading, 5 downloading (done and total are bytes)
 	std::atomic<long long> done{0}, total{0};
 	std::atomic<int64_t> since_ms{0};     // when the stage began, steady clock
 	std::atomic<int64_t> end_ms{0};       // when it finished (0: still going), so that its speed stops changing

@@ -69,7 +69,6 @@ struct Scenario {
 
 struct Config {
 	std::vector<std::string> inputs;
-	std::map<std::string, std::string> input_urls; // local copy -> the URL it was downloaded from
 	std::vector<Scenario> scenarios;
 	VmafOptions vo;
 	ScaleOptions scale;
@@ -168,7 +167,7 @@ static std::vector<Options> expand(const std::string& encoder, const std::vector
 }
 
 static void add_inputs(Config& cfg, const std::string& path) {
-	if (is_url(path)) { cfg.inputs.push_back(path); return; } // fetched once the cache folder is known, see main()
+	if (is_url(path)) { cfg.inputs.push_back(path); return; } // fetched when the first run that needs it comes up, see local_path() in main()
 	if (!fs::exists(path)) throw std::runtime_error("input '" + path + "' does not exist");
 	if (!fs::is_directory(path)) { cfg.inputs.push_back(path); return; }
 	std::vector<std::string> found;
@@ -456,7 +455,7 @@ static std::string jq(const std::string& s) { // JSON string
 }
 
 // Result files name inputs and model files without the folders they sit in: the paths are the user's own, and results are matched by hash.
-static std::string file_name(const std::string& path) { return fs::path(path).filename().string(); }
+static std::string file_name(const std::string& path) { return is_url(path) ? url_file_name(path) : fs::path(path).filename().string(); }
 static std::string model_name(const std::string& model) { return model.rfind("path=", 0) == 0 ? "path=" + file_name(model.substr(5)) : model; }
 
 int main(int argc, char** argv) {
@@ -472,16 +471,6 @@ int main(int argc, char** argv) {
 		else if (argc == 1) load_config(default_config(), cfg);
 		else if (argc == 2 && !fs::is_directory(argv[1]) && (fs::path(argv[1]).extension() == ".json" || fs::path(argv[1]).extension() == ".jsonc")) load_config(argv[1], cfg);
 		else { print_help(stderr); return 1; }
-	} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
-	// Inputs given as URLs are downloaded once into the cache folder (or the temp folder if there is no cache) and used from there.
-	try {
-		const std::string downloads = (cfg.cache_dir.empty() ? fs::temp_directory_path() / "ves-downloads" : fs::path(cfg.cache_dir) / "downloads").string();
-		for (auto& in : cfg.inputs) {
-			if (!is_url(in)) continue;
-			const std::string url = in;
-			in = fetch_url(url, downloads);
-			cfg.input_urls[in] = url;
-		}
 	} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
 	if (cfg.inputs.empty() || cfg.scenarios.empty() || cfg.jobs.empty()) { fprintf(stderr, "error: need inputs, bitrates and at least one enabled encoder (see --help)\n"); return 1; }
 
@@ -524,7 +513,7 @@ int main(int argc, char** argv) {
 		const Codec id = codec_of(job.encoder, job.codec);
 		if (id == Codec::None) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", job.encoder.c_str(), job.codec.c_str()); failed++; continue; }
 			for (auto& sc : cfg.scenarios) if (takes_part(job, sc)) {
-				ui::log("Preparing " + job.encoder + "/" + job.codec + ", scenario " + (sc.name.empty() ? "(unnamed)" : sc.name) + ", " + fs::path(input).filename().string());
+				ui::log("Preparing " + job.encoder + "/" + job.codec + ", scenario " + (sc.name.empty() ? "(unnamed)" : sc.name) + ", " + file_name(input));
 				const std::vector<Options> sets = expand(job.encoder, job.axes);
 			for (int64_t br : sc.bitrates) for (double kf : sc.kfs) for (auto& shape : sc.shapes) for (auto& opts : sets) {
 			Task t;
@@ -540,7 +529,7 @@ int main(int argc, char** argv) {
 			// run that comes up again finds its result straight away. They go to the output folder; without one, results are kept in the cache.
 			t.key = cache_key(input, job.encoder, job.codec, opts, br, kf, shape, cfg.scale, cfg.vo);
 			if (!cfg.output_dir.empty()) {
-				const std::string folder = sanitize(fs::path(input).stem().string()), base = result_name(t.r.label + " " + std::to_string(br) + "k kf" + std::to_string((double)kf).substr(0, std::to_string((double)kf).find('.') + 2), t.key);
+				const std::string folder = sanitize(fs::path(file_name(input)).stem().string()), base = result_name(t.r.label + " " + std::to_string(br) + "k kf" + std::to_string((double)kf).substr(0, std::to_string((double)kf).find('.') + 2), t.key);
 				t.result_file = (fs::path(cfg.output_dir) / folder / (base + ".json")).string();
 				t.r.result = folder + "/" + base + ".json";
 				if (cfg.save_videos) {
@@ -614,17 +603,34 @@ int main(int argc, char** argv) {
 	const int total = (int)tasks.size();
 	ui::overall(0, total);
 	std::map<std::string, SourceInfo> infos;
+	// The file behind an input. A URL is downloaded when it is first needed (its folder is under the cache folder, or the temp folder if there is
+	// none), with the progress in the live display like the runs; an input that cannot be had throws.
+	std::map<std::string, std::string> local_paths;
+	std::set<std::string> source_failed; // inputs that could not be had: said once, not tried again
+	auto local_path = [&](const std::string& input) -> std::string {
+		if (!is_url(input)) return input;
+		if (auto it = local_paths.find(input); it != local_paths.end()) return it->second;
+		const std::string dir = (cfg.cache_dir.empty() ? fs::temp_directory_path() / "ves-downloads" : fs::path(cfg.cache_dir) / "downloads").string();
+		RunProgress rp;
+		rp.begin(5, 0);
+		const int handle = ui::attach(&rp, file_name(input), "input");
+		struct Detach { RunProgress& rp; int h; ~Detach() { rp.finish(); ui::detach(h); } } detach{rp, handle};
+		return local_paths[input] = fetch_url(input, dir, &rp);
+	};
 	// SHA-256 of an input file, read once per input and only when a result needs it.
 	std::map<std::string, std::string> reference_hashes;
 	auto reference_hash = [&](const std::string& input) -> const std::string& {
 		auto it = reference_hashes.find(input);
-		return it != reference_hashes.end() ? it->second : reference_hashes.emplace(input, sha256_file(input)).first->second;
+		if (it != reference_hashes.end()) return it->second;
+		std::string hash;
+		if (!source_failed.count(input)) try { hash = sha256_file(local_path(input)); } catch (const std::exception& e) { ui::log("Input " + file_name(input) + ": " + e.what()); }
+		return reference_hashes.emplace(input, hash).first->second;
 	};
 	// What goes into a run's result file besides its key, bitrate and scores.
 	auto run_details = [&](const Task& t) {
 		const Run& r = t.r;
 		std::ostringstream o;
-		o << "\"input\":" << jq(file_name(r.input)) << ",\"input_url\":" << (cfg.input_urls.count(r.input) ? jq(cfg.input_urls.at(r.input)) : std::string("null"))
+		o << "\"input\":" << jq(file_name(r.input)) << ",\"input_url\":" << (is_url(r.input) ? jq(r.input) : std::string("null"))
 		  << ",\"source_decoder\":" << jq(infos.count(r.input) ? infos.at(r.input).decoder : std::string()) << ",\"encoder\":" << jq(r.encoder) << ",\"codec\":" << jq(r.codec) << ",\"options\":{";
 		bool first = true;
 		for (auto& [k, v] : r.options) { o << (first ? "" : ",") << jq(k) << ":" << jq(v); first = false; }
@@ -669,10 +675,13 @@ int main(int argc, char** argv) {
 	auto source_of = [&](const std::string& input) -> const SourceInfo* {
 		auto it = infos.find(input);
 		if (it != infos.end()) return &it->second;
+		if (source_failed.count(input)) return nullptr;
 		SourceInfo si;
-		if (!source_info(input, si)) return nullptr;
+		try {
+			if (!source_info(local_path(input), si)) { source_failed.insert(input); return nullptr; }
+		} catch (const std::exception& e) { ui::log("Input " + file_name(input) + ": " + e.what()); source_failed.insert(input); return nullptr; }
 		it = infos.emplace(input, si).first;
-		ui::log("Source " + fs::path(input).filename().string() + ": " + std::to_string(si.width) + "x" + std::to_string(si.height) + " decoded by " + si.decoder);
+		ui::log("Source " + file_name(input) + ": " + std::to_string(si.width) + "x" + std::to_string(si.height) + " decoded by " + si.decoder);
 		return &it->second;
 	};
 	auto fit_shape = [](Task& t) {
@@ -681,8 +690,8 @@ int main(int argc, char** argv) {
 	};
 	// Whatever cannot work, or was done before, is finished right away. The rest is sorted by the frames it needs: runs with the
 	// same input, resolution, frame rate and pixel format share one decode.
-	std::map<std::string, std::vector<Task*>> by_feed;
-	std::vector<std::string> feed_order;
+	std::map<std::string, std::vector<size_t>> uncached; // by input: the runs that have to be done, planned when their input comes up
+	std::vector<std::string> input_order;
 	for (size_t i = 0; i < tasks.size(); i++) {
 		Task& t = tasks[i];
 		Run& r = t.r;
@@ -694,7 +703,11 @@ int main(int argc, char** argv) {
 			CachedRun hit;
 			if (result_load(t.result_file, t.key, hit)) {
 				r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.video_sha256 = hit.video_sha256; r.cached = t.ok = true;
-				if (const SourceInfo* src = source_of(r.input)) { // the geometry the run was encoded at, for its result and the summary
+				if (!hit.reference_sha256.empty()) reference_hashes.emplace(r.input, hit.reference_sha256); // known: the file is not needed to say it
+				if (!r.shape.w && hit.width > 0 && hit.height > 0 && hit.fps > 0) { // the geometry the run was encoded at, for the summary: from its result file
+					r.shape.w = hit.width; r.shape.h = hit.height;
+					r.shape.fps = Rational{(int)std::lround(hit.fps * 1000), 1000};
+				} else if (!r.shape.w) if (const SourceInfo* src = source_of(r.input)) { // an older result file: ask the source (which has to be had for that)
 					t.plan = make_plan(*src, t.job->encoder, t.job->codec, t.p.options, r.shape);
 					fit_shape(t);
 				}
@@ -709,14 +722,8 @@ int main(int argc, char** argv) {
 				continue;
 			}
 		}
-		const SourceInfo* src = source_of(r.input);
-		if (!src) { finish(t); continue; }
-		t.plan = make_plan(*src, t.job->encoder, t.job->codec, t.p.options, r.shape);
-		if (t.plan.ignored) { r.ignored = true; r.reason = t.plan.reason; finish(t); continue; }
-		fit_shape(t);
-		const std::string fk = r.input + "|" + t.plan.feed_key();
-		if (!by_feed.count(fk)) feed_order.push_back(fk);
-		by_feed[fk].push_back(&t);
+		if (!uncached.count(r.input)) input_order.push_back(r.input);
+		uncached[r.input].push_back(i);
 	}
 
 	// A wave is the runs that are encoded at the same time from one decode: up to `parallel` of each pool. Each run is scored while it is
@@ -736,6 +743,23 @@ int main(int argc, char** argv) {
 		}
 		return parent / ".ves-tmp";
 	}();
+	for (const std::string& input_name : input_order) {
+	// Plan the runs of this input: opening the source is where a URL is downloaded. Runs that cannot work are finished right away; the rest is
+	// sorted by the frames it needs, and runs with the same resolution, frame rate and pixel format share one decode.
+	std::map<std::string, std::vector<Task*>> by_feed;
+	std::vector<std::string> feed_order;
+	for (size_t i : uncached[input_name]) {
+		Task& t = tasks[i];
+		Run& r = t.r;
+		const SourceInfo* src = source_of(r.input);
+		if (!src) { finish(t); continue; }
+		t.plan = make_plan(*src, t.job->encoder, t.job->codec, t.p.options, r.shape);
+		if (t.plan.ignored) { r.ignored = true; r.reason = t.plan.reason; finish(t); continue; }
+		fit_shape(t);
+		const std::string fk = r.input + "|" + t.plan.feed_key();
+		if (!by_feed.count(fk)) feed_order.push_back(fk);
+		by_feed[fk].push_back(&t);
+	}
 	for (auto& fk : feed_order) {
 		std::map<std::string, std::vector<Task*>> by_pool;
 		for (Task* t : by_feed[fk]) by_pool[t->pool].push_back(t);
@@ -762,16 +786,16 @@ int main(int argc, char** argv) {
 				ej.id = t.id; ej.color = t.plan.color;
 				run.codec = t.id; run.score_rp = t.r.score_progress.get();
 				ptrs.push_back(&run);
-				ui::log_plain(t.r.tag + " encoding and scoring  " + t.r.label + "  (" + fs::path(input).filename().string() + ", " + std::to_string(t.r.bitrate) + " kbps, pool " + t.pool + ")");
+				ui::log_plain(t.r.tag + " encoding and scoring  " + t.r.label + "  (" + file_name(input) + ", " + std::to_string(t.r.bitrate) + " kbps, pool " + t.pool + ")");
 				handles.push_back(ui::attach(t.r.progress.get(), t.r.label, t.pool));
 				handles.push_back(ui::attach(t.r.score_progress.get(), t.r.label, t.pool));
 			}
 			RunProgress feed_rp;
 			feed_rp.begin(3, 1);
-			const int feed_handle = ui::attach(&feed_rp, "decode+convert " + fs::path(input).filename().string() + " to " + std::to_string(wave[0]->plan.enc.w) + "x" + std::to_string(wave[0]->plan.enc.h), "decode");
+			const int feed_handle = ui::attach(&feed_rp, "decode+convert " + file_name(input) + " to " + std::to_string(wave[0]->plan.enc.w) + "x" + std::to_string(wave[0]->plan.enc.h), "decode");
 			FeedResult fr;
 			const auto t_wave = std::chrono::steady_clock::now();
-			run_wave(input, si, ptrs, cfg.scale, cfg.vo, &feed_rp, fr);
+			run_wave(local_path(input), si, ptrs, cfg.scale, cfg.vo, &feed_rp, fr);
 			const double wave_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_wave).count();
 			ui::detach(feed_handle);
 			for (int h : handles) ui::detach(h);
@@ -794,6 +818,7 @@ int main(int argc, char** argv) {
 				finish(t);
 			}
 		}
+	}
 	}
 	{ std::error_code ec; fs::remove_all(spool_dir, ec); }
 	if (uploader) uploader->finish(); // the live display stays up while the last uploads go out
@@ -873,9 +898,9 @@ int main(int argc, char** argv) {
 		std::error_code ec;
 		fs::create_directories(cfg.output_dir, ec);
 		for (auto& input : cfg.inputs) {
-			const fs::path file = fs::path(cfg.output_dir) / (sanitize(fs::path(input).stem().string()) + ".json");
+			const fs::path file = fs::path(cfg.output_dir) / (sanitize(fs::path(file_name(input)).stem().string()) + ".json");
 			std::ofstream f(file);
-			f << "{\"tool\":\"ves\",\"version\":" << jq(VERSION) << ",\"input\":" << jq(file_name(input)) << ",\"input_url\":" << (cfg.input_urls.count(input) ? jq(cfg.input_urls.at(input)) : std::string("null")) << ",\"reference_sha256\":" << jq(reference_hash(input)) << ",\"source_decoder\":" << jq(infos.count(input) ? infos.at(input).decoder : std::string()) << ",\"vmaf_model\":" << jq(model_name(cfg.vo.model)) << ",\"over_penalty\":" << over_penalty << ",\"failed\":[";
+			f << "{\"tool\":\"ves\",\"version\":" << jq(VERSION) << ",\"input\":" << jq(file_name(input)) << ",\"input_url\":" << (is_url(input) ? jq(input) : std::string("null")) << ",\"reference_sha256\":" << jq(reference_hash(input)) << ",\"source_decoder\":" << jq(infos.count(input) ? infos.at(input).decoder : std::string()) << ",\"vmaf_model\":" << jq(model_name(cfg.vo.model)) << ",\"over_penalty\":" << over_penalty << ",\"failed\":[";
 			for (size_t i = 0; i < failed_runs[input].size(); i++) f << (i ? "," : "") << jq(failed_runs[input][i]);
 			f << "],\"ignored\":[";
 			for (size_t i = 0; i < ignored_runs[input].size(); i++) f << (i ? "," : "") << ignored_runs[input][i];

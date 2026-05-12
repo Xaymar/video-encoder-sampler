@@ -95,9 +95,9 @@ std::string run_line(const Entry& e, int width) {
 	const int pct = total > 0 ? (int)std::min<long long>(100, done * 100 / total) : 0;
 	std::string bar(20, '-');
 	for (int i = 0; i < pct / 5; i++) bar[i] = '#';
-	if (st == 4) { // an upload: bytes sent, and the rate since it began
+	if (st == 4 || st == 5) { // an upload or a download: bytes moved, and the rate since it began
 		const double mb = 1048576.0;
-		snprintf(head, sizeof head, "%-9.9s upload [%s] %3d%% %7.1f/%-7.1f MB %6.2f MB/s ", e.pool.c_str(), bar.c_str(), pct, done / mb, total / mb, done / secs / mb);
+		snprintf(head, sizeof head, "%-9.9s %-8s [%s] %3d%% %7.1f/%-7.1f MB %6.2f MB/s ", e.pool.c_str(), st == 4 ? "upload" : "download", bar.c_str(), pct, done / mb, total / mb, done / secs / mb);
 		return fit(head + e.label, width);
 	}
 	static const char* waits[] = {"", "starved", "backed up"};
@@ -144,7 +144,7 @@ void plain_status() {
 	for (auto& [h, e] : entries) {
 		const long long total = e.p->total, done = e.p->done;
 		if (e.p->stage == 0 || total <= 0 || e.p->end_ms) continue; // not started, or already finished
-		if (e.p->stage == 4) { printf("  uploading: %lld%% (%.1f/%.1f MB)  %s\n", done * 100 / total, done / 1048576.0, total / 1048576.0, e.label.c_str()); continue; }
+		if (e.p->stage == 4 || e.p->stage == 5) { printf("  %s: %lld%% (%.1f/%.1f MB)  %s\n", e.p->stage == 4 ? "uploading" : "downloading", done * 100 / total, done / 1048576.0, total / 1048576.0, e.label.c_str()); continue; }
 		static const char* waits[] = {"", " [starved: waiting for frames]", " [backed up: waiting for room downstream]"};
 		const int ws = e.p->state;
 		printf("  %s %s: %lld%% (%lld/%lld frames)%s  %s\n", e.p->stage == 1 ? "encoding" : e.p->stage == 3 ? "decoding" : "scoring", e.pool.c_str(), done * 100 / total, done, total, waits[ws >= 0 && ws < 3 ? ws : 0], e.label.c_str());

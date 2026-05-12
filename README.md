@@ -19,6 +19,7 @@ ves -enc x264 -br 6000 -i clip.mkv --option preset=fast,slow --option max_b_fram
 ves --help
 ```
 
+* An input given as an http(s) URL is downloaded into the cache folder the first time a run needs it (progress and rate show like the runs do), and not at all when all its results exist already. Results of URL inputs are identified by the URL.
 * [`config.jsonc`](config.jsonc) is the commented example to start from; [`config.all-options.jsonc`](config.all-options.jsonc) lists every option of every encoder.
 * Every option is a list of values and every combination is tested. `null` leaves an option to the encoder; an unknown name fails the run.
 * Option names are snake_case. `max_b_frames`, `lookahead_frames`, `max_ref_frames`, `b_reference_mode` and `rate_control` mean the same on every encoder that has them. `preset`, `profile` (`main`, `high`, ...), `tier` (`main`, `high`) and `level` (`4.1`) use the same names everywhere and are translated to what each encoder's library wants. The rest are each library's own names, converted to snake_case.

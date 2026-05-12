@@ -6,6 +6,11 @@
 
 bool is_url(const std::string& s);
 
-// Returns the local path of the file behind `url`, downloading it into `dir` if needed. Progress is printed to stdout.
+// The name the file gets (and shows under), from the URL: its last path segment with anything but letters, digits and . - _ replaced.
+std::string url_file_name(const std::string& url);
+
+// Returns the local path of the file behind `url`, downloading it into `dir` if needed. With `progress` the live display shows it (stage 5, bytes);
+// without, progress is printed to stdout.
 // Throws std::runtime_error when the file cannot be had (no server and no earlier copy, HTTP errors, a short download).
-std::string fetch_url(const std::string& url, const std::string& dir);
+struct RunProgress;
+std::string fetch_url(const std::string& url, const std::string& dir, RunProgress* progress = nullptr);

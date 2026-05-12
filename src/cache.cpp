@@ -7,6 +7,7 @@
 #include <map>
 #include <sstream>
 
+#include "download.h"
 #include "gpu.h"
 #include "json.h"
 
@@ -41,7 +42,9 @@ std::string cache_key(const std::string& input, const std::string& encoder, cons
 	std::ostringstream k;
 	std::error_code ec;
 	k << "ves-cache-1\n";
-	k << "input=" << fs::path(input).filename().string() << '|' << fs::file_size(input, ec) << '|' << fs::last_write_time(input, ec).time_since_epoch().count() << '\n';
+	// A URL input is identified by its address, so that results can be found without downloading the file; a file by its name, size and time.
+	if (is_url(input)) k << "input=" << url_file_name(input) << "|url=" << input << '\n';
+	else k << "input=" << fs::path(input).filename().string() << '|' << fs::file_size(input, ec) << '|' << fs::last_write_time(input, ec).time_since_epoch().count() << '\n';
 	k << "encoder=" << encoder << '/' << codec << '\n';
 	k << "environment=" << encoder_environment(encoder, options) << '\n';
 	k << "options=";
@@ -107,6 +110,10 @@ bool result_load(const std::string& file, const std::string& key, CachedRun& out
 		out.video_sha256 = sha && sha->type == Json::Str ? sha->text() : std::string();
 		auto* wd = j.find("width");
 		out.width = wd && wd->type == Json::Num ? atoi(wd->s.c_str()) : 0;
+		auto* ht = j.find("height");
+		out.height = ht && ht->type == Json::Num ? atoi(ht->s.c_str()) : 0;
+		auto* fp = j.find("fps");
+		out.fps = fp && fp->type == Json::Num ? atof(fp->s.c_str()) : 0.0;
 		auto* in = j.find("input");
 		out.input = in && in->type == Json::Str ? in->text() : std::string();
 		auto* ref = j.find("reference_sha256");

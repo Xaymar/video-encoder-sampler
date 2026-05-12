@@ -10,6 +10,8 @@
 
 #include <curl/curl.h>
 
+#include "ui.h"
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -77,6 +79,7 @@ struct Transfer {
 	// progress
 	std::ofstream out;
 	uint64_t done = 0;
+	RunProgress* rp = nullptr; // when set, the live display shows the progress and nothing is printed
 	bool unchanged = false, bad_status = false, write_failed = false;
 	std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 	uint64_t at_last = 0;
@@ -127,12 +130,13 @@ size_t on_body(char* buf, size_t size, size_t n, void* user) {
 		}
 		if (!t.out) { t.write_failed = true; return 0; }
 		std::string what = t.status == 206 ? "continuing the download at " + size_text(t.done) + (t.total ? " of " + size_text(t.total) : "") : "downloading" + (t.total ? " " + size_text(t.total) : std::string());
-		printf("Input %s: %s\n", t.name.c_str(), what.c_str());
-		fflush(stdout);
+		if (t.rp) { t.rp->total = (long long)t.total; t.rp->done = (long long)t.done; t.rp->since_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+		else { printf("Input %s: %s\n", t.name.c_str(), what.c_str()); fflush(stdout); }
 	}
 	t.out.write(buf, (std::streamsize)(size * n));
 	if (!t.out) { t.write_failed = true; return 0; }
 	t.done += size * n;
+	if (t.rp) t.rp->done = (long long)t.done;
 	return size * n;
 }
 
@@ -140,7 +144,7 @@ int on_progress(void* user, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
 	Transfer& t = *(Transfer*)user;
 	const auto now = std::chrono::steady_clock::now();
 	const double secs = std::chrono::duration<double>(now - t.last).count();
-	if (t.out.is_open() && secs >= 2.0) {
+	if (!t.rp && t.out.is_open() && secs >= 2.0) {
 		printf("  %s%s  %.1f MB/s\n", size_text(t.done).c_str(), t.total ? (" of " + size_text(t.total) + " (" + std::to_string(t.done * 100 / t.total) + "%)").c_str() : "",
 		       (t.done - t.at_last) / secs / (1 << 20));
 		fflush(stdout);
@@ -152,9 +156,11 @@ int on_progress(void* user, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
 
 } // namespace
 
+std::string url_file_name(const std::string& url) { return file_name_of(url); }
+
 bool is_url(const std::string& s) { return s.rfind("http://", 0) == 0 || s.rfind("https://", 0) == 0; }
 
-std::string fetch_url(const std::string& url, const std::string& dir) {
+std::string fetch_url(const std::string& url, const std::string& dir, RunProgress* progress) {
 	uint64_t h = 1469598103934665603ull;
 	for (unsigned char c : url) h = (h ^ c) * 1099511628211ull;
 	char folder[20];
@@ -166,6 +172,7 @@ std::string fetch_url(const std::string& url, const std::string& dir) {
 
 	Transfer t;
 	t.name = file_name_of(url);
+	t.rp = progress;
 	t.part = part;
 	t.have = fs::exists(file) && fs::exists(meta_file);
 	if (t.have) t.old = read_meta(meta_file);
@@ -215,8 +222,8 @@ std::string fetch_url(const std::string& url, const std::string& dir) {
 
 		if (res == CURLE_OK && code == 304) t.unchanged = true;
 		if (t.unchanged) {
-			printf("Input %s: already downloaded (%s)\n", t.name.c_str(), size_text(t.old.size).c_str());
-			fflush(stdout);
+			if (progress) ui::log("Input " + t.name + ": already downloaded (" + size_text(t.old.size) + ")");
+			else { printf("Input %s: already downloaded (%s)\n", t.name.c_str(), size_text(t.old.size).c_str()); fflush(stdout); }
 			return file.string();
 		}
 		if (res == CURLE_RANGE_ERROR && t.resume_at) continue; // the server would not continue where we stopped
@@ -237,8 +244,8 @@ std::string fetch_url(const std::string& url, const std::string& dir) {
 		Meta m;
 		m.url = url; m.etag = t.etag; m.last_modified = t.modified; m.size = t.done;
 		write_meta(meta_file, m);
-		printf("  done: %s\n", size_text(t.done).c_str());
-		fflush(stdout);
+		if (progress) ui::log("Input " + t.name + ": downloaded " + size_text(t.done));
+		else { printf("  done: %s\n", size_text(t.done).c_str()); fflush(stdout); }
 		return file.string();
 	}
 	throw std::runtime_error("the server would not continue the download of " + url);
