@@ -125,7 +125,7 @@ public:
 	}
 
 	bool push(const Picture* p) override {
-		if (!p) return true; // nothing is ever held back
+		if (!p) return !(vk && pl_gpu_is_failed(vk->gpu)); // nothing is ever held back
 		const Layout& L = p->layout;
 		if (!vk || L.planes == 0) return false;
 		const pl_color_system sys = color_system(*p);
@@ -217,6 +217,8 @@ public:
 			out.data[i] = planes->mem[i].data();
 			out.stride[i] = (int)stride;
 		}
+		// After a lost device (driver reset) calls can still report success and hand back stale memory
+		if (pl_gpu_is_failed(vk->gpu)) { fprintf(stderr, "libplacebo: the GPU failed (device lost), the converted frame cannot be trusted\n"); return false; }
 		out.pts = p->pts;
 		out.duration = p->duration;
 		out.color = p->color;
