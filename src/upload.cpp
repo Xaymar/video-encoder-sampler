@@ -8,6 +8,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -197,6 +198,11 @@ struct Uploader::Impl {
 	bool ready = false, may_scores = false, may_videos = false;
 	uint64_t chunk = 0;
 	std::unique_ptr<Site> site;
+	std::map<std::string, int> declined; // what the site said no to, and how often: said once when it first happens, counted at the end
+
+	void decline(const std::string& what, const std::string& reason) {
+		if (declined[what + ": " + reason]++ == 0) log("Upload: not sent, " + what + ": " + reason + " (said once, counted at the end)");
+	}
 
 	// Asks the site who we are, once. False when nothing can be uploaded.
 	bool connect() {
@@ -268,7 +274,7 @@ struct Uploader::Impl {
 			} else if (score && text_of(*score, "status") == "exists") {
 				scores_known++;
 				done = "score already there";
-			}
+			} else if (score && !send_score) decline("score", may_scores ? text_of(*score, "reason") : "this account may not upload scores");
 
 			if (video && with_video) {
 				const std::string status = text_of(*video, "status");
@@ -279,7 +285,7 @@ struct Uploader::Impl {
 				} else if (status == "exists") done += ", video already there";
 				else {
 					const std::string reason = text_of(*video, "reason");
-					if (!reason.empty()) done += ", no video: " + reason;
+					if (!reason.empty()) { done += ", no video: " + reason; decline("video", reason); }
 				}
 			}
 			if (!done.empty() && !ui::live()) log(who + done); // the live display shows what is going out; plain output says what happened to each
@@ -331,4 +337,5 @@ void Uploader::finish() {
 	if (!impl->ready) return; // said why in connect(), or nothing was ever queued
 	impl->log("Upload finished: " + std::to_string(impl->scores_new) + " new scores, " + std::to_string(impl->scores_known) + " already known, " + std::to_string(impl->videos_sent) + " videos" +
 	          (impl->problems ? ", " + std::to_string(impl->problems) + " problems (they are tried again next time)" : ""));
+	for (auto& [what, n] : impl->declined) impl->log("Upload: " + std::to_string(n) + " not sent, " + what);
 }
