@@ -22,6 +22,7 @@
 #include <dxgi.h>
 #include <wrl/client.h>
 
+#include <components/PreProcessing.h>
 #include <components/VideoEncoderAV1.h>
 #include <components/VideoEncoderHEVC.h>
 #include <components/VideoEncoderVCE.h>
@@ -93,6 +94,74 @@ class Amf : public Encoder {
 		pack_uv(*fr, w, h, depth, (uint8_t*)uvp->GetNative(), uvp->GetHPitch());
 	}
 
+	// Property names are written snake_case without the codec's prefix (QualityPreset, HevcQualityPreset and Av1QualityPreset are all quality_preset).
+	void collect_names(std::map<std::string, std::string>& names) const {
+		for (amf_size i = 0; i < enc->GetPropertiesInfoCount(); i++) {
+			const amf::AMFPropertyInfo* pi = nullptr;
+			if (enc->GetPropertyInfo(i, &pi) != AMF_OK || !pi || !pi->name) continue;
+			std::string native, bare;
+			for (const wchar_t* w = pi->name; *w; w++) native += (char)*w;
+			bare = native;
+			if (native.find("HalfPixel") != std::string::npos || native.find("QuarterPixel") != std::string::npos || native == "AdaptiveMiniGOP") continue; // GCN4 and older only, which AMD no longer supports
+			// Rate control settings are scoped per temporal layer and quality layer ("TL0.QL0.EnforceHRD"); ves uses the base layer only.
+			if (native.compare(0, 8, "TL0.QL0.") == 0) bare = native.substr(8);
+			else if (native.compare(0, 2, "TL") == 0 && native.find(".QL") != std::string::npos) continue;
+			for (const char* prefix : {"Hevc", "Av1", "AV1"}) {
+				const size_t n = strlen(prefix);
+				if (bare.size() > n && bare.compare(0, n, prefix) == 0 && isupper((unsigned char)bare[n])) { bare.erase(0, n); break; }
+			}
+			std::string name = snake_case(bare);
+			if (name == "quality_preset") name = "preset"; // AMF's QualityPreset, HevcQualityPreset and Av1QualityPreset
+			if (name == "profile_level") name = "level";  // ProfileLevel and HevcProfileLevel; the AV1 one is Av1Level already
+			if (name == "rate_control_preanalysis_enable" || name == "rate_control_pre_analysis_enable") name = "pre_encode"; // pre-encode assisted rate control
+			names.emplace(name, native);
+		}
+	}
+
+	// The pre-encode filter: AMF's adaptive filter (a denoiser tuned by the target bitrate), run on every picture before the encoder gets it.
+	amf::AMFComponentPtr filter_pp;
+	bool open_filter(const std::map<std::string, std::string>& opts, const Params& p) {
+		bool on = false;
+		amf_int64 strength = 4, sensitivity = 4;
+		for (auto& [k, v] : opts) {
+			char* end = nullptr;
+			const long long n = v == "true" ? 1 : v == "false" ? 0 : strtoll(v.c_str(), &end, 10);
+			if (v != "true" && v != "false" && (end == v.c_str() || *end)) { fprintf(stderr, "amf: '%s' is not a number for '%s'\n", v.c_str(), k.c_str()); return false; }
+			if (k == "pre_filter") on = n != 0;
+			else if (k == "pre_filter_strength") strength = n;       // 0 to 10
+			else if (k == "pre_filter_sensitivity") sensitivity = n; // 0 to 10, lower keeps more detail
+			else { fprintf(stderr, "amf: unknown option '%s'; the pre-encode filter has: pre_filter, pre_filter_strength, pre_filter_sensitivity\n", k.c_str()); return false; }
+		}
+		if (!on) return true;
+		AMF_RESULT r = factory->CreateComponent(ctx, AMFPreProcessing, &filter_pp);
+		if (r != AMF_OK) return fail(r, "CreateComponent(PreProcessing)");
+		filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_ENABLE, true);
+		filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_STRENGTH, strength);
+		filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_SENSITIVITY, sensitivity);
+		filter_pp->SetProperty(AMF_PP_TARGET_BITRATE, (amf_int64)p.bitrate);
+		filter_pp->SetProperty(AMF_PP_FRAME_RATE, AMFConstructRate(p.framerate.num, p.framerate.den));
+		if ((r = filter_pp->Init(depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init(PreProcessing)");
+		return true;
+	}
+
+	// The picture the encoder gets: the filtered one when the filter is on.
+	bool filter(amf::AMFSurface* in, amf::AMFDataPtr& out) {
+		AMF_RESULT r = AMF_OK;
+		for (int i = 0; i < 5000; i++) { // AMF_INPUT_FULL: the filter has not taken the last picture's output yet
+			r = filter_pp->SubmitInput(in);
+			if (r != AMF_INPUT_FULL) break;
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		if (r != AMF_OK) return fail(r, "SubmitInput(PreProcessing)");
+		for (int i = 0; i < 5000; i++) {
+			r = filter_pp->QueryOutput(&out);
+			if (r == AMF_OK && out) { out->SetPts(in->GetPts()); return true; }
+			if (r != AMF_OK && r != AMF_REPEAT) return fail(r, "QueryOutput(PreProcessing)");
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		return fail(AMF_REPEAT, "QueryOutput(PreProcessing) timed out");
+	}
+
 	void receive() {
 		while (!stop && !eof) {
 			amf::AMFDataPtr data;
@@ -109,6 +178,8 @@ public:
 	~Amf() override {
 		stop = true;
 		if (rx.joinable()) rx.join();
+		if (filter_pp) filter_pp->Terminate();
+		filter_pp = nullptr;
 		if (enc) enc->Terminate();
 		enc = nullptr;
 		if (ctx) ctx->Terminate();
@@ -198,31 +269,21 @@ public:
 		enc->SetProperty(n->gop, (amf_int64)p.gop);
 		enc->SetProperty(n->bitdepth, (amf_int64)(depth > 8 ? 10 : 8));
 		set_color(p.color);
-		// Property names are written snake_case without the codec's prefix (QualityPreset, HevcQualityPreset and Av1QualityPreset are all quality_preset).
-		std::map<std::string, std::string> names;
-		for (amf_size i = 0; i < enc->GetPropertiesInfoCount(); i++) {
-			const amf::AMFPropertyInfo* pi = nullptr;
-			if (enc->GetPropertyInfo(i, &pi) != AMF_OK || !pi || !pi->name) continue;
-			std::string native, bare;
-			for (const wchar_t* w = pi->name; *w; w++) native += (char)*w;
-			bare = native;
-			if (native.find("HalfPixel") != std::string::npos || native.find("QuarterPixel") != std::string::npos || native == "AdaptiveMiniGOP") continue; // GCN4 and older only, which AMD no longer supports
-			// Rate control settings are scoped per temporal layer and quality layer ("TL0.QL0.EnforceHRD"); ves uses the base layer only.
-			if (native.compare(0, 8, "TL0.QL0.") == 0) bare = native.substr(8);
-			else if (native.compare(0, 2, "TL") == 0 && native.find(".QL") != std::string::npos) continue;
-			for (const char* prefix : {"Hevc", "Av1", "AV1"}) {
-				const size_t n = strlen(prefix);
-				if (bare.size() > n && bare.compare(0, n, prefix) == 0 && isupper((unsigned char)bare[n])) { bare.erase(0, n); break; }
-			}
-			std::string name = snake_case(bare);
-			if (name == "quality_preset") name = "preset"; // AMF's QualityPreset, HevcQualityPreset and Av1QualityPreset
-			if (name == "profile_level") name = "level";  // ProfileLevel and HevcProfileLevel; the AV1 one is Av1Level already
-			names.emplace(name, native);
-		}
 		NativeOptions native_opts;
 		std::string why;
 		if (!resolve_options("amf", p.codec, o, [](const std::string& k) { return k; }, native_opts, why)) { fprintf(stderr, "amf: %s\n", why.c_str()); return false; }
-		for (auto& [k, v] : native_opts) {
+
+		// The pre-encode filter is a component of its own in front of the encoder; its options (pre_filter, pre_filter_strength, pre_filter_sensitivity) are not encoder properties.
+		std::map<std::string, std::string> filter_opts;
+		for (auto it = native_opts.begin(); it != native_opts.end();) {
+			if (it->first.compare(0, 10, "pre_filter") == 0) { filter_opts.emplace(it->first, it->second); it = native_opts.erase(it); }
+			else ++it;
+		}
+
+		// Pre-analysis adds its PA* properties to the encoder only once it is on, so those are looked up after it was set.
+		std::map<std::string, std::string> names;
+		collect_names(names);
+		auto apply = [&](const std::string& k, const std::string& v) {
 			auto it = names.find(k);
 			if (it == names.end()) {
 				std::string known;
@@ -230,10 +291,14 @@ public:
 				fprintf(stderr, "amf: unknown property '%s'; this encoder has: %s\n", k.c_str(), known.c_str());
 				return false;
 			}
-			if (!set(it->second, v)) return false;
-		}
+			return set(it->second, v);
+		};
+		for (auto& [k, v] : native_opts) if (k == "enable_pre_analysis" && !apply(k, v)) return false;
+		collect_names(names);
+		for (auto& [k, v] : native_opts) if (k != "enable_pre_analysis" && !apply(k, v)) return false;
 
 		if ((r = enc->Init(depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init");
+		if (!filter_opts.empty() && !open_filter(filter_opts, p)) return false;
 		amf::AMFVariant bp;
 		if (enc->GetProperty(L"BPicturesPattern", &bp) == AMF_OK && bp.ToInt64() > 0) b_delay = (int)bp.ToInt64() + 1; // H.264; the other codecs have no such property
 		rx = std::thread([this] { receive(); });
@@ -255,8 +320,10 @@ public:
 		surf->SetPts(fr->pts);
 		if ((r = surf->Convert(amf::AMF_MEMORY_DX11)) != AMF_OK) return fail(r, "Convert");
 
+		amf::AMFDataPtr data(surf);
+		if (filter_pp && !filter(surf, data)) return false;
 		for (;;) {
-			r = enc->SubmitInput(surf);
+			r = enc->SubmitInput(data);
 			if (r != AMF_INPUT_FULL) break;
 			std::this_thread::sleep_for(std::chrono::milliseconds(1));
 		}

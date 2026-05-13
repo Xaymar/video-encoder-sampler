@@ -285,6 +285,11 @@
 				"cabac_enable": [0, 1],
 				"rate_control_skip_frame_enable": [0, 1],
 				"low_latency_internal": [0, 1],
+				"pre_encode": [0, 1],   // pre-encode assisted rate control
+				"enable_pre_analysis": [0, 1],   // pre-analysis; the pa_* options (pa_scene_change_detection_enable, pa_look_ahead_buffer_depth, pa_perceptual_aq_mode, ...) exist once it is on, and it needs rate_control_method 2 (peak constrained VBR)
+				"pre_filter": [0, 1],   // AMF's adaptive filter in front of the encoder
+				"pre_filter_strength": [0, 4, 10],   // 0 to 10, with pre_filter
+				"pre_filter_sensitivity": [0, 4, 10],   // 0 to 10, lower keeps more detail
 			},
 		},
 		// AMD, HEVC
