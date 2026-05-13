@@ -23,6 +23,12 @@ struct CachedRun {
 std::string cache_key(const std::string& input, const std::string& encoder, const std::string& codec, const Options& options,
                       long long bitrate_kbps, double kf, const Shape& shape, const ScaleOptions& scale, const VmafOptions& vmaf);
 
+// The same key in parts (cache_key is these one after the other), for callers that build many keys and want the parts that do not change built once.
+std::string key_input(const std::string& input);
+std::string key_encoder(const std::string& encoder, const std::string& codec, const Options& options); // with its environment (GPU and driver, library version)
+std::string key_run(long long bitrate_kbps, double kf, const Shape& shape);
+std::string key_settings(const ScaleOptions& scale, const VmafOptions& vmaf);
+
 // "<label>_<hash>", unique for the run's key: the name of its result file (.json) and stream (.mp4).
 std::string result_name(const std::string& label, const std::string& key);
 // The hash part alone, for files kept in the cache folder.

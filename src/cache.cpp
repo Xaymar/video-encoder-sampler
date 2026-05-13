@@ -37,21 +37,35 @@ static std::string encoder_environment(const std::string& encoder, const Options
 	return encoder_library_version(encoder);
 }
 
-std::string cache_key(const std::string& input, const std::string& encoder, const std::string& codec, const Options& options,
-                      long long bitrate_kbps, double kf, const Shape& shape, const ScaleOptions& scale, const VmafOptions& vmaf) {
+// The key in parts, so that what stays the same from run to run is built once: the input, the encoder with its options, the bitrate, key frame interval and
+// geometry, and the settings of scaler, decoder and scorer. cache_key() is these one after the other.
+std::string key_input(const std::string& input) {
 	std::ostringstream k;
 	std::error_code ec;
 	k << "ves-cache-1\n";
 	// A URL input is identified by its address, so that results can be found without downloading the file; a file by its name, size and time.
 	if (is_url(input)) k << "input=" << url_file_name(input) << "|url=" << input << '\n';
 	else k << "input=" << fs::path(input).filename().string() << '|' << fs::file_size(input, ec) << '|' << fs::last_write_time(input, ec).time_since_epoch().count() << '\n';
+	return k.str();
+}
+
+std::string key_encoder(const std::string& encoder, const std::string& codec, const Options& options) {
+	std::ostringstream k;
 	k << "encoder=" << encoder << '/' << codec << '\n';
 	k << "environment=" << encoder_environment(encoder, options) << '\n';
 	k << "options=";
 	for (auto& [name, value] : options) k << name << '=' << value << ';';
+	return k.str();
+}
+
+std::string key_run(long long bitrate_kbps, double kf, const Shape& shape) {
 	char buf[128];
 	snprintf(buf, sizeof buf, "\nbitrate=%lld kf=%.6g shape=%dx%d@%d/%d\n", bitrate_kbps, kf, shape.w, shape.h, shape.fps.num, shape.fps.den);
-	k << buf;
+	return buf;
+}
+
+std::string key_settings(const ScaleOptions& scale, const VmafOptions& vmaf) {
+	std::ostringstream k;
 	k << "scaling=" << scale.upscaler << '/' << scale.downscaler << ' ' << scale.device << ' ' << scaler_library_version() << '\n';
 	k << "decoder=" << decoder_library_version() << '\n';
 	// the scorer: library version, model, and the model file's contents when it is a path
@@ -72,6 +86,11 @@ std::string cache_key(const std::string& input, const std::string& encoder, cons
 	}
 	k << '\n';
 	return k.str();
+}
+
+std::string cache_key(const std::string& input, const std::string& encoder, const std::string& codec, const Options& options,
+                      long long bitrate_kbps, double kf, const Shape& shape, const ScaleOptions& scale, const VmafOptions& vmaf) {
+	return key_input(input) + key_encoder(encoder, codec, options) + key_run(bitrate_kbps, kf, shape) + key_settings(scale, vmaf);
 }
 
 static std::string json_escape(const std::string& s) {

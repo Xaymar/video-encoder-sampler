@@ -28,6 +28,9 @@
 			// Encoded frame rates: 30, 29.97, or a fraction such as 30000/1001. Frames are dropped to get there, never invented.
 			"framerates": [120, 60, 30],
 			// "kfintervals": [2.0, 1.0],   // key frame intervals in seconds; defaults to the top-level list below
+			// "chroma": [420, 444],        // the pixel format and sample range the encoders get; left out, the source's. Every combination is tested
+			// "bitdepth": [8, 10],
+			// "range": ["limited", "full"],   // source, limited or full: the samples are converted before encoding and back for scoring
 			// "upscale": true,             // allow encoding above the source's resolution, chroma layout and bit depth (off by default)
 		},
 		{
@@ -111,7 +114,6 @@
 				// "b_reference_mode": [null, "none", "middle"],  // B-frames as references
 				// "spatial_aq": [null, 0, 1],
 				// "aq_strength": [],
-				// "bitdepth": [8, 10],
 				// "gpu": [0],                                    // which NVIDIA GPU; ["all"] uses every one, each in a pool of its own
 			},
 			// "scenarios": ["mid", "low"],  // only these scenarios; left out, the encoder takes part in all of them
@@ -138,7 +140,6 @@
 				"preset": ["superfast", "veryfast", "fast", "medium"],
 				"tune": [null],
 				// "max_b_frames": [2, 4],
-				// "bitdepth": [8, 10],
 			},
 		},
 		{

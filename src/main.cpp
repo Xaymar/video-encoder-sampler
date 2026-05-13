@@ -65,6 +65,7 @@ struct Scenario {
 	std::vector<int64_t> bitrates;   // kbps
 	std::vector<double> kfs{2.0};    // key frame intervals, seconds
 	std::vector<Shape> shapes{Shape{}}; // resolution / frame rate to encode at; zero fields mean "as the source"
+	std::vector<std::string> chroma, bitdepth, range; // pixel format to encode in (420, 444; 8, 10; source, limited, full); empty: the source's
 };
 
 struct Config {
@@ -206,6 +207,9 @@ static void load_config(const std::string& path, Config& cfg) {
 		strs("resolutions", [&](const std::string& t) { res.push_back(t); });
 		strs("framerates", [&](const std::string& t) { fps.push_back(t); });
 		sc.shapes = make_shapes(res, fps);
+		strs("chroma", [&](const std::string& t) { sc.chroma.push_back(t); });
+		strs("bitdepth", [&](const std::string& t) { sc.bitdepth.push_back(t); });
+		strs("range", [&](const std::string& t) { sc.range.push_back(t); });
 		if (auto* u = o.find("upscale"); u && (u->text() == "1" || u->text() == "true")) for (auto& sh : sc.shapes) sh.upscale = true;
 		if (sc.bitrates.empty()) throw std::runtime_error("a scenario needs bitrates");
 		cfg.scenarios.push_back(std::move(sc));
@@ -496,6 +500,7 @@ int main(int argc, char** argv) {
 		std::vector<size_t> tasks;
 		std::atomic<size_t> next{0};
 		int parallel = 1;
+		std::string name;
 	};
 	std::vector<Task> tasks;
 	std::map<std::string, Pool> pools;
@@ -509,59 +514,116 @@ int main(int argc, char** argv) {
 		return job.scenarios.empty() || std::find(job.scenarios.begin(), job.scenarios.end(), sc.name) != job.scenarios.end();
 	};
 
-	for (auto& input : cfg.inputs) for (auto& job : cfg.jobs) {
-		const Codec id = codec_of(job.encoder, job.codec);
-		if (id == Codec::None) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", job.encoder.c_str(), job.codec.c_str()); failed++; continue; }
+	for (auto& job : cfg.jobs) for (auto& ax : job.axes) for (auto& sc : cfg.scenarios) {
+		const bool in_scenario = (ax.key == "chroma" && !sc.chroma.empty()) || (ax.key == "bitdepth" && !sc.bitdepth.empty()) || (ax.key == "range" && !sc.range.empty());
+		if (in_scenario && takes_part(job, sc)) {
+			fprintf(stderr, "config: '%s' is listed by encoder '%s' and by scenario '%s'; list it in one of them\n", ax.key.c_str(), job.encoder.c_str(), sc.name.c_str());
+			return 1;
+		}
+	}
+
+	// What does not depend on the input is built once, for each encoder and scenario: the option sets merged with the scenario's chroma, bit depth and
+	// range, each with its label, the part of the cache key it decides, and the GPU and pool it runs on. The inputs, bitrates and key frame intervals
+	// and geometries are then put around them, which is all that is left to do for a run.
+	struct Variant {
+		Options opts;
+		std::string label;     // " name=value ..."
+		std::string key;       // the encoder, its environment and these options, as the cache key has them
+		std::string gpu_index;
+		std::string gpu;
+		const std::string *gpu_json = &NULL_JSON, *caps_json = &NULL_JSON;
+		Pool* pool = nullptr;
+	};
+	std::map<std::pair<const Job*, const Scenario*>, std::vector<Variant>> variants;
+	auto variants_of = [&](const Job& job, const Scenario& sc) -> const std::vector<Variant>& {
+		auto found = variants.find({&job, &sc});
+		if (found != variants.end()) return found->second;
+		std::vector<Variant>& out = variants[{&job, &sc}];
+		auto axis = [](const std::vector<std::string>& v) { return v.empty() ? std::vector<std::string>{""} : v; }; // "": the source's
+		for (const Options& base : expand(job.encoder, job.axes))
+			for (auto& chroma : axis(sc.chroma)) for (auto& bitdepth : axis(sc.bitdepth)) for (auto& range : axis(sc.range)) {
+				Variant v;
+				v.opts = base;
+				if (!chroma.empty()) v.opts["chroma"] = chroma;
+				if (!bitdepth.empty()) v.opts["bitdepth"] = bitdepth;
+				if (!range.empty()) v.opts["range"] = range;
+				for (auto& [k, val] : v.opts) v.label += " " + k + "=" + val;
+				v.key = key_encoder(job.encoder, job.codec, v.opts);
+				// Every GPU is a pool of its own, so GPUs work in parallel; CPU encoders share one pool.
+				v.gpu_index = v.opts.count("gpu") ? v.opts.at("gpu") : "0";
+				if (is_gpu_encoder(job.encoder)) {
+					v.gpu = gpu_description(encoder_vendor(job.encoder), atoi(v.gpu_index.c_str()));
+					static std::map<std::string, std::string> gpu_known; // asked once per vendor and GPU; the runs only point at the text
+					const std::string gpu_key = job.encoder + "/" + v.gpu_index;
+					auto gpu_at = gpu_known.find(gpu_key);
+					if (gpu_at == gpu_known.end()) gpu_at = gpu_known.emplace(gpu_key, gpu_json(encoder_vendor(job.encoder), atoi(v.gpu_index.c_str()))).first;
+					v.gpu_json = &gpu_at->second;
+					static std::map<std::string, std::string> caps_known; // asked once per encoder, codec and GPU
+					const std::string caps_key = job.encoder + "/" + job.codec + "/" + v.gpu_index;
+					auto known = caps_known.find(caps_key);
+					if (known == caps_known.end()) known = caps_known.emplace(caps_key, encoder_caps_json(job.encoder, job.codec, atoi(v.gpu_index.c_str()))).first;
+					v.caps_json = &known->second;
+				}
+				const std::string pool = !job.pool.empty() ? job.pool : is_gpu_encoder(job.encoder) ? job.encoder + ":" + v.gpu_index : "cpu";
+				v.pool = &pools[pool];
+				v.pool->parallel = std::max(v.pool->parallel, job.parallel ? job.parallel : (is_gpu_encoder(job.encoder) ? 2 : 1));
+				v.pool->name = pool;
+				out.push_back(std::move(v));
+			}
+		return out;
+	};
+	const std::string key_tail = key_settings(cfg.scale, cfg.vo);
+	const char sep = (char)fs::path::preferred_separator;
+
+	for (auto& input : cfg.inputs) {
+		const std::string key_head = key_input(input);
+		const std::string folder = sanitize(fs::path(file_name(input)).stem().string());
+		const std::string folder_path = cfg.output_dir.empty() ? std::string() : (fs::path(cfg.output_dir) / folder).string() + sep;
+		bool folder_made = false;
+		for (auto& job : cfg.jobs) {
+			const Codec id = codec_of(job.encoder, job.codec);
+			if (id == Codec::None) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", job.encoder.c_str(), job.codec.c_str()); failed++; continue; }
+			const std::string encoder_label = is_gpu_encoder(job.encoder) ? job.encoder + "/" + job.codec : job.encoder;
 			for (auto& sc : cfg.scenarios) if (takes_part(job, sc)) {
 				ui::log("Preparing " + job.encoder + "/" + job.codec + ", scenario " + (sc.name.empty() ? "(unnamed)" : sc.name) + ", " + file_name(input));
-				const std::vector<Options> sets = expand(job.encoder, job.axes);
-			for (int64_t br : sc.bitrates) for (double kf : sc.kfs) for (auto& shape : sc.shapes) for (auto& opts : sets) {
-			Task t;
-			t.job = &job; t.id = id;
-				t.r.input = input; t.r.bitrate = br; t.r.kf = kf; t.r.shape = shape;
-				t.r.label = is_gpu_encoder(job.encoder) ? job.encoder + "/" + job.codec : job.encoder;
-				if (shape.w) t.r.label += " " + std::to_string(shape.w) + "x" + std::to_string(shape.h);
-				if (shape.fps.num) t.r.label += " @" + std::to_string(shape.fps.value()).substr(0, 6);
-			for (auto& [k, v] : opts) t.r.label += " " + k + "=" + v;
-			t.p.codec = job.codec; t.p.bitrate = br * 1000; t.p.options = opts;
-			t.r.encoder = job.encoder; t.r.codec = job.codec; t.r.options = opts;
-			// The run's result (.json) and stream (.mp4) share a name made from the run and a hash of everything its outcome depends on, so a
-			// run that comes up again finds its result straight away. They go to the output folder; without one, results are kept in the cache.
-			t.key = cache_key(input, job.encoder, job.codec, opts, br, kf, shape, cfg.scale, cfg.vo);
-			if (!cfg.output_dir.empty()) {
-				const std::string folder = sanitize(fs::path(file_name(input)).stem().string()), base = result_name(t.r.label + " " + std::to_string(br) + "k kf" + std::to_string((double)kf).substr(0, std::to_string((double)kf).find('.') + 2), t.key);
-				t.result_file = (fs::path(cfg.output_dir) / folder / (base + ".json")).string();
-				t.r.result = folder + "/" + base + ".json";
-				if (cfg.save_videos) {
-					t.r.video = folder + "/" + base + ".mp4";
-					t.r.video_file = (fs::path(cfg.output_dir) / t.r.video).string();
+				const std::vector<Variant>& sets = variants_of(job, sc);
+				for (int64_t br : sc.bitrates) for (double kf : sc.kfs) {
+					const std::string kf_text = std::to_string((double)kf).substr(0, std::to_string((double)kf).find('.') + 2);
+					for (auto& shape : sc.shapes) {
+						std::string head = encoder_label; // the part of the label the options come after
+						if (shape.w) head += " " + std::to_string(shape.w) + "x" + std::to_string(shape.h);
+						if (shape.fps.num) head += " @" + std::to_string(shape.fps.value()).substr(0, 6);
+						const std::string key_run_text = key_run(br, kf, shape);
+						const std::string group_head = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|";
+						for (const Variant& v : sets) {
+							Task t;
+							t.job = &job; t.id = id;
+							t.r.input = input; t.r.bitrate = br; t.r.kf = kf; t.r.shape = shape;
+							t.r.label = head + v.label;
+							t.p.codec = job.codec; t.p.bitrate = br * 1000; t.p.options = v.opts;
+							t.r.encoder = job.encoder; t.r.codec = job.codec; t.r.options = v.opts;
+							// The run's result (.json) and stream (.mp4) share a name made from the run and a hash of everything its outcome depends on, so a
+							// run that comes up again finds its result straight away. They go to the output folder; without one, results are kept in the cache.
+							t.key = key_head + v.key + key_run_text + key_tail;
+							if (!cfg.output_dir.empty()) {
+								const std::string base = result_name(t.r.label + " " + std::to_string(br) + "k kf" + kf_text, t.key);
+								t.result_file = folder_path + base + ".json";
+								t.r.result = folder + "/" + base + ".json";
+								if (cfg.save_videos) {
+									t.r.video = folder + "/" + base + ".mp4";
+									t.r.video_file = folder_path + base + ".mp4";
+								}
+								if (!folder_made) { std::error_code ec; fs::create_directories(fs::path(cfg.output_dir) / folder, ec); folder_made = true; }
+							} else if (!cfg.cache_dir.empty()) t.result_file = (fs::path(cfg.cache_dir) / "results" / (key_hash(t.key) + ".json")).string();
+							t.r.group = group_head + v.gpu_index;
+							t.r.gpu = v.gpu; t.r.gpu_json = v.gpu_json; t.r.caps_json = v.caps_json;
+							t.pool = v.pool->name;
+							v.pool->tasks.push_back(tasks.size());
+							tasks.push_back(std::move(t));
+						}
+					}
 				}
-				static std::set<std::string> made; // creating a folder for every one of many thousand runs is slow
-				if (made.insert(folder).second) { std::error_code ec; fs::create_directories(fs::path(cfg.output_dir) / folder, ec); }
-			} else if (!cfg.cache_dir.empty()) t.result_file = (fs::path(cfg.cache_dir) / "results" / (key_hash(t.key) + ".json")).string();
-			// Every GPU is a pool of its own, so GPUs work in parallel; CPU encoders share one pool.
-			std::string gpu_index = opts.count("gpu") ? opts.at("gpu") : "0";
-			t.r.group = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|" + gpu_index;
-			if (is_gpu_encoder(job.encoder)) {
-				t.r.gpu = gpu_description(encoder_vendor(job.encoder), atoi(gpu_index.c_str()));
-				static std::map<std::string, std::string> gpu_known; // asked once per vendor and GPU; the runs only point at the text
-				const std::string gpu_key = job.encoder + "/" + gpu_index;
-				auto gpu_at = gpu_known.find(gpu_key);
-				if (gpu_at == gpu_known.end()) gpu_at = gpu_known.emplace(gpu_key, gpu_json(encoder_vendor(job.encoder), atoi(gpu_index.c_str()))).first;
-				t.r.gpu_json = &gpu_at->second;
-				static std::map<std::string, std::string> caps_known; // asked once per encoder, codec and GPU
-				const std::string caps_key = job.encoder + "/" + job.codec + "/" + gpu_index;
-				auto known = caps_known.find(caps_key);
-				if (known == caps_known.end()) known = caps_known.emplace(caps_key, encoder_caps_json(job.encoder, job.codec, atoi(gpu_index.c_str()))).first;
-				t.r.caps_json = &known->second;
 			}
-			std::string pool = !job.pool.empty() ? job.pool : is_gpu_encoder(job.encoder) ? job.encoder + ":" + gpu_index : "cpu";
-			t.pool = pool;
-			Pool& pl = pools[pool];
-			pl.parallel = std::max(pl.parallel, job.parallel ? job.parallel : (is_gpu_encoder(job.encoder) ? 2 : 1));
-			pl.tasks.push_back(tasks.size());
-			tasks.push_back(std::move(t));
-		}
 		}
 	}
 
@@ -583,6 +645,10 @@ int main(int argc, char** argv) {
 			for (size_t k = 0; k < sc.kfs.size(); k++) put("%s%g", k ? "," : "", sc.kfs[k]);
 			put(" s");
 			for (auto& sh : sc.shapes) if (sh.w || sh.fps.num) put(", %dx%d@%g", sh.w, sh.h, sh.fps.num ? sh.fps.value() : 0.0);
+			for (auto* list : {&sc.chroma, &sc.bitdepth, &sc.range}) if (!list->empty()) {
+				put(", %s ", list == &sc.chroma ? "chroma" : list == &sc.bitdepth ? "bitdepth" : "range");
+				for (size_t k = 0; k < list->size(); k++) put("%s%s", k ? "," : "", (*list)[k].c_str());
+			}
 			put("\n");
 		}
 		put("Encoders\n");
