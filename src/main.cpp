@@ -297,7 +297,7 @@ Paths
                             "off" writes nothing
         --no-videos         write the result files but not the encoded streams
         --best-videos       keep only the stream of the best run so far (highest mean VMAF after the overshoot penalty) of each input, encoder, bitrate,
-                            key frame interval and size; the others are deleted once they are scored (and uploaded)
+                            key frame interval and size; the others are deleted once they are scored; the kept one is uploaded when its group is complete
         --upload <url>      after the sweep, upload the results (and videos) to this VES website, e.g. https://ves.example.com ("off" disables it)
         --upload-key <key>  the API key from the website's account page; better in the config ("upload": {"key": ...}) or the VES_API_KEY environment variable
         --no-upload-videos  upload the results but not the encoded videos
@@ -730,7 +730,9 @@ int main(int argc, char** argv) {
 		uploader = std::make_unique<Uploader>(up, [](const std::string& line) { ui::log(line); });
 	}
 	std::map<std::string, std::pair<Task*, double>> best_video; // group -> the run whose stream is kept, and its mean VMAF less the overshoot penalty
-	auto finish = [&](Task& t) {
+	std::map<std::string, int> group_left; // group -> runs not finished yet; its kept stream is uploaded when this reaches 0
+	if (cfg.best_videos) for (auto& t : tasks) group_left[t.r.group]++;
+	auto finish_run = [&](Task& t) {
 		Run& r = t.r;
 		ui::overall(++finished, total);
 		char line[1024];
@@ -745,26 +747,36 @@ int main(int argc, char** argv) {
 			UploadItem it;
 			it.result_file = (fs::path(cfg.output_dir) / r.result).string();
 			it.label = r.label;
-			if (!r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) it.video_file = (fs::path(cfg.output_dir) / r.video).string();
+			if (!cfg.best_videos && !r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) it.video_file = (fs::path(cfg.output_dir) / r.video).string();
 			uploader->add(std::move(it));
 		}
-		// Only the stream of the best run so far of each group stays. The loser is deleted after its upload (queued above, in order) is done.
+		// Only the stream of the best run so far of each group stays; the others are deleted. The kept one is uploaded when the group is complete.
 		if (cfg.best_videos && !r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) {
 			const double score = mean - r.penalty;
 			auto [at, fresh] = best_video.emplace(r.group, std::make_pair(&t, score));
 			Task* loser = &t;
 			if (!fresh && score > at->second.second) { loser = at->second.first; at->second = {&t, score}; }
-			if (loser->r.video.size()) {
-				const std::string file = (fs::path(cfg.output_dir) / loser->r.video).string();
-				loser->r.video.clear();
-				if (uploader) { UploadItem rm; rm.remove_file = file; uploader->add(std::move(rm)); }
-				else { std::error_code ec; fs::remove(file, ec); }
-			}
+			std::error_code ec;
+			fs::remove(fs::path(cfg.output_dir) / loser->r.video, ec);
+			loser->r.video.clear();
 		}
 		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s  [wave %.1fs: encoder busy %.1f, starved %.1f; decoder backed up %.1f; scorer starved %.1f]", r.tag.c_str(), r.label.c_str(), r.kbps,
 		         mean, sc.front(), sc[(size_t)(sc.size() * 0.05)], r.cached ? " (cached)" : "",
 		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.enc_busy_s, r.enc_starved_s, r.decode_blocked_s, r.score_starved_s);
 		ui::log(line);
+	};
+	auto finish = [&](Task& t) {
+		finish_run(t);
+		if (!cfg.best_videos || --group_left[t.r.group] > 0) return;
+		auto kept = best_video.find(t.r.group);
+		if (kept == best_video.end() || !uploader) return;
+		const Run& k = kept->second.first->r;
+		UploadItem it;
+		it.result_file = (fs::path(cfg.output_dir) / k.result).string();
+		it.video_file = (fs::path(cfg.output_dir) / k.video).string();
+		it.label = k.label;
+		it.late = true;
+		uploader->add(std::move(it));
 	};
 
 	// The source files, probed once each. A run that asks for no particular resolution or frame rate gets the source's, which is what its result records.

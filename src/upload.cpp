@@ -269,7 +269,7 @@ struct Uploader::Impl {
 					done = "score stored";
 				} else { log(who + "the score was refused (" + Site::why(up) + ")"); problems++; return; }
 			} else if (score && text_of(*score, "status") == "exists") {
-				scores_known++;
+				if (!item.late) scores_known++;
 				done = "score already there";
 			} else if (score && !send_score) decline("score", may_scores ? text_of(*score, "reason") : "this account may not upload scores");
 
@@ -302,7 +302,6 @@ struct Uploader::Impl {
 				item = std::move(queue.front());
 				queue.pop_front();
 			}
-			if (item.result_file.empty()) { std::error_code ec; fs::remove(item.remove_file, ec); continue; }
 			if (disabled) skipped++;
 			else if (!connect()) { disabled = true; skipped++; }
 			else process(item);
@@ -320,7 +319,7 @@ Uploader::Uploader(const UploadOptions& options, std::function<void(const std::s
 Uploader::~Uploader() { finish(); }
 
 void Uploader::add(UploadItem item) {
-	if (!item.result_file.empty()) ui::uploads(impl->handled, ++impl->added);
+	ui::uploads(impl->handled, ++impl->added);
 	{ std::lock_guard lock(impl->m); impl->queue.push_back(std::move(item)); }
 	impl->cv.notify_all();
 }
