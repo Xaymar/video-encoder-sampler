@@ -43,7 +43,13 @@ static constexpr double BEST_FRAME_SHARE = 0.95;
 
 // Running under a CBR target is the encoder's own loss, so only overshoot is penalized.
 // Default slope: the 3000 -> 6000 kbps sweep gains roughly 2.5 VMAF over +100%, i.e. ~0.025 per percent.
-static double over_penalty = 0.025; // VMAF points per percent over target
+static double over_penalty = 0.025; // VMAF points per percent over target, for a hair over; it steepens from there
+// The same curve as the website's over_penalty(): slope * width * (e^(x / width) - 1) with x the percent over target (2% over loses 0.07, 10% 1.9, 20% 59), at most 100.
+static double over_penalty_points(double kbps, double target) {
+	const double width = 3.0;
+	if (target <= 0 || kbps <= target) return 0;
+	return std::min(100.0, over_penalty * width * (std::exp((kbps / target - 1) * 100 / width) - 1));
+}
 
 struct Axis { // one swept option; a missing value (JSON null) leaves the option unset
 	std::string key;
@@ -76,6 +82,7 @@ struct Config {
 	std::string cache_dir = "cache"; // finished runs are kept here and not repeated; empty turns it off
 	std::string output_dir = "output"; // encoded streams and result files go here; empty: nothing is written
 	bool save_videos = true;
+	bool best_videos = false; // keep only the stream of the best run so far of each group
 	UploadOptions upload; // where the results go after a sweep; no address: nowhere
 	bool plain = false; // no live display, just lines
 	std::string hw_decode = "auto"; // "" software only, "auto", or a device type or decoder name: see set_hw_decode()
@@ -237,7 +244,10 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* x = u->find("key")) cfg.upload.key = x->text();
 		if (auto* x = u->find("videos")) cfg.upload.videos = !(x->text() == "0" || x->text() == "false");
 	}
-	if (auto* v = setting("videos")) cfg.save_videos = !(v->text() == "0" || v->text() == "false");
+	if (auto* v = setting("videos")) {
+		cfg.save_videos = !(v->text() == "0" || v->text() == "false");
+		cfg.best_videos = v->text() == "best";
+	}
 	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str()); // where older files have it; it belongs in "vmaf" now
 	if (auto* v = root.find("vmaf")) {
 		if (auto* m = v->find("model")) cfg.vo.model = m->text();
@@ -286,6 +296,8 @@ Paths
                             <dir>/<input>/ (fragmented .mp4) and the result file <dir>/<input>.json;
                             "off" writes nothing
         --no-videos         write the result files but not the encoded streams
+        --best-videos       keep only the stream of the best run so far (highest mean VMAF after the overshoot penalty) of each input, encoder, bitrate,
+                            key frame interval and size; the others are deleted once they are scored (and uploaded)
         --upload <url>      after the sweep, upload the results (and videos) to this VES website, e.g. https://ves.example.com ("off" disables it)
         --upload-key <key>  the API key from the website's account page; better in the config ("upload": {"key": ...}) or the VES_API_KEY environment variable
         --no-upload-videos  upload the results but not the encoded videos
@@ -300,7 +312,7 @@ Paths
 Scoring
         --vmaf-model <spec> libvmaf model, e.g. path=models/vmaf_4k_v0.6.1.json
         --vmaf-threads <n>
-        --over-penalty <p>  VMAF points deducted per percent over the target bitrate (default: 0.025)
+        --over-penalty <p>  VMAF points deducted per percent for a run just over the target bitrate (default: 0.025); it grows exponentially, like the website's
 
 Quick run (replaces the encoders and scenarios of the config file)
   -enc, --encoder <name>    nvenc | amf | qsv | x264 | x265 | svtav1
@@ -361,7 +373,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	std::optional<std::string> output, cache, model, upload_url, upload_key;
 	std::optional<int> threads;
 	std::optional<double> penalty;
-	bool videos = true, upload_videos = true, quick = false, upscale = false;
+	bool videos = true, best_videos = false, upload_videos = true, quick = false, upscale = false;
 	Job job;
 	for (int i = 1; i < argc; i++) {
 		std::string a = argv[i], v;
@@ -380,6 +392,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "-i" || a == "--input") inputs.push_back(value());
 		else if (a == "-o" || a == "--output") output = value();
 		else if (a == "--no-videos") videos = false;
+		else if (a == "--best-videos") best_videos = true;
 		else if (a == "--upload") upload_url = value();
 		else if (a == "--upload-key") upload_key = value();
 		else if (a == "--no-upload-videos") upload_videos = false;
@@ -424,6 +437,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	if (!inputs.empty()) { cfg.inputs.clear(); for (auto& i : inputs) add_inputs(cfg, i); }
 	if (output) cfg.output_dir = *output == "off" ? "" : *output;
 	cfg.save_videos = cfg.save_videos && videos;
+	cfg.best_videos = (cfg.best_videos || best_videos) && cfg.save_videos;
 	if (upload_url) cfg.upload.url = *upload_url == "off" ? "" : *upload_url;
 	if (upload_key) cfg.upload.key = *upload_key;
 	cfg.upload.videos = cfg.upload.videos && upload_videos;
@@ -715,12 +729,17 @@ int main(int argc, char** argv) {
 		if (up.key.empty()) if (const char* k = getenv("VES_API_KEY")) up.key = k;
 		uploader = std::make_unique<Uploader>(up, [](const std::string& line) { ui::log(line); });
 	}
+	std::map<std::string, std::pair<Task*, double>> best_video; // group -> the run whose stream is kept, and its mean VMAF less the overshoot penalty
 	auto finish = [&](Task& t) {
 		Run& r = t.r;
 		ui::overall(++finished, total);
 		char line[1024];
 		if (r.ignored) { if (!r.expected) { snprintf(line, sizeof line, "%s IGNORED  %s: %s", r.tag.c_str(), r.label.c_str(), r.reason.c_str()); ui::log(line); } return; }
 		if (!t.ok) { snprintf(line, sizeof line, "%s FAILED  %s  (%s, %lld kbps)", r.tag.c_str(), r.label.c_str(), r.input.c_str(), (long long)r.bitrate); ui::log(line); return; }
+		r.penalty = over_penalty_points(r.kbps, (double)r.bitrate);
+		std::vector<double> sc = r.scores;
+		std::sort(sc.begin(), sc.end());
+		const double mean = std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size();
 		if (!t.result_file.empty() && !r.cached) result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
 		if (uploader && !r.result.empty() && (r.video_sha256.empty() || sent_streams.insert(r.group + "|" + r.video_sha256).second)) {
 			UploadItem it;
@@ -729,11 +748,21 @@ int main(int argc, char** argv) {
 			if (!r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) it.video_file = (fs::path(cfg.output_dir) / r.video).string();
 			uploader->add(std::move(it));
 		}
-		r.penalty = std::max(0.0, r.kbps / r.bitrate - 1) * 100 * over_penalty;
-		std::vector<double> sc = r.scores;
-		std::sort(sc.begin(), sc.end());
+		// Only the stream of the best run so far of each group stays. The loser is deleted after its upload (queued above, in order) is done.
+		if (cfg.best_videos && !r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) {
+			const double score = mean - r.penalty;
+			auto [at, fresh] = best_video.emplace(r.group, std::make_pair(&t, score));
+			Task* loser = &t;
+			if (!fresh && score > at->second.second) { loser = at->second.first; at->second = {&t, score}; }
+			if (loser->r.video.size()) {
+				const std::string file = (fs::path(cfg.output_dir) / loser->r.video).string();
+				loser->r.video.clear();
+				if (uploader) { UploadItem rm; rm.remove_file = file; uploader->add(std::move(rm)); }
+				else { std::error_code ec; fs::remove(file, ec); }
+			}
+		}
 		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s  [wave %.1fs: encoder busy %.1f, starved %.1f; decoder backed up %.1f; scorer starved %.1f]", r.tag.c_str(), r.label.c_str(), r.kbps,
-		         std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size(), sc.front(), sc[(size_t)(sc.size() * 0.05)], r.cached ? " (cached)" : "",
+		         mean, sc.front(), sc[(size_t)(sc.size() * 0.05)], r.cached ? " (cached)" : "",
 		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.enc_busy_s, r.enc_starved_s, r.decode_blocked_s, r.score_starved_s);
 		ui::log(line);
 	};

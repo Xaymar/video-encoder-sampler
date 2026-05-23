@@ -15,6 +15,7 @@ struct UploadOptions {
 struct UploadItem {
 	std::string result_file; // the run's result .json
 	std::string video_file;  // its encoded video; empty if none was saved
+	std::string remove_file; // an item with only this deletes the file once everything added before it has been handled
 	std::string label;       // for the messages
 };
 
