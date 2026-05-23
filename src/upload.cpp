@@ -240,11 +240,8 @@ struct Uploader::Impl {
 			if (with_video) video_size = fs::file_size(item.video_file, ec);
 
 			std::string body = "{\"key_sha256\":\"" + sha256_bytes(k->s) + "\"";
-			if (with_video) {
-				body += ",\"video_sha256\":\"" + video_hash + "\"";
-				if (!reference_hash.empty()) body += ",\"reference_sha256\":\"" + reference_hash + "\"";
-				body += ",\"video_size\":" + std::to_string(video_size);
-			}
+			if (!reference_hash.empty()) body += ",\"reference_sha256\":\"" + reference_hash + "\""; // the site wants it for the score as well
+			if (with_video) body += ",\"video_sha256\":\"" + video_hash + "\",\"video_size\":" + std::to_string(video_size);
 			body += "}";
 			const Reply check = site->request(true, "/api/v1/check", "application/json", body.data(), body.size(), 120);
 			if (check.status != 200) { log(who + "check failed (" + Site::why(check) + ")"); problems++; return; }
