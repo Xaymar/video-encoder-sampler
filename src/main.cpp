@@ -78,6 +78,7 @@ struct Config {
 	bool save_videos = true;
 	UploadOptions upload; // where the results go after a sweep; no address: nowhere
 	bool plain = false; // no live display, just lines
+	bool quiet = false; // no line for each run that was ignored because it cannot work with its input (they are still counted at the end)
 	std::string hw_decode = "auto"; // "" software only, "auto", or a device type or decoder name: see set_hw_decode()
 	int decode_threads = 0;  // 0: as many as the cores allow within a memory budget
 	std::string priority = "low"; // "low": idle CPU and lowest disk priority, see priority.h; "normal" leaves the system's default
@@ -308,6 +309,7 @@ Quick run (replaces the encoders and scenarios of the config file)
   -res, --resolution <WxH[,..]>    -fps, --framerate <n[,..]>    --kf <seconds[,..]>
         --option <key=a,b>  an encoder option, can be given more than once; comma separated values are swept
                             and every combination is tested; "null" leaves the option unset
+        -q,   --quiet       do not list each run that is skipped because it cannot work with its input (for example needs --upscale); they are counted at the end
         --upscale           allow encoding above the source's resolution, chroma layout and bit depth
         --pool <name>  --parallel <n>
 
@@ -383,6 +385,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--upload-key") upload_key = value();
 		else if (a == "--no-upload-videos") upload_videos = false;
 		else if (a == "--plain") cfg.plain = true;
+		else if (a == "-q" || a == "--quiet") cfg.quiet = true;
 		else if (a == "--low-memory") cfg.low_memory = true;
 		else if (a == "--decode-threads") cfg.decode_threads = atoi(value().c_str());
 		else if (a == "--hw-decode") cfg.hw_decode = value();
@@ -718,7 +721,7 @@ int main(int argc, char** argv) {
 		Run& r = t.r;
 		ui::overall(++finished, total);
 		char line[1024];
-		if (r.ignored) { snprintf(line, sizeof line, "%s IGNORED  %s: %s", r.tag.c_str(), r.label.c_str(), r.reason.c_str()); ui::log(line); return; }
+		if (r.ignored) { if (!cfg.quiet) { snprintf(line, sizeof line, "%s IGNORED  %s: %s", r.tag.c_str(), r.label.c_str(), r.reason.c_str()); ui::log(line); } return; }
 		if (!t.ok) { snprintf(line, sizeof line, "%s FAILED  %s  (%s, %lld kbps)", r.tag.c_str(), r.label.c_str(), r.input.c_str(), (long long)r.bitrate); ui::log(line); return; }
 		if (!t.result_file.empty() && !r.cached) result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
 		if (uploader && !r.result.empty() && (r.video_sha256.empty() || sent_streams.insert(r.group + "|" + r.video_sha256).second)) {
