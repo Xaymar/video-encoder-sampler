@@ -317,9 +317,12 @@ public:
 		}
 		if (take("max_b_frames", v)) cfg.frameIntervalP = atoi(v.c_str()) + 1;
 		if (take("lookahead_frames", v)) { rc.lookaheadDepth = (uint16_t)atoi(v.c_str()); rc.enableLookahead = rc.lookaheadDepth > 0; }
-		if (take("spatial_aq", v)) rc.enableAQ = atoi(v.c_str()) != 0;
+		if (take("spatial_aq", v)) { // 0 switches it off, 1..15 switches it on with that strength
+			const int n = atoi(v.c_str());
+			rc.enableAQ = n > 0;
+			rc.aqStrength = n > 0 ? n : 0;
+		}
 		if (take("temporal_aq", v)) rc.enableTemporalAQ = atoi(v.c_str()) != 0;
-		if (take("aq_strength", v)) rc.aqStrength = atoi(v.c_str());
 		if (take("b_reference_mode", v)) {
 			NV_ENC_BFRAME_REF_MODE m = v == "each" ? NV_ENC_BFRAME_REF_MODE_EACH : v == "middle" ? NV_ENC_BFRAME_REF_MODE_MIDDLE : NV_ENC_BFRAME_REF_MODE_DISABLED;
 			if (codec == NV_ENC_CODEC_H264_GUID) cfg.encodeCodecConfig.h264Config.useBFramesAsRef = m;

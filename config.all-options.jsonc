@@ -37,9 +37,8 @@
 				"rate_control": ["cbr", "vbr"],   // rate control
 				"max_b_frames": [null, 0, 1, 2, 3, 4],   // B-frames
 				"lookahead_frames": [0, 8, 16, 32],   // frames of lookahead
-				"spatial_aq": [null, 0, 1],
+				"spatial_aq": [null, 0, 1, 8, 15],   // 0 is off, 1..15 is on with that strength
 				"temporal_aq": [null, 0, 1],
-				"aq_strength": [null, 1, 8, 15],   // 1..15
 				"vbv_buffer_size": [0, 500000, 2000000],   // bits; 0 is the encoder's default
 				"vbv_initial_delay": [0, 250000],   // bits
 				"min_qp": [null, 10, 20],   // also switches the minimum QP on
@@ -82,9 +81,8 @@
 				"rate_control": ["cbr", "vbr"],   // rate control
 				"max_b_frames": [null, 0, 1, 2, 3, 4],   // B-frames
 				"lookahead_frames": [0, 8, 16, 32],   // frames of lookahead
-				"spatial_aq": [null, 0, 1],
+				"spatial_aq": [null, 0, 1, 8, 15],   // 0 is off, 1..15 is on with that strength
 				"temporal_aq": [null, 0, 1],
-				"aq_strength": [null, 1, 8, 15],   // 1..15
 				"vbv_buffer_size": [0, 500000, 2000000],   // bits; 0 is the encoder's default
 				"vbv_initial_delay": [0, 250000],   // bits
 				"min_qp": [null, 10, 20],   // also switches the minimum QP on
@@ -127,9 +125,8 @@
 				"rate_control": ["cbr", "vbr"],   // rate control
 				"max_b_frames": [null, 0, 1, 2, 3, 4],   // B-frames
 				"lookahead_frames": [0, 8, 16, 32],   // frames of lookahead
-				"spatial_aq": [null, 0, 1],
+				"spatial_aq": [null, 0, 1, 8, 15],   // 0 is off, 1..15 is on with that strength
 				"temporal_aq": [null, 0, 1],
-				"aq_strength": [null, 1, 8, 15],   // 1..15
 				"vbv_buffer_size": [0, 500000, 2000000],   // bits; 0 is the encoder's default
 				"vbv_initial_delay": [0, 250000],   // bits
 				"min_qp": [null, 10, 20],   // also switches the minimum QP on
