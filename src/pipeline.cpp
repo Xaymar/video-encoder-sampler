@@ -43,16 +43,17 @@ std::string Plan::feed_key() const {
 Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::string& codec, const Options& options, const Shape& want) {
 	Plan pl;
 	auto ignore = [&](std::string why) { pl.ignored = true; pl.reason = std::move(why); return pl; };
+	auto beyond = [&](std::string why) { pl.expected = true; return ignore(std::move(why)); }; // the request is beyond what the input has
 	Shape& enc = pl.enc;
 	enc.w = want.w ? want.w : src.width;
 	enc.h = want.h ? want.h : src.height;
 	enc.fps = want.fps.num ? want.fps : src.framerate;
 	if (!want.upscale && (enc.w > src.width || enc.h > src.height))
-		return ignore("upscaling to " + std::to_string(enc.w) + "x" + std::to_string(enc.h) + " is off for this scenario (source: " + std::to_string(src.width) + "x" + std::to_string(src.height) + ")");
+		return beyond("upscaling to " + std::to_string(enc.w) + "x" + std::to_string(enc.h) + " is off for this scenario (source: " + std::to_string(src.width) + "x" + std::to_string(src.height) + ")");
 	// A source rate is a measurement (119.905 for a 120 fps clip with jittery timestamps), so a request within half a percent of it is the
 	// source's own rate: no frames are dropped, and the encoder is told the rate that was asked for.
 	const bool same_rate = std::fabs(enc.fps.value() / src.framerate.value() - 1) < 0.005;
-	if (!same_rate && compare(enc.fps, src.framerate) > 0) return ignore("frame rate " + std::to_string(enc.fps.value()).substr(0, 6) + " is higher than the source's");
+	if (!same_rate && compare(enc.fps, src.framerate) > 0) return beyond("frame rate " + std::to_string(enc.fps.value()).substr(0, 6) + " is higher than the source's");
 
 	// Encoder input format: "chroma" and "bitdepth" options if given, else the source's, else the closest the encoder takes.
 	// What the config asks for is used as is; what it leaves open follows the source, falling back to the closest thing the
@@ -68,7 +69,7 @@ Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::str
 	}
 	if (!chroma) return ignore(encoder + " cannot encode " + std::to_string(depths[0]) + "-bit " + std::to_string(chromas[0]) + " here");
 	if (!want.upscale && (depth > sf.depth || chroma > sf.chroma))
-		return ignore("upsampling to " + std::to_string(depth) + "-bit " + std::to_string(chroma) + " is off for this scenario (source: " + std::to_string(sf.depth) + "-bit " + std::to_string(sf.chroma) + ")");
+		return beyond("upsampling to " + std::to_string(depth) + "-bit " + std::to_string(chroma) + " is off for this scenario (source: " + std::to_string(sf.depth) + "-bit " + std::to_string(sf.chroma) + ")");
 	// "range": limited (TV) or full (PC) samples for the encoder, whatever the source has; the values are converted, not just tagged, and the
 	// decoded stream is converted back to the source's range for scoring. RGB sources become limited BT.709 unless asked for full.
 	if (auto it = o.find("range"); it != o.end()) {

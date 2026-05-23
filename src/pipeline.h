@@ -46,6 +46,7 @@ bool source_info(const std::string& path, SourceInfo& out); // opens the file on
 // How one run is encoded, worked out from the input's properties alone.
 struct Plan {
 	bool ignored = false; // cannot work with this input or encoder; not an error
+	bool expected = false; // ignored only because the input is smaller than the request (upscaling off, a higher frame rate): known beforehand, so not reported run by run
 	std::string reason;
 	Shape enc;            // resolution, frame rate and pixel format the frames are encoded at
 	Fmt score_fmt;        // both sides are scored in this format
