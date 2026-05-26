@@ -258,6 +258,9 @@ static void load_config(const std::string& path, Config& cfg) {
 	list("encoders", [&](const Json& e) {
 		if (off(e.find("enabled"))) return;
 		Job j;
+		for (auto& [k, v] : e.o)
+			if (k != "enabled" && k != "encoder" && k != "codec" && k != "pool" && k != "parallel" && k != "scenarios" && k != "options")
+				fprintf(stderr, "warning: encoder entry key '%s' is not known and is ignored\n", k.c_str());
 		auto* name = e.find("encoder");
 		if (!name) throw std::runtime_error("encoder entry without 'encoder'");
 		j.encoder = name->text();
