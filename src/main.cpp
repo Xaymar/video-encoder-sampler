@@ -323,7 +323,7 @@ Quick run (replaces the encoders and scenarios of the config file)
         --option <key=a,b>  an encoder option, can be given more than once; comma separated values are swept
                             and every combination is tested; "null" leaves the option unset
         --upscale           allow encoding above the source's resolution, chroma layout and bit depth
-        --pool <name>  --parallel <n>
+        --pool <name>  --parallel <n>   (with a config file, these apply to every encoder entry of it)
 
   -h, --help                this text
   -v, --version
@@ -434,7 +434,14 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		for (auto& sh : sc.shapes) sh.upscale = upscale;
 		cfg.scenarios.push_back(std::move(sc));
 		cfg.jobs.push_back(std::move(job));
-	} else load_config(config_path, cfg);
+	} else {
+		load_config(config_path, cfg);
+		// --parallel and --pool given with a config file override every encoder entry of it.
+		for (auto& j : cfg.jobs) {
+			if (job.parallel > 0) j.parallel = job.parallel;
+			if (!job.pool.empty()) j.pool = job.pool;
+		}
+	}
 	if (!inputs.empty()) { cfg.inputs.clear(); for (auto& i : inputs) add_inputs(cfg, i); }
 	if (output) cfg.output_dir = *output == "off" ? "" : *output;
 	cfg.save_videos = cfg.save_videos && videos;
