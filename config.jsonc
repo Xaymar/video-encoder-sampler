@@ -63,8 +63,10 @@
 		// Running over the target bitrate costs this many VMAF points per percent for a run just over; the cost grows exponentially, as on the website
 		// (2% over loses 0.07, 10% 1.9, 20% 59). The default is about what 3000 -> 6000 kbit/s gains.
 		"over_penalty": 0.025,
-		// Model file, relative to the working directory ("path=..."), or a built-in one ("version=vmaf_v0.6.1").
-		"model": "path=models/vmaf_4k_v0.6.1.json",
+		// Model file, relative to the working directory ("path=..."), or a built-in one ("version=..."), which the libvmaf we ship has none of.
+		// The "neg" models (no enhancement gain) do not reward sharpening or contrast changes; vmaf_4k_v0.6.1neg is meant for 4K viewing,
+		// vmaf_v0.6.1neg for 1080p. models/ also has the plain ones (vmaf_4k_v0.6.1.json, vmaf_v0.6.1.json).
+		"model": "path=models/vmaf_4k_v0.6.1neg.json",
 		// Threads per run being scored; 0 shares all cores between the runs that are scored at the same time.
 		"threads": 0,
 	},

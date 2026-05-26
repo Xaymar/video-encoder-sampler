@@ -20,7 +20,7 @@
 		{ "name": "sample", "bitrates": [4000], "resolutions": ["1920x1080"], "framerates": [30] },
 	],
 	"kfintervals": [2.0],
-	"vmaf": { "model": "path=models/vmaf_v0.6.1.json", "over_penalty": 0.025 },
+	"vmaf": { "model": "path=models/vmaf_v0.6.1neg.json", "over_penalty": 0.025 },
 	"settings": { "cache": "cache" },
 
 	"encoders": [

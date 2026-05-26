@@ -10,7 +10,7 @@
 #include "source.h"
 
 struct VmafOptions {
-	std::string model = "path=models/vmaf_4k_v0.6.1.json"; // "path=<json model>", relative to the working directory, or "version=<builtin>" if libvmaf has it
+	std::string model = "path=models/vmaf_4k_v0.6.1neg.json"; // "path=<json model>", relative to the working directory, or "version=<builtin>" if libvmaf has it
 	int threads = 0; // 0: all cores, shared between the scorers that run at the same time
 };
 

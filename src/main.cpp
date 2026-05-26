@@ -311,7 +311,7 @@ Paths
   -c,   --cache <dir>       finished runs are kept here and not repeated (default: cache); "off" disables it
 
 Scoring
-        --vmaf-model <spec> libvmaf model, e.g. path=models/vmaf_4k_v0.6.1.json
+        --vmaf-model <spec> libvmaf model, e.g. path=models/vmaf_4k_v0.6.1neg.json
         --vmaf-threads <n>
         --over-penalty <p>  VMAF points deducted per percent for a run just over the target bitrate (default: 0.025); it grows exponentially, like the website's
 
