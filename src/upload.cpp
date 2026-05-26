@@ -84,7 +84,7 @@ public:
 
 	// One request. `body` is sent as a POST body when `post` is set. The timeout is generous because the last chunk of a video is answered only
 	// after the server has hashed the whole file.
-	Reply request(bool post, const std::string& path, const char* content_type, const char* data, size_t size, long timeout, Transfer* progress = nullptr) const {
+	Reply request(bool post, const std::string& path, const char* content_type, const char* data, size_t size, long timeout, Transfer* progress = nullptr, const char* method = nullptr) const {
 		Reply r;
 		CURL* c = curl_easy_init();
 		if (!c) { r.error = "cannot start libcurl"; return r; }
@@ -103,6 +103,7 @@ public:
 			curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, on_transfer);
 			curl_easy_setopt(c, CURLOPT_XFERINFODATA, progress);
 		}
+		if (method) curl_easy_setopt(c, CURLOPT_CUSTOMREQUEST, method);
 		if (post) {
 			curl_easy_setopt(c, CURLOPT_POST, 1L);
 			curl_easy_setopt(c, CURLOPT_POSTFIELDS, data);
@@ -191,7 +192,7 @@ struct Uploader::Impl {
 	bool closing = false;
 	std::atomic<bool> disabled{false};                 // the key was refused, the site is out of reach or the account may not upload: the rest is skipped
 	bool announced = false;
-	int scores_new = 0, scores_known = 0, videos_sent = 0, problems = 0, skipped = 0;
+	int scores_new = 0, scores_known = 0, videos_sent = 0, videos_removed = 0, problems = 0, skipped = 0;
 	std::atomic<int> added{0}, handled{0}; // for the count in the live display
 
 	// What /me said, once it has been asked.
@@ -234,6 +235,18 @@ struct Uploader::Impl {
 			const Json* k = result.find("key");
 			if (!k || k->type != Json::Str) throw std::runtime_error("the result file has no key");
 			std::string video_hash = text_of(result, "video_sha256"), reference_hash = text_of(result, "reference_sha256");
+			if (item.drop_video) { // a stream this tool does not keep any more: if the site has it, it goes
+				if (!options.videos || video_hash.empty()) return;
+				const std::string b = "{\"key_sha256\":\"" + sha256_bytes(k->s) + "\",\"video_sha256\":\"" + video_hash + "\"}";
+				const Reply check = site->request(true, "/api/v1/check", "application/json", b.data(), b.size(), 120);
+				const Json* v = check.status == 200 ? check.json.find("video") : nullptr;
+				const std::string run = v && text_of(*v, "status") == "exists" ? text_of(*v, "run") : std::string();
+				if (run.empty()) return;
+				const Reply del = site->request(false, "/api/v1/run/" + run + "/video", nullptr, nullptr, 0, 120, nullptr, "DELETE");
+				if (del.status == 200) { videos_removed++; if (!ui::live()) log(who + "video removed from the site, a better one was found"); }
+				else { log(who + "its video could not be removed from the site (" + Site::why(del) + ")"); problems++; }
+				return;
+			}
 			uint64_t video_size = 0;
 			std::error_code ec;
 			const bool with_video = options.videos && may_videos && !item.video_file.empty() && !video_hash.empty() && fs::exists(item.video_file, ec);
@@ -332,7 +345,7 @@ void Uploader::finish() {
 	impl->cv.notify_all();
 	impl->worker.join();
 	if (!impl->ready) return; // said why in connect(), or nothing was ever queued
-	impl->log("Upload finished: " + std::to_string(impl->scores_new) + " new scores, " + std::to_string(impl->scores_known) + " already known, " + std::to_string(impl->videos_sent) + " videos" +
+	impl->log("Upload finished: " + std::to_string(impl->scores_new) + " new scores, " + std::to_string(impl->scores_known) + " already known, " + std::to_string(impl->videos_sent) + " videos" + (impl->videos_removed ? ", " + std::to_string(impl->videos_removed) + " superseded videos removed" : "") +
 	          (impl->problems ? ", " + std::to_string(impl->problems) + " problems (they are tried again next time)" : ""));
 	for (auto& [what, n] : impl->declined) impl->log("Upload: " + std::to_string(n) + " not sent, " + what);
 }

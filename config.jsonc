@@ -82,7 +82,9 @@
 		// one, each run's result file is kept next to its stream there, and a run whose result file exists is not repeated). "" / false (or
 		// `--cache off`) turns it off.
 		"cache": "cache",
-		"videos": true,        // false: write the result files but not the encoded streams; "best": keep only the best run's stream of each input, encoder, bitrate, key frame interval and size
+		// true / "best": keep only the stream of the best run so far of each input, encoder, bitrate, key frame interval and size (uploaded once the
+		// group is complete; a stream an earlier sweep sent that is beaten now is removed from the site). "all": keep every stream. false: result files only.
+		"videos": "best",
 		// Decode the sources on the GPU when that gives exactly the same frames as software (checked on the first 120 frames):
 		// "auto", false for software only, a device ("cuda", "d3d11va", "d3d12va", "dxva2", "qsv", "amf", "vaapi", "vulkan") or a decoder
 		// ("hevc_cuvid"). The encoded streams that are scored are always decoded in software.

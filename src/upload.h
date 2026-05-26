@@ -15,7 +15,8 @@ struct UploadOptions {
 struct UploadItem {
 	std::string result_file; // the run's result .json
 	std::string video_file;  // its encoded video; empty if none was saved
-	bool late = false;       // the score went out with an earlier item; this one brings the video (not counted as another score)
+	bool drop_video = false; // not an upload: delete this run's video from the site, if it has one (a better stream was found)
+	bool late = false;      // the score went out with an earlier item; this one brings the video (not counted as another score)
 	std::string label;       // for the messages
 };
 

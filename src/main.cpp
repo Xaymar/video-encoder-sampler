@@ -82,7 +82,7 @@ struct Config {
 	std::string cache_dir = "cache"; // finished runs are kept here and not repeated; empty turns it off
 	std::string output_dir = "output"; // encoded streams and result files go here; empty: nothing is written
 	bool save_videos = true;
-	bool best_videos = false; // keep only the stream of the best run so far of each group
+	bool best_videos = true; // keep only the stream of the best run so far of each group
 	UploadOptions upload; // where the results go after a sweep; no address: nowhere
 	bool plain = false; // no live display, just lines
 	std::string hw_decode = "auto"; // "" software only, "auto", or a device type or decoder name: see set_hw_decode()
@@ -246,7 +246,7 @@ static void load_config(const std::string& path, Config& cfg) {
 	}
 	if (auto* v = setting("videos")) {
 		cfg.save_videos = !(v->text() == "0" || v->text() == "false");
-		cfg.best_videos = v->text() == "best";
+		cfg.best_videos = v->text() != "all";
 	}
 	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str()); // where older files have it; it belongs in "vmaf" now
 	if (auto* v = root.find("vmaf")) {
@@ -296,8 +296,9 @@ Paths
                             <dir>/<input>/ (fragmented .mp4) and the result file <dir>/<input>.json;
                             "off" writes nothing
         --no-videos         write the result files but not the encoded streams
-        --best-videos       keep only the stream of the best run so far (highest mean VMAF after the overshoot penalty) of each input, encoder, bitrate,
-                            key frame interval and size; the others are deleted once they are scored; the kept one is uploaded when its group is complete
+        --all-videos        keep every encoded stream. By default only the best run so far (highest mean VMAF after the overshoot penalty) of each input,
+                            encoder, bitrate, key frame interval and size keeps its stream; the others are deleted once they are scored, and the kept
+                            one is uploaded when its group is complete (a stream an earlier sweep sent that is beaten now is removed from the site)
         --upload <url>      after the sweep, upload the results (and videos) to this VES website, e.g. https://ves.example.com ("off" disables it)
         --upload-key <key>  the API key from the website's account page; better in the config ("upload": {"key": ...}) or the VES_API_KEY environment variable
         --no-upload-videos  upload the results but not the encoded videos
@@ -373,7 +374,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	std::optional<std::string> output, cache, model, upload_url, upload_key;
 	std::optional<int> threads;
 	std::optional<double> penalty;
-	bool videos = true, best_videos = false, upload_videos = true, quick = false, upscale = false;
+	bool videos = true, all_videos = false, upload_videos = true, quick = false, upscale = false;
 	Job job;
 	for (int i = 1; i < argc; i++) {
 		std::string a = argv[i], v;
@@ -392,7 +393,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "-i" || a == "--input") inputs.push_back(value());
 		else if (a == "-o" || a == "--output") output = value();
 		else if (a == "--no-videos") videos = false;
-		else if (a == "--best-videos") best_videos = true;
+		else if (a == "--all-videos") all_videos = true;
 		else if (a == "--upload") upload_url = value();
 		else if (a == "--upload-key") upload_key = value();
 		else if (a == "--no-upload-videos") upload_videos = false;
@@ -437,7 +438,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	if (!inputs.empty()) { cfg.inputs.clear(); for (auto& i : inputs) add_inputs(cfg, i); }
 	if (output) cfg.output_dir = *output == "off" ? "" : *output;
 	cfg.save_videos = cfg.save_videos && videos;
-	cfg.best_videos = (cfg.best_videos || best_videos) && cfg.save_videos;
+	cfg.best_videos = cfg.best_videos && !all_videos && cfg.save_videos;
 	if (upload_url) cfg.upload.url = *upload_url == "off" ? "" : *upload_url;
 	if (upload_key) cfg.upload.key = *upload_key;
 	cfg.upload.videos = cfg.upload.videos && upload_videos;
@@ -754,11 +755,20 @@ int main(int argc, char** argv) {
 		if (cfg.best_videos && !r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) {
 			const double score = mean - r.penalty;
 			auto [at, fresh] = best_video.emplace(r.group, std::make_pair(&t, score));
-			Task* loser = &t;
+			Task* loser = fresh ? nullptr : &t;
 			if (!fresh && score > at->second.second) { loser = at->second.first; at->second = {&t, score}; }
-			std::error_code ec;
-			fs::remove(fs::path(cfg.output_dir) / loser->r.video, ec);
-			loser->r.video.clear();
+			if (loser) {
+				std::error_code ec;
+				fs::remove(fs::path(cfg.output_dir) / loser->r.video, ec);
+				loser->r.video.clear();
+				if (uploader && loser->r.cached && !loser->r.result.empty()) { // an earlier sweep may have sent it to the site as its best
+					UploadItem drop;
+					drop.result_file = (fs::path(cfg.output_dir) / loser->r.result).string();
+					drop.label = loser->r.label;
+					drop.drop_video = true;
+					uploader->add(std::move(drop));
+				}
+			}
 		}
 		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s  [wave %.1fs: encoder busy %.1f, starved %.1f; decoder backed up %.1f; scorer starved %.1f]", r.tag.c_str(), r.label.c_str(), r.kbps,
 		         mean, sc.front(), sc[(size_t)(sc.size() * 0.05)], r.cached ? " (cached)" : "",
