@@ -288,6 +288,18 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
 
 } // namespace
 
+bool encode_wave(const std::string& input, const SourceInfo& si, std::vector<EncodeJob*>& jobs, const ScaleOptions& so, RunProgress* feed_rp, FeedResult& fr) {
+	Broadcast bc(jobs.size());
+	for (auto* j : jobs) if (j->rp) j->rp->begin(1, std::max<long long>(1, si.frame_count));
+	std::thread producer([&] { produce(input, si, *jobs[0]->plan, so, bc, fr, feed_rp); });
+	std::vector<std::thread> consumers;
+	for (size_t i = 0; i < jobs.size(); i++) consumers.emplace_back([&, i] { consume(*jobs[i], si, bc.at(i)); });
+	for (auto& c : consumers) c.join();
+	producer.join();
+	for (auto* j : jobs) j->ok = j->ok && fr.ok;
+	return fr.ok;
+}
+
 bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRun*>& runs, const ScaleOptions& so, const VmafOptions& vo, RunProgress* feed_rp, FeedResult& fr) {
 	const size_t n = runs.size();
 	Broadcast bc(n);
@@ -299,7 +311,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 		if (runs[i]->enc.rp) runs[i]->enc.rp->begin(1, std::max<long long>(1, si.frame_count));
 	}
 
-	// Encoding: one decode feeds every encoder.
+	// Encoding: one decode feeds every encoder, as in encode_wave().
 	std::thread producer([&] { produce(input, si, *runs[0]->enc.plan, so, bc, fr, feed_rp); });
 	std::vector<std::thread> threads;
 	for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {

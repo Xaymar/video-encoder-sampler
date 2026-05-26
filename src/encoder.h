@@ -58,6 +58,10 @@ bool amf_supports(const std::string& codec, int chroma, int depth);
 bool qsv_supports(const std::string& codec, int chroma, int depth);
 
 inline bool is_gpu_encoder(const std::string& name) { return name == "nvenc" || name == "amf" || name == "qsv"; }
+// Whether the same configuration always gives the same bytes. SVT-AV1 does not (its multi-threaded rate control races, seen with the stock CLI too),
+// so nothing that compares output bytes across runs can be trusted there.
+inline bool is_deterministic(const std::string& name) { return name != "svtav1"; }
+
 inline bool is_native_encoder(const std::string& name) { return is_gpu_encoder(name) || name == "x264" || name == "x265" || name == "svtav1"; }
 
 inline std::unique_ptr<Encoder> make_encoder(const std::string& name) {
