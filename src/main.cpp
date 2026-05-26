@@ -883,6 +883,12 @@ int main(int argc, char** argv) {
 		if (!by_feed.count(fk)) feed_order.push_back(fk);
 		by_feed[fk].push_back(&t);
 	}
+	// The smallest uncompressed data rate of the encoded format (resolution, frame rate, chroma, bit depth) goes first: the cheap ones finish early.
+	auto raw_rate = [&](const std::string& fk) {
+		const Shape& s = by_feed[fk][0]->plan.enc;
+		return (double)s.w * s.h * s.fps.value() * (s.pix.chroma == 444 ? 3.0 : 1.5) * s.pix.depth;
+	};
+	std::stable_sort(feed_order.begin(), feed_order.end(), [&](const std::string& a, const std::string& b) { return raw_rate(a) < raw_rate(b); });
 	for (auto& fk : feed_order) {
 		std::map<std::string, std::vector<Task*>> by_pool;
 		for (Task* t : by_feed[fk]) by_pool[t->pool].push_back(t);
