@@ -516,6 +516,8 @@ int main(int argc, char** argv) {
 		std::vector<size_t> tasks;
 		std::atomic<size_t> next{0};
 		int parallel = 1;
+		int limit = 0;     // the lowest "parallel" an encoder entry asked for; it beats the defaults of the other entries in the pool
+		int fallback = 1;  // the highest default of the entries that asked for nothing
 		std::string name;
 	};
 	std::vector<Task> tasks;
@@ -582,7 +584,10 @@ int main(int argc, char** argv) {
 				}
 				const std::string pool = !job.pool.empty() ? job.pool : is_gpu_encoder(job.encoder) ? job.encoder + ":" + v.gpu_index : "cpu";
 				v.pool = &pools[pool];
-				v.pool->parallel = std::max(v.pool->parallel, job.parallel ? job.parallel : (is_gpu_encoder(job.encoder) ? 2 : 1));
+				// A "parallel" that is written down wins over the defaults of other entries of the pool (several codecs of one GPU share it).
+				if (job.parallel > 0) v.pool->limit = v.pool->limit ? std::min(v.pool->limit, job.parallel) : job.parallel;
+				else v.pool->fallback = std::max(v.pool->fallback, is_gpu_encoder(job.encoder) ? 2 : 1);
+				v.pool->parallel = v.pool->limit ? v.pool->limit : v.pool->fallback;
 				v.pool->name = pool;
 				out.push_back(std::move(v));
 			}
