@@ -101,9 +101,6 @@ struct FeedResult {
 	bool ok = false;
 };
 
-// Encodes all jobs (which must share a feed key) from one decode of `input`. `feed_rp` shows the decoder's progress.
-bool encode_wave(const std::string& input, const SourceInfo& si, std::vector<EncodeJob*>& jobs, const ScaleOptions& so, RunProgress* feed_rp, FeedResult& fr);
-
 // A run of a wave: its encoder, and the scoring that follows the encoder's output while it is still being written.
 struct WaveRun {
 	EncodeJob enc;

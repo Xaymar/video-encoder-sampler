@@ -62,8 +62,6 @@ struct Job {
 	std::vector<std::string> scenarios; // names of the scenarios this encoder takes part in; empty: all of them
 	int parallel = 0;  // 0: default for the pool (NVENC 2, everything else 1 since CPU encoders use every core)
 	std::vector<Axis> axes;
-	bool prune = true;                 // leave out options that change nothing, found by comparing output bytes
-	std::set<std::string> fixed;       // options that are never left out, and every combination of them is screened on its own (preset, ...)
 };
 
 // One sub-sweep: every combination of its lists is tested with every encoder. Several scenarios let a setup
@@ -257,14 +255,11 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* p = v->find("over_penalty")) over_penalty = atof(p->text().c_str());
 	}
 	auto off = [](const Json* v) { return v && (v->text() == "0" || v->text() == "false"); };
-	const bool default_prune = !off(setting("prune"));
 	list("encoders", [&](const Json& e) {
 		if (off(e.find("enabled"))) return;
 		Job j;
-		j.prune = default_prune && !off(e.find("prune"));
-		if (auto* f = e.find("fixed")) for (auto& x : f->a) j.fixed.insert(x.text());
 		for (auto& [k, v] : e.o)
-			if (k != "enabled" && k != "encoder" && k != "codec" && k != "pool" && k != "parallel" && k != "scenarios" && k != "options" && k != "fixed" && k != "prune")
+			if (k != "enabled" && k != "encoder" && k != "codec" && k != "pool" && k != "parallel" && k != "scenarios" && k != "options")
 				fprintf(stderr, "warning: encoder entry key '%s' is not known and is ignored\n", k.c_str());
 		auto* name = e.find("encoder");
 		if (!name) throw std::runtime_error("encoder entry without 'encoder'");
@@ -330,8 +325,6 @@ Quick run (replaces the encoders and scenarios of the config file)
   -res, --resolution <WxH[,..]>    -fps, --framerate <n[,..]>    --kf <seconds[,..]>
         --option <key=a,b>  an encoder option, can be given more than once; comma separated values are swept
                             and every combination is tested; "null" leaves the option unset
-        --fixed <key[,..]>  options that are never left out when pruning
-        --no-prune          test options even when they change nothing
         --upscale           allow encoding above the source's resolution, chroma layout and bit depth
         --pool <name>  --parallel <n>   (with a config file, these apply to every encoder entry of it)
 
@@ -363,8 +356,6 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 		else if (k == "over.penalty") over_penalty = atof(v.c_str());
 		else if (k == "cache") cfg.cache_dir = v == "off" ? "" : v;
 		else if (k == "output") cfg.output_dir = v;
-		else if (k == "prune") j.prune = v != "off";
-		else if (k == "fixed") { for (auto& x : split(v)) j.fixed.insert(x); }
 		else if (k == "pool") j.pool = v;
 		else if (k == "parallel") j.parallel = atoi(v.c_str());
 		else if (k == "kf") { sc.kfs.clear(); for (auto& x : split(v)) sc.kfs.push_back(atof(x.c_str())); }
@@ -432,8 +423,6 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 			for (auto& x : split(o.substr(eq + 1))) ax.values.push_back(x == "null" ? std::nullopt : std::optional<std::string>(x));
 			job.axes.push_back(std::move(ax));
 		}
-		else if (a == "--fixed") { for (auto& x : split(value())) job.fixed.insert(x); }
-		else if (a == "--no-prune") job.prune = false;
 		else if (a == "--upscale") upscale = true;
 		else if (a == "--pool") job.pool = value();
 		else if (a == "--parallel") job.parallel = atoi(value().c_str());
@@ -484,128 +473,6 @@ static std::string sanitize(std::string s, size_t max = 100) {
 }
 
 
-
-// Which of the swept options change anything. The baseline has every option at its default (unset when its list has a null,
-// else its first value). Options are tested in groups, always moving the whole group away from the baseline: a group whose output
-// bytes stay identical does nothing, so all of it is left out; otherwise the group is split in half and each half is tested again.
-// If both halves do nothing alone but the group does something, its options only matter together and all of them stay.
-// Whatever was left out is then tested again with the options found so far switched on.
-// The encoders are deterministic, so identical bytes mean the options did nothing in this setup. A run that fails counts as a difference.
-using Probe = std::function<std::optional<uint64_t>(const Options&)>; // hash of the output bytes; nullopt when the run failed
-
-static std::vector<Axis> screen(const std::vector<Axis>& axes, const Options& base, const Probe& probe, std::string& dropped) {
-	struct Info { std::optional<std::string> base; std::vector<std::optional<std::string>> alts; };
-	std::vector<Info> info(axes.size());
-	std::vector<size_t> swept;
-	size_t rounds = 0;
-	for (size_t i = 0; i < axes.size(); i++) {
-		auto& v = axes[i].values;
-		if (!v.empty() && std::find(v.begin(), v.end(), std::nullopt) == v.end()) info[i].base = v[0];
-		for (auto& x : v) if (x != info[i].base) info[i].alts.push_back(x);
-		if (!info[i].alts.empty()) { swept.push_back(i); rounds = std::max(rounds, info[i].alts.size()); }
-	}
-	std::map<std::string, std::optional<uint64_t>> seen;
-	auto hash_with = [&](const std::vector<size_t>& set, size_t round) {
-		Options o = base;
-		for (size_t i = 0; i < axes.size(); i++) {
-			const std::optional<std::string>* v = &info[i].base;
-			if (std::find(set.begin(), set.end(), i) != set.end()) v = &info[i].alts[std::min(round, info[i].alts.size() - 1)];
-			if (*v) o[axes[i].key] = **v;
-		}
-		std::string k;
-		for (auto& [a, b] : o) k += a + "=" + b + ";";
-		auto it = seen.find(k);
-		if (it == seen.end()) it = seen.emplace(k, probe(o)).first;
-		return it->second;
-	};
-	if (!hash_with({}, 0)) return axes; // nothing to compare against
-	// Whether moving `set` away from its defaults changes the output, with the options in `ctx` already moved.
-	auto inert = [&](std::vector<size_t> set, const std::vector<size_t>& ctx) {
-		const auto base_set = ctx;
-		set.insert(set.end(), ctx.begin(), ctx.end());
-		for (size_t j = 0; j < rounds; j++) {
-			auto h = hash_with(set, j), h0 = hash_with(base_set, j);
-			if (!h || !h0 || *h != *h0) return false;
-		}
-		return true;
-	};
-	std::function<std::vector<size_t>(const std::vector<size_t>&, const std::vector<size_t>&)> solve =
-	    [&](const std::vector<size_t>& set, const std::vector<size_t>& ctx) -> std::vector<size_t> {
-		if (inert(set, ctx)) return {};
-		if (set.size() == 1) return set;
-		std::vector<size_t> a(set.begin(), set.begin() + set.size() / 2), b(set.begin() + set.size() / 2, set.end());
-		std::vector<size_t> ka = solve(a, ctx), kb = solve(b, ctx);
-		if (ka.empty() && kb.empty()) return set;
-		ka.insert(ka.end(), kb.begin(), kb.end());
-		return ka;
-	};
-	// An option that did nothing next to the defaults may still do something once another one is on (weightb needs b-frames),
-	// so what was left out is tried again with everything found so far moved, until nothing new turns up.
-	std::vector<size_t> keep;
-	for (;;) {
-		std::vector<size_t> rest;
-		for (size_t i : swept) if (std::find(keep.begin(), keep.end(), i) == keep.end()) rest.push_back(i);
-		std::vector<size_t> found = rest.empty() ? rest : solve(rest, keep);
-		if (found.empty()) break;
-		keep.insert(keep.end(), found.begin(), found.end());
-	}
-	std::vector<Axis> out = axes;
-	for (size_t i : swept) {
-		if (std::find(keep.begin(), keep.end(), i) != keep.end()) continue;
-		out[i].values = {info[i].base}; // left out: stays at its default
-		dropped += (dropped.empty() ? "" : ", ") + axes[i].key;
-	}
-	return out;
-}
-
-// The option combinations to run for one input and scenario. Pruning is judged at the scenario's first bitrate, key frame interval
-// and shape, once for every combination of the `fixed` options (preset, ...), since those change what the others do.
-// shortcut: an option that only matters at another bitrate or shape, or only together with one in a different group, can be missed; use prune=off then.
-static std::vector<Options> option_sets(const Config& cfg, const std::string& input, const Job& job, const Scenario& sc) {
-	if (!job.prune || !is_deterministic(job.encoder)) return expand(job.encoder, job.axes);
-	std::vector<Axis> fixed, free;
-	bool any = false;
-	for (auto& ax : job.axes) {
-		const bool pinned = job.fixed.count(ax.key) || ax.key == "gpu"; // gpu does not change the bytes, but is exactly what is being swept
-		(pinned ? fixed : free).push_back(ax);
-		any |= !pinned && ax.values.size() > 1;
-	}
-	if (!any) return expand(job.encoder, job.axes);
-	std::vector<Options> out;
-	for (auto& base : expand(job.encoder, fixed)) {
-		const Probe probe = [&](const Options& o) -> std::optional<uint64_t> {
-			SourceInfo si;
-			if (!source_info(input, si)) return std::nullopt;
-			const Plan pl = make_plan(si, job.encoder, job.codec, o, sc.shapes[0]);
-			if (pl.ignored) return std::nullopt;
-			EncodeJob ej;
-			ej.encoder = job.encoder; ej.codec = job.codec; ej.plan = &pl;
-			ej.bitrate = sc.bitrates[0] * 1000; ej.kf = sc.kfs[0];
-			std::string what = "screening " + job.encoder + "/" + job.codec;
-			for (auto& [k, v] : o) what += " " + k + "=" + v;
-			RunProgress rp, feed;
-			ej.rp = &rp;
-			const int h1 = ui::attach(&rp, what, "prepare"), h2 = ui::attach(&feed, "decode+convert", "prepare");
-			std::vector<EncodeJob*> jobs{&ej};
-			FeedResult fr;
-			encode_wave(input, si, jobs, cfg.scale, &feed, fr);
-			ui::detach(h1);
-			ui::detach(h2);
-			if (!ej.ok) return std::nullopt;
-			return ej.output.hash;
-		};
-		std::string dropped;
-		auto kept = screen(free, base, probe, dropped);
-		if (!dropped.empty()) {
-			std::string ctx;
-			for (auto& [k, v] : base) ctx += " " + k + "=" + v;
-			ui::log("[" + sc.name + "] " + job.encoder + "/" + job.codec + ctx + ": no effect on the output, left out: " + dropped);
-		}
-		auto sets = expand(job.encoder, kept, base);
-		out.insert(out.end(), sets.begin(), sets.end());
-	}
-	return out;
-}
 
 static std::string jq(const std::string& s) { // JSON string
 	std::string o = "\"";
@@ -695,13 +562,13 @@ int main(int argc, char** argv) {
 		const std::string *gpu_json = &NULL_JSON, *caps_json = &NULL_JSON;
 		Pool* pool = nullptr;
 	};
-	std::map<std::tuple<const Job*, const Scenario*, std::string>, std::vector<Variant>> variants;
-	auto variants_of = [&](const std::string& input, const Job& job, const Scenario& sc) -> const std::vector<Variant>& {
-		auto found = variants.find({&job, &sc, input});
+	std::map<std::pair<const Job*, const Scenario*>, std::vector<Variant>> variants;
+	auto variants_of = [&](const Job& job, const Scenario& sc) -> const std::vector<Variant>& {
+		auto found = variants.find({&job, &sc});
 		if (found != variants.end()) return found->second;
-		std::vector<Variant>& out = variants[{&job, &sc, input}];
+		std::vector<Variant>& out = variants[{&job, &sc}];
 		auto axis = [](const std::vector<std::string>& v) { return v.empty() ? std::vector<std::string>{""} : v; }; // "": the source's
-		for (const Options& base : option_sets(cfg, input, job, sc))
+		for (const Options& base : expand(job.encoder, job.axes))
 			for (auto& chroma : axis(sc.chroma)) for (auto& bitdepth : axis(sc.bitdepth)) for (auto& range : axis(sc.range)) {
 				Variant v;
 				v.opts = base;
@@ -750,7 +617,7 @@ int main(int argc, char** argv) {
 			const std::string encoder_label = is_gpu_encoder(job.encoder) ? job.encoder + "/" + job.codec : job.encoder;
 			for (auto& sc : cfg.scenarios) if (takes_part(job, sc)) {
 				ui::log("Preparing " + job.encoder + "/" + job.codec + ", scenario " + (sc.name.empty() ? "(unnamed)" : sc.name) + ", " + file_name(input));
-				const std::vector<Variant>& sets = variants_of(input, job, sc);
+				const std::vector<Variant>& sets = variants_of(job, sc);
 				for (int64_t br : sc.bitrates) for (double kf : sc.kfs) {
 					const std::string kf_text = std::to_string((double)kf).substr(0, std::to_string((double)kf).find('.') + 2);
 					for (auto& shape : sc.shapes) {
@@ -819,7 +686,7 @@ int main(int argc, char** argv) {
 		for (auto& job : cfg.jobs) {
 			size_t runs_here = 0;
 			for (auto& t : tasks) runs_here += t.job == &job;
-			put("  %s%s%s: %zu runs%s\n", job.encoder.c_str(), is_gpu_encoder(job.encoder) ? "/" : "", is_gpu_encoder(job.encoder) ? job.codec.c_str() : "", runs_here, job.prune ? "" : " (pruning off)");
+			put("  %s%s%s: %zu runs\n", job.encoder.c_str(), is_gpu_encoder(job.encoder) ? "/" : "", is_gpu_encoder(job.encoder) ? job.codec.c_str() : "", runs_here);
 		}
 		put("Pools:");
 		for (auto& [name, pl] : pools) put(" %s x%d (%zu runs)", name.c_str(), pl.parallel, pl.tasks.size());
