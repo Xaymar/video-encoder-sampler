@@ -307,9 +307,9 @@ Paths
                             <dir>/<input>/ (fragmented .mp4) and the result file <dir>/<input>.json;
                             "off" writes nothing
         --no-videos         write the result files but not the encoded streams
-        --all-videos        keep every encoded stream. By default only the best run so far (highest mean VMAF after the overshoot penalty) of each input,
-                            encoder, bitrate, key frame interval and size keeps its stream; the others are deleted once they are scored, and the kept
-                            one is uploaded when its group is complete (a stream an earlier sweep sent that is beaten now is removed from the site)
+        --all-videos        keep every encoded stream. By default only the winner (the run that is best in the most frames after the overshoot penalty, as in the ranking) of each input,
+                            encoder, bitrate, key frame interval and size keeps its stream; the others are deleted when the group is complete, and the kept
+                            one is uploaded then (a stream an earlier sweep sent that is beaten now is removed from the site)
         --upload <url>      after the sweep, upload the results (and videos) to this VES website, e.g. https://ves.example.com ("off" disables it)
         --upload-key <key>  the API key from the website's account page; better in the config ("upload": {"key": ...}) or the VES_API_KEY environment variable
         --no-upload-videos  upload the results but not the encoded videos
@@ -761,7 +761,7 @@ int main(int argc, char** argv) {
 		if (up.key.empty()) if (const char* k = getenv("VES_API_KEY")) up.key = k;
 		uploader = std::make_unique<Uploader>(up, [](const std::string& line) { ui::log(line); });
 	}
-	std::map<std::string, std::pair<Task*, double>> best_video; // group -> the run whose stream is kept, and its mean VMAF less the overshoot penalty
+	std::map<std::string, std::vector<Task*>> group_ok; // group -> its runs that were scored, for picking the stream to keep
 	std::map<std::string, int> group_left; // group -> runs not finished yet; its kept stream is uploaded when this reaches 0
 	if (cfg.best_videos) for (auto& t : tasks) group_left[t.r.group]++;
 	auto finish_run = [&](Task& t) {
@@ -783,25 +783,8 @@ int main(int argc, char** argv) {
 			if (!cfg.best_videos && !r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) it.video_file = (fs::path(cfg.output_dir) / r.video).string();
 			uploader->add(std::move(it));
 		}
-		// Only the stream of the best run so far of each group stays; the others are deleted. The kept one is uploaded when the group is complete.
-		if (cfg.best_videos && !r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) {
-			const double score = mean - r.penalty;
-			auto [at, fresh] = best_video.emplace(r.group, std::make_pair(&t, score));
-			Task* loser = fresh ? nullptr : &t;
-			if (!fresh && score > at->second.second) { loser = at->second.first; at->second = {&t, score}; }
-			if (loser) {
-				std::error_code ec;
-				fs::remove(fs::path(cfg.output_dir) / loser->r.video, ec);
-				loser->r.video.clear();
-				if (uploader && loser->r.cached && !loser->r.result.empty()) { // an earlier sweep may have sent it to the site as its best
-					UploadItem drop;
-					drop.result_file = (fs::path(cfg.output_dir) / loser->r.result).string();
-					drop.label = loser->r.label;
-					drop.drop_video = true;
-					uploader->add(std::move(drop));
-				}
-			}
-		}
+		// Only the stream of the group's winner stays, decided when the group is complete (see `finish`).
+		if (cfg.best_videos) group_ok[r.group].push_back(&t);
 		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s  [wave %.1fs: encoder busy %.1f, starved %.1f; decoder backed up %.1f; scorer starved %.1f]", r.tag.c_str(), r.label.c_str(), r.kbps,
 		         mean, sc.front(), sc[(size_t)(sc.size() * 0.05)], r.cached ? " (cached)" : "",
 		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.enc_busy_s, r.enc_starved_s, r.decode_blocked_s, r.score_starved_s);
@@ -811,13 +794,43 @@ int main(int argc, char** argv) {
 		t.done = true;
 		finish_run(t);
 		if (!cfg.best_videos || --group_left[t.r.group] > 0) return;
-		auto kept = best_video.find(t.r.group);
-		if (kept == best_video.end() || !uploader) return;
-		const Run& k = kept->second.first->r;
+		// The group is complete. The winner is ranked as in the summary: the run that is at least as good as all the others (after the overshoot penalty)
+		// in the most frames; ties go to the higher mean. Only runs that still have a stream can keep it.
+		auto& runs_ok = group_ok[t.r.group];
+		const size_t frames = runs_ok.empty() ? 0 : runs_ok.front()->r.scores.size();
+		std::vector<double> top(frames, 0.0);
+		for (Task* x : runs_ok) if (x->r.scores.size() == frames) for (size_t f = 0; f < frames; f++) top[f] = std::max(top[f], x->r.scores[f] - x->r.penalty);
+		Task* kept = nullptr;
+		double kept_share = -1, kept_mean = 0;
+		for (Task* x : runs_ok) {
+			if (x->r.video.empty() || !fs::exists(fs::path(cfg.output_dir) / x->r.video)) continue;
+			size_t best = 0;
+			double sum = 0;
+			for (size_t f = 0; f < x->r.scores.size(); f++) {
+				sum += x->r.scores[f];
+				best += x->r.scores.size() == frames && x->r.scores[f] - x->r.penalty >= top[f] - 1e-6;
+			}
+			const double share = frames ? (double)best / frames : 0, mean = sum / std::max<size_t>(1, x->r.scores.size()) - x->r.penalty;
+			if (share > kept_share || (share == kept_share && mean > kept_mean)) { kept = x; kept_share = share; kept_mean = mean; }
+		}
+		for (Task* x : runs_ok) {
+			if (x == kept || x->r.video.empty()) continue;
+			std::error_code ec;
+			fs::remove(fs::path(cfg.output_dir) / x->r.video, ec);
+			x->r.video.clear();
+			if (uploader && x->r.cached && !x->r.result.empty()) { // an earlier sweep may have sent it to the site as its best
+				UploadItem drop;
+				drop.result_file = (fs::path(cfg.output_dir) / x->r.result).string();
+				drop.label = x->r.label;
+				drop.drop_video = true;
+				uploader->add(std::move(drop));
+			}
+		}
+		if (!kept || !uploader) return;
 		UploadItem it;
-		it.result_file = (fs::path(cfg.output_dir) / k.result).string();
-		it.video_file = (fs::path(cfg.output_dir) / k.video).string();
-		it.label = k.label;
+		it.result_file = (fs::path(cfg.output_dir) / kept->r.result).string();
+		it.video_file = (fs::path(cfg.output_dir) / kept->r.video).string();
+		it.label = kept->r.label;
 		it.late = true;
 		uploader->add(std::move(it));
 	};
