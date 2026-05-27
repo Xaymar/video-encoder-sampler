@@ -21,7 +21,7 @@
 	],
 	"kfintervals": [2.0],
 	"vmaf": { "model": "path=models/vmaf_v0.6.1neg.json", "over_penalty": 0.025 },
-	"settings": { "cache": "cache" },
+	"settings": { "cache": "cache", "prune": true },   // prune: skip the values between an option's lowest and highest when those two score the same; "fixed": [...] on an entry exempts options
 
 	"encoders": [
 		// NVIDIA, H.264. The first block of options is shared by all three codecs; the names are NVENC's own fields (nvEncodeAPI.h), numeric

@@ -10,6 +10,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <list>
 #include <map>
 #include <mutex>
 #include <numeric>
@@ -20,6 +21,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 
 #include "cache.h"
 #include "hash.h"
@@ -62,6 +64,8 @@ struct Job {
 	std::vector<std::string> scenarios; // names of the scenarios this encoder takes part in; empty: all of them
 	int parallel = 0;  // 0: default for the pool (NVENC 2, everything else 1 since CPU encoders use every core)
 	std::vector<Axis> axes;
+	bool prune = true;                 // skip runs of an option that shows no effect (judged on the scores of the runs themselves)
+	std::set<std::string> fixed;       // options that are never pruned
 };
 
 // One sub-sweep: every combination of its lists is tested with every encoder. Several scenarios let a setup
@@ -111,6 +115,7 @@ struct Run {
 	std::string video_sha256; // SHA-256 of the encoded stream
 	std::string result;     // its result file (options, bitrates, per-frame VMAF), relative to the output directory; empty if none
 	std::string tag;        // "[run 12/240]", for the progress lines
+	bool pruned = false;    // not run: an option showed no effect, see reason
 	bool ignored = false;   // incompatible with the input or the encoder, so it was not run
 	bool expected = false;  // because the input is smaller than the request: not reported run by run
 	std::string reason;
@@ -255,11 +260,14 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* p = v->find("over_penalty")) over_penalty = atof(p->text().c_str());
 	}
 	auto off = [](const Json* v) { return v && (v->text() == "0" || v->text() == "false"); };
+	const bool default_prune = !off(setting("prune"));
 	list("encoders", [&](const Json& e) {
 		if (off(e.find("enabled"))) return;
 		Job j;
+		j.prune = default_prune && !off(e.find("prune"));
+		if (auto* f = e.find("fixed")) for (auto& x : f->a) j.fixed.insert(x.text());
 		for (auto& [k, v] : e.o)
-			if (k != "enabled" && k != "encoder" && k != "codec" && k != "pool" && k != "parallel" && k != "scenarios" && k != "options")
+			if (k != "enabled" && k != "encoder" && k != "codec" && k != "pool" && k != "parallel" && k != "scenarios" && k != "options" && k != "fixed" && k != "prune")
 				fprintf(stderr, "warning: encoder entry key '%s' is not known and is ignored\n", k.c_str());
 		auto* name = e.find("encoder");
 		if (!name) throw std::runtime_error("encoder entry without 'encoder'");
@@ -325,6 +333,8 @@ Quick run (replaces the encoders and scenarios of the config file)
   -res, --resolution <WxH[,..]>    -fps, --framerate <n[,..]>    --kf <seconds[,..]>
         --option <key=a,b>  an encoder option, can be given more than once; comma separated values are swept
                             and every combination is tested; "null" leaves the option unset
+        --fixed <key[,..]>  options that are never pruned
+        --no-prune          run every combination even when an option shows no effect
         --upscale           allow encoding above the source's resolution, chroma layout and bit depth
         --pool <name>  --parallel <n>   (with a config file, these apply to every encoder entry of it)
 
@@ -356,6 +366,8 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 		else if (k == "over.penalty") over_penalty = atof(v.c_str());
 		else if (k == "cache") cfg.cache_dir = v == "off" ? "" : v;
 		else if (k == "output") cfg.output_dir = v;
+		else if (k == "prune") j.prune = v != "off";
+		else if (k == "fixed") { for (auto& x : split(v)) j.fixed.insert(x); }
 		else if (k == "pool") j.pool = v;
 		else if (k == "parallel") j.parallel = atoi(v.c_str());
 		else if (k == "kf") { sc.kfs.clear(); for (auto& x : split(v)) sc.kfs.push_back(atof(x.c_str())); }
@@ -423,6 +435,8 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 			for (auto& x : split(o.substr(eq + 1))) ax.values.push_back(x == "null" ? std::nullopt : std::optional<std::string>(x));
 			job.axes.push_back(std::move(ax));
 		}
+		else if (a == "--fixed") { for (auto& x : split(value())) job.fixed.insert(x); }
+		else if (a == "--no-prune") job.prune = false;
 		else if (a == "--upscale") upscale = true;
 		else if (a == "--pool") job.pool = value();
 		else if (a == "--parallel") job.parallel = atoi(value().c_str());
@@ -521,6 +535,8 @@ int main(int argc, char** argv) {
 		std::string key, pool; // what the run's outcome depends on (see cache_key); the pool it counts against
 		std::string result_file; // where its result is kept, and looked for when the same run comes up again; empty: not at all
 		Plan plan;
+		bool done = false;               // finished, however it came about
+		std::vector<int> mid;            // pruning: the lines along which this run is neither the lowest nor the highest value (see `lines`)
 	};
 	struct Pool {
 		std::vector<size_t> tasks;
@@ -752,6 +768,7 @@ int main(int argc, char** argv) {
 		Run& r = t.r;
 		ui::overall(++finished, total);
 		char line[1024];
+		if (r.pruned) { snprintf(line, sizeof line, "%s pruned  %s: %s", r.tag.c_str(), r.label.c_str(), r.reason.c_str()); ui::log(line); return; }
 		if (r.ignored) { if (!r.expected) { snprintf(line, sizeof line, "%s IGNORED  %s: %s", r.tag.c_str(), r.label.c_str(), r.reason.c_str()); ui::log(line); } return; }
 		if (!t.ok) { snprintf(line, sizeof line, "%s FAILED  %s  (%s, %lld kbps)", r.tag.c_str(), r.label.c_str(), r.input.c_str(), (long long)r.bitrate); ui::log(line); return; }
 		r.penalty = over_penalty_points(r.kbps, (double)r.bitrate);
@@ -791,6 +808,7 @@ int main(int argc, char** argv) {
 		ui::log(line);
 	};
 	auto finish = [&](Task& t) {
+		t.done = true;
 		finish_run(t);
 		if (!cfg.best_videos || --group_left[t.r.group] > 0) return;
 		auto kept = best_video.find(t.r.group);
@@ -859,6 +877,77 @@ int main(int argc, char** argv) {
 		uncached[r.input].push_back(i);
 	}
 
+	// Pruning, after encoding: an option that shows no effect is not swept further. Within a group (and with every other option at the same values) the
+	// runs that differ only in one option form a line. Its lowest and its highest value (not counting null) run first; when their scores match on every
+	// frame, the option does nothing there and the values in between (and null) are not run. When they differ, or a probe failed, the line runs in full.
+	// The probes are runs of the sweep itself, with the other options as they actually are, so an option that only matters in some situations
+	// (B-frame settings when B-frames are on) is found where it matters. Cached runs count as probes too.
+	struct Line { Task* lo = nullptr; Task* hi = nullptr; int verdict = 0; std::string axis; }; // verdict: 0 not known yet, 1 has an effect, 2 has none
+	std::vector<Line> lines;
+	{
+		std::unordered_map<std::string, int> line_ids;
+		std::map<const Job*, std::vector<std::tuple<size_t, std::string, std::string>>> samples; // per job: axis, lowest, highest
+		for (auto& t : tasks) {
+			const Job& job = *t.job;
+			if (!job.prune) continue;
+			auto sm = samples.find(&job);
+			if (sm == samples.end()) {
+				sm = samples.emplace(&job, decltype(sm->second){}).first;
+				for (size_t a = 0; a < job.axes.size(); a++) {
+					const Axis& ax = job.axes[a];
+					if (job.fixed.count(ax.key) || ax.key == "gpu" || ax.key == "chroma" || ax.key == "bitdepth" || ax.key == "range") continue;
+					std::vector<std::string> vals;
+					bool numeric = true, has_null = false;
+					for (auto& v : ax.values) {
+						if (!v) { has_null = true; continue; }
+						if (std::find(vals.begin(), vals.end(), *v) != vals.end()) continue;
+						vals.push_back(*v);
+						char* end = nullptr;
+						strtod(v->c_str(), &end);
+						numeric &= !v->empty() && *end == 0;
+					}
+					if (vals.size() < 2 || vals.size() + has_null < 3) continue; // nothing in between to leave out
+					auto less = [](const std::string& x, const std::string& y) { return atof(x.c_str()) < atof(y.c_str()); };
+					if (numeric) sm->second.emplace_back(a, *std::min_element(vals.begin(), vals.end(), less), *std::max_element(vals.begin(), vals.end(), less));
+					else sm->second.emplace_back(a, vals.front(), vals.back()); // not numbers (presets): the order of the list
+				}
+			}
+			for (auto& [a, lo, hi] : sm->second) {
+				const std::string& name = job.axes[a].key;
+				const auto have = t.p.options.find(name);
+				std::string key = std::to_string((uintptr_t)&job) + "|" + t.r.group + "|" + name + "|";
+				for (auto& [k, v] : t.p.options) if (k != name) key += k + "=" + v + ";";
+				auto [at, fresh] = line_ids.emplace(key, (int)lines.size());
+				if (fresh) { lines.emplace_back(); lines.back().axis = name; }
+				Line& L = lines[at->second];
+				if (have != t.p.options.end() && have->second == lo) L.lo = &t;
+				else if (have != t.p.options.end() && have->second == hi) L.hi = &t;
+				else t.mid.push_back(at->second);
+			}
+		}
+	}
+	auto verdict = [&](Line& L) {
+		if (L.verdict) return L.verdict;
+		if (!L.lo || !L.hi) return L.verdict = 1;
+		const int a = L.lo->ok ? 1 : L.lo->done ? 2 : 0, b = L.hi->ok ? 1 : L.hi->done ? 2 : 0; // ran, did not run, still to come
+		if (a == 2 || b == 2) return L.verdict = 1;
+		if (!a || !b) return 0;
+		const Run &x = L.lo->r, &y = L.hi->r;
+		bool same = x.scores.size() == y.scores.size() && std::abs(x.kbps - y.kbps) <= 1e-6 * std::max(1.0, x.kbps);
+		for (size_t f = 0; same && f < x.scores.size(); f++) same = std::abs(x.scores[f] - y.scores[f]) <= 1e-6;
+		return L.verdict = same ? 2 : 1;
+	};
+	// 0: can run now, 1: pruned (`why` says by which option), 2: waits for probes
+	auto prune_state = [&](Task& t, std::string& why) {
+		int state = 0;
+		for (int id : t.mid) {
+			const int v = verdict(lines[id]);
+			if (v == 2) { why = lines[id].axis + " has no effect here: its lowest and highest values scored the same on every frame"; return 1; }
+			if (v == 0) state = 2;
+		}
+		return state;
+	};
+
 	// A wave is the runs that are encoded at the same time from one decode: up to `parallel` of each pool. Each run is scored while it is
 	// being encoded, from the packets as they come out, so a wave is done when its slowest encoder and scorer are.
 	// Encoded packets are muxed to disk as they arrive; scratch files go next to the results if there are any, else in the temp folder.
@@ -900,15 +989,34 @@ int main(int argc, char** argv) {
 	};
 	std::stable_sort(feed_order.begin(), feed_order.end(), [&](const std::string& a, const std::string& b) { return raw_rate(a) < raw_rate(b); });
 	for (auto& fk : feed_order) {
-		std::map<std::string, std::vector<Task*>> by_pool;
-		for (Task* t : by_feed[fk]) by_pool[t->pool].push_back(t);
-		std::map<std::string, size_t> taken;
+		// The runs of a pool in order, each group's probes before the rest of it.
+		std::map<std::string, std::list<Task*>> by_pool;
+		{
+			std::map<std::string, std::vector<Task*>> sorted;
+			std::map<std::string, int> group_at;
+			for (Task* t : by_feed[fk]) { group_at.emplace(t->r.group, (int)group_at.size()); sorted[t->pool].push_back(t); }
+			for (auto& [pool, list] : sorted) {
+				std::stable_sort(list.begin(), list.end(), [&](Task* a, Task* b) { return std::make_pair(group_at[a->r.group], a->mid.size()) < std::make_pair(group_at[b->r.group], b->mid.size()); });
+				by_pool[pool].assign(list.begin(), list.end());
+			}
+		}
 		for (;;) {
 			std::vector<Task*> wave;
 			for (auto& [pool, list] : by_pool) {
-				for (int k = 0; k < pools[pool].parallel && taken[pool] < list.size(); k++) wave.push_back(list[taken[pool]++]);
+				int room = pools[pool].parallel;
+				for (auto it = list.begin(); it != list.end() && room > 0;) {
+					Task& t = **it;
+					std::string why;
+					const int state = prune_state(t, why);
+					if (state == 1) { t.r.pruned = true; t.r.reason = why; it = list.erase(it); finish(t); }
+					else if (state == 0) { wave.push_back(&t); it = list.erase(it); room--; }
+					else ++it;
+				}
 			}
-			if (wave.empty()) break;
+			if (wave.empty()) { // only runs that wait for probes that will never come are left: run them
+				for (auto& [pool, list] : by_pool) if (!list.empty()) { wave.push_back(list.front()); list.pop_front(); }
+				if (wave.empty()) break;
+			}
 			const std::string& input = wave[0]->r.input;
 			const SourceInfo& si = infos.at(input);
 			std::vector<WaveRun> wr(wave.size());
@@ -965,8 +1073,8 @@ int main(int argc, char** argv) {
 
 	// Collect in task order so the ranking below does not depend on which run finished first.
 	std::vector<Run> runs;
-	std::map<std::string, std::vector<std::string>> failed_runs, ignored_runs, group_json; // by input
-	int ignored = 0;
+	std::map<std::string, std::vector<std::string>> failed_runs, ignored_runs, pruned_runs, group_json; // by input
+	int ignored = 0, pruned = 0;
 	std::map<std::string, size_t> first_with; // group and stream hash -> the run that has it
 	int identical = 0;
 	for (auto& t : tasks) {
@@ -979,6 +1087,7 @@ int main(int argc, char** argv) {
 			}
 			runs.push_back(std::move(t.r));
 		}
+		else if (t.r.pruned) { pruned++; pruned_runs[t.r.input].push_back("{\"label\":" + jq(t.r.label) + ",\"reason\":" + jq(t.r.reason) + "}"); }
 		else if (t.r.ignored) { ignored++; ignored_runs[t.r.input].push_back("{\"label\":" + jq(t.r.label) + ",\"reason\":" + jq(t.r.reason) + "}"); }
 		else { failed++; failed_runs[t.r.input].push_back(t.r.label); }
 	}
@@ -1043,6 +1152,8 @@ int main(int argc, char** argv) {
 			for (size_t i = 0; i < failed_runs[input].size(); i++) f << (i ? "," : "") << jq(failed_runs[input][i]);
 			f << "],\"ignored\":[";
 			for (size_t i = 0; i < ignored_runs[input].size(); i++) f << (i ? "," : "") << ignored_runs[input][i];
+			f << "],\"pruned\":[";
+			for (size_t i = 0; i < pruned_runs[input].size(); i++) f << (i ? "," : "") << pruned_runs[input][i];
 			f << "],\"groups\":[";
 			for (size_t i = 0; i < group_json[input].size(); i++) f << (i ? "," : "") << group_json[input][i];
 			f << "]}\n";
@@ -1051,6 +1162,7 @@ int main(int argc, char** argv) {
 		}
 	}
 	printf("\nPeak memory use: %lld MB\n", ui::peak_memory_mb());
+	if (pruned) printf("\n%d runs were not run: an option showed no effect (see \"pruned\" in the result files)\n", pruned);
 	if (ignored) printf("\n%d runs were ignored: they cannot work with the input or the encoder (see the result files)\n", ignored);
 	return failed ? 2 : 0;
 }

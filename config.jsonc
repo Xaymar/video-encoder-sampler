@@ -94,6 +94,10 @@
 		"decode_threads": 0,   // threads per decoder; 0 uses every core
 		"priority": "low",     // "low": idle CPU priority and the lowest disk priority, so ves never slows down other programs; "normal": the system default
 		"low_memory": false,   // true: fewer VMAF and decoder threads, much less memory, a bit slower
+		// An option that shows no effect is not swept further: within a group, for every combination of the other options, the lowest and the highest
+		// value (not null) of a list run first, and when they score the same on every frame the values in between are skipped. Set to false to run
+		// every combination. Per encoder, "fixed" lists options that are never pruned.
+		"prune": true,
 	},
 
 	// ---- Encoders -----------------------------------------------------------------------------------------------------------------
@@ -123,6 +127,8 @@
 			// "scenarios": ["mid", "low"],  // only these scenarios; left out, the encoder takes part in all of them
 			// "pool": "nvenc",              // runs in one pool share a device; at most "parallel" of them run at the same time
 			// "parallel": 2,                // runs of this pool in one wave (default 2 for GPU encoders, 1 for the CPU ones)
+			// "fixed": ["preset"],          // options of this encoder that are never pruned
+			// "prune": false,               // this encoder only: run every combination
 		},
 		{
 			"enabled": false,
