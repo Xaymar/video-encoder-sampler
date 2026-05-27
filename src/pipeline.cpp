@@ -296,7 +296,10 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 		packets.push_back(std::make_unique<PacketQueue>());
 		PacketQueue* pq = packets.back().get();
 		runs[i]->enc.tee = [pq](const uint8_t* d, size_t size) { return pq->push(d, size); };
-		if (runs[i]->enc.rp) runs[i]->enc.rp->begin(1, std::max<long long>(1, si.frame_count));
+		if (runs[i]->enc.rp) { // frames the encoder gets: fewer than the source's when the frame rate is lowered
+			const Plan& pl = *runs[i]->enc.plan;
+			runs[i]->enc.rp->begin(1, pl.convert_rate ? std::max<long long>(1, std::llround(si.duration * pl.enc.fps.value())) : std::max<long long>(1, si.frame_count));
+		}
 	}
 
 	// Encoding: one decode feeds every encoder.
