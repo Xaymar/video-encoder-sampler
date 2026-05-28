@@ -145,7 +145,7 @@ Row make_row(const Entry& e) {
 	const std::string enc = e.pool.substr(0, e.pool.find(':'));
 	if (!enc.empty() && label.compare(0, enc.size() + 1, enc + "/") == 0) label.erase(0, enc.size() + 1);
 	const std::string stage = names[st >= 0 && st < 6 ? st : 0];
-	r.task = label.compare(0, stage.size(), stage) == 0 ? label : stage + " " + label; // some labels already begin with it (decode+convert ..)
+	r.task = label.find(stage) != std::string::npos ? label : stage + " " + label; // some labels already begin with it (decode+convert ..)
 	r.fraction = total > 0 ? (double)done / total : 0;
 	char b[32];
 	if (st == 4 || st == 5) snprintf(b, sizeof b, "%.1f MB/s", done / secs / 1048576.0);
