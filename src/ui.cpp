@@ -122,7 +122,7 @@ std::string bar(double fraction, int width) {
 	std::string o = repeat("\xE2\x96\x88", full);
 	int used = full;
 	if (eighths % 8 && used < width) { o += part[eighths % 8]; used++; }
-	return o + repeat("\xE2\x96\x91", width - used);
+	return o + repeat("\xC2\xB7", width - used);
 }
 
 // What a run in flight shows: its group, task, speed, status and how far it is.
