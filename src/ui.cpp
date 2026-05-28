@@ -125,9 +125,9 @@ std::string bar(double fraction, int width) {
 	return o + repeat("\xC2\xB7", width - used);
 }
 
-// What a run in flight shows: its group, task, speed, status and how far it is.
+// What a run in flight shows: its task, speed, status and how far it is.
 struct Row {
-	std::string group, task, speed, status;
+	std::string task, speed, status;
 	double fraction = 0;
 };
 
@@ -139,11 +139,7 @@ Row make_row(const Entry& e) {
 	const int64_t end = e.p->end_ms;
 	const double secs = std::max(0.001, ((end ? end : now_ms()) - e.p->since_ms) / 1000.0);
 	Row r;
-	r.group = e.pool;
-	// The label starts with the encoder (and its codec), which the group already says.
-	std::string label = e.label;
-	const std::string enc = e.pool.substr(0, e.pool.find(':'));
-	if (!enc.empty() && label.compare(0, enc.size() + 1, enc + "/") == 0) label.erase(0, enc.size() + 1);
+	const std::string& label = e.label;
 	const std::string stage = names[st >= 0 && st < 6 ? st : 0];
 	r.task = label.find(stage) != std::string::npos ? label : stage + " " + label; // some labels already begin with it (decode+convert ..)
 	r.fraction = total > 0 ? (double)done / total : 0;
@@ -189,21 +185,18 @@ void render() {
 	size_t hidden = 0;
 	if (rows.size() > room) { hidden = rows.size() - (room - 1); rows.resize(room - 1); }
 
-	int group_w = 5, speed_w = 8, status_w = 9;
-	for (auto& r : rows) { group_w = std::max(group_w, cells(r.group)); speed_w = std::max(speed_w, cells(r.speed)); }
-	group_w = std::min(group_w, 14);
-	bool show_group = true, show_speed = true;
+	int speed_w = 8, status_w = 9;
+	for (auto& r : rows) speed_w = std::max(speed_w, cells(r.speed));
+	bool show_speed = true;
 	// Each column costs its width, two spaces of padding and a border; the frame has one more border at the end.
-	auto fixed = [&] { return 1 + (show_group ? group_w + 3 : 0) + (show_speed ? speed_w + 3 : 0) + status_w + 3 + 3 + 3; }; // + task and bar paddings and borders
+	auto fixed = [&] { return 1 + (show_speed ? speed_w + 3 : 0) + status_w + 3 + 3 + 3; }; // + task and bar paddings and borders
 	if (width - fixed() < 30) show_speed = false;
-	if (width - fixed() < 30) show_group = false;
 	const int rest = std::max(10, width - fixed());
 	const int bar_w = std::max(4, std::min(40, rest * 2 / 5));
 	const int task_w = std::max(4, rest - bar_w);
 
 	struct Col { std::string name; int w; bool right; };
 	std::vector<Col> cols;
-	if (show_group) cols.push_back({"Group", group_w, false});
 	cols.push_back({"Task", task_w, false});
 	if (show_speed) cols.push_back({"Speed", speed_w, true});
 	cols.push_back({"Status", status_w, false});
@@ -234,7 +227,6 @@ void render() {
 	int lines = 3;
 	for (auto& r : rows) {
 		std::vector<std::string> c;
-		if (show_group) c.push_back(pad(r.group, group_w));
 		c.push_back(pad(r.task, task_w));
 		if (show_speed) c.push_back(pad(r.speed, speed_w, true));
 		c.push_back(pad(r.status, status_w));
