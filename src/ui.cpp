@@ -10,6 +10,7 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #ifdef _WIN32
 #include <io.h>
@@ -46,6 +47,9 @@ bool is_live = false, running = false;
 Clock::time_point t0;
 std::thread renderer, stderr_reader;
 int saved_stderr = -1, pipe_read = -1;
+#ifdef _WIN32
+unsigned saved_code_page = 0;
+#endif
 
 std::string span(double sec) {
 	char b[32];
@@ -79,59 +83,173 @@ int console_height() {
 }
 #endif
 
-std::string fit(std::string s, int width) {
-	if ((int)s.size() > width) s.resize(width);
-	return s;
+// Text is UTF-8 and the frame is drawn with box characters; widths count code points (labels are ASCII apart from file names).
+int cells(const std::string& s) {
+	int n = 0;
+	for (unsigned char c : s) n += (c & 0xC0) != 0x80;
+	return n;
 }
 
-// One line per run in flight.
-std::string run_line(const Entry& e, int width) {
-	static const char* names[] = {"wait ", "encode", "score ", "decode"};
+// The first `width` characters of s, ending in an ellipsis when something was cut.
+std::string cut(const std::string& s, int width) {
+	if (width <= 0) return "";
+	if (cells(s) <= width) return s;
+	int n = 0;
+	size_t i = 0;
+	for (; i < s.size(); i++) {
+		if (((unsigned char)s[i] & 0xC0) != 0x80 && n++ == width - 1) break;
+	}
+	return s.substr(0, i) + "\xE2\x80\xA6";
+}
+
+std::string pad(const std::string& s, int width, bool right = false) {
+	std::string t = cut(s, width);
+	const std::string fill(std::max(0, width - cells(t)), ' ');
+	return right ? fill + t : t + fill;
+}
+
+std::string repeat(const char* s, int n) {
+	std::string o;
+	for (int i = 0; i < n; i++) o += s;
+	return o;
+}
+
+// A bar of `width` cells, filled in eighths of a cell.
+std::string bar(double fraction, int width) {
+	static const char* part[] = {"", "\xE2\x96\x8F", "\xE2\x96\x8E", "\xE2\x96\x8D", "\xE2\x96\x8C", "\xE2\x96\x8B", "\xE2\x96\x8A", "\xE2\x96\x89"};
+	const int eighths = (int)(std::min(1.0, std::max(0.0, fraction)) * width * 8);
+	const int full = eighths / 8;
+	std::string o = repeat("\xE2\x96\x88", full);
+	int used = full;
+	if (eighths % 8 && used < width) { o += part[eighths % 8]; used++; }
+	return o + repeat("\xE2\x96\x91", width - used);
+}
+
+// What a run in flight shows: its group, task, speed, status and how far it is.
+struct Row {
+	std::string group, task, speed, status;
+	double fraction = 0;
+};
+
+Row make_row(const Entry& e) {
+	static const char* names[] = {"wait", "encode", "score", "decode", "upload", "download"};
+	static const char* waits[] = {"working", "starved", "backed up"};
 	const int st = e.p->stage;
 	const long long done = e.p->done, total = e.p->total;
 	const int64_t end = e.p->end_ms;
 	const double secs = std::max(0.001, ((end ? end : now_ms()) - e.p->since_ms) / 1000.0);
-	char head[96];
-	const int pct = total > 0 ? (int)std::min<long long>(100, done * 100 / total) : 0;
-	std::string bar(20, '-');
-	for (int i = 0; i < pct / 5; i++) bar[i] = '#';
-	if (st == 4 || st == 5) { // an upload or a download: bytes moved, and the rate since it began
-		const double mb = 1048576.0;
-		snprintf(head, sizeof head, "%-9.9s %-8s [%s] %3d%% %7.1f/%-7.1f MB %6.2f MB/s ", e.pool.c_str(), st == 4 ? "upload" : "download", bar.c_str(), pct, done / mb, total / mb, done / secs / mb);
-		return fit(head + e.label, width);
-	}
-	static const char* waits[] = {"", "starved", "backed up"};
+	Row r;
+	r.group = e.pool;
+	// The label starts with the encoder (and its codec), which the group already says.
+	std::string label = e.label;
+	const std::string enc = e.pool.substr(0, e.pool.find(':'));
+	if (!enc.empty() && label.compare(0, enc.size() + 1, enc + "/") == 0) label.erase(0, enc.size() + 1);
+	const std::string stage = names[st >= 0 && st < 6 ? st : 0];
+	r.task = label.compare(0, stage.size(), stage) == 0 ? label : stage + " " + label; // some labels already begin with it (decode+convert ..)
+	r.fraction = total > 0 ? (double)done / total : 0;
+	char b[32];
+	if (st == 4 || st == 5) snprintf(b, sizeof b, "%.1f MB/s", done / secs / 1048576.0);
+	else snprintf(b, sizeof b, "%.1f fps", done / secs);
+	r.speed = b;
 	const int ws = e.p->state;
-	snprintf(head, sizeof head, "%-9.9s %-6s [%s] %3d%% %5lld/%-5lld %6.1f fps %-9s ", e.pool.c_str(), names[st >= 0 && st < 4 ? st : 0], bar.c_str(), pct, done, total, done / secs, end ? "done" : waits[ws >= 0 && ws < 3 ? ws : 0]);
-	return fit(head + e.label, width);
+	r.status = end ? "done" : st == 0 ? "waiting" : waits[ws >= 0 && ws < 3 ? ws : 0];
+	return r;
 }
 
+// The live area: a frame with the overall progress in its top border and one row per run in flight. It takes the width of the terminal: the
+// task column and the bar share what the fixed columns leave, and columns drop out when the terminal is too narrow for them.
 void render() {
+	const int term_w = console_width(), term_h = console_height();
+	static int last_w = 0;
 	std::string out;
-	if (live_lines) out += "\x1b[" + std::to_string(live_lines) + "A";
+	if (live_lines) {
+		// Narrowing the window re-wraps the old frame into more rows than it had.
+		int rows = live_lines;
+		if (last_w && term_w < last_w) rows = std::min(term_h - 1, rows * ((last_w + term_w - 1) / term_w));
+		out += "\x1b[" + std::to_string(rows) + "A";
+	}
+	last_w = term_w;
 	out += "\r\x1b[J";
 	for (auto& l : pending) out += l + "\n";
 	pending.clear();
-	const int width = console_width() - 1;
+	const int width = term_w - 1;
+
 	const double elapsed = std::chrono::duration<double>(Clock::now() - t0).count();
 	char head[160];
-	if (runs_total > 0 && runs_done >= runs_total) {
-		snprintf(head, sizeof head, "ves  %d/%d runs finished  %s elapsed", runs_done, runs_total, span(elapsed).c_str());
-	} else if (runs_total > 0) {
-		snprintf(head, sizeof head, "ves  %d/%d runs finished  %s elapsed  ~%s left", runs_done, runs_total, span(elapsed).c_str(),
-		         runs_done ? span(elapsed / runs_done * (runs_total - runs_done)).c_str() : "?");
-	} else snprintf(head, sizeof head, "ves  preparing  %s elapsed", span(elapsed).c_str());
-	std::string top = head;
-	if (uploads_total > 0) top += "  |  uploads " + std::to_string(uploads_done) + "/" + std::to_string(uploads_total);
-	out += fit(top, width) + "\x1b[K\n";
-	int lines = 1;
-	const int room = console_height() - 3;
-	for (auto& [h, e] : entries) {
-		if (lines > room) break;
-		out += run_line(e, width) + "\x1b[K\n";
+	if (runs_total > 0 && runs_done >= runs_total) snprintf(head, sizeof head, "ves  %d/%d runs finished  %s elapsed", runs_done, runs_total, span(elapsed).c_str());
+	else if (runs_total > 0) snprintf(head, sizeof head, "ves  %d/%d runs finished  %s elapsed  ~%s left", runs_done, runs_total, span(elapsed).c_str(), runs_done ? span(elapsed / runs_done * (runs_total - runs_done)).c_str() : "?");
+	else snprintf(head, sizeof head, "ves  preparing  %s elapsed", span(elapsed).c_str());
+	std::string title = head;
+	if (uploads_total > 0) title += "  |  uploads " + std::to_string(uploads_done) + "/" + std::to_string(uploads_total);
+
+	std::vector<Row> rows;
+	for (auto& [h, e] : entries) rows.push_back(make_row(e));
+	// Rows that fit: the frame has a top border, a header, a rule and a bottom border around them.
+	const size_t room = (size_t)std::max(1, term_h - 6);
+	size_t hidden = 0;
+	if (rows.size() > room) { hidden = rows.size() - (room - 1); rows.resize(room - 1); }
+
+	int group_w = 5, speed_w = 8, status_w = 9;
+	for (auto& r : rows) { group_w = std::max(group_w, cells(r.group)); speed_w = std::max(speed_w, cells(r.speed)); }
+	group_w = std::min(group_w, 14);
+	bool show_group = true, show_speed = true;
+	// Each column costs its width, two spaces of padding and a border; the frame has one more border at the end.
+	auto fixed = [&] { return 1 + (show_group ? group_w + 3 : 0) + (show_speed ? speed_w + 3 : 0) + status_w + 3 + 3 + 3; }; // + task and bar paddings and borders
+	if (width - fixed() < 30) show_speed = false;
+	if (width - fixed() < 30) show_group = false;
+	const int rest = std::max(10, width - fixed());
+	const int bar_w = std::max(4, std::min(40, rest * 2 / 5));
+	const int task_w = std::max(4, rest - bar_w);
+
+	struct Col { std::string name; int w; bool right; };
+	std::vector<Col> cols;
+	if (show_group) cols.push_back({"Group", group_w, false});
+	cols.push_back({"Task", task_w, false});
+	if (show_speed) cols.push_back({"Speed", speed_w, true});
+	cols.push_back({"Status", status_w, false});
+	cols.push_back({"Progress", bar_w, false});
+
+	// Top border with the title in it.
+	int total_w = 1;
+	for (auto& c : cols) total_w += c.w + 3;
+	const std::string title_cut = cut(title, std::max(1, total_w - 6));
+	std::string top = "\xE2\x94\x8C\xE2\x94\x80 " + title_cut + " " + repeat("\xE2\x94\x80", std::max(0, total_w - 5 - cells(title_cut))) + "\xE2\x94\x90";
+	auto rule = [&](const char* l, const char* mid, const char* r) {
+		std::string o = l;
+		for (size_t i = 0; i < cols.size(); i++) o += repeat("\xE2\x94\x80", cols[i].w + 2) + (i + 1 < cols.size() ? mid : r);
+		return o;
+	};
+	auto line = [&](const std::vector<std::string>& cells_) {
+		std::string o = "\xE2\x94\x82";
+		for (size_t i = 0; i < cols.size(); i++) o += " " + cells_[i] + " \xE2\x94\x82";
+		return o;
+	};
+	out += top + "\x1b[K\n";
+	{
+		std::vector<std::string> h;
+		for (auto& c : cols) h.push_back(pad(c.name, c.w, c.right));
+		out += line(h) + "\x1b[K\n";
+	}
+	out += rule("\xE2\x94\x9C", "\xE2\x94\xBC", "\xE2\x94\xA4") + "\x1b[K\n";
+	int lines = 3;
+	for (auto& r : rows) {
+		std::vector<std::string> c;
+		if (show_group) c.push_back(pad(r.group, group_w));
+		c.push_back(pad(r.task, task_w));
+		if (show_speed) c.push_back(pad(r.speed, speed_w, true));
+		c.push_back(pad(r.status, status_w));
+		c.push_back(bar(r.fraction, bar_w));
+		out += line(c) + "\x1b[K\n";
 		lines++;
 	}
-	live_lines = lines;
+	if (hidden) {
+		std::vector<std::string> c(cols.size());
+		for (size_t i = 0; i < cols.size(); i++) c[i] = pad(cols[i].name == "Task" ? "+" + std::to_string(hidden) + " more" : "", cols[i].w);
+		out += line(c) + "\x1b[K\n";
+		lines++;
+	}
+	out += rule("\xE2\x94\x94", "\xE2\x94\xB4", "\xE2\x94\x98") + "\x1b[K\n";
+	live_lines = lines + 1;
 	fwrite(out.data(), 1, out.size(), stdout);
 	fflush(stdout);
 }
@@ -212,6 +330,10 @@ void start(bool plain) {
 #endif
 	if (!plain && terminal) {
 		is_live = true;
+#ifdef _WIN32
+		saved_code_page = GetConsoleOutputCP();
+		SetConsoleOutputCP(CP_UTF8); // the frame is drawn with box characters
+#endif
 		capture_stderr();
 	}
 	renderer = std::thread(render_loop);
@@ -239,6 +361,9 @@ void stop() {
 			m.lock();
 		}
 		is_live = false;
+#ifdef _WIN32
+		if (saved_code_page) SetConsoleOutputCP(saved_code_page);
+#endif
 	}
 }
 
