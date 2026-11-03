@@ -34,7 +34,7 @@ namespace fs = std::filesystem;
 namespace {
 
 enum : uint8_t { M_HELLO = 1, M_JOB = 2, M_NEED = 3, M_FILE_DATA = 4, M_FILE_END = 5, M_RESULT = 6, M_DONE = 7 };
-constexpr int kVersion = 2;
+constexpr int kVersion = 3;
 constexpr size_t kChunk = 1 << 20;
 constexpr int kTries = 3;
 
@@ -96,6 +96,7 @@ struct Worker {
 	std::string name;
 	std::vector<Gpu> gpus;
 	std::set<std::string> inputs; // inputs it has been sent
+	int slots = 1;                // jobs it runs at the same time
 };
 
 } // namespace
@@ -174,7 +175,21 @@ struct RemoteHost::Impl {
 		return false;
 	}
 
-	void serve(std::unique_ptr<net::Conn> conn) {
+	// Ids travel as 4 big-endian bytes in front of the binary messages.
+	static std::string id_bytes(size_t id) {
+		std::string s(4, '\0');
+		for (int i = 0; i < 4; i++) s[(size_t)i] = (char)((id >> (24 - 8 * i)) & 255);
+		return s;
+	}
+	static size_t id_of(const std::string& payload) {
+		size_t id = 0;
+		for (int i = 0; i < 4 && (size_t)i < payload.size(); i++) id = (id << 8) | (uint8_t)payload[(size_t)i];
+		return id;
+	}
+
+	// One worker's connection: a dispatcher thread keeps it supplied with up to `slots` jobs at a time while this thread reads what comes back.
+	void serve(std::unique_ptr<net::Conn> conn_in) {
+		std::shared_ptr<net::Conn> conn = std::move(conn_in);
 		uint8_t type;
 		std::string payload;
 		auto worker = std::make_shared<Worker>();
@@ -185,6 +200,7 @@ struct RemoteHost::Impl {
 			if (auto* t = hello.find("token"); (t ? t->text() : std::string()) != opt.token) { log("worker " + who + " refused: wrong token"); return; }
 			if (auto* v = hello.find("version"); !v || atoi(v->text().c_str()) != kVersion) { log("worker " + who + " refused: other protocol version"); return; }
 			if (auto* n = hello.find("name")) worker->name = n->text();
+			if (auto* s = hello.find("slots")) worker->slots = std::max(1, atoi(s->text().c_str()));
 			if (auto* gs = hello.find("gpus")) {
 				for (auto& g : gs->a) {
 					Gpu gpu;
@@ -207,82 +223,112 @@ struct RemoteHost::Impl {
 		cv.notify_all();
 		std::string gpus_text;
 		for (auto& g : worker->gpus) gpus_text += (gpus_text.empty() ? "" : "; ") + g.encoder + " " + std::to_string(g.index) + ": " + g.description;
-		log("worker " + who + " connected" + (gpus_text.empty() ? "" : ", GPUs: " + gpus_text));
+		log("worker " + who + " connected, " + std::to_string(worker->slots) + " job" + (worker->slots == 1 ? "" : "s") + " at a time" + (gpus_text.empty() ? "" : ", GPUs: " + gpus_text));
 
-		for (;;) {
-			size_t id = 0;
-			int gpu = -1;
-			{
-				std::unique_lock lock(m);
-				cv.wait(lock, [&] { return stop || next_job(*worker, id, gpu); });
-				if (stop) break;
-				tries[id]++;
-			}
-			const RemoteJobSpec& job = (*jobs)[id];
-			bool ok = false;
-			size_t stored = 0;
-			try {
-				std::string sha, size = "0";
-				if (!is_url(job.input)) { sha = input_sha(job.input); size = std::to_string(fs::file_size(job.input)); }
-				std::string config = job.config;
-				for (size_t at; (at = config.find("@GPU@")) != std::string::npos;) config.replace(at, 5, std::to_string(std::max(gpu, 0)));
-				std::string msg = "{\"id\":" + std::to_string(id) + ",\"name\":" + jq(job.name) + ",\"config\":" + jq(config) + ",\"input\":{\"url\":" + (is_url(job.input) ? "true" : "false") +
-				                  ",\"name\":" + jq(is_url(job.input) ? job.input : fs::path(job.input).filename().string()) + ",\"sha256\":" + jq(sha) + ",\"size\":" + size + "}}";
-				log("job " + job.name + " -> " + who + (job.model.empty() ? "" : " on " + job.model));
-				if (!conn->send_msg(M_JOB, msg)) throw std::runtime_error("connection lost");
-				std::string log_tail;
-				for (;;) {
-					if (!conn->recv_msg(type, payload)) throw std::runtime_error("connection lost");
-					if (type == M_NEED) {
-						{
-							std::lock_guard lock(m);
-							worker->inputs.insert(job.input);
-						}
-						std::ifstream f(job.input, std::ios::binary);
-						std::string chunk(kChunk, '\0');
-						while (f) {
-							f.read(chunk.data(), (std::streamsize)kChunk);
-							const size_t n = (size_t)f.gcount();
-							if (n && !conn->send_msg(M_FILE_DATA, chunk.substr(0, n))) throw std::runtime_error("connection lost");
-						}
-						if (!conn->send_msg(M_FILE_END, "")) throw std::runtime_error("connection lost");
-					} else if (type == M_RESULT) {
-						if (payload.size() < 2) continue;
-						const size_t nl = (uint8_t)payload[0] | ((uint8_t)payload[1] << 8);
-						if (payload.size() < 2 + nl) continue;
-						const std::string name = fs::path(payload.substr(2, nl)).filename().string();
-						if (import_result(job, name, payload.substr(2 + nl))) stored++;
-					} else if (type == M_DONE) {
-						Json d = Json::parse(payload);
-						ok = d.find("ok") && flag_set(d.find("ok")->text());
-						if (auto* l = d.find("log")) log_tail = l->text();
-						break;
-					}
+		struct Active { size_t stored = 0; };
+		std::map<size_t, Active> active; // jobs this worker has now, guarded by m
+		std::mutex send_m;
+		std::atomic<bool> dead{false};
+		auto send = [&](uint8_t t, const std::string& p) {
+			std::lock_guard lock(send_m);
+			return conn->send_msg(t, p);
+		};
+		std::vector<std::thread> senders; // input transfers
+
+		std::thread dispatcher([&] {
+			for (;;) {
+				size_t id = 0;
+				int gpu = -1;
+				{
+					std::unique_lock lock(m);
+					cv.wait(lock, [&] { return stop || dead || ((int)active.size() < worker->slots && next_job(*worker, id, gpu)); });
+					if (stop || dead) return;
+					tries[id]++;
+					active[id] = Active{};
+					worker->inputs.insert((*jobs)[id].input); // it is about to get this one
 				}
+				try {
+					const RemoteJobSpec& job = (*jobs)[id];
+					std::string sha, size = "0";
+					if (!is_url(job.input)) { sha = input_sha(job.input); size = std::to_string(fs::file_size(job.input)); }
+					std::string config = job.config;
+					for (size_t at; (at = config.find("@GPU@")) != std::string::npos;) config.replace(at, 5, std::to_string(std::max(gpu, 0)));
+					const std::string msg = "{\"id\":" + std::to_string(id) + ",\"name\":" + jq(job.name) + ",\"config\":" + jq(config) + ",\"input\":{\"url\":" + (is_url(job.input) ? "true" : "false") +
+					                        ",\"name\":" + jq(is_url(job.input) ? job.input : fs::path(job.input).filename().string()) + ",\"sha256\":" + jq(sha) + ",\"size\":" + size + "}}";
+					log("job " + job.name + " -> " + who + (job.model.empty() ? "" : " on " + job.model));
+					if (!send(M_JOB, msg)) throw std::runtime_error("connection lost");
+				} catch (const std::exception&) {
+					dead = true; // the reader notices the lost connection and gives the jobs back
+					return;
+				}
+			}
+		});
+
+		while (conn->recv_msg(type, payload)) {
+			if (type == M_NEED) {
+				const size_t id = id_of(payload);
+				senders.emplace_back([&, id] {
+					const std::string path = (*jobs)[id].input;
+					std::ifstream f(path, std::ios::binary);
+					std::string chunk(kChunk, '\0');
+					while (f) {
+						f.read(chunk.data(), (std::streamsize)kChunk);
+						const size_t n = (size_t)f.gcount();
+						if (n && !send(M_FILE_DATA, id_bytes(id) + chunk.substr(0, n))) return;
+					}
+					send(M_FILE_END, id_bytes(id));
+				});
+			} else if (type == M_RESULT) {
+				if (payload.size() < 6) continue;
+				const size_t id = id_of(payload);
+				const size_t nl = (uint8_t)payload[4] | ((uint8_t)payload[5] << 8);
+				if (payload.size() < 6 + nl) continue;
+				const std::string name = fs::path(payload.substr(6, nl)).filename().string();
+				if (id < jobs->size() && import_result((*jobs)[id], name, payload.substr(6 + nl))) {
+					std::lock_guard lock(m);
+					active[id].stored++;
+				}
+			} else if (type == M_DONE) {
+				bool ok = false;
+				std::string log_tail;
+				size_t id = 0;
+				try {
+					Json d = Json::parse(payload);
+					id = (size_t)atoll(d.find("id")->text().c_str());
+					ok = d.find("ok") && flag_set(d.find("ok")->text());
+					if (auto* l = d.find("log")) log_tail = l->text();
+				} catch (const std::exception&) { continue; }
+				size_t stored = 0;
 				{
 					std::lock_guard lock(m);
-					worker->inputs.insert(job.input); // fetched earlier, or an URL it downloaded
+					auto it = active.find(id);
+					if (it == active.end()) continue;
+					stored = it->second.stored;
+					active.erase(it);
+					imported += stored;
+					left--;
 				}
+				const RemoteJobSpec& job = (*jobs)[id];
 				log("job " + job.name + " done on " + who + ": " + std::to_string(stored) + " of " + std::to_string(job.runs.size()) + " results" + (ok ? "" : " (the worker reported a failure)"));
 				if (!log_tail.empty() && !ok) log(log_tail);
-			} catch (const std::exception& e) {
-				log("job " + job.name + " lost with " + who + ": " + e.what());
-				std::lock_guard lock(m);
-				if (tries[id] < kTries) queue.push_front(id);
-				else { left--; log("job " + job.name + " given up after " + std::to_string(kTries) + " tries"); }
-				workers.erase(std::remove(workers.begin(), workers.end(), worker), workers.end());
 				cv.notify_all();
-				return;
 			}
-			{
-				std::lock_guard lock(m);
-				imported += stored;
-				left--;
-			}
-			cv.notify_all();
 		}
+
+		// The connection is gone: what this worker was running goes back to the queue.
+		dead = true;
+		cv.notify_all();
+		dispatcher.join();
+		for (auto& t : senders) t.join();
 		std::lock_guard lock(m);
+		for (auto& [id, a] : active) {
+			const RemoteJobSpec& job = (*jobs)[id];
+			log("job " + job.name + " lost with " + who);
+			if (tries[id] < kTries) queue.push_front(id);
+			else { left--; log("job " + job.name + " given up after " + std::to_string(kTries) + " tries"); }
+		}
 		workers.erase(std::remove(workers.begin(), workers.end(), worker), workers.end());
+		cv.notify_all();
 	}
 };
 
@@ -467,23 +513,67 @@ std::string inventory_json(int only_gpu) {
 	return out + "]";
 }
 
+// What the reader thread hands to a job: the pieces of an input being fetched.
+struct Inbox {
+	std::mutex m;
+	std::condition_variable cv;
+	std::deque<std::pair<uint8_t, std::string>> q;
+	bool lost = false;
+	void push(uint8_t type, std::string payload) {
+		{
+			std::lock_guard lock(m);
+			q.emplace_back(type, std::move(payload));
+		}
+		cv.notify_all();
+	}
+	void close() {
+		{
+			std::lock_guard lock(m);
+			lost = true;
+		}
+		cv.notify_all();
+	}
+	bool pop(uint8_t& type, std::string& payload) {
+		std::unique_lock lock(m);
+		cv.wait(lock, [&] { return !q.empty() || lost; });
+		if (q.empty()) return false;
+		type = q.front().first;
+		payload = std::move(q.front().second);
+		q.pop_front();
+		return true;
+	}
+};
+
+std::string id_bytes(size_t id) {
+	std::string s(4, '\0');
+	for (int i = 0; i < 4; i++) s[(size_t)i] = (char)((id >> (24 - 8 * i)) & 255);
+	return s;
+}
+
+size_t id_of(const std::string& payload) {
+	size_t id = 0;
+	for (int i = 0; i < 4 && (size_t)i < payload.size(); i++) id = (id << 8) | (uint8_t)payload[(size_t)i];
+	return id;
+}
+
 // Fetches an input from the host (if it is not here already) and returns its path.
-bool fetch_input(net::Conn& conn, const fs::path& dir, const std::string& name, const std::string& sha, fs::path& out, std::string& err) {
+bool fetch_input(const std::function<bool(uint8_t, const std::string&)>& send, Inbox& inbox, size_t job_id, const fs::path& dir, const std::string& name, const std::string& sha, fs::path& out,
+                 std::string& err) {
 	std::string safe = fs::path(name).filename().string();
 	out = dir / (sha.substr(0, 16) + "_" + safe);
 	std::error_code ec;
 	if (fs::exists(out, ec)) return true;
-	if (!conn.send_msg(M_NEED, "{\"sha256\":" + jq(sha) + "}")) { err = "connection lost"; return false; }
+	if (!send(M_NEED, id_bytes(job_id) + "{\"sha256\":" + jq(sha) + "}")) { err = "connection lost"; return false; }
 	fs::create_directories(dir, ec);
-	const fs::path tmp = out.string() + ".part";
+	const fs::path tmp = out.string() + ".part" + std::to_string(job_id);
 	std::ofstream f(tmp, std::ios::binary);
 	uint8_t type;
 	std::string payload;
 	for (;;) {
-		if (!conn.recv_msg(type, payload)) { err = "connection lost"; return false; }
+		if (!inbox.pop(type, payload)) { err = "connection lost"; return false; }
 		if (type == M_FILE_END) break;
 		if (type != M_FILE_DATA) { err = "unexpected message"; return false; }
-		f.write(payload.data(), (std::streamsize)payload.size());
+		f.write(payload.data() + 4, (std::streamsize)payload.size() - 4);
 	}
 	f.close();
 	if (sha256_file(tmp.string()) != sha) { fs::remove(tmp, ec); err = "the input arrived damaged"; return false; }
@@ -493,7 +583,7 @@ bool fetch_input(net::Conn& conn, const fs::path& dir, const std::string& name, 
 
 } // namespace
 
-int remote_worker(const std::string& host, int port, const std::string& token, const std::string& workdir, int only_gpu, const std::vector<std::string>& extra_args,
+int remote_worker(const std::string& host, int port, const std::string& token, const std::string& workdir, int only_gpu, int slots, const std::vector<std::string>& extra_args,
                   const RemoteLog& log) {
 	std::error_code ec;
 	fs::create_directories(workdir, ec);
@@ -505,16 +595,21 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 	if (const char* n = getenv("HOSTNAME")) name = n;
 #endif
 	if (only_gpu >= 0) name += " GPU " + std::to_string(only_gpu);
+	slots = std::max(1, slots);
 	const std::string inventory = inventory_json(only_gpu);
+	std::mutex fetch_m;
+	std::map<std::string, std::shared_ptr<std::mutex>> fetching; // one fetch of an input at a time, however many jobs want it
 	for (;;) {
 		std::string err;
-		auto conn = net::connect_to(host, port, err);
-		if (!conn) {
+		auto conn_u = net::connect_to(host, port, err);
+		if (!conn_u) {
 			log(err + "; trying again in 5 s");
 			std::this_thread::sleep_for(std::chrono::seconds(5));
 			continue;
 		}
-		if (!conn->send_msg(M_HELLO, "{\"version\":" + std::to_string(kVersion) + ",\"token\":" + jq(token) + ",\"name\":" + jq(name) + ",\"gpus\":" + inventory + "}")) continue;
+		std::shared_ptr<net::Conn> conn = std::move(conn_u);
+		if (!conn->send_msg(M_HELLO, "{\"version\":" + std::to_string(kVersion) + ",\"token\":" + jq(token) + ",\"name\":" + jq(name) + ",\"slots\":" + std::to_string(slots) + ",\"gpus\":" + inventory + "}"))
+			continue;
 		uint8_t type;
 		std::string payload;
 		if (!conn->recv_msg(type, payload) || type != M_HELLO) {
@@ -522,22 +617,41 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 			std::this_thread::sleep_for(std::chrono::seconds(10));
 			continue;
 		}
-		log("connected to " + conn->peer);
-		while (conn->recv_msg(type, payload)) {
-			if (type != M_JOB) continue;
-			Json job = Json::parse(payload);
-			const std::string id = job.find("id")->text();
+		log("connected to " + conn->peer + ", " + std::to_string(slots) + " job" + (slots == 1 ? "" : "s") + " at a time");
+
+		std::mutex send_m;
+		auto send = [&](uint8_t t, const std::string& p) {
+			std::lock_guard lock(send_m);
+			return conn->send_msg(t, p);
+		};
+		std::mutex inbox_m;
+		std::map<size_t, std::shared_ptr<Inbox>> inboxes;
+		std::vector<std::thread> jobs;
+
+		auto run_job = [&](std::string job_payload, std::shared_ptr<Inbox> inbox) {
+			Json job = Json::parse(job_payload);
+			const size_t id = (size_t)atoll(job.find("id")->text().c_str());
 			const std::string jname = job.find("name")->text();
 			const Json& in = *job.find("input");
-			const fs::path dir = fs::path(workdir) / ("job-" + id);
-			fs::remove_all(dir, ec);
-			fs::create_directories(dir / "out", ec);
+			const fs::path dir = fs::path(workdir) / ("job-" + std::to_string(id));
+			std::error_code ec2;
+			fs::remove_all(dir, ec2);
+			fs::create_directories(dir / "out", ec2);
 			log("job " + jname);
 			std::string input, failure;
 			if (flag_set(in.find("url")->text())) input = in.find("name")->text();
 			else {
+				const std::string sha = in.find("sha256")->text();
+				std::shared_ptr<std::mutex> one;
+				{
+					std::lock_guard lock(fetch_m);
+					auto& slot = fetching[sha];
+					if (!slot) slot = std::make_shared<std::mutex>();
+					one = slot;
+				}
+				std::lock_guard lock(*one);
 				fs::path p;
-				if (fetch_input(*conn, fs::path(workdir) / "inputs", in.find("name")->text(), in.find("sha256")->text(), p, failure)) input = p.string();
+				if (fetch_input(send, *inbox, id, fs::path(workdir) / "inputs", in.find("name")->text(), sha, p, failure)) input = p.string();
 			}
 			bool ok = false;
 			std::string log_text = failure;
@@ -559,17 +673,42 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 					for (auto& f : fs::directory_iterator(folder.path())) {
 						if (f.path().extension() != ".json") continue;
 						const std::string n = f.path().filename().string();
-						std::string msg;
+						std::string msg = id_bytes(id);
 						msg += (char)(n.size() & 255);
 						msg += (char)(n.size() >> 8);
 						msg += n + read_file(f.path());
-						if (!conn->send_msg(M_RESULT, msg)) break;
+						if (!send(M_RESULT, msg)) break;
 					}
 				}
 			}
-			fs::remove_all(dir, ec);
-			if (!conn->send_msg(M_DONE, "{\"ok\":" + std::string(ok ? "true" : "false") + ",\"log\":" + jq(log_text) + "}")) break;
+			fs::remove_all(dir, ec2);
+			send(M_DONE, "{\"id\":" + std::to_string(id) + ",\"ok\":" + std::string(ok ? "true" : "false") + ",\"log\":" + jq(log_text) + "}");
+		};
+
+		while (conn->recv_msg(type, payload)) {
+			if (type == M_JOB) {
+				auto inbox = std::make_shared<Inbox>();
+				try {
+					const size_t id = (size_t)atoll(Json::parse(payload).find("id")->text().c_str());
+					std::lock_guard lock(inbox_m);
+					inboxes[id] = inbox;
+				} catch (const std::exception&) { continue; }
+				jobs.emplace_back(run_job, payload, inbox);
+			} else if (type == M_FILE_DATA || type == M_FILE_END) {
+				std::shared_ptr<Inbox> inbox;
+				{
+					std::lock_guard lock(inbox_m);
+					auto it = inboxes.find(id_of(payload));
+					if (it != inboxes.end()) inbox = it->second;
+				}
+				if (inbox) inbox->push(type, payload);
+			}
 		}
+		{
+			std::lock_guard lock(inbox_m);
+			for (auto& [id, inbox] : inboxes) inbox->close();
+		}
+		for (auto& t : jobs) t.join();
 		log("lost the connection; trying again in 5 s");
 		std::this_thread::sleep_for(std::chrono::seconds(5));
 	}

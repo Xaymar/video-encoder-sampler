@@ -35,6 +35,17 @@ An encoder generation changes what comes out: the same settings on a 2080 Ti and
 * A GPU encoder entry with no capable GPU among the workers is skipped, with a line saying so. Runs of a model that no worker ran are reported as ignored and are not run on the host.
 * A machine with several GPUs runs one worker per GPU: `ves --worker host:port --worker-gpu 1`. AMF and QuickSync encode on the first GPU of their vendor only.
 
+## How much a worker runs at once
+
+Machines differ in how many encoder sessions they take (an NVENC card may allow 10, another 5 or 3), so each worker sets its own limits:
+
+* `--worker-jobs N`: how many jobs it runs at the same time (default 1). The host keeps it supplied with that many.
+* `--parallel N`: how many runs of one job run at the same time (it is passed on to every job, and replaces the host's value). Without it a job uses the host's `parallel`
+  for that encoder, or the default of 2 for GPU encoders and 1 for CPU encoders.
+
+The encoders running at once on a worker are about `--worker-jobs` times `--parallel`, and a job has as many runs as its option combinations, so `--parallel` beyond that does nothing.
+Several jobs that need the same input fetch it once.
+
 ## Inputs
 
 An input travels from the host to a worker the first time a job of that worker needs it, and stays in the worker's `--worker-dir`. The host sends a worker the jobs whose input it already
@@ -42,15 +53,15 @@ has before any other, so with several inputs each worker settles on a few of the
 
 ## Protocol
 
-TCP, each message is a type byte, a 32-bit big-endian length and a payload. `HELLO` (version, token, name, GPUs) in both directions; `JOB` (id, name, config, input) from the host;
-`NEED` / `FILE_DATA` / `FILE_END` to fetch an input; `RESULT` (file name and contents) and `DONE` (ok, tail of the log) from the worker.
+TCP, each message is a type byte, a 32-bit big-endian length and a payload. `HELLO` (version, token, name, slots, GPUs) in both directions; `JOB` (id, name, config, input) from the host;
+`NEED` / `FILE_DATA` / `FILE_END` to fetch an input; `RESULT` (file name and contents) and `DONE` (ok, tail of the log) from the worker. Everything after `JOB` carries the job id, so a worker's jobs share one connection.
 
 ## Not done yet
 
 * **No encoded streams** come back (workers run with `--no-videos`), so best-videos mode keeps nothing from remote runs.
 * **Pruning is off** with `--host`: it needs the scores of earlier runs, which are on other machines.
 * **No encryption.** The token only keeps strangers out; use a VPN or an SSH tunnel on untrusted networks.
-* **One job per worker at a time.** Inputs are sent whole, once per worker, from the host; a transfer cannot resume.
+* **Inputs are sent whole**, once per worker, from the host; a transfer cannot resume.
 * **Workers are expected to be there when the host plans.** A worker that connects later takes jobs it matches but does not add GPU models to the plan.
 * **CPU encoders** are keyed by the host's library versions; workers should run the same build.
 * **No live view** of the workers' runs on the host; it logs when a job goes out and comes back.

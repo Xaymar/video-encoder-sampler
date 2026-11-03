@@ -347,7 +347,8 @@ Distributed (see docs/distributed.md)
         --min-workers <n>   jobs start when this many workers have connected (default: 1)
         --worker <host:port>  be a worker: connect to a host and run the jobs it sends, until stopped. Every other flag (--priority, --hw-decode,
                             --vmaf-device, ...) is passed on to the runs; --worker-dir <dir> keeps fetched inputs and scratch files (default: ves-worker);
-                            --worker-gpu <n> offers only NVIDIA GPU n, so a machine with several GPUs runs one worker per GPU
+                            --worker-gpu <n> offers only NVIDIA GPU n, so a machine with several GPUs runs one worker per GPU;
+                            --worker-jobs <n> runs n jobs at the same time (default 1), --parallel <n> sets the runs at the same time within each job
 
 Quick run (replaces the encoders and scenarios of the config file)
   -enc, --encoder <name>    nvenc | amf | qsv | x264 | x265 | svtav1
@@ -578,7 +579,7 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 // `ves --worker host:port`: runs the jobs a host sends, until it is stopped. Every other flag is passed on to the `ves` that runs a job, so --priority, --hw-decode,
 // --vmaf-device and so on work as they do for a sweep started by hand.
 static int run_worker(int argc, char** argv) {
-	int only_gpu = -1;
+	int only_gpu = -1, slots = 1;
 	std::string target, dir = "ves-worker", token = getenv("VES_TOKEN") ? getenv("VES_TOKEN") : "";
 	std::vector<std::string> pass;
 	for (int i = 1; i < argc; i++) {
@@ -588,13 +589,14 @@ static int run_worker(int argc, char** argv) {
 			if (a == "--worker") target = value();
 			else if (a == "--worker-dir") dir = value();
 			else if (a == "--worker-gpu") only_gpu = atoi(value().c_str());
+			else if (a == "--worker-jobs") slots = std::max(1, atoi(value().c_str()));
 			else if (a == "--token") token = value();
 			else pass.push_back(a);
 		} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
 	}
 	const size_t colon = target.rfind(':');
 	if (colon == std::string::npos) { fprintf(stderr, "error: --worker takes host:port\n"); return 1; }
-	return remote_worker(target.substr(0, colon), atoi(target.c_str() + colon + 1), token, dir, only_gpu, pass, [](const std::string& line) { printf("%s\n", line.c_str()); fflush(stdout); });
+	return remote_worker(target.substr(0, colon), atoi(target.c_str() + colon + 1), token, dir, only_gpu, slots, pass, [](const std::string& line) { printf("%s\n", line.c_str()); fflush(stdout); });
 }
 
 int main(int argc, char** argv) {
