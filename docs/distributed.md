@@ -49,7 +49,7 @@ Several jobs that need the same input fetch it once.
 ## Inputs
 
 An input travels from the host to a worker the first time a job of that worker needs it, and stays in the worker's `--worker-dir`. The host sends a worker the jobs whose input it already
-has before any other, so with several inputs each worker settles on a few of them and fetches each at most once. URL inputs are never sent; every worker downloads them itself.
+has before any other, so with several inputs each worker settles on a few of them and fetches each at most once. URL inputs are never sent; every worker downloads them itself, once however many of its jobs use the URL (one download row on the worker, and the jobs find the file in its cache).
 
 ## Progress
 

@@ -23,6 +23,7 @@
 #include <unistd.h>
 #endif
 
+#include "download.h"
 #include "encoder.h"
 #include "gpu.h"
 #include "hash.h"
@@ -50,8 +51,6 @@ std::string jq(const std::string& s) { // JSON string
 }
 
 bool flag_set(const std::string& v) { return v == "1" || v == "true"; } // JSON booleans read back as 1 or 0
-
-bool is_url(const std::string& s) { return s.rfind("http://", 0) == 0 || s.rfind("https://", 0) == 0; }
 
 // "name_1a2b3c4d.json" -> "name": result files of the same run are named alike on both sides except for the hash of the key, which depends on the machine, and the GPU
 // index the worker ran on ("_gpu=1"), which the host's own label does not have.
@@ -682,8 +681,26 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 			fs::create_directories(dir / "out", ec2);
 			log("job " + jname);
 			std::string input, failure;
-			if (flag_set(in.find("url")->text())) input = in.find("name")->text();
-			else {
+			if (flag_set(in.find("url")->text())) {
+				// A URL input is downloaded here, once however many jobs want it, into the folder the job's `ves` looks in, so that it finds the file there.
+				input = in.find("name")->text();
+				std::shared_ptr<std::mutex> one;
+				{
+					std::lock_guard lock(fetch_m);
+					auto& slot = fetching[input];
+					if (!slot) slot = std::make_shared<std::mutex>();
+					one = slot;
+				}
+				std::lock_guard lock(*one);
+				RunProgress rp;
+				rp.begin(5, 0);
+				const int handle = ui::attach(&rp, url_file_name(input), "input");
+				try {
+					fetch_url(input, (fs::path(workdir) / "cache" / "downloads").string(), &rp);
+				} catch (const std::exception& e) { failure = e.what(); }
+				rp.finish();
+				ui::detach(handle);
+			} else {
 				const std::string sha = in.find("sha256")->text();
 				std::shared_ptr<std::mutex> one;
 				{
@@ -719,7 +736,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 				});
 				for (auto& l : tail) log_text += l + "\n";
 				ok = code == 0;
-				if (!ok) log("job " + jname + " failed with code " + std::to_string(code));
+				if (!ok) log("job " + jname + " failed with code " + std::to_string(code) + (log_text.empty() ? std::string() : ":\n" + log_text));
 				// The run results are the .json files in the input's folder; the sweep summary next to it is not one.
 				for (auto& folder : fs::directory_iterator(dir / "out")) {
 					if (!folder.is_directory()) continue;
