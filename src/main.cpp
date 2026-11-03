@@ -58,12 +58,39 @@ static double over_penalty_points(double kbps, double target) {
 	return std::min(100.0, over_penalty * width * (std::exp((kbps / target - 1) * 100 / width) - 1));
 }
 
+// A condition on another option: that it is set, set to one of some values, or compares so with a number (">=2").
+struct Cond {
+	std::string key;
+	std::vector<std::string> any_of; // empty: any value
+	std::string op;                  // "", or ">=", ">", "<=", "<", "==", "!=": the value is read as a number
+	double num = 0;
+	static bool number(const std::string& v, double& out) {
+		char* end = nullptr;
+		out = strtod(v.c_str(), &end);
+		return !v.empty() && *end == 0;
+	}
+	bool holds(const Options& o) const {
+		const auto it = o.find(key);
+		if (it == o.end()) return false;
+		double have = 0;
+		if (!op.empty()) {
+			if (!number(it->second, have)) return false;
+			return op == ">=" ? have >= num : op == ">" ? have > num : op == "<=" ? have <= num : op == "<" ? have < num : op == "==" ? have == num : have != num;
+		}
+		if (any_of.empty()) return true;
+		double want = 0;
+		for (auto& v : any_of) if (v == it->second || (number(v, want) && number(it->second, have) && want == have)) return true;
+		return false;
+	}
+	std::string json() const; // as the config writes it: true, a list of values, or a comparison; defined after jq()
+};
+
 struct Axis { // one swept option; a missing value (JSON null) leaves the option unset
 	std::string key;
 	std::vector<std::optional<std::string>> values;
 	// Options that only matter in some combinations: where the condition does not hold the option is left unset, and combinations that come out the same are one.
-	std::vector<std::string> requires_set; // it is only set when all of these options are set
-	std::vector<std::string> unless_set;   // it is only set when none of these options is set
+	std::vector<Cond> requires_all; // it is only set when all of these hold
+	std::vector<Cond> unless_any;   // it is only set when none of these holds
 };
 
 struct Job {
@@ -176,6 +203,28 @@ static std::vector<Shape> make_shapes(const std::vector<std::string>& res, const
 	return out;
 }
 
+// "requires" and "unless" of an option: a name ("max_b_frames": it is set), a list of names, or an object of name to what it must be:
+// true (set), a value or a list of values, or a comparison with a number (">=2").
+static void parse_conds(const Json& j, std::vector<Cond>& out, const std::string& option) {
+	if (j.type == Json::Arr) { for (auto& x : j.a) parse_conds(x, out, option); return; }
+	if (j.type != Json::Obj) { Cond c; c.key = j.text(); out.push_back(c); return; }
+	for (auto& [name, spec] : j.o) {
+		Cond c;
+		c.key = name;
+		if (spec.type == Json::Arr) for (auto& x : spec.a) c.any_of.push_back(x.text());
+		else if (spec.type == Json::Bool) { if (spec.text() != "1" && spec.text() != "true") throw std::runtime_error("option '" + option + "': a condition on '" + name + "' says false; leave it out"); }
+		else {
+			const std::string t = spec.text();
+			size_t n = 0;
+			for (const char* op : {">=", "<=", "==", "!=", ">", "<"}) if (t.compare(0, strlen(op), op) == 0) { c.op = op; n = strlen(op); break; }
+			if (!c.op.empty()) {
+				if (!Cond::number(t.substr(n), c.num)) throw std::runtime_error("option '" + option + "': '" + t + "' is not a comparison with a number");
+			} else c.any_of.push_back(t);
+		}
+		out.push_back(c);
+	}
+}
+
 // Every combination of the axes on top of `base`.
 static std::vector<Options> expand(const std::string& encoder, const std::vector<Axis>& axes, const Options& base = {}) {
 	std::vector<Options> combos{base};
@@ -195,7 +244,7 @@ static std::vector<Options> expand(const std::string& encoder, const std::vector
 	}
 	// Conditions: where one does not hold the option is left out, which makes combinations equal; each is kept once, in the order they came.
 	bool any_rule = false;
-	for (auto& ax : axes) any_rule |= !ax.requires_set.empty() || !ax.unless_set.empty();
+	for (auto& ax : axes) any_rule |= !ax.requires_all.empty() || !ax.unless_any.empty();
 	if (!any_rule) return combos;
 	std::set<Options> seen;
 	std::vector<Options> out;
@@ -205,8 +254,8 @@ static std::vector<Options> expand(const std::string& encoder, const std::vector
 			for (auto& ax : axes) {
 				if (!c.count(ax.key)) continue;
 				bool holds = true;
-				for (auto& r : ax.requires_set) holds &= c.count(r) > 0;
-				for (auto& u : ax.unless_set) holds &= c.count(u) == 0;
+				for (auto& r : ax.requires_all) holds &= r.holds(c);
+				for (auto& u : ax.unless_any) holds &= !u.holds(c);
 				if (!holds) { c.erase(ax.key); changed = true; }
 			}
 		}
@@ -322,11 +371,9 @@ static void load_config(const std::string& path, Config& cfg) {
 				for (auto& [rk, rv] : v.o) if (rk != "values" && rk != "requires" && rk != "unless") throw std::runtime_error("option '" + k + "' has an unknown key '" + rk + "' (it takes values, requires and unless)");
 				list = v.find("values");
 				if (!list) throw std::runtime_error("option '" + k + "' needs 'values'");
-				for (auto* rule : {&ax.requires_set, &ax.unless_set}) {
-					const Json* names = v.find(rule == &ax.requires_set ? "requires" : "unless");
-					if (!names) continue;
-					if (names->type == Json::Arr) for (auto& x : names->a) rule->push_back(x.text());
-					else rule->push_back(names->text());
+				for (auto* rule : {&ax.requires_all, &ax.unless_any}) {
+					const Json* conds = v.find(rule == &ax.requires_all ? "requires" : "unless");
+					if (conds) parse_conds(*conds, *rule, k);
 				}
 			}
 			if (list->type == Json::Arr) { for (auto& x : list->a) ax.values.push_back(x.type == Json::Null ? std::nullopt : std::optional(x.text())); }
@@ -591,6 +638,14 @@ static std::string jq(const std::string& s) { // JSON string
 	return o + "\"";
 }
 
+std::string Cond::json() const {
+	if (!op.empty()) { char b[32]; snprintf(b, sizeof b, "%g", num); return jq(op + b); }
+	if (any_of.empty()) return "true";
+	std::string r = "[";
+	for (size_t i = 0; i < any_of.size(); i++) r += (i ? "," : "") + jq(any_of[i]);
+	return r + "]";
+}
+
 // Result files name inputs and model files without the folders they sit in: the paths are the user's own, and results are matched by hash.
 static std::string file_name(const std::string& path) { return is_url(path) ? url_file_name(path) : fs::path(path).filename().string(); }
 static std::string model_name(const std::string& model) { return model.rfind("path=", 0) == 0 ? "path=" + file_name(model.substr(5)) : model; }
@@ -619,7 +674,7 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 	if (is_gpu_encoder(job.encoder)) { o << "\"gpu\":[\"@GPU@\"]"; first = false; } // the host puts the worker's GPU index in
 	for (auto& ax : job.axes) {
 		if (ax.key == "gpu" && is_gpu_encoder(job.encoder)) continue;
-		const bool rules = !ax.requires_set.empty() || !ax.unless_set.empty(); // the worker expands the same combinations as the host does
+		const bool rules = !ax.requires_all.empty() || !ax.unless_any.empty(); // the worker expands the same combinations as the host does
 		o << (first ? "" : ",") << jq(ax.key) << ":" << (rules ? "{\"values\":[" : "[");
 		first = false;
 		bool first_value = true;
@@ -633,11 +688,11 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 		}
 		o << "]";
 		if (rules) {
-			for (auto* rule : {&ax.requires_set, &ax.unless_set}) {
+			for (auto* rule : {&ax.requires_all, &ax.unless_any}) {
 				if (rule->empty()) continue;
-				o << ",\"" << (rule == &ax.requires_set ? "requires" : "unless") << "\":[";
-				for (size_t i = 0; i < rule->size(); i++) o << (i ? "," : "") << jq((*rule)[i]);
-				o << "]";
+				o << ",\"" << (rule == &ax.requires_all ? "requires" : "unless") << "\":{";
+				for (size_t i = 0; i < rule->size(); i++) o << (i ? "," : "") << jq((*rule)[i].key) << ":" << (*rule)[i].json();
+				o << "}";
 			}
 			o << "}";
 		}

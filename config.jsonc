@@ -126,8 +126,12 @@
 				// "b_reference_mode": [null, "none", "middle"],  // B-frames as references
 				// An option that does nothing without another one, or when another one is set, takes its values in an object. It is left unset where
 				// the condition fails ("set" means it has a value, null is unset), and combinations that come out the same run once:
-				// "b_reference_mode": { "values": ["none", "middle"], "requires": "max_b_frames" },   // only with max_b_frames set (also a list: ["a", "b"])
-				// "weighted_prediction": { "values": [0, 1], "unless": "max_b_frames" },              // only without max_b_frames
+				// "requires" and "unless" take an option name, a list of names, or an object of name to what it must be: true (set), a value, a list of
+				// values, or a comparison with a number ("<", "<=", ">", ">=", "==", "!="):
+				// "hierarchical_b_frames": { "values": [0, 1], "requires": { "max_b_frames": ">=2" } },   // a single B-frame cannot be in a hierarchy
+				// "b_reference_mode": { "values": ["none", "middle"], "requires": { "max_b_frames": ">=2" } },
+				// "weighted_prediction": { "values": [0, 1], "unless": { "max_b_frames": ">=1" } },
+				// "b_adapt": { "values": [0, 1], "requires": "max_b_frames" },                          // only with max_b_frames set
 				// "spatial_aq": [null, 0, 1, 8, 15],             // 0 is off, 1..15 is on with that strength
 				// "gpu": [0],                                    // which NVIDIA GPU; ["all"] uses every one, each in a pool of its own
 			},
