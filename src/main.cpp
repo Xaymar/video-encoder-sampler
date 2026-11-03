@@ -85,9 +85,9 @@ struct Cond {
 	std::string json() const; // as the config writes it: true, a list of values, or a comparison; defined after jq()
 };
 
-struct Axis { // one swept option; a missing value (JSON null) leaves the option unset
+struct Axis { // one swept option. null is not a value: it would mean "whatever the preset gives", which is not known; leave the option out to run without it
 	std::string key;
-	std::vector<std::optional<std::string>> values;
+	std::vector<std::string> values;
 	// Options that only matter in some combinations: where the condition does not hold the option is left unset, and combinations that come out the same are one.
 	std::vector<Cond> requires_all; // it is only set when all of these hold
 	std::vector<Cond> unless_any;   // it is only set when none of these holds
@@ -248,9 +248,9 @@ static std::vector<Options> expand(const std::string& encoder, const std::vector
 		const Axis& ax = *axp;
 		if (ax.values.empty()) continue;
 		// gpu=all means every GPU of the encoder's vendor
-		std::vector<std::optional<std::string>> values;
+		std::vector<std::string> values;
 		for (auto& v : ax.values) {
-			if (ax.key == "gpu" && v && *v == "all") {
+			if (ax.key == "gpu" && v == "all") {
 				size_t n = std::max<size_t>(list_gpus(encoder_vendor(encoder)).size(), 1);
 				for (size_t i = 0; i < n; i++) values.push_back(std::to_string(i));
 			} else values.push_back(v);
@@ -265,7 +265,7 @@ static std::vector<Options> expand(const std::string& encoder, const std::vector
 				for (auto& u : ax.unless_any) applies &= !u.holds(c);
 				if (!applies) { next.push_back(std::move(c)); continue; }
 			}
-			for (auto& v : values) { Options n = c; if (v) n[ax.key] = *v; next.push_back(std::move(n)); }
+			for (auto& v : values) { Options n = c; n[ax.key] = v; next.push_back(std::move(n)); }
 		}
 		combos = std::move(next);
 	}
@@ -384,8 +384,10 @@ static void load_config(const std::string& path, Config& cfg) {
 					if (conds) parse_conds(*conds, *rule, k);
 				}
 			}
-			if (list->type == Json::Arr) { for (auto& x : list->a) ax.values.push_back(x.type == Json::Null ? std::nullopt : std::optional(x.text())); }
-			else ax.values.push_back(list->type == Json::Null ? std::nullopt : std::optional(list->text()));
+			bool dropped_null = false;
+			auto add_value = [&](const Json& x) { if (x.type == Json::Null) dropped_null = true; else ax.values.push_back(x.text()); };
+			if (list->type == Json::Arr) { for (auto& x : list->a) add_value(x); } else add_value(*list);
+			if (dropped_null) fprintf(stderr, "config: %s option '%s' lists null, which is no longer a value (it meant the preset's own, which ves cannot know); it is left out. To run without the option, do not list it\n", j.encoder.c_str(), k.c_str());
 			j.axes.push_back(std::move(ax));
 		}
 		cfg.jobs.push_back(std::move(j));
@@ -453,7 +455,7 @@ Quick run (replaces the encoders and scenarios of the config file)
   -br,  --bitrate <kbps[,..]>
   -res, --resolution <WxH[,..]>    -fps, --framerate <n[,..]>    --kf <seconds[,..]>
         --option <key=a,b>  an encoder option, can be given more than once; comma separated values are swept
-                            and every combination is tested; "null" leaves the option unset
+                            and every combination is tested
         --fixed <key[,..]>  options that are never pruned
         --no-prune          run every combination even when an option shows no effect
         --upscale           allow encoding above the source's resolution, chroma layout and bit depth
@@ -568,7 +570,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 			const size_t eq = o.find('=');
 			if (eq == std::string::npos) throw std::runtime_error("bad option '" + o + "', expected key=value");
 			Axis ax{o.substr(0, eq), {}, {}, {}};
-			for (auto& x : split(o.substr(eq + 1))) ax.values.push_back(x == "null" ? std::nullopt : std::optional<std::string>(x));
+			for (auto& x : split(o.substr(eq + 1))) { if (x == "null") fprintf(stderr, "option %s: null is not a value any more and is left out%s", ax.key.c_str(), "\n"); else ax.values.push_back(x); }
 			job.axes.push_back(std::move(ax));
 		}
 		else if (a == "--fixed") { for (auto& x : split(value())) job.fixed.insert(x); }
@@ -687,11 +689,11 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 		first = false;
 		bool first_value = true;
 		for (auto& v : ax.values) {
-			if (ax.key == "gpu" && v && *v == "all") { // as expand() does on the host: every GPU of the vendor
+			if (ax.key == "gpu" && v == "all") { // as expand() does on the host: every GPU of the vendor
 				for (size_t i = 0; i < std::max<size_t>(list_gpus(encoder_vendor(job.encoder)).size(), 1); i++) { o << (first_value ? "" : ",") << jq(std::to_string(i)); first_value = false; }
 				continue;
 			}
-			o << (first_value ? "" : ",") << (v ? jq(*v) : std::string("null"));
+			o << (first_value ? "" : ",") << jq(v);
 			first_value = false;
 		}
 		o << "]";
@@ -1341,8 +1343,8 @@ int main(int argc, char** argv) {
 	}
 
 	// Pruning, after encoding: an option that shows no effect is not swept further. Within a group (and with every other option at the same values) the
-	// runs that differ only in one option form a line. Its lowest and its highest value (not counting null) run first; when their scores match on every
-	// frame, the option does nothing there and the values in between (and null) are not run. When they differ, or a probe failed, the line runs in full.
+	// runs that differ only in one option form a line. Its lowest and its highest value run first; when their scores match on every
+	// frame, the option does nothing there and the values in between are not run. When they differ, or a probe failed, the line runs in full.
 	// The probes are runs of the sweep itself, with the other options as they actually are, so an option that only matters in some situations
 	// (B-frame settings when B-frames are on) is found where it matters. Cached runs count as probes too.
 	struct Line { Task* lo = nullptr; Task* hi = nullptr; int verdict = 0; std::string axis; }; // verdict: 0 not known yet, 1 has an effect, 2 has none
@@ -1360,16 +1362,15 @@ int main(int argc, char** argv) {
 					const Axis& ax = job.axes[a];
 					if (job.fixed.count(ax.key) || ax.key == "gpu" || ax.key == "chroma" || ax.key == "bitdepth" || ax.key == "range") continue;
 					std::vector<std::string> vals;
-					bool numeric = true, has_null = false;
+					bool numeric = true;
 					for (auto& v : ax.values) {
-						if (!v) { has_null = true; continue; }
-						if (std::find(vals.begin(), vals.end(), *v) != vals.end()) continue;
-						vals.push_back(*v);
+						if (std::find(vals.begin(), vals.end(), v) != vals.end()) continue;
+						vals.push_back(v);
 						char* end = nullptr;
-						strtod(v->c_str(), &end);
-						numeric &= !v->empty() && *end == 0;
+						strtod(v.c_str(), &end);
+						numeric &= !v.empty() && *end == 0;
 					}
-					if (vals.size() < 2 || vals.size() + has_null < 3) continue; // nothing in between to leave out
+					if (vals.size() < 3) continue; // nothing in between to leave out
 					auto less = [](const std::string& x, const std::string& y) { return atof(x.c_str()) < atof(y.c_str()); };
 					if (numeric) sm->second.emplace_back(a, *std::min_element(vals.begin(), vals.end(), less), *std::max_element(vals.begin(), vals.end(), less));
 					else sm->second.emplace_back(a, vals.front(), vals.back()); // not numbers (presets): the order of the list

@@ -98,14 +98,14 @@
 		"priority": "low",     // "low": idle CPU priority and the lowest disk priority, so ves never slows down other programs; "normal": the system default
 		"low_memory": false,   // true: fewer VMAF and decoder threads, much less memory, a bit slower
 		// An option that shows no effect is not swept further: within a group, for every combination of the other options, the lowest and the highest
-		// value (not null) of a list run first, and when they score the same on every frame the values in between are skipped. Set to false to run
+		// value of a list run first, and when they score the same on every frame the values in between are skipped. Set to false to run
 		// every combination. Per encoder, "fixed" lists options that are never pruned.
 		"prune": true,
 	},
 
 	// ---- Encoders -----------------------------------------------------------------------------------------------------------------
 	// Every option is a list of values and every combination is tested. Special values:
-	//   null  leaves the option unset (the encoder's default), so [null, 1, 2] tests the default as well
+	//   (null is not a value: it would mean "whatever the preset gives", which ves cannot know. To run without an option, leave it out.)
 	//   []    ignores the option (as if it were not there), handy for switching one off without deleting it
 	// Option names are snake_case. Some are common: the same name and meaning for every encoder that can do them (an encoder that cannot fails the
 	// run with a message): max_b_frames, lookahead_frames, max_ref_frames, b_reference_mode (none | middle | each) and rate_control (cbr | vbr).
@@ -121,18 +121,18 @@
 				"preset": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
 				"tune": ["hq"],             // hq | ll | ull | lossless
 				// "rate_control": ["cbr", "vbr"],
-				// "max_b_frames": [null, 0, 1, 2, 3, 4],
+				// "max_b_frames": [0, 1, 2, 3, 4],
 				// "lookahead_frames": [32, 16, 8, 0],
-				// "b_reference_mode": [null, "none", "middle"],  // B-frames as references
+				// "b_reference_mode": ["none", "middle"],  // B-frames as references
 				// An option that does nothing without another one, or when another one is set, takes its values in an object. It is left unset where
-				// the condition fails ("set" means it has a value, null is unset), and combinations that come out the same run once:
+				// the condition fails ("set" means it is listed and its own condition holds), and combinations that come out the same run once:
 				// "requires" and "unless" take an option name, a list of names, or an object of name to what it must be: true (set), a value, a list of
 				// values, or a comparison with a number ("<", "<=", ">", ">=", "==", "!="):
 				// "hierarchical_b_frames": { "values": [0, 1], "requires": { "max_b_frames": ">=2" } },   // a single B-frame cannot be in a hierarchy
 				// "b_reference_mode": { "values": ["none", "middle"], "requires": { "max_b_frames": ">=2" } },
 				// "weighted_prediction": { "values": [0, 1], "unless": { "max_b_frames": ">=1" } },
 				// "b_adapt": { "values": [0, 1], "requires": "max_b_frames" },                          // only with max_b_frames set
-				// "spatial_aq": [null, 0, 1, 8, 15],             // 0 is off, 1..15 is on with that strength
+				// "spatial_aq": [0, 1, 8, 15],             // 0 is off, 1..15 is on with that strength
 				// "gpu": [0],                                    // which NVIDIA GPU; ["all"] uses every one, each in a pool of its own
 			},
 			// "scenarios": ["mid", "low"],  // only these scenarios; left out, the encoder takes part in all of them
@@ -147,7 +147,7 @@
 			"scenarios": ["mid", "low"],
 			"options": {
 				"preset": ["veryfast", "fast", "medium", "slow", "veryslow"],
-				"tune": [null, "film", "animation"],
+				"tune": ["film", "animation"],
 				// "max_b_frames": [0, 3],
 				// "lookahead_frames": [20, 40],
 				// "max_ref_frames": [3, 5],
@@ -159,7 +159,7 @@
 			"scenarios": ["mid", "low"],
 			"options": {
 				"preset": ["superfast", "veryfast", "fast", "medium"],
-				"tune": [null],
+				"tune": [],
 				// "max_b_frames": [2, 4],
 			},
 		},
