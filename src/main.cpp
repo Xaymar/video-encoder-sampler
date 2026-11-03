@@ -346,7 +346,8 @@ Distributed (see docs/distributed.md)
         --token <secret>    what workers must present (or the VES_TOKEN environment variable); use it on both sides
         --min-workers <n>   jobs start when this many workers have connected (default: 1)
         --worker <host:port>  be a worker: connect to a host and run the jobs it sends, until stopped. Every other flag (--priority, --hw-decode,
-                            --vmaf-device, ...) is passed on to the runs; --worker-dir <dir> keeps fetched inputs and scratch files (default: ves-worker)
+                            --vmaf-device, ...) is passed on to the runs; --worker-dir <dir> keeps fetched inputs and scratch files (default: ves-worker);
+                            --worker-gpu <n> offers only NVIDIA GPU n, so a machine with several GPUs runs one worker per GPU
 
 Quick run (replaces the encoders and scenarios of the config file)
   -enc, --encoder <name>    nvenc | amf | qsv | x264 | x265 | svtav1
@@ -554,7 +555,9 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 	if (job.parallel > 0) o << ",\"parallel\":" << job.parallel;
 	o << ",\"prune\":false,\"options\":{";
 	bool first = true;
+	if (is_gpu_encoder(job.encoder)) { o << "\"gpu\":[\"@GPU@\"]"; first = false; } // the host puts the worker's GPU index in
 	for (auto& ax : job.axes) {
+		if (ax.key == "gpu" && is_gpu_encoder(job.encoder)) continue;
 		o << (first ? "" : ",") << jq(ax.key) << ":[";
 		first = false;
 		bool first_value = true;
@@ -575,6 +578,7 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 // `ves --worker host:port`: runs the jobs a host sends, until it is stopped. Every other flag is passed on to the `ves` that runs a job, so --priority, --hw-decode,
 // --vmaf-device and so on work as they do for a sweep started by hand.
 static int run_worker(int argc, char** argv) {
+	int only_gpu = -1;
 	std::string target, dir = "ves-worker", token = getenv("VES_TOKEN") ? getenv("VES_TOKEN") : "";
 	std::vector<std::string> pass;
 	for (int i = 1; i < argc; i++) {
@@ -583,13 +587,14 @@ static int run_worker(int argc, char** argv) {
 		try {
 			if (a == "--worker") target = value();
 			else if (a == "--worker-dir") dir = value();
+			else if (a == "--worker-gpu") only_gpu = atoi(value().c_str());
 			else if (a == "--token") token = value();
 			else pass.push_back(a);
 		} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
 	}
 	const size_t colon = target.rfind(':');
 	if (colon == std::string::npos) { fprintf(stderr, "error: --worker takes host:port\n"); return 1; }
-	return remote_worker(target.substr(0, colon), atoi(target.c_str() + colon + 1), token, dir, pass, [](const std::string& line) { printf("%s\n", line.c_str()); fflush(stdout); });
+	return remote_worker(target.substr(0, colon), atoi(target.c_str() + colon + 1), token, dir, only_gpu, pass, [](const std::string& line) { printf("%s\n", line.c_str()); fflush(stdout); });
 }
 
 int main(int argc, char** argv) {
@@ -631,6 +636,19 @@ int main(int argc, char** argv) {
 	ui::start(cfg.plain);
 	struct UiGuard { ~UiGuard() { ui::stop(); } } ui_guard; // the live display is cleared on every way out
 
+	// Distributed: workers connect first, because what GPU models they have decides what is planned for GPU encoders.
+	std::unique_ptr<RemoteHost> remote;
+	std::deque<std::string> remote_texts; // the GPU details of workers that runs point at
+	if (cfg.host_port) {
+		RemoteHostOptions ro;
+		ro.port = cfg.host_port;
+		ro.token = cfg.token;
+		remote = std::make_unique<RemoteHost>(ro, [](const std::string& line) { ui::log(line); });
+		std::string err;
+		if (!remote->start(err)) { fprintf(stderr, "error: %s\n", err.c_str()); return 1; }
+		remote->wait_for_workers(cfg.min_workers);
+	}
+
 	struct Task {
 		Run r;
 		const Job* job;
@@ -643,6 +661,7 @@ int main(int argc, char** argv) {
 		bool done = false;               // finished, however it came about
 		std::vector<int> mid;            // pruning: the lines along which this run is neither the lowest nor the highest value (see `lines`)
 		const Scenario* sc = nullptr;    // the scenario it comes from, and which of its sizes: where a remote job is cut
+		std::string model;               // distributed GPU runs: the GPU model of the worker that runs it
 		size_t shape_i = 0;
 	};
 	struct Pool {
@@ -684,6 +703,7 @@ int main(int argc, char** argv) {
 		std::string gpu;
 		const std::string *gpu_json = &NULL_JSON, *caps_json = &NULL_JSON;
 		Pool* pool = nullptr;
+		std::string model;     // distributed: the GPU model of the worker that runs it
 	};
 	std::map<std::pair<const Job*, const Scenario*>, std::vector<Variant>> variants;
 	auto variants_of = [&](const Job& job, const Scenario& sc) -> const std::vector<Variant>& {
@@ -691,7 +711,17 @@ int main(int argc, char** argv) {
 		if (found != variants.end()) return found->second;
 		std::vector<Variant>& out = variants[{&job, &sc}];
 		auto axis = [](const std::vector<std::string>& v) { return v.empty() ? std::vector<std::string>{""} : v; }; // "": the source's
-		for (const Options& base : expand(job.encoder, job.axes))
+		// Distributed: a GPU encoder's runs are planned once for every GPU model the workers have that can encode the codec, and the "gpu" option (which GPU of the
+		// host) has no meaning.
+		const bool remote_gpu = remote && is_gpu_encoder(job.encoder);
+		std::vector<RemoteHost::Model> models;
+		std::vector<Axis> axes_no_gpu;
+		if (remote_gpu) {
+			models = remote->models(job.encoder, job.codec);
+			for (auto& ax : job.axes) if (ax.key != "gpu") axes_no_gpu.push_back(ax);
+			if (models.empty()) ui::log("no worker has a GPU that can encode " + job.encoder + "/" + job.codec + ": those runs are skipped");
+		}
+		for (const Options& base : expand(job.encoder, remote_gpu ? axes_no_gpu : job.axes))
 			for (auto& chroma : axis(sc.chroma)) for (auto& bitdepth : axis(sc.bitdepth)) for (auto& range : axis(sc.range)) {
 				Variant v;
 				v.opts = base;
@@ -722,7 +752,18 @@ int main(int argc, char** argv) {
 				else v.pool->fallback = std::max(v.pool->fallback, is_gpu_encoder(job.encoder) ? 2 : 1);
 				v.pool->parallel = v.pool->limit ? v.pool->limit : v.pool->fallback;
 				v.pool->name = pool;
-				out.push_back(std::move(v));
+				if (!remote_gpu) { out.push_back(std::move(v)); continue; }
+				for (auto& m : models) {
+					Variant w = v;
+					w.model = m.description;
+					w.key = key_encoder(job.encoder, job.codec, w.opts, m.description);
+					w.gpu = m.description;
+					remote_texts.push_back(m.info);
+					w.gpu_json = &remote_texts.back();
+					remote_texts.push_back(m.caps);
+					w.caps_json = &remote_texts.back();
+					out.push_back(std::move(w));
+				}
 			}
 		return out;
 	};
@@ -751,7 +792,7 @@ int main(int argc, char** argv) {
 						const std::string group_head = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|";
 						for (const Variant& v : sets) {
 							Task t;
-							t.job = &job; t.id = id; t.sc = &sc; t.shape_i = (size_t)(&shape - sc.shapes.data());
+							t.job = &job; t.id = id; t.sc = &sc; t.shape_i = (size_t)(&shape - sc.shapes.data()); t.model = v.model;
 							t.r.input = input; t.r.bitrate = br; t.r.kf = kf; t.r.shape = shape;
 							t.r.label = head + v.label;
 							t.p.codec = job.codec; t.p.bitrate = br * 1000; t.p.options = v.opts;
@@ -769,7 +810,7 @@ int main(int argc, char** argv) {
 								}
 								if (!folder_made) { std::error_code ec; fs::create_directories(fs::path(cfg.output_dir) / folder, ec); folder_made = true; }
 							} else if (!cfg.cache_dir.empty()) t.result_file = (fs::path(cfg.cache_dir) / "results" / (key_hash(t.key) + ".json")).string();
-							t.r.group = group_head + v.gpu_index;
+							t.r.group = group_head + v.gpu_index + (v.model.empty() ? std::string() : "|" + v.model);
 							t.r.gpu = v.gpu; t.r.gpu_json = v.gpu_json; t.r.caps_json = v.caps_json;
 							t.pool = v.pool->name;
 							v.pool->tasks.push_back(tasks.size());
@@ -962,18 +1003,21 @@ int main(int argc, char** argv) {
 	// Distributed: the runs that are not done yet are cut into jobs (one input, encoder entry, scenario, bitrate, key frame interval and size each) for the workers
 	// that connect to --host. What they send back is stored as result files with this run's keys, so the loop below finds those runs finished. Whatever the workers
 	// could not do (runs that cannot work with their input, a job given up) is run here as usual.
-	if (cfg.host_port) {
+	if (remote) {
 		std::map<std::string, RemoteJobSpec> groups;
 		std::vector<std::string> order;
 		for (auto& t : tasks) {
 			if (t.result_file.empty() || fs::exists(t.result_file)) continue;
 			const std::string g = t.r.input + "|" + std::to_string(t.job - cfg.jobs.data()) + "|" + std::to_string(t.sc - cfg.scenarios.data()) + "|" + std::to_string(t.r.bitrate) + "|" +
-			                      std::to_string(t.r.kf) + "|" + std::to_string(t.shape_i);
+			                      std::to_string(t.r.kf) + "|" + std::to_string(t.shape_i) + "|" + t.model;
 			auto it = groups.find(g);
 			if (it == groups.end()) {
 				RemoteJobSpec spec;
 				spec.config = sub_config(cfg, *t.job, *t.sc, t.r.bitrate, t.r.kf, t.r.shape);
 				spec.input = t.r.input;
+				spec.encoder = t.job->encoder;
+				spec.codec = t.job->codec;
+				spec.model = t.model;
 				spec.name = file_name(t.r.input) + " " + t.job->encoder + (is_gpu_encoder(t.job->encoder) ? "/" + t.job->codec : std::string()) + " " + std::to_string(t.r.bitrate) + "k";
 				order.push_back(g);
 				it = groups.emplace(g, std::move(spec)).first;
@@ -983,11 +1027,7 @@ int main(int argc, char** argv) {
 		std::vector<RemoteJobSpec> jobs;
 		for (auto& g : order) jobs.push_back(std::move(groups[g]));
 		for (auto& j : jobs) j.name += " (" + std::to_string(j.runs.size()) + " runs)";
-		RemoteHostOptions ro;
-		ro.port = cfg.host_port;
-		ro.token = cfg.token;
-		ro.min_workers = cfg.min_workers;
-		const size_t stored = remote_run_jobs(jobs, ro, [](const std::string& line) { ui::log(line); });
+		const size_t stored = remote->run_jobs(jobs);
 		ui::log("remote: " + std::to_string(stored) + " results from the workers");
 	}
 
@@ -1125,6 +1165,7 @@ int main(int argc, char** argv) {
 	for (size_t i : uncached[input_name]) {
 		Task& t = tasks[i];
 		Run& r = t.r;
+		if (!t.model.empty()) { r.ignored = true; r.reason = "no worker produced it (on " + t.model + ")"; finish(t); continue; } // not on this machine's GPU: the key says another one
 		const SourceInfo* src = source_of(r.input);
 		if (!src) { finish(t); continue; }
 		t.plan = make_plan(*src, t.job->encoder, t.job->codec, t.p.options, r.shape);

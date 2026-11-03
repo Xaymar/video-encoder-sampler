@@ -26,7 +26,8 @@ static std::string hex64(uint64_t v) {
 }
 
 // Version of whatever does the encoding for this encoder name.
-static std::string encoder_environment(const std::string& encoder, const Options& options) {
+static std::string encoder_environment(const std::string& encoder, const Options& options, const std::string& gpu_override) {
+	if (!gpu_override.empty() && (encoder == "nvenc" || encoder == "amf" || encoder == "qsv")) return encoder + " " + gpu_override; // the GPU of a worker
 	auto gpu = [&](unsigned vendor) {
 		auto it = options.find("gpu");
 		return gpu_description(vendor, it == options.end() ? 0 : atoi(it->second.c_str()));
@@ -49,10 +50,10 @@ std::string key_input(const std::string& input) {
 	return k.str();
 }
 
-std::string key_encoder(const std::string& encoder, const std::string& codec, const Options& options) {
+std::string key_encoder(const std::string& encoder, const std::string& codec, const Options& options, const std::string& gpu_override) {
 	std::ostringstream k;
 	k << "encoder=" << encoder << '/' << codec << '\n';
-	k << "environment=" << encoder_environment(encoder, options) << '\n';
+	k << "environment=" << encoder_environment(encoder, options, gpu_override) << '\n';
 	k << "options=";
 	for (auto& [name, value] : options) k << name << '=' << value << ';';
 	return k.str();

@@ -25,7 +25,7 @@ std::string cache_key(const std::string& input, const std::string& encoder, cons
 
 // The same key in parts (cache_key is these one after the other), for callers that build many keys and want the parts that do not change built once.
 std::string key_input(const std::string& input);
-std::string key_encoder(const std::string& encoder, const std::string& codec, const Options& options); // with its environment (GPU and driver, library version)
+std::string key_encoder(const std::string& encoder, const std::string& codec, const Options& options, const std::string& gpu_override = {}); // with its environment (GPU and driver, library version); a worker's GPU replaces this machine's
 std::string key_run(long long bitrate_kbps, double kf, const Shape& shape);
 std::string key_settings(const ScaleOptions& scale, const VmafOptions& vmaf);
 
