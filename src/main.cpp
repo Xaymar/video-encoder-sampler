@@ -122,7 +122,7 @@ struct Run {
 	std::vector<std::string> identical; // labels of the runs that produced exactly the same stream (left out of the ranking, see below)
 	std::string group;      // what runs must share for identical output to mean identical scores
 	std::string encoder, codec;
-	Options options;
+	const Options* options = nullptr; // the run's encoder options: the variant's, shared by every run of it
 	std::string video;      // the saved stream, relative to the output directory; empty if none was saved
 	std::string video_file; // where run_one() writes it
 	std::string video_sha256; // SHA-256 of the encoded stream
@@ -753,7 +753,7 @@ int main(int argc, char** argv) {
 		Run r;
 		const Job* job;
 		Codec id;
-		Params p;
+		const Options* opts = nullptr;   // its encoder options: the variant's, shared by every run of it (a task is made millions of times for a big config)
 		bool ok = false;
 		std::string key, pool; // what the run's outcome depends on (see cache_key); the pool it counts against
 		std::string result_file; // where its result is kept, and looked for when the same run comes up again; empty: not at all
@@ -902,8 +902,8 @@ int main(int argc, char** argv) {
 							t.job = &job; t.id = id; t.sc = &sc; t.shape_i = (size_t)(&shape - sc.shapes.data()); t.model = v.model;
 							t.r.input = input; t.r.bitrate = br; t.r.kf = kf; t.r.shape = shape;
 							t.r.label = head + v.label;
-							t.p.codec = job.codec; t.p.bitrate = br * 1000; t.p.options = v.opts;
-							t.r.encoder = job.encoder; t.r.codec = job.codec; t.r.options = v.opts;
+							t.opts = &v.opts;
+							t.r.encoder = job.encoder; t.r.codec = job.codec; t.r.options = &v.opts;
 							// The run's result (.json) and stream (.mp4) share a name made from the run and a hash of everything its outcome depends on, so a
 							// run that comes up again finds its result straight away. They go to the output folder; without one, results are kept in the cache.
 							t.key = key_head + v.key + key_run_text + key_tail;
@@ -1002,7 +1002,7 @@ int main(int argc, char** argv) {
 		o << "\"input\":" << jq(file_name(r.input)) << ",\"input_url\":" << (is_url(r.input) ? jq(r.input) : std::string("null"))
 		  << ",\"source_decoder\":" << jq(infos.count(r.input) ? infos.at(r.input).decoder : std::string()) << ",\"encoder\":" << jq(r.encoder) << ",\"codec\":" << jq(r.codec) << ",\"options\":{";
 		bool first = true;
-		for (auto& [k, v] : r.options) { o << (first ? "" : ",") << jq(k) << ":" << jq(v); first = false; }
+		for (auto& [k, v] : *r.options) { o << (first ? "" : ",") << jq(k) << ":" << jq(v); first = false; }
 		o << "},\"width\":" << r.shape.w << ",\"height\":" << r.shape.h << ",\"fps\":" << (r.shape.fps.num ? r.shape.fps.value() : 0.0)
 		  << ",\"target_kbps\":" << r.bitrate << ",\"keyframe_interval_s\":" << r.kf << ",\"gpu\":" << (r.gpu.empty() ? std::string("null") : jq(r.gpu))
 		  << ",\"encoder_version\":" << (is_gpu_encoder(r.encoder) ? std::string("null") : jq(encoder_library_version(r.encoder))) // the library behind a software encoder (a GPU encoder has gpu_info)
@@ -1137,7 +1137,7 @@ int main(int argc, char** argv) {
 			}
 			it->second.runs.push_back({t.result_file, t.key});
 			asked.push_back(&t);
-			job_runs[g].push_back({t.p.options, t.r.shape});
+			job_runs[g].push_back({*t.opts, t.r.shape});
 		}
 		std::vector<RemoteJobSpec> jobs;
 		for (auto& g : order) {
@@ -1215,7 +1215,7 @@ int main(int argc, char** argv) {
 					r.shape.w = hit.width; r.shape.h = hit.height;
 					r.shape.fps = Rational{(int)std::lround(hit.fps * 1000), 1000};
 				} else if (!r.shape.w) if (const SourceInfo* src = source_of(r.input)) { // an older result file: ask the source (which has to be had for that)
-					t.plan = make_plan(*src, t.job->encoder, t.job->codec, t.p.options, r.shape);
+					t.plan = make_plan(*src, t.job->encoder, t.job->codec, *t.opts, r.shape);
 					fit_shape(t);
 				}
 				const bool have_video = !r.video_file.empty() && fs::exists(r.video_file);
@@ -1270,14 +1270,14 @@ int main(int argc, char** argv) {
 			}
 			for (auto& [a, lo, hi] : sm->second) {
 				const std::string& name = job.axes[a].key;
-				const auto have = t.p.options.find(name);
+				const auto have = t.opts->find(name);
 				std::string key = std::to_string((uintptr_t)&job) + "|" + t.r.group + "|" + name + "|";
-				for (auto& [k, v] : t.p.options) if (k != name) key += k + "=" + v + ";";
+				for (auto& [k, v] : *t.opts) if (k != name) key += k + "=" + v + ";";
 				auto [at, fresh] = line_ids.emplace(key, (int)lines.size());
 				if (fresh) { lines.emplace_back(); lines.back().axis = name; }
 				Line& L = lines[at->second];
-				if (have != t.p.options.end() && have->second == lo) L.lo = &t;
-				else if (have != t.p.options.end() && have->second == hi) L.hi = &t;
+				if (have != t.opts->end() && have->second == lo) L.lo = &t;
+				else if (have != t.opts->end() && have->second == hi) L.hi = &t;
 				else t.mid.push_back(at->second);
 			}
 		}
@@ -1332,7 +1332,7 @@ int main(int argc, char** argv) {
 		if (!t.model.empty()) { r.ignored = true; r.expected = true; r.reason = "no worker produced it (on " + t.model + ")"; finish(t); continue; } // not on this machine's GPU: the key says another one
 		const SourceInfo* src = source_of(r.input);
 		if (!src) { finish(t); continue; }
-		t.plan = make_plan(*src, t.job->encoder, t.job->codec, t.p.options, r.shape);
+		t.plan = make_plan(*src, t.job->encoder, t.job->codec, *t.opts, r.shape);
 		if (t.plan.ignored) { r.ignored = true; r.expected = t.plan.expected; r.reason = t.plan.reason; finish(t); continue; }
 		fit_shape(t);
 		const std::string fk = r.input + "|" + t.plan.feed_key();
@@ -1488,7 +1488,7 @@ int main(int argc, char** argv) {
 			std::sort(sc.begin(), sc.end());
 			o << (i > g ? "," : "") << "{\"label\":" << jq(r.label) << ",\"encoder\":" << jq(r.encoder) << ",\"codec\":" << jq(r.codec) << ",\"options\":{";
 			bool first = true;
-			for (auto& [k, v] : r.options) { o << (first ? "" : ",") << jq(k) << ":" << jq(v); first = false; }
+			for (auto& [k, v] : *r.options) { o << (first ? "" : ",") << jq(k) << ":" << jq(v); first = false; }
 			o << "},\"width\":" << r.shape.w << ",\"height\":" << r.shape.h << ",\"fps\":" << (r.shape.fps.num ? r.shape.fps.value() : 0.0)
 			  << ",\"kbps\":" << r.kbps << ",\"over_target_penalty\":" << r.penalty << ",\"best_frame_share\":" << r.best_share << ",\"winner\":" << (r.best_share >= BEST_FRAME_SHARE ? "true" : "false")
 			  << ",\"vmaf\":{\"mean\":" << std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size() << ",\"min\":" << sc.front() << ",\"p5\":" << sc[(size_t)(sc.size() * 0.05)] << "}"
