@@ -700,6 +700,13 @@ int main(int argc, char** argv) {
 	_CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
 	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
 #endif
+	// `ves --probe-amf <codec> <gpu>`: whether AMD GPU <gpu> can encode the codec, and its capabilities, on one line. A worker asks this in a process of its own: AMD's runtime
+	// has crashed on GPUs a newer driver no longer supports, and that must not take the worker with it.
+	if (argc == 4 && std::string(argv[1]) == "--probe-amf") {
+	const int gpu = atoi(argv[3]);
+	if (amf_supports(argv[2], 420, 8, gpu)) printf("ok %s\n", amf_caps_json(argv[2], gpu).c_str()); else printf("no\n");
+	return 0;
+	}
 	for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--worker") return run_worker(argc, argv);
 	Config cfg;
 	try {

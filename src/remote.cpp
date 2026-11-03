@@ -625,6 +625,20 @@ std::string tail_of(const std::string& text, size_t lines) {
 	return out;
 }
 
+// Whether AMD GPU `gpu` can encode the codec, and its capabilities (JSON), asked of a process of our own: AMD's runtime can crash on a GPU its driver does not support
+// (the access violation would end the worker), and then the GPU is just not offered.
+bool probe_amf(const std::string& codec, int gpu, std::string& json) {
+	static const std::atomic<bool> never{false};
+	std::string answer;
+	const int code = run_process(self_exe(), {"--probe-amf", codec, std::to_string(gpu)}, [&](const std::string& line) {
+		if (line.rfind("ok ", 0) == 0) answer = line.substr(3);
+	}, never);
+	if (code != 0) fprintf(stderr, "amf: asking AMD GPU %d about %s ended with code %d: not offered\n", gpu, codec.c_str(), code);
+	if (code != 0 || answer.empty()) return false;
+	json = answer;
+	return true;
+}
+
 // The GPUs this machine offers: for each GPU encoder, its GPUs and the codecs each can encode. NVENC and AMF are asked per GPU; QuickSync only encodes on the
 // first GPU of its vendor, so that is the one offered.
 // How many encodes run at once on a resource: what is written down for it, else the default (0: 1 on the CPU, 2 on a GPU). -1 for none written down.
@@ -659,7 +673,7 @@ std::string inventory_json(int only_gpu, const std::vector<WorkerResource>& reso
 				std::string json = "null";
 				bool ok;
 				if (encoder == "nvenc") { json = nvenc_caps_json(codec, (int)i); ok = json != "null" && json != "{}"; }
-				else if (encoder == "amf") { ok = amf_supports(codec, 420, 8, (int)i); if (ok) json = amf_caps_json(codec, (int)i); }
+				else if (encoder == "amf") ok = probe_amf(codec, (int)i, json);
 				else ok = qsv_supports(codec, 420, 8);
 				if (!ok) continue;
 				codecs += (codecs.empty() ? "" : ",") + jq(codec);
