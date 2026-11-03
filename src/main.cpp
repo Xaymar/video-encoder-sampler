@@ -1069,6 +1069,14 @@ int main(int argc, char** argv) {
 		std::vector<RemoteJobSpec> jobs;
 		for (auto& g : order) {
 			RemoteJobSpec spec = std::move(groups[g]);
+			// A URL input is downloaded here once and streamed to the workers, which then all have the same bytes as the host.
+			if (is_url(spec.input)) {
+				try { spec.path = local_path(spec.input); } catch (const std::exception& e) {
+					if (!source_failed.count(spec.input)) ui::log("Input " + file_name(spec.input) + ": " + e.what());
+					source_failed.insert(spec.input);
+					continue;
+				}
+			}
 			// The job is left out when every run of it asks for more than the input has (a higher frame rate, or a size, chroma or bit depth above it without "upscale").
 			// Other reasons a run cannot work (this GPU, a codec) are for the worker to find out.
 			spec.possible = [encoder = spec.encoder, codec = spec.codec, runs = job_runs[g]](const std::string& json, std::string& why) {

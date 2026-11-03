@@ -11,6 +11,7 @@ using RemoteLog = std::function<void(const std::string&)>;
 
 struct RemoteJobSpec {
 	std::string name;    // for messages
+	std::string path;    // the input as a file on this machine, when `input` is a URL: the host downloads it once and streams it to the workers
 	std::string config;  // the sub-config (JSON), without inputs; "@GPU@" stands for the index of the GPU the worker runs it on
 	std::string input;   // a path on the host, or an http(s) URL the worker fetches itself
 	std::string encoder, codec;

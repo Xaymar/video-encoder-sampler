@@ -17,7 +17,7 @@ Both sides need the same `models/` folder and the same VMAF device (`vmaf.device
 1. A worker tells the host which GPUs it has when it connects: for NVENC, AMF and QuickSync the GPU's name and driver, and which of H.264, HEVC and AV1 it can encode.
 2. The host plans the sweep. Runs whose result file already exists are done; the rest are cut into **jobs**. A job is one input, one encoder entry, one scenario,
    one bitrate, one key frame interval and one size: all the option combinations of that entry, so the runs of a job still share a decode.
-3. A worker takes a job, as a small config. It fetches the input from the host if it does not have it (by SHA-256, kept in its `--worker-dir`; URL inputs it downloads itself),
+3. A worker takes a job, as a small config. It fetches the input from the host if it does not have it (by SHA-256, kept in its `--worker-dir`; a URL input is downloaded by the host once and sent like a file),
    then runs its own `ves` on the job (a child process, so a crash stays with the job) and sends the result files back.
 4. The host stores each result under the name and **key** it would have used for the run itself, so the rest of the sweep finds those runs finished: ranking, best videos,
    uploads and the result files are exactly as in a local sweep. CPU encoder runs no worker produced are run on the host.
@@ -58,7 +58,7 @@ Several jobs that need the same input fetch it once.
 ## Inputs
 
 An input travels from the host to a worker the first time a job of that worker needs it, and stays in the worker's `--worker-dir`. The host sends a worker the jobs whose input it already
-has before any other, so with several inputs each worker settles on a few of them and fetches each at most once. URL inputs are never sent; every worker downloads them itself, once however many of its jobs use the URL (one download row on the worker, and the jobs find the file in its cache). A worker asks the server about a URL once per run of the worker; its jobs use the downloaded file as it is (`--trust-downloads`), so a server that sends no ETag or Last-Modified is not asked for the whole file again for every job.
+has before any other, so with several inputs each worker settles on a few of them and fetches each at most once. A URL input is downloaded by the host once (it needs the file itself) and streamed to the workers like a local file, so every worker has the host's bytes and the server is asked once. A download that is not the size recorded with it is damaged and fetched again.
 
 ## Progress
 

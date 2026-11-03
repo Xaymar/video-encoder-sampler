@@ -256,11 +256,13 @@ struct RemoteHost::Impl {
 				try {
 					const RemoteJobSpec& job = (*jobs)[id];
 					std::string sha, size = "0";
-					if (!is_url(job.input)) { sha = input_sha(job.input); size = std::to_string(fs::file_size(job.input)); }
+					const std::string& file = job.path.empty() ? job.input : job.path;
+					sha = input_sha(file);
+					size = std::to_string(fs::file_size(file));
 					std::string config = job.config;
 					for (size_t at; (at = config.find("@GPU@")) != std::string::npos;) config.replace(at, 5, std::to_string(std::max(gpu, 0)));
-					const std::string msg = "{\"id\":" + std::to_string(id) + ",\"name\":" + jq(job.name) + ",\"config\":" + jq(config) + ",\"input\":{\"url\":" + (is_url(job.input) ? "true" : "false") +
-					                        ",\"name\":" + jq(is_url(job.input) ? job.input : fs::path(job.input).filename().string()) + ",\"sha256\":" + jq(sha) + ",\"size\":" + size + "}}";
+					const std::string msg = "{\"id\":" + std::to_string(id) + ",\"name\":" + jq(job.name) + ",\"config\":" + jq(config) + ",\"input\":{\"url\":false" +
+					                        ",\"name\":" + jq(fs::path(file).filename().string()) + ",\"sha256\":" + jq(sha) + ",\"size\":" + size + "}}";
 					log("job " + job.name + " -> " + who + (job.model.empty() ? "" : " on " + job.model));
 					if (!send(M_JOB, msg)) throw std::runtime_error("connection lost");
 				} catch (const std::exception&) {
@@ -274,7 +276,7 @@ struct RemoteHost::Impl {
 			if (type == M_NEED) {
 				const size_t id = id_of(payload);
 				senders.emplace_back([&, id] {
-					const std::string path = (*jobs)[id].input;
+					const std::string path = (*jobs)[id].path.empty() ? (*jobs)[id].input : (*jobs)[id].path;
 					std::ifstream f(path, std::ios::binary);
 					std::string chunk(kChunk, '\0');
 					while (f) {
