@@ -417,6 +417,14 @@ void set_title(const std::string& title) {
 	custom_title = title;
 }
 
+void emit_record(char kind, const std::string& payload) {
+	std::lock_guard lock(m);
+	if (!progress_stdout) return;
+	const std::string line = std::string(1, kind) + payload + "\n";
+	fwrite(line.data(), 1, line.size(), stdout);
+	fflush(stdout);
+}
+
 void set_progress_stdout(bool on) {
 	std::lock_guard lock(m);
 	progress_stdout = on;

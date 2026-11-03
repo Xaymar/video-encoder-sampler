@@ -580,6 +580,36 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 	return o.str();
 }
 
+// A source's details as JSON, and back: the first job of an input tells the host what the input is, and the host leaves out the jobs that ask for more.
+static std::string source_json(const SourceInfo& si) {
+	std::ostringstream o;
+	o << "{\"w\":" << si.width << ",\"h\":" << si.height << ",\"chroma\":" << si.fmt.chroma << ",\"depth\":" << si.fmt.depth << ",\"rgb\":" << si.fmt.rgb << ",\"planar\":" << si.fmt.planar
+	  << ",\"fps_num\":" << si.framerate.num << ",\"fps_den\":" << si.framerate.den << ",\"range\":" << si.color.range << ",\"space\":" << si.color.space << ",\"primaries\":" << si.color.primaries
+	  << ",\"trc\":" << si.color.trc << ",\"duration\":" << si.duration << ",\"frames\":" << si.frame_count << ",\"decoder\":" << jq(si.decoder) << "}";
+	return o.str();
+}
+
+static SourceInfo source_from_json(const std::string& text) {
+	Json j = Json::parse(text);
+	auto num = [&](const char* k) { return atof(j.find(k)->text().c_str()); };
+	SourceInfo si;
+	si.width = (int)num("w");
+	si.height = (int)num("h");
+	si.fmt.chroma = (int)num("chroma");
+	si.fmt.depth = (int)num("depth");
+	si.fmt.rgb = num("rgb") != 0;
+	si.fmt.planar = num("planar") != 0;
+	si.framerate = Rational{(int)num("fps_num"), (int)num("fps_den")};
+	si.color.range = (int)num("range");
+	si.color.space = (int)num("space");
+	si.color.primaries = (int)num("primaries");
+	si.color.trc = (int)num("trc");
+	si.duration = num("duration");
+	si.frame_count = (long long)num("frames");
+	si.decoder = j.find("decoder")->text();
+	return si;
+}
+
 // `ves --worker host:port`: runs the jobs a host sends, until it is stopped. Every other flag is passed on to the `ves` that runs a job, so --priority, --hw-decode,
 // --vmaf-device and so on work as they do for a sweep started by hand.
 static int run_worker(int argc, char** argv) {
@@ -1002,6 +1032,7 @@ int main(int argc, char** argv) {
 		} catch (const std::exception& e) { ui::log("Input " + file_name(input) + ": " + e.what()); source_failed.insert(input); return nullptr; }
 		it = infos.emplace(input, si).first;
 		ui::log("Source " + file_name(input) + ": " + std::to_string(si.width) + "x" + std::to_string(si.height) + " decoded by " + si.decoder);
+		ui::emit_record((char)29, source_json(it->second));
 		return &it->second;
 	};
 	auto fit_shape = [](Task& t) {
@@ -1014,6 +1045,7 @@ int main(int argc, char** argv) {
 	if (remote) {
 		std::map<std::string, RemoteJobSpec> groups;
 		std::vector<std::string> order;
+		std::map<std::string, std::vector<std::pair<Options, Shape>>> job_runs; // the options and size of each run of a job, for telling whether the input allows any
 		for (auto& t : tasks) {
 			if (t.result_file.empty() || fs::exists(t.result_file)) continue;
 			const std::string g = t.r.input + "|" + std::to_string(t.job - cfg.jobs.data()) + "|" + std::to_string(t.sc - cfg.scenarios.data()) + "|" + std::to_string(t.r.bitrate) + "|" +
@@ -1032,9 +1064,25 @@ int main(int argc, char** argv) {
 				it = groups.emplace(g, std::move(spec)).first;
 			}
 			it->second.runs.push_back({t.result_file, t.key});
+			job_runs[g].push_back({t.p.options, t.r.shape});
 		}
 		std::vector<RemoteJobSpec> jobs;
-		for (auto& g : order) jobs.push_back(std::move(groups[g]));
+		for (auto& g : order) {
+			RemoteJobSpec spec = std::move(groups[g]);
+			// The job is left out when every run of it asks for more than the input has (a higher frame rate, or a size, chroma or bit depth above it without "upscale").
+			// Other reasons a run cannot work (this GPU, a codec) are for the worker to find out.
+			spec.possible = [encoder = spec.encoder, codec = spec.codec, runs = job_runs[g]](const std::string& json, std::string& why) {
+				SourceInfo si;
+				try { si = source_from_json(json); } catch (const std::exception&) { return true; }
+				for (auto& [opts, shape] : runs) {
+					const Plan plan = make_plan(si, encoder, codec, opts, shape);
+					if (!(plan.ignored && plan.expected)) return true;
+					why = plan.reason;
+				}
+				return false;
+			};
+			jobs.push_back(std::move(spec));
+		}
 		for (auto& j : jobs) j.name += " (" + std::to_string(j.runs.size()) + " runs)";
 		size_t in_jobs = 0;
 		for (auto& j : jobs) in_jobs += j.runs.size();

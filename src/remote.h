@@ -14,6 +14,9 @@ struct RemoteJobSpec {
 	std::string config;  // the sub-config (JSON), without inputs; "@GPU@" stands for the index of the GPU the worker runs it on
 	std::string input;   // a path on the host, or an http(s) URL the worker fetches itself
 	std::string encoder, codec;
+	// Whether any run of the job can work with a source, given as JSON (what the first job of an input reports); `why` says what is in the way when not.
+	// Jobs for which it says no are not sent.
+	std::function<bool(const std::string& source_json, std::string& why)> possible;
 	std::string model;   // GPU encoders: the GPU (as gpu_description() names it) this job must run on; empty: any worker
 	struct Run {
 		std::string result_file; // where the host keeps this run's result

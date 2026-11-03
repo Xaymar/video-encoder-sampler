@@ -26,6 +26,13 @@ A job that returns fewer results than it has runs (runs that cannot work with th
 
 A worker that loses its connection mid-job gives the job back; it goes to the next free worker. A job is tried three times.
 
+## Jobs the input cannot do
+
+The host does not open the inputs, so it does not know what a source allows. The first job of each input goes out alone, and its `ves` tells the host what the source is (size, frame rate, pixel format).
+The host then leaves out every queued job of that input whose runs all ask for more than the input has: a higher frame rate, or a size, chroma layout or bit depth above the source's when the scenario
+does not say `"upscale": true`. It logs once how many jobs it dropped and why. Other reasons a run cannot work (this GPU lacks a codec, say) are left to the worker, since the host's own GPU says nothing about it.
+The runs of dropped jobs count as ignored.
+
 ## GPUs
 
 An encoder generation changes what comes out: the same settings on a 2080 Ti and on a 4080 Super give different streams. So a run is identified by its settings **and the GPU model**:

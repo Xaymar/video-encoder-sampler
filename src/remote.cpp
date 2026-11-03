@@ -35,7 +35,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-enum : uint8_t { M_HELLO = 1, M_JOB = 2, M_NEED = 3, M_FILE_DATA = 4, M_FILE_END = 5, M_RESULT = 6, M_DONE = 7, M_PROGRESS = 8 };
+enum : uint8_t { M_HELLO = 1, M_JOB = 2, M_NEED = 3, M_FILE_DATA = 4, M_FILE_END = 5, M_RESULT = 6, M_DONE = 7, M_PROGRESS = 8, M_SOURCE = 9 };
 constexpr int kVersion = 3;
 constexpr size_t kChunk = 1 << 20;
 constexpr int kTries = 3;
@@ -118,6 +118,8 @@ struct RemoteHost::Impl {
 	std::map<std::string, std::string> sha_of; // input path -> SHA-256
 	size_t left = 0, imported = 0, stored_now = 0;
 	std::function<void(size_t)> on_stored;
+	// The first job of an input goes out alone and reports what the source is (0 not known and nobody finding out, 1 a job is finding out, 2 known).
+	std::map<std::string, int> probe_state;
 
 	std::string input_sha(const std::string& path) {
 		{
@@ -146,9 +148,12 @@ struct RemoteHost::Impl {
 				const RemoteJobSpec& j = (*jobs)[*it];
 				const int g = gpu_for(w, j);
 				if (g == -2) continue;
+				const int state = j.possible ? probe_state[j.input] : 2;
+				if (state == 1) continue; // another job of this input is finding out what the input can do
 				if (pass == 0 && !w.inputs.count(j.input)) continue;
 				id = *it;
 				gpu = g;
+				if (state == 0) probe_state[j.input] = 1;
 				queue.erase(it);
 				return true;
 			}
@@ -294,6 +299,35 @@ struct RemoteHost::Impl {
 					}
 					if (on_stored) on_stored(now);
 				}
+			} else if (type == M_SOURCE) {
+				if (payload.size() < 5) continue;
+				const size_t id = id_of(payload);
+				if (id >= jobs->size()) continue;
+				const std::string json = payload.substr(4);
+				std::map<std::string, int> why_count;
+				size_t dropped = 0;
+				{
+					std::lock_guard lock(m);
+					const std::string& input = (*jobs)[id].input;
+					if (probe_state[input] == 2) continue;
+					probe_state[input] = 2;
+					for (auto it = queue.begin(); it != queue.end();) {
+						const RemoteJobSpec& j = (*jobs)[*it];
+						std::string why;
+						if (j.input == input && j.possible && !j.possible(json, why)) {
+							why_count[why]++;
+							it = queue.erase(it);
+							left--;
+							dropped++;
+						} else ++it;
+					}
+				}
+				if (dropped) {
+					std::string text = "remote: " + std::to_string(dropped) + " jobs are left out because the input cannot do what they ask for:";
+					for (auto& [why, n] : why_count) text += " " + std::to_string(n) + " x " + why + ";";
+					log(text);
+					cv.notify_all();
+				}
 			} else if (type == M_PROGRESS) {
 				if (payload.size() < 5) continue;
 				const size_t id = id_of(payload);
@@ -315,6 +349,7 @@ struct RemoteHost::Impl {
 					if (it == active.end()) continue;
 					stored = it->second.stored;
 					active.erase(it);
+					if (probe_state[(*jobs)[id].input] == 1) probe_state[(*jobs)[id].input] = 0; // it did not find out: the next job may try
 					ui::set_remote(worker->name + "#" + std::to_string(id), "", {});
 					imported += stored;
 					left--;
@@ -333,6 +368,7 @@ struct RemoteHost::Impl {
 		for (auto& t : senders) t.join();
 		std::lock_guard lock(m);
 		for (auto& [id, a] : active) {
+			if (probe_state[(*jobs)[id].input] == 1) probe_state[(*jobs)[id].input] = 0;
 			ui::set_remote(worker->name + "#" + std::to_string(id), "", {});
 			const RemoteJobSpec& job = (*jobs)[id];
 			log("job " + job.name + " lost with " + who);
@@ -403,6 +439,7 @@ size_t RemoteHost::run_jobs(const std::vector<RemoteJobSpec>& jobs, const std::f
 		impl->left = jobs.size();
 		impl->imported = 0;
 		impl->stored_now = 0;
+		impl->probe_state.clear();
 		impl->on_stored = on_stored;
 	}
 	impl->log("remote: " + std::to_string(jobs.size()) + " jobs");
@@ -747,7 +784,9 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 				// Once a second the job's `ves` prints the numbers of its runs; they go to the host and to this worker's own display. Its other lines are kept for a failure.
 				std::deque<std::string> tail;
 				const int code = run_process(exe, args, [&](const std::string& text) {
-					if (!text.empty() && text[0] == (char)30) {
+					if (!text.empty() && text[0] == (char)29) {
+						send(M_SOURCE, id_bytes(id) + text.substr(1));
+					} else if (!text.empty() && text[0] == (char)30) {
 						send(M_PROGRESS, id_bytes(id) + text.substr(1));
 						ui::set_remote(rows_key, jname + ": ", ui::parse_progress(text.substr(1)));
 					} else if (!text.empty()) {
