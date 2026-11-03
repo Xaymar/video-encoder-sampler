@@ -724,8 +724,13 @@ size_t id_of(const std::string& payload) {
 bool fetch_input(const std::function<bool(uint8_t, const std::string&)>& send, Inbox& inbox, size_t job_id, const fs::path& dir, const std::string& name, const std::string& sha, long long size, fs::path& out,
                  std::string& err) {
 	std::string safe = fs::path(name).filename().string();
-	out = dir / (sha.substr(0, 16) + "_" + safe);
+	// Short on purpose: the name of the input becomes a folder of the job's results, and with the result names under it the path must stay below the 260 characters
+	// Windows allows. The hash tells inputs apart; a few letters of the name keep the display readable.
+	const std::string stem = fs::path(safe).stem().string().substr(0, 20);
+	out = dir / (sha.substr(0, 8) + "_" + stem + fs::path(safe).extension().string());
+	const fs::path earlier = dir / (sha.substr(0, 16) + "_" + safe); // the name earlier versions gave it: no need to fetch the file again
 	std::error_code ec;
+	if (!fs::exists(out, ec) && fs::exists(earlier, ec)) fs::rename(earlier, out, ec);
 	if (fs::exists(out, ec)) return true;
 	if (!send(M_NEED, id_bytes(job_id) + "{\"sha256\":" + jq(sha) + "}")) { err = "connection lost"; return false; }
 	fs::create_directories(dir, ec);

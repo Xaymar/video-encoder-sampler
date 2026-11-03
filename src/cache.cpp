@@ -160,7 +160,7 @@ void result_store(const std::string& file, const std::string& key, const CachedR
 		f << ",\"vmaf\":{\"scores\":[";
 		for (size_t i = 0; i < run.scores.size(); i++) { snprintf(b, sizeof b, "%.17g", run.scores[i]); f << (i ? "," : "") << b; }
 		f << "]}}\n";
-		if (!f) { fs::remove(tmp, ec); return; }
+		if (!f) { fprintf(stderr, "cannot write the result %s (is the path too long?)\n", file.c_str()); fs::remove(tmp, ec); return; }
 	}
 	fs::rename(tmp, file, ec); // atomic, so an interrupted run never leaves a half-written file
 }
