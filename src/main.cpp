@@ -1005,6 +1005,7 @@ int main(int argc, char** argv) {
 		for (auto& [k, v] : r.options) { o << (first ? "" : ",") << jq(k) << ":" << jq(v); first = false; }
 		o << "},\"width\":" << r.shape.w << ",\"height\":" << r.shape.h << ",\"fps\":" << (r.shape.fps.num ? r.shape.fps.value() : 0.0)
 		  << ",\"target_kbps\":" << r.bitrate << ",\"keyframe_interval_s\":" << r.kf << ",\"gpu\":" << (r.gpu.empty() ? std::string("null") : jq(r.gpu))
+		  << ",\"encoder_version\":" << (is_gpu_encoder(r.encoder) ? std::string("null") : jq(encoder_library_version(r.encoder))) // the library behind a software encoder (a GPU encoder has gpu_info)
 		  << ",\"gpu_info\":" << *r.gpu_json << ",\"encoder_caps\":" << *r.caps_json << ",\"video\":" << (r.video.empty() ? std::string("null") : jq(r.video))
 		  << ",\"video_sha256\":" << (r.video_sha256.empty() ? std::string("null") : jq(r.video_sha256)) << ",\"reference_sha256\":" << jq(reference_hash(r.input));
 		return o.str();
