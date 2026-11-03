@@ -97,6 +97,8 @@ struct Worker {
 	std::vector<Gpu> gpus;
 	std::set<std::string> inputs; // inputs it has been sent
 	int slots = 1;                // jobs it runs at the same time
+	std::map<std::string, int> load;      // jobs running per encoder and GPU
+	std::map<size_t, std::string> device; // which of them each running job counts for
 };
 
 } // namespace
@@ -140,10 +142,14 @@ struct RemoteHost::Impl {
 		return -2;
 	}
 
-	// The next job for a worker, or false: the queue has none it can run. Prefers a job whose input the worker already has, so inputs travel once per worker.
-	bool next_job(const Worker& w, size_t& id, int& gpu) {
+	// The next job for a worker, or false: the queue has none it can run. Prefers a job whose input the worker already has, so inputs travel once per worker, and
+	// among those the one for the encoder and GPU with the fewest jobs running, so that every GPU of a worker is kept busy and not only the one first in the queue.
+	bool next_job(Worker& w, size_t& id, int& gpu) {
 		if (!jobs) return false;
 		for (int pass = 0; pass < 2; pass++) {
+			auto best = queue.end();
+			int best_load = 0, best_gpu = -1;
+			std::string best_device;
 			for (auto it = queue.begin(); it != queue.end(); ++it) {
 				const RemoteJobSpec& j = (*jobs)[*it];
 				const int g = gpu_for(w, j);
@@ -151,12 +157,19 @@ struct RemoteHost::Impl {
 				const int state = j.possible ? probe_state[j.input] : 2;
 				if (state == 1) continue; // another job of this input is finding out what the input can do
 				if (pass == 0 && !w.inputs.count(j.input)) continue;
-				id = *it;
-				gpu = g;
-				if (state == 0) probe_state[j.input] = 1;
-				queue.erase(it);
-				return true;
+				const std::string device = j.encoder + "/" + std::to_string(g);
+				const int load = w.load[device];
+				if (best != queue.end() && load >= best_load) continue;
+				best = it; best_load = load; best_gpu = g; best_device = device;
 			}
+			if (best == queue.end()) continue;
+			id = *best;
+			gpu = best_gpu;
+			if ((*jobs)[id].possible && probe_state[(*jobs)[id].input] == 0) probe_state[(*jobs)[id].input] = 1;
+			w.load[best_device]++;
+			w.device[id] = best_device;
+			queue.erase(best);
+			return true;
 		}
 		return false;
 	}
@@ -357,6 +370,7 @@ struct RemoteHost::Impl {
 					if (it == active.end()) continue;
 					stored = it->second.stored;
 					active.erase(it);
+					if (auto d = worker->device.find(id); d != worker->device.end()) { worker->load[d->second]--; worker->device.erase(d); }
 					if (probe_state[(*jobs)[id].input] == 1) probe_state[(*jobs)[id].input] = 0; // it did not find out: the next job may try
 					ui::set_remote(worker->name + "#" + std::to_string(id), "", {});
 					imported += stored;

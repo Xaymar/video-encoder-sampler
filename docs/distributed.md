@@ -48,7 +48,7 @@ An encoder generation changes what comes out: the same settings on a 2080 Ti and
 
 Machines differ in how many encoder sessions they take (an NVENC card may allow 10, another 5 or 3), so each worker sets its own limits:
 
-* `--worker-jobs N`: how many jobs it runs at the same time (default 1). The host keeps it supplied with that many.
+* `--worker-jobs N`: how many jobs it runs at the same time (default 1). The host keeps it supplied with that many, choosing each time the queued job for the encoder and GPU the worker has the fewest jobs on, so that a worker with an NVIDIA and an AMD GPU uses both instead of working through all NVENC jobs first.
 * `--parallel N`: how many runs of one job run at the same time (it is passed on to every job, and replaces the host's value). Without it a job uses the host's `parallel`
   for that encoder, or the default of 2 for GPU encoders and 1 for CPU encoders.
 
