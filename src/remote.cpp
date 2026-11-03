@@ -659,7 +659,7 @@ std::string inventory_json(int only_gpu, const std::vector<WorkerResource>& reso
 				std::string json = "null";
 				bool ok;
 				if (encoder == "nvenc") { json = nvenc_caps_json(codec, (int)i); ok = json != "null" && json != "{}"; }
-				else if (encoder == "amf") ok = amf_supports(codec, 420, 8);
+				else if (encoder == "amf") { ok = amf_supports(codec, 420, 8); if (ok) json = amf_caps_json(codec); }
 				else ok = qsv_supports(codec, 420, 8);
 				if (!ok) continue;
 				codecs += (codecs.empty() ? "" : ",") + jq(codec);

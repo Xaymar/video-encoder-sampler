@@ -97,6 +97,29 @@ class Amf : public Encoder {
 		pack_uv(*fr, w, h, depth, (uint8_t*)uvp->GetNative(), uvp->GetHPitch());
 	}
 
+	// What the encoder says it can do: where it runs (dedicated hardware, GPU compute or software) and the capability values the SDK lists (maximum bit rate, B-frames,
+	// hardware instances, ...), as a JSON object. Names and values are the SDK's own.
+	std::string caps_json = "null";
+	void read_caps() {
+		amf::AMFCapsPtr caps;
+		if (enc->GetCaps(&caps) != AMF_OK || !caps) return;
+		const amf::AMF_ACCELERATION_TYPE accel = caps->GetAccelerationType();
+		caps_json = std::string("{\"ACCELERATION_TYPE\":\"") + (accel == amf::AMF_ACCEL_HARDWARE ? "HARDWARE" : accel == amf::AMF_ACCEL_GPU ? "GPU" : accel == amf::AMF_ACCEL_SOFTWARE ? "SOFTWARE" : "NOT_SUPPORTED") + "\"";
+		for (amf_size i = 0; i < caps->GetPropertyCount(); i++) {
+			wchar_t name[128];
+			amf::AMFVariant v;
+			if (caps->GetPropertyAt(i, name, 128, &v) != AMF_OK) continue;
+			std::string key, val;
+			for (const wchar_t* c = name; *c; c++) key += (char)*c;
+			if (key.find("Requested") != std::string::npos) continue; // what is running on the encoder right now: changes from one ask to the next, a capability does not
+			if (v.type == amf::AMF_VARIANT_BOOL) val = v.ToBool() ? "true" : "false";
+			else if (v.type == amf::AMF_VARIANT_INT64) val = std::to_string(v.ToInt64());
+			else continue;
+			caps_json += ",\"" + key + "\":" + val;
+		}
+		caps_json += "}";
+	}
+
 	// Property names are written snake_case without the codec's prefix (QualityPreset, HevcQualityPreset and Av1QualityPreset are all quality_preset).
 	void collect_names(std::map<std::string, std::string>& names) const {
 		for (amf_size i = 0; i < enc->GetPropertiesInfoCount(); i++) {
@@ -178,6 +201,7 @@ class Amf : public Encoder {
 	}
 
 public:
+	const std::string& caps() const { return caps_json; } // see read_caps
 	~Amf() override {
 		stop = true;
 		if (rx.joinable()) rx.join();
@@ -301,6 +325,7 @@ public:
 		for (auto& [k, v] : native_opts) if (k != "enable_pre_analysis" && !apply(k, v)) return false;
 
 		if ((r = enc->Init(depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init");
+		read_caps();
 		if (!filter_opts.empty() && !open_filter(filter_opts, p)) return false;
 		amf::AMFVariant bp;
 		if (enc->GetProperty(L"BPicturesPattern", &bp) == AMF_OK && bp.ToInt64() > 0) b_delay = (int)bp.ToInt64() + 1; // H.264; the other codecs have no such property
@@ -360,6 +385,26 @@ bool amf_supports(const std::string& codec, int chroma, int depth) {
 	return it->second;
 }
 
+// The capabilities of the codec on the AMD GPU (see Amf::read_caps), "null" when it cannot encode it. Asked once per codec: AMF only encodes on the first AMD GPU.
+std::string amf_caps_json(const std::string& codec) {
+	static std::mutex m;
+	static std::map<std::string, std::string> cache;
+	std::lock_guard<std::mutex> lock(m);
+	auto it = cache.find(codec);
+	if (it == cache.end()) {
+		Params p;
+		p.width = 1280; p.height = 720; p.bitrate = 5000000; p.gop = 60;
+		p.pix = planar_fmt(420, 8);
+		p.codec = codec;
+		probing = true;
+		Amf probe;
+		const bool ok = probe.open(p, nullptr);
+		probing = false;
+		it = cache.emplace(codec, ok ? probe.caps() : "null").first;
+	}
+	return it->second;
+}
+
 #else
 // AMF's Linux runtime needs a Vulkan context (AMFContext::InitVulkan); not implemented, so the encoder reports itself as unavailable.
 #include <cstdio>
@@ -373,4 +418,5 @@ struct AmfUnavailable : Encoder {
 
 std::unique_ptr<Encoder> make_encoder_amf() { return std::make_unique<AmfUnavailable>(); }
 bool amf_supports(const std::string&, int, int) { return false; }
+std::string amf_caps_json(const std::string&) { return "null"; }
 #endif

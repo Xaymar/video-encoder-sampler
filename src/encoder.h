@@ -53,7 +53,8 @@ bool nvenc_supports(const std::string& codec, int chroma, int depth);
 // if the encoder cannot tell. Together with the PCI ids of the GPU this identifies the encoder generation: the CUDA generation of a GPU says
 // nothing about it, since a newer GPU can carry an older encoder block.
 std::string nvenc_caps_json(const std::string& codec, int gpu);
-inline std::string encoder_caps_json(const std::string& encoder, const std::string& codec, int gpu) { return encoder == "nvenc" ? nvenc_caps_json(codec, gpu) : "null"; }
+std::string amf_caps_json(const std::string& codec); // where the encoder runs (hardware, GPU compute, software) and the SDK's capability values; the first AMD GPU
+inline std::string encoder_caps_json(const std::string& encoder, const std::string& codec, int gpu) { return encoder == "nvenc" ? nvenc_caps_json(codec, gpu) : encoder == "amf" ? amf_caps_json(codec) : "null"; }
 bool amf_supports(const std::string& codec, int chroma, int depth);
 bool qsv_supports(const std::string& codec, int chroma, int depth);
 
