@@ -49,9 +49,11 @@ Several jobs that need the same input fetch it once.
 ## Inputs
 
 An input travels from the host to a worker the first time a job of that worker needs it, and stays in the worker's `--worker-dir`. The host sends a worker the jobs whose input it already
-has before any other, so with several inputs each worker settles on a few of them and fetches each at most once. URL inputs are never sent; every worker downloads them itself, once however many of its jobs use the URL (one download row on the worker, and the jobs find the file in its cache).
+has before any other, so with several inputs each worker settles on a few of them and fetches each at most once. URL inputs are never sent; every worker downloads them itself, once however many of its jobs use the URL (one download row on the worker, and the jobs find the file in its cache). A worker asks the server about a URL once per run of the worker; its jobs use the downloaded file as it is (`--trust-downloads`), so a server that sends no ETag or Last-Modified is not asked for the whole file again for every job.
 
 ## Progress
+
+The host's "runs finished" count goes up as results arrive from the workers.
 
 A worker shows the same table as a sweep: its log lines above, and below them the rows of the jobs it runs, with a header that says whether it is connected and how many jobs are running.
 The host shows the workers' rows with its own, tagged `[worker name]`; they go away when the job is done or the worker is lost. In plain mode (no terminal) they are listed every 15 seconds like local runs.

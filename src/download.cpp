@@ -160,6 +160,9 @@ std::string url_file_name(const std::string& url) { return file_name_of(url); }
 
 bool is_url(const std::string& s) { return s.rfind("http://", 0) == 0 || s.rfind("https://", 0) == 0; }
 
+static bool trust_downloads = false;
+void set_trust_downloads(bool on) { trust_downloads = on; }
+
 std::string fetch_url(const std::string& url, const std::string& dir, RunProgress* progress) {
 	uint64_t h = 1469598103934665603ull;
 	for (unsigned char c : url) h = (h ^ c) * 1099511628211ull;
@@ -169,6 +172,7 @@ std::string fetch_url(const std::string& url, const std::string& dir, RunProgres
 	fs::create_directories(fs::path(dir) / folder, ec);
 	const fs::path file = fs::path(dir) / folder / file_name_of(url);
 	const fs::path part = file.string() + ".part", meta_file = file.string() + ".meta";
+	if (trust_downloads && fs::exists(file) && fs::exists(meta_file)) return file.string();
 
 	Transfer t;
 	t.name = file_name_of(url);

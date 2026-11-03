@@ -42,7 +42,8 @@ public:
 	std::vector<Model> models(const std::string& encoder, const std::string& codec);
 
 	// Serves `jobs` to the workers until every job is done or given up (three tries each). Returns how many result files were stored.
-	size_t run_jobs(const std::vector<RemoteJobSpec>& jobs);
+	// `on_stored` is told how many result files have been stored so far, each time one is.
+	size_t run_jobs(const std::vector<RemoteJobSpec>& jobs, const std::function<void(size_t)>& on_stored = {});
 
 private:
 	struct Impl;

@@ -116,7 +116,8 @@ struct RemoteHost::Impl {
 	std::deque<size_t> queue;
 	std::vector<int> tries;
 	std::map<std::string, std::string> sha_of; // input path -> SHA-256
-	size_t left = 0, imported = 0;
+	size_t left = 0, imported = 0, stored_now = 0;
+	std::function<void(size_t)> on_stored;
 
 	std::string input_sha(const std::string& path) {
 		{
@@ -285,8 +286,13 @@ struct RemoteHost::Impl {
 				if (payload.size() < 6 + nl) continue;
 				const std::string name = fs::path(payload.substr(6, nl)).filename().string();
 				if (id < jobs->size() && import_result((*jobs)[id], name, payload.substr(6 + nl))) {
-					std::lock_guard lock(m);
-					active[id].stored++;
+					size_t now;
+					{
+						std::lock_guard lock(m);
+						active[id].stored++;
+						now = ++stored_now;
+					}
+					if (on_stored) on_stored(now);
 				}
 			} else if (type == M_PROGRESS) {
 				if (payload.size() < 5) continue;
@@ -386,7 +392,7 @@ std::vector<RemoteHost::Model> RemoteHost::models(const std::string& encoder, co
 	return out;
 }
 
-size_t RemoteHost::run_jobs(const std::vector<RemoteJobSpec>& jobs) {
+size_t RemoteHost::run_jobs(const std::vector<RemoteJobSpec>& jobs, const std::function<void(size_t)>& on_stored) {
 	if (jobs.empty()) return 0;
 	{
 		std::lock_guard lock(impl->m);
@@ -396,6 +402,8 @@ size_t RemoteHost::run_jobs(const std::vector<RemoteJobSpec>& jobs) {
 		impl->tries.assign(jobs.size(), 0);
 		impl->left = jobs.size();
 		impl->imported = 0;
+		impl->stored_now = 0;
+		impl->on_stored = on_stored;
 	}
 	impl->log("remote: " + std::to_string(jobs.size()) + " jobs");
 	impl->cv.notify_all();
@@ -406,6 +414,7 @@ size_t RemoteHost::run_jobs(const std::vector<RemoteJobSpec>& jobs) {
 	}
 	impl->jobs = nullptr;
 	impl->queue.clear();
+	impl->on_stored = nullptr;
 	return impl->imported;
 }
 
@@ -692,14 +701,25 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 					one = slot;
 				}
 				std::lock_guard lock(*one);
-				RunProgress rp;
-				rp.begin(5, 0);
-				const int handle = ui::attach(&rp, url_file_name(input), "input");
-				try {
-					fetch_url(input, (fs::path(workdir) / "cache" / "downloads").string(), &rp);
-				} catch (const std::exception& e) { failure = e.what(); }
-				rp.finish();
-				ui::detach(handle);
+				static std::set<std::string> fetched; // URLs this worker has downloaded in this run; the file is in its cache and is not asked for again
+				static std::mutex fetched_m;
+				bool have;
+				{
+					std::lock_guard lock2(fetched_m);
+					have = fetched.count(input) > 0;
+				}
+				if (!have) {
+					RunProgress rp;
+					rp.begin(5, 0);
+					const int handle = ui::attach(&rp, url_file_name(input), "input");
+					try {
+						fetch_url(input, (fs::path(workdir) / "cache" / "downloads").string(), &rp);
+						std::lock_guard lock2(fetched_m);
+						fetched.insert(input);
+					} catch (const std::exception& e) { failure = e.what(); }
+					rp.finish();
+					ui::detach(handle);
+				}
 			} else {
 				const std::string sha = in.find("sha256")->text();
 				std::shared_ptr<std::mutex> one;
@@ -721,7 +741,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 					f << job.find("config")->text();
 				}
 				std::vector<std::string> args{"--plain", "--progress", "--config", (dir / "config.jsonc").string(), "--input", input, "--output", (dir / "out").string(), "--no-videos",
-				                               "--cache", (fs::path(workdir) / "cache").string(), "--upload", "off"};
+				                               "--cache", (fs::path(workdir) / "cache").string(), "--upload", "off", "--trust-downloads"};
 				args.insert(args.end(), extra_args.begin(), extra_args.end());
 				// Once a second the job's `ves` prints the numbers of its runs; they go to the host and to this worker's own display. Its other lines are kept for a failure.
 				std::deque<std::string> tail;

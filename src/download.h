@@ -12,5 +12,8 @@ std::string url_file_name(const std::string& url);
 // Returns the local path of the file behind `url`, downloading it into `dir` if needed. With `progress` the live display shows it (stage 5, bytes);
 // without, progress is printed to stdout.
 // Throws std::runtime_error when the file cannot be had (no server and no earlier copy, HTTP errors, a short download).
+// With this on, a file that was downloaded before is used as it is, without asking the server whether it changed (and so without downloading it again from a server
+// that sends nothing to tell by). A worker sets it for the `ves` that runs its jobs, after it has fetched the file itself.
+void set_trust_downloads(bool on);
 struct RunProgress;
 std::string fetch_url(const std::string& url, const std::string& dir, RunProgress* progress = nullptr);
