@@ -227,8 +227,25 @@ static void parse_conds(const Json& j, std::vector<Cond>& out, const std::string
 
 // Every combination of the axes on top of `base`.
 static std::vector<Options> expand(const std::string& encoder, const std::vector<Axis>& axes, const Options& base = {}) {
+	// An option with conditions is placed after the options its conditions name, so the combinations that cannot be are never made: where its condition fails it
+	// stays unset (one branch, not one per value). The rest keeps the order it was written in. Conditions that go in circles are checked against what is placed.
+	std::vector<const Axis*> order;
+	{
+		std::vector<bool> placed(axes.size());
+		auto names_unplaced = [&](const Axis& ax) {
+			for (auto* list : {&ax.requires_all, &ax.unless_any}) for (auto& c : *list)
+				for (size_t k = 0; k < axes.size(); k++) if (!placed[k] && axes[k].key == c.key && &axes[k] != &ax) return true;
+			return false;
+		};
+		while (order.size() < axes.size()) {
+			bool progress = false;
+			for (size_t k = 0; k < axes.size(); k++) if (!placed[k] && !names_unplaced(axes[k])) { placed[k] = true; order.push_back(&axes[k]); progress = true; }
+			if (!progress) for (size_t k = 0; k < axes.size(); k++) if (!placed[k]) { placed[k] = true; order.push_back(&axes[k]); } // a circle
+		}
+	}
 	std::vector<Options> combos{base};
-	for (auto& ax : axes) {
+	for (const Axis* axp : order) {
+		const Axis& ax = *axp;
 		if (ax.values.empty()) continue;
 		// gpu=all means every GPU of the encoder's vendor
 		std::vector<std::optional<std::string>> values;
@@ -238,30 +255,21 @@ static std::vector<Options> expand(const std::string& encoder, const std::vector
 				for (size_t i = 0; i < n; i++) values.push_back(std::to_string(i));
 			} else values.push_back(v);
 		}
+		const bool ruled = !ax.requires_all.empty() || !ax.unless_any.empty();
 		std::vector<Options> next;
-		for (auto& c : combos) for (auto& v : values) { Options n = c; if (v) n[ax.key] = *v; next.push_back(n); }
+		next.reserve(combos.size() * (ruled ? 1 : values.size()));
+		for (auto& c : combos) {
+			if (ruled) {
+				bool applies = true;
+				for (auto& r : ax.requires_all) applies &= r.holds(c);
+				for (auto& u : ax.unless_any) applies &= !u.holds(c);
+				if (!applies) { next.push_back(std::move(c)); continue; }
+			}
+			for (auto& v : values) { Options n = c; if (v) n[ax.key] = *v; next.push_back(std::move(n)); }
+		}
 		combos = std::move(next);
 	}
-	// Conditions: where one does not hold the option is left out, which makes combinations equal; each is kept once, in the order they came.
-	bool any_rule = false;
-	for (auto& ax : axes) any_rule |= !ax.requires_all.empty() || !ax.unless_any.empty();
-	if (!any_rule) return combos;
-	std::set<Options> seen;
-	std::vector<Options> out;
-	for (auto& c : combos) {
-		for (bool changed = true; changed;) { // dropping an option can make a condition on it fail for another
-			changed = false;
-			for (auto& ax : axes) {
-				if (!c.count(ax.key)) continue;
-				bool holds = true;
-				for (auto& r : ax.requires_all) holds &= r.holds(c);
-				for (auto& u : ax.unless_any) holds &= !u.holds(c);
-				if (!holds) { c.erase(ax.key); changed = true; }
-			}
-		}
-		if (seen.insert(c).second) out.push_back(c);
-	}
-	return out;
+	return combos;
 }
 
 static void add_inputs(Config& cfg, const std::string& path) {
