@@ -90,15 +90,17 @@ struct Gpu {
 	std::string description, info;
 	std::vector<std::string> codecs;
 	std::map<std::string, std::string> caps; // per codec
+	int parallel = 2;                         // encodes it runs at the same time
 };
 
 struct Worker {
 	std::string name;
 	std::vector<Gpu> gpus;
 	std::set<std::string> inputs; // inputs it has been sent
-	int slots = 1;                // jobs it runs at the same time
-	std::map<std::string, int> load;      // jobs running per encoder and GPU
-	std::map<size_t, std::string> device; // which of them each running job counts for
+	int slots = 1;                // jobs it can have at the same time: the sum of what its resources run
+	int cpu = 1;                  // encodes it runs on the CPU at the same time (0: none)
+	std::map<std::string, int> load;                      // encodes running per resource
+	std::map<size_t, std::pair<std::string, int>> device; // the resource and the encodes each running job counts for
 };
 
 } // namespace
@@ -134,42 +136,44 @@ struct RemoteHost::Impl {
 		return sha_of[path] = sha;
 	}
 
-	// Which of the worker's GPUs runs this job (-1: any worker will do, -2: this worker cannot).
-	static int gpu_for(const Worker& w, const RemoteJobSpec& job) {
-		if (job.model.empty()) return -1;
+	// Where this worker would run the job: its resource ("cpu" or encoder/GPU), the limit of that and the GPU index (-1 for the CPU); false when it has none for it.
+	static bool place(const Worker& w, const RemoteJobSpec& job, std::string& device, int& limit, int& gpu) {
+		if (job.model.empty()) { device = "cpu"; limit = w.cpu; gpu = -1; return w.cpu > 0; }
 		for (auto& g : w.gpus)
-			if (g.encoder == job.encoder && g.description == job.model && std::find(g.codecs.begin(), g.codecs.end(), job.codec) != g.codecs.end()) return g.index;
-		return -2;
+			if (g.encoder == job.encoder && g.description == job.model && std::find(g.codecs.begin(), g.codecs.end(), job.codec) != g.codecs.end()) {
+				device = g.encoder + "/" + std::to_string(g.index);
+				limit = g.parallel;
+				gpu = g.index;
+				return true;
+			}
+		return false;
 	}
 
-	// The next job for a worker, or false: the queue has none it can run. Prefers a job whose input the worker already has, so inputs travel once per worker, and
-	// among those the one for the encoder and GPU with the fewest jobs running, so that every GPU of a worker is kept busy and not only the one first in the queue.
-	bool next_job(Worker& w, size_t& id, int& gpu) {
+	// The next job for a worker, or false: the queue has none it can run. A job takes as many of its resource's parallel encodes as it has runs (at most all of them), and
+	// waits when that is not free. Prefers a job whose input the worker already has, so inputs travel once per worker.
+	bool next_job(Worker& w, size_t& id, int& gpu, int& weight) {
 		if (!jobs) return false;
 		for (int pass = 0; pass < 2; pass++) {
-			auto best = queue.end();
-			int best_load = 0, best_gpu = -1;
-			std::string best_device;
 			for (auto it = queue.begin(); it != queue.end(); ++it) {
 				const RemoteJobSpec& j = (*jobs)[*it];
-				const int g = gpu_for(w, j);
-				if (g == -2) continue;
+				std::string device;
+				int limit = 0, g = -1;
+				if (!place(w, j, device, limit, g)) continue;
 				const int state = j.possible ? probe_state[j.input] : 2;
 				if (state == 1) continue; // another job of this input is finding out what the input can do
 				if (pass == 0 && !w.inputs.count(j.input)) continue;
-				const std::string device = j.encoder + "/" + std::to_string(g);
+				const int wt = std::max(1, std::min<int>((int)j.runs.size(), limit));
 				const int load = w.load[device];
-				if (best != queue.end() && load >= best_load) continue;
-				best = it; best_load = load; best_gpu = g; best_device = device;
+				if (load > 0 && load + wt > limit) continue;
+				id = *it;
+				gpu = g;
+				weight = wt;
+				if (j.possible && state == 0) probe_state[j.input] = 1;
+				w.load[device] += wt;
+				w.device[id] = {device, wt};
+				queue.erase(it);
+				return true;
 			}
-			if (best == queue.end()) continue;
-			id = *best;
-			gpu = best_gpu;
-			if ((*jobs)[id].possible && probe_state[(*jobs)[id].input] == 0) probe_state[(*jobs)[id].input] = 1;
-			w.load[best_device]++;
-			w.device[id] = best_device;
-			queue.erase(best);
-			return true;
 		}
 		return false;
 	}
@@ -219,7 +223,7 @@ struct RemoteHost::Impl {
 			if (auto* t = hello.find("token"); (t ? t->text() : std::string()) != opt.token) { log("worker " + who + " refused: wrong token"); return; }
 			if (auto* v = hello.find("version"); !v || atoi(v->text().c_str()) != kVersion) { log("worker " + who + " refused: other protocol version"); return; }
 			if (auto* n = hello.find("name")) worker->name = n->text();
-			if (auto* s = hello.find("slots")) worker->slots = std::max(1, atoi(s->text().c_str()));
+			if (auto* c = hello.find("cpu")) worker->cpu = std::max(0, atoi(c->text().c_str()));
 			if (auto* gs = hello.find("gpus")) {
 				for (auto& g : gs->a) {
 					Gpu gpu;
@@ -227,12 +231,16 @@ struct RemoteHost::Impl {
 					gpu.index = atoi(g.find("index")->text().c_str());
 					gpu.description = g.find("description")->text();
 					gpu.info = g.find("info")->text();
+					if (auto* p = g.find("parallel")) gpu.parallel = std::max(1, atoi(p->text().c_str()));
 					for (auto& c : g.find("codecs")->a) gpu.codecs.push_back(c.text());
 					if (auto* caps = g.find("caps")) for (auto& [k, v] : caps->o) gpu.caps[k] = v.text();
 					worker->gpus.push_back(std::move(gpu));
 				}
 			}
 			conn->send_msg(M_HELLO, "{}");
+			worker->slots = worker->cpu;
+			for (auto& g : worker->gpus) worker->slots += g.parallel;
+			worker->slots = std::max(1, worker->slots);
 		} catch (const std::exception&) { return; }
 		who = worker->name + " (" + conn->peer + ")";
 		{
@@ -240,9 +248,9 @@ struct RemoteHost::Impl {
 			workers.push_back(worker);
 		}
 		cv.notify_all();
-		std::string gpus_text;
-		for (auto& g : worker->gpus) gpus_text += (gpus_text.empty() ? "" : "; ") + g.encoder + " " + std::to_string(g.index) + ": " + g.description;
-		log("worker " + who + " connected, " + std::to_string(worker->slots) + " job" + (worker->slots == 1 ? "" : "s") + " at a time" + (gpus_text.empty() ? "" : ", GPUs: " + gpus_text));
+		std::string gpus_text = "cpu x" + std::to_string(worker->cpu);
+		for (auto& g : worker->gpus) gpus_text += "; " + g.encoder + " " + std::to_string(g.index) + " x" + std::to_string(g.parallel) + ": " + g.description;
+		log("worker " + who + " connected, resources: " + gpus_text);
 
 		struct Active { size_t stored = 0; };
 		std::map<size_t, Active> active; // jobs this worker has now, guarded by m
@@ -257,10 +265,10 @@ struct RemoteHost::Impl {
 		std::thread dispatcher([&] {
 			for (;;) {
 				size_t id = 0;
-				int gpu = -1;
+				int gpu = -1, weight = 1;
 				{
 					std::unique_lock lock(m);
-					cv.wait(lock, [&] { return stop || dead || ((int)active.size() < worker->slots && next_job(*worker, id, gpu)); });
+					cv.wait(lock, [&] { return stop || dead || ((int)active.size() < worker->slots && next_job(*worker, id, gpu, weight)); });
 					if (stop || dead) return;
 					tries[id]++;
 					active[id] = Active{};
@@ -275,7 +283,7 @@ struct RemoteHost::Impl {
 					std::string config = job.config;
 					for (size_t at; (at = config.find("@GPU@")) != std::string::npos;) config.replace(at, 5, std::to_string(std::max(gpu, 0)));
 					const std::string msg = "{\"id\":" + std::to_string(id) + ",\"name\":" + jq(job.name) + ",\"config\":" + jq(config) + ",\"input\":{\"url\":false" +
-					                        ",\"name\":" + jq(fs::path(file).filename().string()) + ",\"sha256\":" + jq(sha) + ",\"size\":" + size + "}}";
+					                        ",\"name\":" + jq(fs::path(file).filename().string()) + ",\"sha256\":" + jq(sha) + ",\"size\":" + size + "},\"parallel\":" + std::to_string(weight) + "}";
 					log("job " + job.name + " -> " + who + (job.model.empty() ? "" : " on " + job.model));
 					if (!send(M_JOB, msg)) throw std::runtime_error("connection lost");
 				} catch (const std::exception&) {
@@ -374,7 +382,7 @@ struct RemoteHost::Impl {
 					if (it == active.end()) continue;
 					stored = it->second.stored;
 					active.erase(it);
-					if (auto d = worker->device.find(id); d != worker->device.end()) { worker->load[d->second]--; worker->device.erase(d); }
+					if (auto d = worker->device.find(id); d != worker->device.end()) { worker->load[d->second.first] -= d->second.second; worker->device.erase(d); }
 					if (probe_state[(*jobs)[id].input] == 1) probe_state[(*jobs)[id].input] = 0; // it did not find out: the next job may try
 					ui::set_remote(worker->name + "#" + std::to_string(id), "", {});
 					imported += stored;
@@ -589,8 +597,16 @@ std::string tail_of(const std::string& text, size_t lines) {
 
 // The GPUs this machine offers: for each GPU encoder, its GPUs and the codecs each can encode. NVENC is asked per GPU; AMF and QuickSync only encode on the
 // first GPU of their vendor, so that is the one offered.
-std::string inventory_json(int only_gpu) {
+// How many encodes run at once on a resource: what is written down for it, else the default (0: 1 on the CPU, 2 on a GPU). -1 for none written down.
+int parallel_of(const std::vector<WorkerResource>& resources, const std::string& encoder, int index, int default_parallel) {
+	for (auto& r : resources)
+		if (r.encoder == encoder && (r.index < 0 || r.index == index) && r.parallel >= 0) return r.parallel;
+	return default_parallel > 0 ? default_parallel : encoder == "cpu" ? 1 : 2;
+}
+
+std::string inventory_json(int only_gpu, const std::vector<WorkerResource>& resources, int default_parallel, int& total) {
 	std::string out = "[";
+	total = parallel_of(resources, "cpu", 0, default_parallel);
 	bool first = true;
 	for (const char* enc : {"nvenc", "amf", "qsv"}) {
 		const std::string encoder = enc;
@@ -610,8 +626,11 @@ std::string inventory_json(int only_gpu) {
 				caps += (caps.empty() ? "" : ",") + jq(codec) + ":" + jq(json);
 			}
 			if (codecs.empty()) continue;
+			const int parallel = parallel_of(resources, encoder, (int)i, default_parallel);
+			if (parallel <= 0) continue; // written down as not offered
+			total += parallel;
 			out += std::string(first ? "" : ",") + "{\"encoder\":" + jq(encoder) + ",\"index\":" + std::to_string(i) + ",\"description\":" + jq(gpu_description(vendor, (int)i)) +
-			       ",\"info\":" + jq(gpu_json(vendor, (int)i)) + ",\"codecs\":[" + codecs + "],\"caps\":{" + caps + "}}";
+			       ",\"info\":" + jq(gpu_json(vendor, (int)i)) + ",\"parallel\":" + std::to_string(parallel) + ",\"codecs\":[" + codecs + "],\"caps\":{" + caps + "}}";
 			first = false;
 		}
 	}
@@ -695,8 +714,8 @@ bool fetch_input(const std::function<bool(uint8_t, const std::string&)>& send, I
 
 std::string executable_path() { return self_exe(); }
 
-int remote_worker(const std::string& host, int port, const std::string& token, const std::string& workdir, int only_gpu, int slots, const std::vector<std::string>& extra_args,
-                  const RemoteLog& log) {
+int remote_worker(const std::string& host, int port, const std::string& token, const std::string& workdir, int only_gpu, int default_parallel, const std::vector<WorkerResource>& resources,
+                  const std::vector<std::string>& extra_args, const RemoteLog& log) {
 	std::error_code ec;
 	fs::create_directories(workdir, ec);
 	const std::string exe = self_exe();
@@ -707,8 +726,10 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 	if (const char* n = getenv("HOSTNAME")) name = n;
 #endif
 	if (only_gpu >= 0) name += " GPU " + std::to_string(only_gpu);
+	int slots = 0;
+	const std::string inventory = inventory_json(only_gpu, resources, default_parallel, slots);
 	slots = std::max(1, slots);
-	const std::string inventory = inventory_json(only_gpu);
+	const int cpu_parallel = parallel_of(resources, "cpu", 0, default_parallel);
 	std::mutex fetch_m;
 	std::map<std::string, std::shared_ptr<std::mutex>> fetching; // one fetch of an input at a time, however many jobs want it
 	for (;;) {
@@ -720,7 +741,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 			continue;
 		}
 		std::shared_ptr<net::Conn> conn = std::move(conn_u);
-		if (!conn->send_msg(M_HELLO, "{\"version\":" + std::to_string(kVersion) + ",\"token\":" + jq(token) + ",\"name\":" + jq(name) + ",\"slots\":" + std::to_string(slots) + ",\"gpus\":" + inventory + "}"))
+		if (!conn->send_msg(M_HELLO, "{\"version\":" + std::to_string(kVersion) + ",\"token\":" + jq(token) + ",\"name\":" + jq(name) + ",\"cpu\":" + std::to_string(cpu_parallel) + ",\"gpus\":" + inventory + "}"))
 			continue;
 		uint8_t type;
 		std::string payload;
@@ -729,7 +750,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 			std::this_thread::sleep_for(std::chrono::seconds(10));
 			continue;
 		}
-		log("connected to " + conn->peer + ", " + std::to_string(slots) + " job" + (slots == 1 ? "" : "s") + " at a time");
+		log("connected to " + conn->peer + ", " + std::to_string(slots) + " encode" + (slots == 1 ? "" : "s") + " at a time");
 		std::atomic<int> running_jobs{0};
 		auto show_title = [&](bool connected) {
 			ui::set_title("ves worker " + name + "  " + (connected ? "connected to " + conn->peer + "  " + std::to_string(running_jobs.load()) + " of " + std::to_string(slots) + " jobs running"
@@ -814,6 +835,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 				std::vector<std::string> args{"--plain", "--progress", "--config", (dir / "config.jsonc").string(), "--input", input, "--output", (dir / "out").string(), "--no-videos",
 				                               "--cache", (fs::path(workdir) / "cache").string(), "--upload", "off", "--trust-downloads"};
 				args.insert(args.end(), extra_args.begin(), extra_args.end());
+				if (const Json* pj = job.find("parallel"); pj && atoi(pj->text().c_str()) > 0) { args.push_back("--parallel"); args.push_back(pj->text()); } // the encodes of the resource the host gave this job
 				// Once a second the job's `ves` prints the numbers of its runs; they go to the host and to this worker's own display. Its other lines are kept for a failure.
 				std::deque<std::string> tail;
 				const int code = run_process(exe, args, [&](const std::string& text) {

@@ -56,9 +56,18 @@ private:
 
 // Connects to the host and runs the jobs it sends, until the process is stopped. `workdir` keeps fetched inputs and the jobs' scratch files; `extra_args` are passed on to
 // the `ves` that runs a job (--priority, --hw-decode, ...). The worker tells the host which GPUs it has; `only_gpu` (>= 0) offers just that NVIDIA GPU, so a machine with
-// several runs one worker per GPU. `slots` is how many jobs it runs at the same time.
+// several runs one worker per GPU.
 // The path of this program.
 std::string executable_path();
 
-int remote_worker(const std::string& host, int port, const std::string& token, const std::string& workdir, int only_gpu, int slots, const std::vector<std::string>& extra_args,
-                  const RemoteLog& log);
+// What a worker offers: "cpu", or a GPU encoder ("nvenc", "amf", "qsv") with the GPU's index (-1: every GPU of that encoder), and how many encodes run on it at the same
+// time (0: not offered, -1: the default).
+struct WorkerResource {
+	std::string encoder;
+	int index = -1;
+	int parallel = -1;
+};
+
+// `resources` are what is written down; whatever is not in it is detected, and gets `default_parallel` (0: 1 for the CPU, 2 for a GPU).
+int remote_worker(const std::string& host, int port, const std::string& token, const std::string& workdir, int only_gpu, int default_parallel, const std::vector<WorkerResource>& resources,
+                  const std::vector<std::string>& extra_args, const RemoteLog& log);

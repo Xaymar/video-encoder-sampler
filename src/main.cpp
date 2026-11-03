@@ -347,10 +347,11 @@ Distributed (see docs/distributed.md)
         --progress          once a second, print the numbers of the runs in flight on a line of their own (a worker reads them from the `ves` that runs its job)
         --token <secret>    what workers must present (or the VES_TOKEN environment variable); use it on both sides
         --min-workers <n>   jobs start when this many workers have connected (default: 1)
-        --worker <host:port>  be a worker: connect to a host and run the jobs it sends, until stopped. Every other flag (--priority, --hw-decode,
+        --worker <host:port or file>  be a worker: connect to a host and run the jobs it sends, until stopped. A config file holds the host, the token and
+                            the resources the worker offers with how many encodes run on each at once (see docs/distributed.md). Every other flag (--priority, --hw-decode,
                             --vmaf-device, ...) is passed on to the runs; --worker-dir <dir> keeps fetched inputs and scratch files (default: ves-worker);
                             --worker-gpu <n> offers only NVIDIA GPU n, so a machine with several GPUs runs one worker per GPU;
-                            --worker-jobs <n> runs n jobs at the same time (default 1), --parallel <n> sets the runs at the same time within each job
+                            --worker-jobs <n> sets how many encodes run at once on a resource that is not in the config file (default: 1 on the CPU, 2 on a GPU)
 
 Quick run (replaces the encoders and scenarios of the config file)
   -enc, --encoder <name>    nvenc | amf | qsv | x264 | x265 | svtav1
@@ -567,7 +568,6 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 	o << "}],\"scaling\":{\"upscaler\":" << jq(cfg.scale.upscaler) << ",\"downscaler\":" << jq(cfg.scale.downscaler);
 	if (!cfg.scale.device.empty()) o << ",\"gpu\":" << jq(cfg.scale.device);
 	o << "},\"vmaf\":{\"model\":" << jq(cfg.vo.model) << ",\"device\":" << jq(cfg.vo.device) << "},\"encoders\":[{\"encoder\":" << jq(job.encoder) << ",\"codec\":" << jq(job.codec);
-	if (job.parallel > 0) o << ",\"parallel\":" << job.parallel;
 	o << ",\"prune\":false,\"options\":{";
 	bool first = true;
 	if (is_gpu_encoder(job.encoder)) { o << "\"gpu\":[\"@GPU@\"]"; first = false; } // the host puts the worker's GPU index in
@@ -620,29 +620,61 @@ static SourceInfo source_from_json(const std::string& text) {
 	return si;
 }
 
-// `ves --worker host:port`: runs the jobs a host sends, until it is stopped. Every other flag is passed on to the `ves` that runs a job, so --priority, --hw-decode,
-// --vmaf-device and so on work as they do for a sweep started by hand.
+// `ves --worker <host:port or config file>`: runs the jobs a host sends, until it is stopped. The config file says where the host is and what the worker offers:
+//   { "host": "10.0.0.1:5599", "token": "...", "dir": "ves-worker",
+//     "resources": { "cpu": { "parallel": 4 }, "nvenc": [ { "gpu": 0, "parallel": 10 } ], "amf": { "gpu": 0, "parallel": 2 } } }
+// A resource that is left out is detected and gets the default (1 encode on the CPU, 2 on a GPU); "parallel": 0 does not offer it. Every other flag is passed on to the `ves`
+// that runs a job, so --priority, --hw-decode, --vmaf-device and so on work as they do for a sweep started by hand.
 static int run_worker(int argc, char** argv) {
-	int only_gpu = -1, slots = 1;
-	std::string target, dir = "ves-worker", token = getenv("VES_TOKEN") ? getenv("VES_TOKEN") : "";
+	int only_gpu = -1, default_parallel = 0;
+	std::string target, dir, token = getenv("VES_TOKEN") ? getenv("VES_TOKEN") : "";
+	bool dir_given = false, token_given = false;
 	std::vector<std::string> pass;
 	for (int i = 1; i < argc; i++) {
 		const std::string a = argv[i];
 		auto value = [&]() -> std::string { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
 		try {
 			if (a == "--worker") target = value();
-			else if (a == "--worker-dir") dir = value();
+			else if (a == "--worker-dir") { dir = value(); dir_given = true; }
 			else if (a == "--worker-gpu") only_gpu = atoi(value().c_str());
-			else if (a == "--worker-jobs") slots = std::max(1, atoi(value().c_str()));
-			else if (a == "--token") token = value();
+			else if (a == "--worker-jobs") default_parallel = std::max(1, atoi(value().c_str()));
+			else if (a == "--token") { token = value(); token_given = true; }
 			else pass.push_back(a);
 		} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
 	}
+	std::vector<WorkerResource> resources;
+	if (target.find(':') == std::string::npos || fs::exists(target)) { // a config file
+		try {
+			std::ifstream f(target);
+			if (!f) throw std::runtime_error("cannot read '" + target + "'");
+			std::stringstream ss; ss << f.rdbuf();
+			Json root = Json::parse(ss.str());
+			if (auto* v = root.find("host")) target = v->text(); else throw std::runtime_error("the worker config needs a \"host\" (host:port)");
+			if (auto* v = root.find("token"); v && !token_given) token = v->text();
+			if (auto* v = root.find("dir"); v && !dir_given) { dir = v->text(); dir_given = true; }
+			if (auto* v = root.find("gpu"); v && only_gpu < 0) only_gpu = atoi(v->text().c_str());
+			if (auto* v = root.find("parallel"); v && !default_parallel) default_parallel = std::max(1, atoi(v->text().c_str()));
+			if (auto* rs = root.find("resources")) {
+				for (auto& [name, v] : rs->o) {
+					if (name != "cpu" && !is_gpu_encoder(name)) throw std::runtime_error("unknown resource '" + name + "' (cpu, nvenc, amf, qsv)");
+					auto one = [&](const Json& r) {
+						WorkerResource w;
+						w.encoder = name;
+						if (auto* g = r.find("gpu")) w.index = atoi(g->text().c_str());
+						if (auto* p = r.find("parallel")) w.parallel = std::max(0, atoi(p->text().c_str()));
+						resources.push_back(w);
+					};
+					if (v.type == Json::Arr) for (auto& r : v.a) one(r); else one(v);
+				}
+			}
+		} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
+	}
+	if (dir.empty()) dir = "ves-worker";
 	const size_t colon = target.rfind(':');
-	if (colon == std::string::npos) { fprintf(stderr, "error: --worker takes host:port\n"); return 1; }
+	if (colon == std::string::npos) { fprintf(stderr, "error: --worker takes host:port or a config file\n"); return 1; }
 	// The worker has the same display as a sweep: its log lines above, and the rows of the jobs it runs. --plain turns it off.
 	ui::start(std::find(pass.begin(), pass.end(), "--plain") != pass.end());
-	return remote_worker(target.substr(0, colon), atoi(target.c_str() + colon + 1), token, dir, only_gpu, slots, pass, [](const std::string& line) { ui::log(line); });
+	return remote_worker(target.substr(0, colon), atoi(target.c_str() + colon + 1), token, dir, only_gpu, default_parallel, resources, pass, [](const std::string& line) { ui::log(line); });
 }
 
 int main(int argc, char** argv) {

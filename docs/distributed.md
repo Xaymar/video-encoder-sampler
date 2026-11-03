@@ -44,16 +44,28 @@ An encoder generation changes what comes out: the same settings on a 2080 Ti and
 * A GPU encoder entry with no capable GPU among the workers is skipped, with a line saying so. Runs of a model that no worker ran are reported as ignored and are not run on the host.
 * A machine with several GPUs runs one worker per GPU: `ves --worker host:port --worker-gpu 1`. AMF and QuickSync encode on the first GPU of their vendor only.
 
-## How much a worker runs at once
+## What a worker offers
 
-Machines differ in how many encoder sessions they take (an NVENC card may allow 10, another 5 or 3), so each worker sets its own limits:
+A worker tells the host what it has and how many encodes may run on each resource at once; the host's config only lists what to test and does not name pools or `parallel`. The easy way is a
+config file, `ves --worker worker.jsonc`:
 
-* `--worker-jobs N`: how many jobs it runs at the same time (default 1). The host keeps it supplied with that many, choosing each time the queued job for the encoder and GPU the worker has the fewest jobs on, so that a worker with an NVIDIA and an AMD GPU uses both instead of working through all NVENC jobs first.
-* `--parallel N`: how many runs of one job run at the same time (it is passed on to every job, and replaces the host's value). Without it a job uses the host's `parallel`
-  for that encoder, or the default of 2 for GPU encoders and 1 for CPU encoders.
+```jsonc
+{
+  "host": "10.0.0.1:5599", "token": "...", "dir": "ves-worker",
+  "resources": {
+    "cpu":   { "parallel": 4 },                       // x264, x265, SVT-AV1
+    "nvenc": [ { "gpu": 0, "parallel": 10 } ],        // one entry per GPU; without "gpu" it is every GPU of the encoder
+    "amf":   { "parallel": 2 }
+  }
+}
+```
 
-The encoders running at once on a worker are about `--worker-jobs` times `--parallel`, and a job has as many runs as its option combinations, so `--parallel` beyond that does nothing.
-Several jobs that need the same input fetch it once.
+* A resource that is left out is detected and gets the default: 1 encode on the CPU, 2 on a GPU. `"parallel": 0` does not offer it. `--worker-jobs N` changes the default.
+* Scoring is not counted: it runs on the GPU (`vmaf.device`) and costs little next to an encode.
+* A job with several runs (option combinations) takes that many of its resource's encodes, at most all of them, and the worker runs them at the same time. A job waits when its resource has
+  too few free, while other resources of the worker keep working, so a worker with an NVIDIA and an AMD GPU uses both.
+* `host`, `token`, `dir` and `gpu` in the file are the same as `--worker host:port`, `--token`, `--worker-dir` and `--worker-gpu`; the flags win. `ves --worker host:port` with no file offers everything detected.
+* Several jobs that need the same input fetch it once.
 
 ## Inputs
 
