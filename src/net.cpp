@@ -130,6 +130,18 @@ std::unique_ptr<Conn> connect_to(const std::string& host, int port, std::string&
 	if (s == kBad) { err = "cannot connect to " + host + ":" + std::to_string(port) + " (error " + std::to_string(last_error()) + ")"; return nullptr; }
 	int one = 1;
 	setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof one);
+	// A host that vanishes without closing the connection (power off, cable out) is noticed after about 25 s of silence, not hours.
+#ifdef _WIN32
+	struct { ULONG onoff, time_ms, interval_ms; } keep{1, 10000, 5000};
+	DWORD returned = 0;
+	WSAIoctl(s, 0x98000004 /* SIO_KEEPALIVE_VALS */, &keep, sizeof keep, nullptr, 0, &returned, nullptr, nullptr);
+#else
+	setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+	int idle = 10, interval = 5, count = 3;
+	setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+	setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof interval);
+	setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof count);
+#endif
 	auto c = std::make_unique<Conn>((intptr_t)s);
 	c->peer = peer;
 	return c;

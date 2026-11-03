@@ -524,7 +524,10 @@ std::string self_exe() {
 }
 
 // Runs a program and hands every line it prints (output and errors together) to `on_line`; returns its exit code, or -1 if it could not be started.
-int run_process(const std::string& exe, const std::vector<std::string>& args, const std::function<void(const std::string&)>& on_line) {
+// `cancel` set ends the program early (the host is gone: nobody wants its results).
+int run_process(const std::string& exe, const std::vector<std::string>& args, const std::function<void(const std::string&)>& on_line, const std::atomic<bool>& cancel) {
+	std::atomic<bool> finished{false};
+	auto watch = [&](auto kill_it) { return std::thread([&, kill_it] { while (!finished) { if (cancel) { kill_it(); return; } std::this_thread::sleep_for(std::chrono::milliseconds(100)); } }); };
 	std::string pending;
 	auto feed = [&](const char* data, size_t n) {
 		pending.append(data, n);
@@ -565,12 +568,15 @@ int run_process(const std::string& exe, const std::vector<std::string>& args, co
 	const BOOL ok = CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi);
 	CloseHandle(wr);
 	if (!ok) { CloseHandle(rd); return -1; }
+	std::thread killer = watch([&] { TerminateProcess(pi.hProcess, 1); });
 	char buf[4096];
 	DWORD got;
 	while (ReadFile(rd, buf, sizeof buf, &got, nullptr) && got) feed(buf, got);
 	CloseHandle(rd);
 	if (!pending.empty()) on_line(pending);
 	WaitForSingleObject(pi.hProcess, INFINITE);
+	finished = true;
+	killer.join();
 	DWORD code = 1;
 	GetExitCodeProcess(pi.hProcess, &code);
 	CloseHandle(pi.hProcess);
@@ -594,6 +600,7 @@ int run_process(const std::string& exe, const std::vector<std::string>& args, co
 		_exit(127);
 	}
 	close(fds[1]);
+	std::thread killer = watch([&] { kill(pid, SIGKILL); });
 	char buf[4096];
 	ssize_t got;
 	while ((got = read(fds[0], buf, sizeof buf)) > 0) feed(buf, (size_t)got);
@@ -601,6 +608,8 @@ int run_process(const std::string& exe, const std::vector<std::string>& args, co
 	if (!pending.empty()) on_line(pending);
 	int status = 0;
 	waitpid(pid, &status, 0);
+	finished = true;
+	killer.join();
 	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 #endif
 }
@@ -793,6 +802,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 			return conn->send_msg(t, p);
 		};
 		std::mutex inbox_m;
+		std::atomic<bool> lost{false}; // the host is gone: running jobs are ended
 		std::map<size_t, std::shared_ptr<Inbox>> inboxes;
 		std::vector<std::thread> jobs;
 
@@ -897,7 +907,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 						tail.push_back(text);
 						if (tail.size() > 12) tail.pop_front();
 					}
-				});
+				}, lost);
 				for (auto& l : tail) log_text += l + "\n";
 				ok = code == 0;
 				if (!ok) log("job " + jname + " failed with code " + std::to_string(code) + (log_text.empty() ? std::string() : ":\n" + log_text));
@@ -930,13 +940,14 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 				if (inbox) inbox->push(type, payload);
 			}
 		}
+		lost = true;
 		{
 			std::lock_guard lock(inbox_m);
 			for (auto& [id, inbox] : inboxes) inbox->close();
 		}
 		for (auto& t : jobs) t.join();
 		show_title(false);
-		log("lost the connection; trying again in 5 s");
+		log("lost the connection, jobs stopped; trying again in 5 s");
 		std::this_thread::sleep_for(std::chrono::seconds(5));
 	}
 }
