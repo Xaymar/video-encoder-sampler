@@ -121,7 +121,8 @@ struct RemoteHost::Impl {
 	std::vector<int> tries;
 	std::map<std::string, std::string> sha_of; // input path -> SHA-256
 	size_t left = 0, imported = 0, stored_now = 0;
-	std::function<void(size_t)> on_stored;
+	std::function<void(size_t, const std::string&)> on_stored;
+	std::mutex stored_m; // one on_stored at a time
 	// The first job of an input goes out alone and reports what the source is (0 not known and nobody finding out, 1 a job is finding out, 2 known).
 	std::map<std::string, int> probe_state;
 
@@ -179,7 +180,7 @@ struct RemoteHost::Impl {
 	}
 
 	// Stores a result file the worker sent. Returns whether it belonged to the job.
-	bool import_result(const RemoteJobSpec& job, const std::string& name, std::string content) {
+	bool import_result(const RemoteJobSpec& job, const std::string& name, std::string content, std::string& stored_file) {
 		const std::string want = result_prefix(name);
 		for (auto& r : job.runs) {
 			if (result_prefix(fs::path(r.result_file).filename().string()) != want) continue;
@@ -193,6 +194,7 @@ struct RemoteHost::Impl {
 				if (!f) return false;
 			}
 			fs::rename(tmp, r.result_file, ec);
+			stored_file = r.result_file;
 			return !ec;
 		}
 		return false;
@@ -319,14 +321,15 @@ struct RemoteHost::Impl {
 				const size_t nl = (uint8_t)payload[4] | ((uint8_t)payload[5] << 8);
 				if (payload.size() < 6 + nl) continue;
 				const std::string name = fs::path(payload.substr(6, nl)).filename().string();
-				if (id < jobs->size() && import_result((*jobs)[id], name, payload.substr(6 + nl))) {
+				std::string stored_file;
+				if (id < jobs->size() && import_result((*jobs)[id], name, payload.substr(6 + nl), stored_file)) {
 					size_t now;
 					{
 						std::lock_guard lock(m);
 						active[id].stored++;
 						now = ++stored_now;
 					}
-					if (on_stored) on_stored(now);
+					if (on_stored) { std::lock_guard lock(stored_m); on_stored(now, stored_file); }
 				} else if (id < jobs->size()) {
 					std::string wanted;
 					for (auto& r : (*jobs)[id].runs) wanted += "\n  " + result_prefix(fs::path(r.result_file).filename().string());
@@ -462,7 +465,7 @@ std::vector<RemoteHost::Model> RemoteHost::models(const std::string& encoder, co
 	return out;
 }
 
-size_t RemoteHost::run_jobs(const std::vector<RemoteJobSpec>& jobs, const std::function<void(size_t)>& on_stored) {
+size_t RemoteHost::run_jobs(const std::vector<RemoteJobSpec>& jobs, const std::function<void(size_t, const std::string&)>& on_stored) {
 	if (jobs.empty()) return 0;
 	{
 		std::lock_guard lock(impl->m);

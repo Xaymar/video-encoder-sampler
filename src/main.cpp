@@ -114,6 +114,7 @@ struct Run {
 	double kbps = 0;        // actual
 	std::vector<double> scores; // per frame, display order
 	bool cached = false;    // taken from the result cache instead of being run
+	bool uploaded = false;  // handed to the uploader when the worker sent it
 	bool imported = false;  // its result came from a worker: written again with this sweep's details (the input's name and URL are the host's, not the worker's copy)
 	std::vector<std::string> identical; // labels of the runs that produced exactly the same stream (left out of the ranking, see below)
 	std::string group;      // what runs must share for identical output to mean identical scores
@@ -1005,7 +1006,7 @@ int main(int argc, char** argv) {
 		std::sort(sc.begin(), sc.end());
 		const double mean = std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size();
 		if (!t.result_file.empty() && (!r.cached || r.imported)) result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
-		if (uploader && !r.result.empty() && (r.video_sha256.empty() || sent_streams.insert(r.group + "|" + r.video_sha256).second)) {
+		if (uploader && !r.result.empty() && !r.uploaded && (r.video_sha256.empty() || sent_streams.insert(r.group + "|" + r.video_sha256).second)) {
 			UploadItem it;
 			it.result_file = (fs::path(cfg.output_dir) / r.result).string();
 			it.label = r.label;
@@ -1141,7 +1142,28 @@ int main(int argc, char** argv) {
 		for (auto& j : jobs) in_jobs += j.runs.size();
 		const size_t already = tasks.size() - in_jobs; // runs that were done before
 		ui::overall((int)already, total);
-		const size_t stored = remote->run_jobs(jobs, [&](size_t n) { ui::overall((int)(already + n), total); });
+		std::map<std::string, Task*> by_file;
+		for (Task* t : asked) by_file[t->result_file] = t;
+		// A result is written again with this sweep's details (the worker's copy of the input has another name and no URL) and goes to the site as soon as it is here, not
+		// when the whole sweep is through.
+		const size_t stored = remote->run_jobs(jobs, [&](size_t n, const std::string& file) {
+			ui::overall((int)(already + n), total);
+			auto it = by_file.find(file);
+			if (it == by_file.end()) return;
+			Task& t = *it->second;
+			CachedRun hit;
+			if (!result_load(file, t.key, hit)) return;
+			t.r.kbps = hit.kbps; t.r.scores = std::move(hit.scores);
+			result_store(file, t.key, CachedRun{t.r.kbps, t.r.scores}, run_details(t));
+			t.r.imported = false; // already rewritten
+			if (uploader && !t.r.result.empty()) {
+				UploadItem it2;
+				it2.result_file = (fs::path(cfg.output_dir) / t.r.result).string();
+				it2.label = t.r.label;
+				uploader->add(std::move(it2));
+				t.r.uploaded = true;
+			}
+		});
 		ui::log("remote: " + std::to_string(stored) + " results from the workers");
 		for (Task* t : asked) t->r.imported = fs::exists(t->result_file);
 	}
