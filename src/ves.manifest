@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Embedded into ves.exe: paths longer than 260 characters work when Windows has long paths switched on (LongPathsEnabled=1). Without this, ves.exe is held to MAX_PATH
+     however the setting is. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+	<application xmlns="urn:schemas-microsoft-com:asm.v3">
+		<windowsSettings xmlns:ws2="http://schemas.microsoft.com/SMI/2016/WindowsSettings">
+			<ws2:longPathAware>true</ws2:longPathAware>
+		</windowsSettings>
+	</application>
+</assembly>

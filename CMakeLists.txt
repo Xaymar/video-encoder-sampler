@@ -102,6 +102,8 @@ if(WIN32)
 	target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include" "${CMAKE_SOURCE_DIR}/third-party/amf-include" "${CMAKE_SOURCE_DIR}/third-party/libvpl/ucrt64/include" "${X264_DIR}/include" "${X265_DIR}/include" "${SVTAV1_DIR}/include" "${VMAF_DIR}/include" "${PLACEBO_DIR}/include")
 	target_compile_definitions(ves PRIVATE _CRT_SECURE_NO_WARNINGS)
 	target_link_libraries(ves PRIVATE ${FF_LINK} ${X264_LIB} ${X265_LIB} ${SVTAV1_LIB} ${VMAF_LIB} ${PLACEBO_LIB} d3d11 dxgi CURL::libcurl ws2_32)
+	# The manifest makes paths over 260 characters work (needs Windows' LongPathsEnabled setting); results of long names and deep folders would fail without it.
+	target_link_options(ves PRIVATE "SHELL:-Xlinker /MANIFEST:EMBED" "SHELL:-Xlinker /MANIFESTINPUT:${CMAKE_SOURCE_DIR}/src/ves.manifest")
 
 	# Runtime DLLs next to the executable (only the DLLs: the packages' bin folders also hold command line tools).
 	file(GLOB RUNTIME_DLLS CONFIGURE_DEPENDS
