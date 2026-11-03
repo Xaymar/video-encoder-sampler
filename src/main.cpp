@@ -61,6 +61,9 @@ static double over_penalty_points(double kbps, double target) {
 struct Axis { // one swept option; a missing value (JSON null) leaves the option unset
 	std::string key;
 	std::vector<std::optional<std::string>> values;
+	// Options that only matter in some combinations: where the condition does not hold the option is left unset, and combinations that come out the same are one.
+	std::vector<std::string> requires_set; // it is only set when all of these options are set
+	std::vector<std::string> unless_set;   // it is only set when none of these options is set
 };
 
 struct Job {
@@ -190,7 +193,26 @@ static std::vector<Options> expand(const std::string& encoder, const std::vector
 		for (auto& c : combos) for (auto& v : values) { Options n = c; if (v) n[ax.key] = *v; next.push_back(n); }
 		combos = std::move(next);
 	}
-	return combos;
+	// Conditions: where one does not hold the option is left out, which makes combinations equal; each is kept once, in the order they came.
+	bool any_rule = false;
+	for (auto& ax : axes) any_rule |= !ax.requires_set.empty() || !ax.unless_set.empty();
+	if (!any_rule) return combos;
+	std::set<Options> seen;
+	std::vector<Options> out;
+	for (auto& c : combos) {
+		for (bool changed = true; changed;) { // dropping an option can make a condition on it fail for another
+			changed = false;
+			for (auto& ax : axes) {
+				if (!c.count(ax.key)) continue;
+				bool holds = true;
+				for (auto& r : ax.requires_set) holds &= c.count(r) > 0;
+				for (auto& u : ax.unless_set) holds &= c.count(u) == 0;
+				if (!holds) { c.erase(ax.key); changed = true; }
+			}
+		}
+		if (seen.insert(c).second) out.push_back(c);
+	}
+	return out;
 }
 
 static void add_inputs(Config& cfg, const std::string& path) {
@@ -294,9 +316,21 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* p = e.find("parallel")) j.parallel = atoi(p->text().c_str());
 		if (auto* sn = e.find("scenarios")) for (auto& x : sn->a) j.scenarios.push_back(x.text());
 		if (auto* o = e.find("options")) for (auto& [k, v] : o->o) {
-			Axis ax{k, {}};
-			if (v.type == Json::Arr) { for (auto& x : v.a) ax.values.push_back(x.type == Json::Null ? std::nullopt : std::optional(x.text())); }
-			else ax.values.push_back(v.type == Json::Null ? std::nullopt : std::optional(v.text()));
+			Axis ax{k, {}, {}, {}};
+			const Json* list = &v;
+			if (v.type == Json::Obj) { // { "values": [...], "requires": "other" or ["a", "b"], "unless": "other" or [...] }
+				for (auto& [rk, rv] : v.o) if (rk != "values" && rk != "requires" && rk != "unless") throw std::runtime_error("option '" + k + "' has an unknown key '" + rk + "' (it takes values, requires and unless)");
+				list = v.find("values");
+				if (!list) throw std::runtime_error("option '" + k + "' needs 'values'");
+				for (auto* rule : {&ax.requires_set, &ax.unless_set}) {
+					const Json* names = v.find(rule == &ax.requires_set ? "requires" : "unless");
+					if (!names) continue;
+					if (names->type == Json::Arr) for (auto& x : names->a) rule->push_back(x.text());
+					else rule->push_back(names->text());
+				}
+			}
+			if (list->type == Json::Arr) { for (auto& x : list->a) ax.values.push_back(x.type == Json::Null ? std::nullopt : std::optional(x.text())); }
+			else ax.values.push_back(list->type == Json::Null ? std::nullopt : std::optional(list->text()));
 			j.axes.push_back(std::move(ax));
 		}
 		cfg.jobs.push_back(std::move(j));
@@ -478,7 +512,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 			const std::string o = value();
 			const size_t eq = o.find('=');
 			if (eq == std::string::npos) throw std::runtime_error("bad option '" + o + "', expected key=value");
-			Axis ax{o.substr(0, eq), {}};
+			Axis ax{o.substr(0, eq), {}, {}, {}};
 			for (auto& x : split(o.substr(eq + 1))) ax.values.push_back(x == "null" ? std::nullopt : std::optional<std::string>(x));
 			job.axes.push_back(std::move(ax));
 		}
@@ -585,7 +619,8 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 	if (is_gpu_encoder(job.encoder)) { o << "\"gpu\":[\"@GPU@\"]"; first = false; } // the host puts the worker's GPU index in
 	for (auto& ax : job.axes) {
 		if (ax.key == "gpu" && is_gpu_encoder(job.encoder)) continue;
-		o << (first ? "" : ",") << jq(ax.key) << ":[";
+		const bool rules = !ax.requires_set.empty() || !ax.unless_set.empty(); // the worker expands the same combinations as the host does
+		o << (first ? "" : ",") << jq(ax.key) << ":" << (rules ? "{\"values\":[" : "[");
 		first = false;
 		bool first_value = true;
 		for (auto& v : ax.values) {
@@ -597,6 +632,15 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 			first_value = false;
 		}
 		o << "]";
+		if (rules) {
+			for (auto* rule : {&ax.requires_set, &ax.unless_set}) {
+				if (rule->empty()) continue;
+				o << ",\"" << (rule == &ax.requires_set ? "requires" : "unless") << "\":[";
+				for (size_t i = 0; i < rule->size(); i++) o << (i ? "," : "") << jq((*rule)[i]);
+				o << "]";
+			}
+			o << "}";
+		}
 	}
 	o << "}}]}";
 	return o.str();
