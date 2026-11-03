@@ -365,18 +365,19 @@ public:
 std::unique_ptr<Encoder> make_encoder_amf() { return std::make_unique<Amf>(); }
 
 // Whether this machine's AMD GPU can encode the codec at that bit depth, found by initializing a throwaway encoder once.
-bool amf_supports(const std::string& codec, int chroma, int depth) {
+bool amf_supports(const std::string& codec, int chroma, int depth, int gpu) {
 	if (chroma != 420 || depth > 10) return false;
 	static std::mutex m;
 	static std::map<std::string, bool> cache;
 	std::lock_guard<std::mutex> lock(m);
-	const std::string key = codec + std::to_string(depth);
+	const std::string key = codec + std::to_string(depth) + "/" + std::to_string(gpu);
 	auto it = cache.find(key);
 	if (it == cache.end()) {
 		Params p;
 		p.width = 1280; p.height = 720; p.bitrate = 5000000; p.gop = 60;
 		p.pix = planar_fmt(420, depth > 8 ? 10 : 8);
 		p.codec = codec;
+		p.options["gpu"] = std::to_string(gpu);
 		probing = true;
 		const bool ok = make_encoder_amf()->open(p, nullptr);
 		probing = false;
@@ -385,22 +386,24 @@ bool amf_supports(const std::string& codec, int chroma, int depth) {
 	return it->second;
 }
 
-// The capabilities of the codec on the AMD GPU (see Amf::read_caps), "null" when it cannot encode it. Asked once per codec: AMF only encodes on the first AMD GPU.
-std::string amf_caps_json(const std::string& codec) {
+// The capabilities of the codec on AMD GPU `gpu` (see Amf::read_caps), "null" when it cannot encode it. Asked once per codec and GPU.
+std::string amf_caps_json(const std::string& codec, int gpu) {
 	static std::mutex m;
 	static std::map<std::string, std::string> cache;
 	std::lock_guard<std::mutex> lock(m);
-	auto it = cache.find(codec);
+	const std::string key = codec + "/" + std::to_string(gpu);
+	auto it = cache.find(key);
 	if (it == cache.end()) {
 		Params p;
 		p.width = 1280; p.height = 720; p.bitrate = 5000000; p.gop = 60;
 		p.pix = planar_fmt(420, 8);
 		p.codec = codec;
+		p.options["gpu"] = std::to_string(gpu);
 		probing = true;
 		Amf probe;
 		const bool ok = probe.open(p, nullptr);
 		probing = false;
-		it = cache.emplace(codec, ok ? probe.caps() : "null").first;
+		it = cache.emplace(key, ok ? probe.caps() : "null").first;
 	}
 	return it->second;
 }
@@ -417,6 +420,6 @@ struct AmfUnavailable : Encoder {
 } // namespace
 
 std::unique_ptr<Encoder> make_encoder_amf() { return std::make_unique<AmfUnavailable>(); }
-bool amf_supports(const std::string&, int, int) { return false; }
-std::string amf_caps_json(const std::string&) { return "null"; }
+bool amf_supports(const std::string&, int, int, int) { return false; }
+std::string amf_caps_json(const std::string&, int) { return "null"; }
 #endif

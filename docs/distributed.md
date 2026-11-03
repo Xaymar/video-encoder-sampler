@@ -42,7 +42,7 @@ An encoder generation changes what comes out: the same settings on a 2080 Ti and
 * The key of such a run holds that GPU's name and driver, not the host's, so cached results are never mixed between models.
 * A job goes only to a worker that has its model. The GPU option of the config has no meaning in this mode (the worker's GPU is used) and is dropped.
 * A GPU encoder entry with no capable GPU among the workers is skipped, with a line saying so. Runs of a model that no worker ran are reported as ignored and are not run on the host.
-* A machine with several GPUs runs one worker per GPU: `ves --worker host:port --worker-gpu 1`. AMF and QuickSync encode on the first GPU of their vendor only.
+* A machine with several GPUs runs one worker per GPU: `ves --worker host:port --worker-gpu 1`. AMF is offered for every AMD GPU of the machine (an integrated and a discrete one are two models, each with its own runs); QuickSync encodes on the first Intel GPU only.
 
 ## What a worker offers
 

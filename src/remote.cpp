@@ -625,8 +625,8 @@ std::string tail_of(const std::string& text, size_t lines) {
 	return out;
 }
 
-// The GPUs this machine offers: for each GPU encoder, its GPUs and the codecs each can encode. NVENC is asked per GPU; AMF and QuickSync only encode on the
-// first GPU of their vendor, so that is the one offered.
+// The GPUs this machine offers: for each GPU encoder, its GPUs and the codecs each can encode. NVENC and AMF are asked per GPU; QuickSync only encodes on the
+// first GPU of its vendor, so that is the one offered.
 // How many encodes run at once on a resource: what is written down for it, else the default (0: 1 on the CPU, 2 on a GPU). -1 for none written down.
 int parallel_of(const std::vector<WorkerResource>& resources, const std::string& encoder, int index, int default_parallel) {
 	for (auto& r : resources)
@@ -653,13 +653,13 @@ std::string inventory_json(int only_gpu, const std::vector<WorkerResource>& reso
 		const unsigned vendor = encoder_vendor(encoder);
 		const size_t n = list_gpus(vendor).size();
 		for (size_t i = 0; i < n; i++) {
-			if (encoder == "nvenc" ? (only_gpu >= 0 && (int)i != only_gpu) : i > 0) continue;
+			if (encoder == "nvenc" ? (only_gpu >= 0 && (int)i != only_gpu) : encoder == "qsv" && i > 0) continue;
 			std::string codecs, caps;
 			for (const char* codec : {"h264", "hevc", "av1"}) {
 				std::string json = "null";
 				bool ok;
 				if (encoder == "nvenc") { json = nvenc_caps_json(codec, (int)i); ok = json != "null" && json != "{}"; }
-				else if (encoder == "amf") { ok = amf_supports(codec, 420, 8); if (ok) json = amf_caps_json(codec); }
+				else if (encoder == "amf") { ok = amf_supports(codec, 420, 8, (int)i); if (ok) json = amf_caps_json(codec, (int)i); }
 				else ok = qsv_supports(codec, 420, 8);
 				if (!ok) continue;
 				codecs += (codecs.empty() ? "" : ",") + jq(codec);
