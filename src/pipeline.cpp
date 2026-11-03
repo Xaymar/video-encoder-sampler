@@ -64,8 +64,9 @@ Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::str
 	if (auto it = o.find("chroma"); it != o.end()) { chromas = {atoi(it->second.c_str())}; o.erase(it); }
 	if (auto it = o.find("bitdepth"); it != o.end()) { depths = {atoi(it->second.c_str())}; o.erase(it); }
 	int chroma = 0, depth = 0;
+	const int gpu = options.count("gpu") ? atoi(options.at("gpu").c_str()) : 0; // the GPU of the run: a machine's first GPU is not always the one that encodes
 	for (int c : chromas) for (int d : depths) {
-		if (!chroma && (d <= sf.depth || depths.size() == 1) && encoder_supports(encoder, codec, c, d)) { chroma = c; depth = d; }
+		if (!chroma && (d <= sf.depth || depths.size() == 1) && encoder_supports(encoder, codec, c, d, gpu)) { chroma = c; depth = d; }
 	}
 	if (!chroma) return ignore(encoder + " cannot encode " + std::to_string(depths[0]) + "-bit " + std::to_string(chromas[0]) + " here");
 	if (!want.upscale && (depth > sf.depth || chroma > sf.chroma))

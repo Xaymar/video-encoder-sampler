@@ -15,4 +15,4 @@ inline Fmt planar_fmt(int chroma, int depth) {
 inline bool valid(const Fmt& f) { return f.chroma != 0; }
 
 // Whether an encoder (as named in the config) can take this chroma layout at this bit depth.
-bool encoder_supports(const std::string& encoder, const std::string& codec, int chroma, int depth);
+bool encoder_supports(const std::string& encoder, const std::string& codec, int chroma, int depth, int gpu = 0); // gpu: the GPU the run is on (AMF asks that GPU)
