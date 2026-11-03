@@ -22,6 +22,8 @@ Both sides need the same `models/` folder and the same VMAF device (`vmaf.device
 4. The host stores each result under the name and **key** it would have used for the run itself, so the rest of the sweep finds those runs finished: ranking, best videos,
    uploads and the result files are exactly as in a local sweep. CPU encoder runs no worker produced are run on the host.
 
+A job that returns fewer results than it has runs (runs that cannot work with the input, say a frame rate above the source's, are left out without a result) prints the job's last output lines on the host and on the worker, ending with how many runs were ignored and why. Job names carry the bitrate, key frame interval, size and frame rate.
+
 A worker that loses its connection mid-job gives the job back; it goes to the next free worker. A job is tried three times.
 
 ## GPUs

@@ -1026,7 +1026,8 @@ int main(int argc, char** argv) {
 				spec.encoder = t.job->encoder;
 				spec.codec = t.job->codec;
 				spec.model = t.model;
-				spec.name = file_name(t.r.input) + " " + t.job->encoder + (is_gpu_encoder(t.job->encoder) ? "/" + t.job->codec : std::string()) + " " + std::to_string(t.r.bitrate) + "k";
+				spec.name = file_name(t.r.input) + " " + t.job->encoder + (is_gpu_encoder(t.job->encoder) ? "/" + t.job->codec : std::string()) + " " + std::to_string(t.r.bitrate) + "k kf" + std::to_string(t.r.kf).substr(0, std::to_string(t.r.kf).find('.') + 2) +
+				            (t.r.shape.w ? " " + std::to_string(t.r.shape.w) + "x" + std::to_string(t.r.shape.h) : std::string()) + (t.r.shape.fps.num ? "@" + std::to_string(t.r.shape.fps.value()).substr(0, 6) : std::string());
 				order.push_back(g);
 				it = groups.emplace(g, std::move(spec)).first;
 			}
@@ -1177,7 +1178,7 @@ int main(int argc, char** argv) {
 	for (size_t i : uncached[input_name]) {
 		Task& t = tasks[i];
 		Run& r = t.r;
-		if (!t.model.empty()) { r.ignored = true; r.reason = "no worker produced it (on " + t.model + ")"; finish(t); continue; } // not on this machine's GPU: the key says another one
+		if (!t.model.empty()) { r.ignored = true; r.expected = true; r.reason = "no worker produced it (on " + t.model + ")"; finish(t); continue; } // not on this machine's GPU: the key says another one
 		const SourceInfo* src = source_of(r.input);
 		if (!src) { finish(t); continue; }
 		t.plan = make_plan(*src, t.job->encoder, t.job->codec, t.p.options, r.shape);
@@ -1280,6 +1281,7 @@ int main(int argc, char** argv) {
 	std::vector<Run> runs;
 	std::map<std::string, std::vector<std::string>> failed_runs, ignored_runs, pruned_runs, group_json; // by input
 	int ignored = 0, pruned = 0;
+	std::map<std::string, int> ignored_why; // reason -> how many runs
 	std::map<std::string, size_t> first_with; // group and stream hash -> the run that has it
 	int identical = 0;
 	for (auto& t : tasks) {
@@ -1293,7 +1295,7 @@ int main(int argc, char** argv) {
 			runs.push_back(std::move(t.r));
 		}
 		else if (t.r.pruned) { pruned++; pruned_runs[t.r.input].push_back("{\"label\":" + jq(t.r.label) + ",\"reason\":" + jq(t.r.reason) + "}"); }
-		else if (t.r.ignored) { ignored++; ignored_runs[t.r.input].push_back("{\"label\":" + jq(t.r.label) + ",\"reason\":" + jq(t.r.reason) + "}"); }
+		else if (t.r.ignored) { ignored++; ignored_why[t.r.reason]++; ignored_runs[t.r.input].push_back("{\"label\":" + jq(t.r.label) + ",\"reason\":" + jq(t.r.reason) + "}"); }
 		else { failed++; failed_runs[t.r.input].push_back(t.r.label); }
 	}
 
@@ -1368,6 +1370,9 @@ int main(int argc, char** argv) {
 	}
 	printf("\nPeak memory use: %lld MB\n", ui::peak_memory_mb());
 	if (pruned) printf("\n%d runs were not run: an option showed no effect (see \"pruned\" in the result files)\n", pruned);
-	if (ignored) printf("\n%d runs were ignored: they cannot work with the input or the encoder (see the result files)\n", ignored);
+	if (ignored) {
+		printf("\n%d runs were ignored: they cannot work with the input or the encoder (see the result files)\n", ignored);
+		for (auto& [why, n] : ignored_why) printf("  %d: %s\n", n, why.c_str());
+	}
 	return failed ? 2 : 0;
 }

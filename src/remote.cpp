@@ -321,7 +321,7 @@ struct RemoteHost::Impl {
 				}
 				const RemoteJobSpec& job = (*jobs)[id];
 				log("job " + job.name + " done on " + who + ": " + std::to_string(stored) + " of " + std::to_string(job.runs.size()) + " results" + (ok ? "" : " (the worker reported a failure)"));
-				if (!log_tail.empty() && !ok) log(log_tail);
+				if (!log_tail.empty() && (!ok || stored < job.runs.size())) log(log_tail); // what the job printed last: why runs failed or were left out
 				cv.notify_all();
 			}
 		}
@@ -734,6 +734,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 				if (fetch_input(send, *inbox, id, fs::path(workdir) / "inputs", in.find("name")->text(), sha, p, failure)) input = p.string();
 			}
 			bool ok = false;
+			size_t sent_results = 0;
 			std::string log_text = failure;
 			if (failure.empty()) {
 				{
@@ -768,10 +769,12 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 						msg += (char)(n.size() >> 8);
 						msg += n + read_file(f.path());
 						if (!send(M_RESULT, msg)) break;
+						sent_results++;
 					}
 				}
 			}
 			fs::remove_all(dir, ec2);
+			if (ok && sent_results == 0) log("job " + jname + " made no results:\n" + log_text);
 			ui::set_remote(rows_key, "", {});
 			running_jobs--;
 			show_title(true);
