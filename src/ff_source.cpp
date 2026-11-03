@@ -300,6 +300,63 @@ bool same_pictures(const Picture& a, const Picture& b) {
 	return true;
 }
 
+// One row of component `c` as plain sample values, whatever the memory layout.
+void component_row(const Picture& p, int c, int y, int w, std::vector<uint16_t>& out) {
+	const Layout::Comp& cm = p.layout.comp[c];
+	const uint8_t* line = p.data[cm.plane] + (size_t)y * p.stride[cm.plane] + cm.offset;
+	const int step = p.layout.step[cm.plane];
+	out.resize((size_t)w);
+	if (cm.depth + cm.shift > 8) for (int x = 0; x < w; x++) out[(size_t)x] = (uint16_t)((line[(size_t)x * step] | line[(size_t)x * step + 1] << 8) >> cm.shift);
+	else for (int x = 0; x < w; x++) out[(size_t)x] = (uint16_t)(line[(size_t)x * step] >> cm.shift);
+}
+
+// Says how two pictures that are not the same differ, one line per component: how many samples, by how much and where. With VES_DUMP_FRAME=<folder> the pictures and
+// their difference (times 16) are also written there as .pgm files, one per component, to look at.
+void describe_difference(const Picture& a, const Picture& b, int frame) {
+	fprintf(stderr, "  frame %d: software %dx%d %d-bit chroma %d, range %d matrix %d; hardware %dx%d %d-bit chroma %d, range %d matrix %d\n", frame, a.width, a.height, a.fmt.depth, a.fmt.chroma, a.color.range, a.color.space,
+	        b.width, b.height, b.fmt.depth, b.fmt.chroma, b.color.range, b.color.space);
+	if (a.width != b.width || a.height != b.height || a.fmt.chroma != b.fmt.chroma || a.fmt.depth != b.fmt.depth) return;
+	const char* dump = getenv("VES_DUMP_FRAME");
+	static const char* names[] = {"Y", "U", "V"};
+	std::vector<uint16_t> ra, rb;
+	for (int c = 0; c < 3; c++) {
+		const bool sub = c > 0 && !a.fmt.rgb;
+		const int w = sub ? (a.width + (1 << a.layout.log2_cw) - 1) >> a.layout.log2_cw : a.width;
+		const int h = sub ? (a.height + (1 << a.layout.log2_ch) - 1) >> a.layout.log2_ch : a.height;
+		long long different = 0, total = (long long)w * h, ones = 0, sum = 0;
+		int biggest = 0, first_x = -1, first_y = -1, first_a = 0, first_b = 0;
+		std::vector<uint8_t> pa, pb, pd;
+		const int shift = a.fmt.depth > 8 ? a.fmt.depth - 8 : 0;
+		for (int y = 0; y < h; y++) {
+			component_row(a, c, y, w, ra);
+			component_row(b, c, y, w, rb);
+			for (int x = 0; x < w; x++) {
+				const int d = std::abs((int)ra[(size_t)x] - (int)rb[(size_t)x]);
+				if (d) {
+					if (!different) { first_x = x; first_y = y; first_a = ra[(size_t)x]; first_b = rb[(size_t)x]; }
+					different++; sum += d; ones += d == 1; biggest = std::max(biggest, d);
+				}
+				if (dump) { pa.push_back((uint8_t)(ra[(size_t)x] >> shift)); pb.push_back((uint8_t)(rb[(size_t)x] >> shift)); pd.push_back((uint8_t)std::min(255, d * 16)); }
+			}
+		}
+		if (different) fprintf(stderr, "  %s: %lld of %lld samples differ (%.2f%%), largest difference %d, mean %.2f, %lld of them by 1; first at x=%d y=%d (software %d, hardware %d)\n", names[c], different, total,
+		                       100.0 * different / total, biggest, (double)sum / different, ones, first_x, first_y, first_a, first_b);
+		else fprintf(stderr, "  %s: the same\n", names[c]);
+		if (dump) {
+			const std::pair<const char*, const std::vector<uint8_t>*> files[] = {{"software", &pa}, {"hardware", &pb}, {"difference", &pd}};
+			for (auto& [what, data] : files) {
+				const std::string file = std::string(dump) + "/" + what + "_" + names[c] + ".pgm";
+				if (FILE* f = fopen(file.c_str(), "wb")) {
+					fprintf(f, "P5 %d %d 255\n", w, h);
+					fwrite(data->data(), 1, data->size(), f);
+					fclose(f);
+				}
+			}
+		}
+	}
+	if (dump) fprintf(stderr, "  the frames are in %s\n", dump);
+}
+
 // Decodes the first frames both ways and compares them.
 bool verify_hardware(const std::string& path, const std::string& type) {
 	FfSource sw, hw;
@@ -311,6 +368,7 @@ bool verify_hardware(const std::string& path, const std::string& type) {
 		if (ra != 1) break;
 		if (!same_pictures(a, b)) {
 			fprintf(stderr, "hardware decoding (%s) differs from software at frame %d of '%s'\n", type.c_str(), i, path.c_str());
+			describe_difference(a, b, i);
 			return false;
 		}
 	}
