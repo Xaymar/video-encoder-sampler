@@ -96,12 +96,12 @@ string(APPEND SPV_TEXT "const unsigned char* spv_find(const char* name, size_t& 
 file(WRITE "${CMAKE_BINARY_DIR}/shaders_spv.cpp.new" "${SPV_TEXT}")
 execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/shaders_spv.cpp.new" "${CMAKE_BINARY_DIR}/shaders_spv.cpp")
 
-add_executable(ves src/main.cpp src/source.cpp src/ff.cpp src/ff_source.cpp src/pl_convert.cpp src/ff_decode.cpp src/formats.cpp src/cache.cpp src/gpu.cpp src/versions.cpp src/ui.cpp src/pipeline.cpp src/mux.cpp src/download.cpp src/hash.cpp src/options.cpp src/upload.cpp src/priority.cpp src/vmaf.cpp src/vk_compute.cpp src/vk_vmaf.cpp "${CMAKE_BINARY_DIR}/shaders_spv.cpp" src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_qsv.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
+add_executable(ves src/main.cpp src/source.cpp src/ff.cpp src/ff_source.cpp src/pl_convert.cpp src/ff_decode.cpp src/formats.cpp src/cache.cpp src/gpu.cpp src/versions.cpp src/ui.cpp src/pipeline.cpp src/mux.cpp src/download.cpp src/hash.cpp src/options.cpp src/upload.cpp src/priority.cpp src/vmaf.cpp src/net.cpp src/remote.cpp src/vk_compute.cpp src/vk_vmaf.cpp "${CMAKE_BINARY_DIR}/shaders_spv.cpp" src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_qsv.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
 target_include_directories(ves PRIVATE "${CMAKE_SOURCE_DIR}/src")
 if(WIN32)
 	target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include" "${CMAKE_SOURCE_DIR}/third-party/amf-include" "${CMAKE_SOURCE_DIR}/third-party/libvpl/ucrt64/include" "${X264_DIR}/include" "${X265_DIR}/include" "${SVTAV1_DIR}/include" "${VMAF_DIR}/include" "${PLACEBO_DIR}/include")
 	target_compile_definitions(ves PRIVATE _CRT_SECURE_NO_WARNINGS)
-	target_link_libraries(ves PRIVATE ${FF_LINK} ${X264_LIB} ${X265_LIB} ${SVTAV1_LIB} ${VMAF_LIB} ${PLACEBO_LIB} d3d11 dxgi CURL::libcurl)
+	target_link_libraries(ves PRIVATE ${FF_LINK} ${X264_LIB} ${X265_LIB} ${SVTAV1_LIB} ${VMAF_LIB} ${PLACEBO_LIB} d3d11 dxgi CURL::libcurl ws2_32)
 
 	# Runtime DLLs next to the executable (only the DLLs: the packages' bin folders also hold command line tools).
 	file(GLOB RUNTIME_DLLS CONFIGURE_DEPENDS

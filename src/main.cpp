@@ -1,6 +1,10 @@
 // Sweep encoder option combinations: for each one, encode in-process, decode back and score every
 // frame with VMAF, then report which configurations are the best in at least 95% of frames.
 #include <algorithm>
+#if defined(_WIN32) && defined(_DEBUG)
+#include <crtdbg.h>
+#include <stdlib.h>
+#endif
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -37,6 +41,7 @@
 #include "mux.h"
 #include "pipeline.h"
 #include "ui.h"
+#include "remote.h"
 #include "vmaf.h"
 
 namespace fs = std::filesystem;
@@ -93,6 +98,9 @@ struct Config {
 	int decode_threads = 0;  // 0: as many as the cores allow within a memory budget
 	std::string priority = "low"; // "low": idle CPU and lowest disk priority, see priority.h; "normal" leaves the system's default
 	bool low_memory = false; // score a wave before encoding the next, and fewer VMAF threads
+	int host_port = 0;       // distributed: listen on this port and hand the runs that are not done to the workers that connect (remote.h); 0: run everything here
+	std::string token;       // what a worker must present to the host
+	int min_workers = 1;     // the host starts handing out jobs when this many workers have connected
 	std::vector<Job> jobs;
 };
 
@@ -332,6 +340,14 @@ Scoring
                             auto: the GPU where it can be used (8 or 10 bit YUV, a model file, a Vulkan GPU), else the CPU. These scores are kept apart from libvmaf's in the cache
         --over-penalty <p>  VMAF points deducted per percent for a run just over the target bitrate (default: 0.025); it grows exponentially, like the website's
 
+Distributed (see docs/distributed.md)
+        --host <port>       decide what is run, and hand the runs that are not done to the workers that connect to this port. The host runs nothing
+                            itself, except what no worker could do; it needs an output or cache folder
+        --token <secret>    what workers must present (or the VES_TOKEN environment variable); use it on both sides
+        --min-workers <n>   jobs start when this many workers have connected (default: 1)
+        --worker <host:port>  be a worker: connect to a host and run the jobs it sends, until stopped. Every other flag (--priority, --hw-decode,
+                            --vmaf-device, ...) is passed on to the runs; --worker-dir <dir> keeps fetched inputs and scratch files (default: ves-worker)
+
 Quick run (replaces the encoders and scenarios of the config file)
   -enc, --encoder <name>    nvenc | amf | qsv | x264 | x265 | svtav1
   -cd,  --codec <name>      h264 | hevc | av1, for the GPU encoders
@@ -421,6 +437,9 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--no-upload-videos") upload_videos = false;
 		else if (a == "--plain") cfg.plain = true;
 		else if (a == "--low-memory") cfg.low_memory = true;
+		else if (a == "--host") cfg.host_port = atoi(value().c_str());
+		else if (a == "--token") cfg.token = value();
+		else if (a == "--min-workers") cfg.min_workers = std::max(1, atoi(value().c_str()));
 		else if (a == "--decode-threads") cfg.decode_threads = atoi(value().c_str());
 		else if (a == "--hw-decode") cfg.hw_decode = value();
 		else if (a == "--priority") cfg.priority = value();
@@ -513,7 +532,77 @@ static std::string jq(const std::string& s) { // JSON string
 static std::string file_name(const std::string& path) { return is_url(path) ? url_file_name(path) : fs::path(path).filename().string(); }
 static std::string model_name(const std::string& model) { return model.rfind("path=", 0) == 0 ? "path=" + file_name(model.substr(5)) : model; }
 
+// The config of one remote job (remote.h): the host's option lists for one encoder entry, and a scenario with a single bitrate, key frame interval and size.
+// What the worker decides for itself (hardware decoding, priority, threads) is left out, so the worker's own flags apply.
+static std::string sub_config(const Config& cfg, const Job& job, const Scenario& sc, int64_t bitrate, double kf, const Shape& shape) {
+	std::ostringstream o;
+	auto list = [](const std::vector<std::string>& v) {
+		std::string s = "[";
+		for (size_t i = 0; i < v.size(); i++) s += (i ? "," : "") + jq(v[i]);
+		return s + "]";
+	};
+	o << "{\"scenarios\":[{\"name\":" << jq(sc.name) << ",\"bitrates\":[" << bitrate << "],\"kfintervals\":[" << kf << "]";
+	if (shape.w) o << ",\"resolutions\":[" << jq(std::to_string(shape.w) + "x" + std::to_string(shape.h)) << "]";
+	if (shape.fps.num) o << ",\"framerates\":[" << jq(std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den)) << "]";
+	if (!sc.chroma.empty()) o << ",\"chroma\":" << list(sc.chroma);
+	if (!sc.bitdepth.empty()) o << ",\"bitdepth\":" << list(sc.bitdepth);
+	if (!sc.range.empty()) o << ",\"range\":" << list(sc.range);
+	if (shape.upscale) o << ",\"upscale\":true";
+	o << "}],\"scaling\":{\"upscaler\":" << jq(cfg.scale.upscaler) << ",\"downscaler\":" << jq(cfg.scale.downscaler);
+	if (!cfg.scale.device.empty()) o << ",\"gpu\":" << jq(cfg.scale.device);
+	o << "},\"vmaf\":{\"model\":" << jq(cfg.vo.model) << ",\"device\":" << jq(cfg.vo.device) << "},\"encoders\":[{\"encoder\":" << jq(job.encoder) << ",\"codec\":" << jq(job.codec);
+	if (job.parallel > 0) o << ",\"parallel\":" << job.parallel;
+	o << ",\"prune\":false,\"options\":{";
+	bool first = true;
+	for (auto& ax : job.axes) {
+		o << (first ? "" : ",") << jq(ax.key) << ":[";
+		first = false;
+		bool first_value = true;
+		for (auto& v : ax.values) {
+			if (ax.key == "gpu" && v && *v == "all") { // as expand() does on the host: every GPU of the vendor
+				for (size_t i = 0; i < std::max<size_t>(list_gpus(encoder_vendor(job.encoder)).size(), 1); i++) { o << (first_value ? "" : ",") << jq(std::to_string(i)); first_value = false; }
+				continue;
+			}
+			o << (first_value ? "" : ",") << (v ? jq(*v) : std::string("null"));
+			first_value = false;
+		}
+		o << "]";
+	}
+	o << "}}]}";
+	return o.str();
+}
+
+// `ves --worker host:port`: runs the jobs a host sends, until it is stopped. Every other flag is passed on to the `ves` that runs a job, so --priority, --hw-decode,
+// --vmaf-device and so on work as they do for a sweep started by hand.
+static int run_worker(int argc, char** argv) {
+	std::string target, dir = "ves-worker", token = getenv("VES_TOKEN") ? getenv("VES_TOKEN") : "";
+	std::vector<std::string> pass;
+	for (int i = 1; i < argc; i++) {
+		const std::string a = argv[i];
+		auto value = [&]() -> std::string { if (i + 1 >= argc) throw std::runtime_error("missing value for " + a); return argv[++i]; };
+		try {
+			if (a == "--worker") target = value();
+			else if (a == "--worker-dir") dir = value();
+			else if (a == "--token") token = value();
+			else pass.push_back(a);
+		} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
+	}
+	const size_t colon = target.rfind(':');
+	if (colon == std::string::npos) { fprintf(stderr, "error: --worker takes host:port\n"); return 1; }
+	return remote_worker(target.substr(0, colon), atoi(target.c_str() + colon + 1), token, dir, pass, [](const std::string& line) { printf("%s\n", line.c_str()); fflush(stdout); });
+}
+
 int main(int argc, char** argv) {
+#if defined(_WIN32) && defined(_DEBUG)
+	// A failed assertion of the debug runtime goes to stderr and aborts, instead of opening a dialog that offers to start a debugger.
+	_set_error_mode(_OUT_TO_STDERR);
+	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+	_CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
+	for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--worker") return run_worker(argc, argv);
 	Config cfg;
 	try {
 		// (config errors, including missing inputs, throw and are reported below)
@@ -529,6 +618,11 @@ int main(int argc, char** argv) {
 	} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
 	if (cfg.inputs.empty() || cfg.scenarios.empty() || cfg.jobs.empty()) { fprintf(stderr, "error: need inputs, bitrates and at least one enabled encoder (see --help)\n"); return 1; }
 
+	if (cfg.host_port) {
+		if (cfg.output_dir.empty() && cfg.cache_dir.empty()) { fprintf(stderr, "error: --host needs an output or a cache folder to keep the workers' results in\n"); return 1; }
+		if (cfg.token.empty()) if (const char* t = getenv("VES_TOKEN")) cfg.token = t;
+		for (auto& j : cfg.jobs) j.prune = false; // pruning needs the scores of earlier runs, which are somewhere else
+	}
 	if (cfg.low_memory && cfg.vo.threads <= 0) cfg.vo.threads = 2;
 	if (cfg.priority != "low" && cfg.priority != "normal") { fprintf(stderr, "error: priority must be low or normal\n"); return 1; }
 	if (cfg.priority == "low" && !set_low_priority()) fprintf(stderr, "warning: could not lower the process priority\n");
@@ -548,6 +642,8 @@ int main(int argc, char** argv) {
 		Plan plan;
 		bool done = false;               // finished, however it came about
 		std::vector<int> mid;            // pruning: the lines along which this run is neither the lowest nor the highest value (see `lines`)
+		const Scenario* sc = nullptr;    // the scenario it comes from, and which of its sizes: where a remote job is cut
+		size_t shape_i = 0;
 	};
 	struct Pool {
 		std::vector<size_t> tasks;
@@ -655,7 +751,7 @@ int main(int argc, char** argv) {
 						const std::string group_head = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|";
 						for (const Variant& v : sets) {
 							Task t;
-							t.job = &job; t.id = id;
+							t.job = &job; t.id = id; t.sc = &sc; t.shape_i = (size_t)(&shape - sc.shapes.data());
 							t.r.input = input; t.r.bitrate = br; t.r.kf = kf; t.r.shape = shape;
 							t.r.label = head + v.label;
 							t.p.codec = job.codec; t.p.bitrate = br * 1000; t.p.options = v.opts;
@@ -863,6 +959,38 @@ int main(int argc, char** argv) {
 		if (!t.r.shape.w) { t.r.shape.w = t.plan.enc.w; t.r.shape.h = t.plan.enc.h; }
 		if (!t.r.shape.fps.num) t.r.shape.fps = t.plan.enc.fps;
 	};
+	// Distributed: the runs that are not done yet are cut into jobs (one input, encoder entry, scenario, bitrate, key frame interval and size each) for the workers
+	// that connect to --host. What they send back is stored as result files with this run's keys, so the loop below finds those runs finished. Whatever the workers
+	// could not do (runs that cannot work with their input, a job given up) is run here as usual.
+	if (cfg.host_port) {
+		std::map<std::string, RemoteJobSpec> groups;
+		std::vector<std::string> order;
+		for (auto& t : tasks) {
+			if (t.result_file.empty() || fs::exists(t.result_file)) continue;
+			const std::string g = t.r.input + "|" + std::to_string(t.job - cfg.jobs.data()) + "|" + std::to_string(t.sc - cfg.scenarios.data()) + "|" + std::to_string(t.r.bitrate) + "|" +
+			                      std::to_string(t.r.kf) + "|" + std::to_string(t.shape_i);
+			auto it = groups.find(g);
+			if (it == groups.end()) {
+				RemoteJobSpec spec;
+				spec.config = sub_config(cfg, *t.job, *t.sc, t.r.bitrate, t.r.kf, t.r.shape);
+				spec.input = t.r.input;
+				spec.name = file_name(t.r.input) + " " + t.job->encoder + (is_gpu_encoder(t.job->encoder) ? "/" + t.job->codec : std::string()) + " " + std::to_string(t.r.bitrate) + "k";
+				order.push_back(g);
+				it = groups.emplace(g, std::move(spec)).first;
+			}
+			it->second.runs.push_back({t.result_file, t.key});
+		}
+		std::vector<RemoteJobSpec> jobs;
+		for (auto& g : order) jobs.push_back(std::move(groups[g]));
+		for (auto& j : jobs) j.name += " (" + std::to_string(j.runs.size()) + " runs)";
+		RemoteHostOptions ro;
+		ro.port = cfg.host_port;
+		ro.token = cfg.token;
+		ro.min_workers = cfg.min_workers;
+		const size_t stored = remote_run_jobs(jobs, ro, [](const std::string& line) { ui::log(line); });
+		ui::log("remote: " + std::to_string(stored) + " results from the workers");
+	}
+
 	// Whatever cannot work, or was done before, is finished right away. The rest is sorted by the frames it needs: runs with the
 	// same input, resolution, frame rate and pixel format share one decode.
 	std::map<std::string, std::vector<size_t>> uncached; // by input: the runs that have to be done, planned when their input comes up
