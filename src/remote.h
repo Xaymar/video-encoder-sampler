@@ -57,5 +57,8 @@ private:
 // Connects to the host and runs the jobs it sends, until the process is stopped. `workdir` keeps fetched inputs and the jobs' scratch files; `extra_args` are passed on to
 // the `ves` that runs a job (--priority, --hw-decode, ...). The worker tells the host which GPUs it has; `only_gpu` (>= 0) offers just that NVIDIA GPU, so a machine with
 // several runs one worker per GPU. `slots` is how many jobs it runs at the same time.
+// The path of this program.
+std::string executable_path();
+
 int remote_worker(const std::string& host, int port, const std::string& token, const std::string& workdir, int only_gpu, int slots, const std::vector<std::string>& extra_args,
                   const RemoteLog& log);

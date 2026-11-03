@@ -282,7 +282,7 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
 	if (job.rp) job.rp->busy_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_flush).count();
 	if (!job.file.empty() && !(mp4.close() && !write_failed)) { fprintf(stderr, "cannot write %s\n", job.file.c_str()); ok = false; }
 	job.ok = ok;
-	if (job.rp) job.rp->finish();
+	if (job.rp) { job.rp->failed = !ok; job.rp->finish(); }
 	job.kbps = codec->stats.bytes * 8 / si.duration / 1000;
 }
 
@@ -374,7 +374,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 			const ShownFeed shown = [&fr](size_t k, uint32_t& v) { return fr.shown.get(k, v); };
 			run.score_ok = vmaf_score(ref, feed, run.codec, next_packet, {}, run.enc.plan->enc, run.enc.plan->color, shown, g.fmt, group_vo, so, run.scores, run.score_rp);
 			if (run.score_ok && (long long)run.scores.size() != fr.frames) { fprintf(stderr, "%zu scores for %lld frames\n", run.scores.size(), fr.frames); run.score_ok = false; }
-			if (run.score_rp) run.score_rp->finish();
+			if (run.score_rp) { run.score_rp->failed = !run.score_ok; run.score_rp->finish(); }
 			rq.cancel(); // done with the original frames: do not hold the reference decode back
 			pq.cancel(); // and with the packets: do not hold the encoder back
 		});

@@ -664,6 +664,8 @@ bool fetch_input(const std::function<bool(uint8_t, const std::string&)>& send, I
 
 } // namespace
 
+std::string executable_path() { return self_exe(); }
+
 int remote_worker(const std::string& host, int port, const std::string& token, const std::string& workdir, int only_gpu, int slots, const std::vector<std::string>& extra_args,
                   const RemoteLog& log) {
 	std::error_code ec;

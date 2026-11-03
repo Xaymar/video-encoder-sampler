@@ -506,6 +506,16 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	if (model) cfg.vo.model = *model;
 	if (threads) cfg.vo.threads = *threads;
 	if (penalty) over_penalty = *penalty;
+	// A relative model is looked for where the program is as well (a worker's jobs run wherever the worker was started), and in the folder above it, where a build sits.
+	if (cfg.vo.model.rfind("path=", 0) == 0) {
+		const fs::path rel = cfg.vo.model.substr(5);
+		std::error_code ec;
+		if (rel.is_relative() && !fs::exists(rel, ec)) {
+			const fs::path exe = fs::path(executable_path()).parent_path();
+			for (const fs::path& base : {exe, exe.parent_path()})
+				if (fs::exists(base / rel, ec)) { cfg.vo.model = "path=" + (base / rel).string(); break; }
+		}
+	}
 }
 
 static Codec codec_of(const std::string& encoder, const std::string& codec) {

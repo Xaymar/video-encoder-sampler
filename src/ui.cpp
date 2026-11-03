@@ -148,7 +148,7 @@ Row row_of(const ui::Progress& p, const std::string& prefix) {
 	if (p.stage == 4 || p.stage == 5) snprintf(b, sizeof b, "%.1f MB/s", p.rate / 1048576.0);
 	else snprintf(b, sizeof b, "%.1f fps", p.rate);
 	r.speed = b;
-	r.status = p.finished ? "done" : p.stage == 0 ? "waiting" : waits[p.state >= 0 && p.state < 3 ? p.state : 0];
+	r.status = p.finished ? (p.failed ? "failed" : "done") : p.stage == 0 ? "waiting" : waits[p.state >= 0 && p.state < 3 ? p.state : 0];
 	return r;
 }
 
@@ -163,6 +163,7 @@ ui::Progress progress_of(const Entry& e) {
 	p.rate = p.done / secs;
 	p.state = e.p->state;
 	p.finished = end != 0;
+	p.failed = e.p->failed;
 	return p;
 }
 
@@ -303,7 +304,7 @@ void write_snapshot() {
 	for (auto& [h, e] : entries) {
 		const ui::Progress p = progress_of(e);
 		char numbers[160];
-		snprintf(numbers, sizeof numbers, ",%lld,%lld,%.3f,%d,%d]", p.done, p.total, p.rate, p.state, p.finished ? 1 : 0);
+		snprintf(numbers, sizeof numbers, ",%lld,%lld,%.3f,%d,%d]", p.done, p.total, p.rate, p.state, p.finished ? (p.failed ? 2 : 1) : 0);
 		line += std::string(first ? "" : ",") + "[" + std::to_string(p.stage) + "," + json_string(p.label) + numbers;
 		first = false;
 	}
@@ -350,6 +351,7 @@ void RunProgress::finish() { end_ms = now_ms(); }
 
 void RunProgress::begin(int st, long long tot) {
 	end_ms = 0;
+	failed = false;
 	busy_ms = starved_ms = blocked_ms = 0;
 	state = 0;
 	done = 0;
@@ -444,6 +446,7 @@ std::vector<Progress> parse_progress(const std::string& json) {
 			p.rate = atof(r.a[4].text().c_str());
 			p.state = atoi(r.a[5].text().c_str());
 			p.finished = r.a[6].text() != "0";
+			p.failed = r.a[6].text() == "2";
 			list.push_back(std::move(p));
 		}
 	} catch (const std::exception&) {}
