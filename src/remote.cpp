@@ -279,10 +279,16 @@ struct RemoteHost::Impl {
 					const std::string path = (*jobs)[id].path.empty() ? (*jobs)[id].input : (*jobs)[id].path;
 					std::ifstream f(path, std::ios::binary);
 					std::string chunk(kChunk, '\0');
+					std::error_code size_ec;
+					RunProgress rp; // shown while the file goes out
+					rp.begin(4, (long long)fs::file_size(path, size_ec));
+					const int handle = ui::attach(&rp, "send " + fs::path(path).filename().string() + " to " + who, "input");
+					struct Detach { RunProgress& rp; int h; ~Detach() { rp.finish(); ui::detach(h); } } detach{rp, handle};
 					while (f) {
 						f.read(chunk.data(), (std::streamsize)kChunk);
 						const size_t n = (size_t)f.gcount();
 						if (n && !send(M_FILE_DATA, id_bytes(id) + chunk.substr(0, n))) return;
+						rp.done += (long long)n;
 					}
 					send(M_FILE_END, id_bytes(id));
 				});
@@ -638,7 +644,7 @@ size_t id_of(const std::string& payload) {
 }
 
 // Fetches an input from the host (if it is not here already) and returns its path.
-bool fetch_input(const std::function<bool(uint8_t, const std::string&)>& send, Inbox& inbox, size_t job_id, const fs::path& dir, const std::string& name, const std::string& sha, fs::path& out,
+bool fetch_input(const std::function<bool(uint8_t, const std::string&)>& send, Inbox& inbox, size_t job_id, const fs::path& dir, const std::string& name, const std::string& sha, long long size, fs::path& out,
                  std::string& err) {
 	std::string safe = fs::path(name).filename().string();
 	out = dir / (sha.substr(0, 16) + "_" + safe);
@@ -648,6 +654,10 @@ bool fetch_input(const std::function<bool(uint8_t, const std::string&)>& send, I
 	fs::create_directories(dir, ec);
 	const fs::path tmp = out.string() + ".part" + std::to_string(job_id);
 	std::ofstream f(tmp, std::ios::binary);
+	RunProgress rp; // shown while the file comes in
+	rp.begin(5, size);
+	const int handle = ui::attach(&rp, "receive " + safe + " from the host", "input");
+	struct Detach { RunProgress& rp; int h; ~Detach() { rp.finish(); ui::detach(h); } } detach{rp, handle};
 	uint8_t type;
 	std::string payload;
 	for (;;) {
@@ -655,6 +665,7 @@ bool fetch_input(const std::function<bool(uint8_t, const std::string&)>& send, I
 		if (type == M_FILE_END) break;
 		if (type != M_FILE_DATA) { err = "unexpected message"; return false; }
 		f.write(payload.data() + 4, (std::streamsize)payload.size() - 4);
+		rp.done += (long long)payload.size() - 4;
 	}
 	f.close();
 	if (sha256_file(tmp.string()) != sha) { fs::remove(tmp, ec); err = "the input arrived damaged"; return false; }
@@ -772,7 +783,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 				}
 				std::lock_guard lock(*one);
 				fs::path p;
-				if (fetch_input(send, *inbox, id, fs::path(workdir) / "inputs", in.find("name")->text(), sha, p, failure)) input = p.string();
+				if (fetch_input(send, *inbox, id, fs::path(workdir) / "inputs", in.find("name")->text(), sha, atoll(in.find("size")->text().c_str()), p, failure)) input = p.string();
 			}
 			bool ok = false;
 			size_t sent_results = 0;
