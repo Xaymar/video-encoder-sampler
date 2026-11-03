@@ -73,7 +73,31 @@ set(CURL_DISABLE_LDAPS ON CACHE BOOL "" FORCE)
 set(CURL_ENABLE_EXPORT_TARGET OFF CACHE BOOL "" FORCE)
 add_subdirectory(third-party/curl EXCLUDE_FROM_ALL)
 
-add_executable(ves src/main.cpp src/source.cpp src/ff.cpp src/ff_source.cpp src/pl_convert.cpp src/ff_decode.cpp src/formats.cpp src/cache.cpp src/gpu.cpp src/versions.cpp src/ui.cpp src/pipeline.cpp src/mux.cpp src/download.cpp src/hash.cpp src/options.cpp src/upload.cpp src/priority.cpp src/vmaf.cpp src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_qsv.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
+# The compute shaders of the GPU VMAF scorer: shaders/*.spv (compiled from the .comp files by shaders/build.sh and committed, so building ves needs
+# no shader compiler) are embedded into the program as byte arrays.
+file(GLOB SPV_FILES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/shaders/*.spv")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${SPV_FILES})
+set(SPV_TEXT "#include \"shaders_spv.h\"
+#include <cstring>
+")
+set(SPV_TABLE "")
+foreach(f ${SPV_FILES})
+	get_filename_component(n "${f}" NAME_WE)
+	file(READ "${f}" hex HEX)
+	string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${hex}")
+	string(APPEND SPV_TEXT "static const unsigned char spv_${n}[] = {${bytes}};
+")
+	string(APPEND SPV_TABLE "{\"${n}\", spv_${n}, sizeof spv_${n}},")
+endforeach()
+string(APPEND SPV_TEXT "static const struct { const char* name; const unsigned char* data; size_t size; } table[] = {${SPV_TABLE}};
+")
+string(APPEND SPV_TEXT "const unsigned char* spv_find(const char* name, size_t& size) { for (auto& e : table) if (!strcmp(e.name, name)) { size = e.size; return e.data; } return nullptr; }
+")
+file(WRITE "${CMAKE_BINARY_DIR}/shaders_spv.cpp.new" "${SPV_TEXT}")
+execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/shaders_spv.cpp.new" "${CMAKE_BINARY_DIR}/shaders_spv.cpp")
+
+add_executable(ves src/main.cpp src/source.cpp src/ff.cpp src/ff_source.cpp src/pl_convert.cpp src/ff_decode.cpp src/formats.cpp src/cache.cpp src/gpu.cpp src/versions.cpp src/ui.cpp src/pipeline.cpp src/mux.cpp src/download.cpp src/hash.cpp src/options.cpp src/upload.cpp src/priority.cpp src/vmaf.cpp src/vk_compute.cpp src/vk_vmaf.cpp "${CMAKE_BINARY_DIR}/shaders_spv.cpp" src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_qsv.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
+target_include_directories(ves PRIVATE "${CMAKE_SOURCE_DIR}/src")
 if(WIN32)
 	target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include" "${CMAKE_SOURCE_DIR}/third-party/amf-include" "${CMAKE_SOURCE_DIR}/third-party/libvpl/ucrt64/include" "${X264_DIR}/include" "${X265_DIR}/include" "${SVTAV1_DIR}/include" "${VMAF_DIR}/include" "${PLACEBO_DIR}/include")
 	target_compile_definitions(ves PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -93,6 +117,13 @@ if(WIN32)
 	install(FILES config.jsonc README.md DESTINATION .)
 else()
 	target_include_directories(ves PRIVATE "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include")
+	# The GPU VMAF scorer needs the Vulkan headers (the loader is opened at run time); without them it is left out.
+	find_path(VULKAN_INCLUDE_DIR vulkan/vulkan.h)
+	if(VULKAN_INCLUDE_DIR)
+		target_include_directories(ves PRIVATE "${VULKAN_INCLUDE_DIR}")
+	else()
+		target_compile_definitions(ves PRIVATE VES_NO_VULKAN)
+	endif()
 	target_link_libraries(ves PRIVATE PkgConfig::LIBS ${X265_LIB} Threads::Threads ${CMAKE_DL_LIBS} CURL::libcurl)
 	if(VPL_FOUND)
 		target_link_libraries(ves PRIVATE PkgConfig::VPL)

@@ -1,0 +1,80 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "vif_common.glsl"
+// VIF statistic, horizontal pass and the per pixel sums; each workgroup writes four sums:
+// accum_num_log, accum_den_log, accum_num_non_log, accum_den_non_log.
+
+shared int64_t sh[4][256];
+
+int log2_32(uint t) {
+	const int k = findMSB(t) - 15;
+	return int(log2_table[t >> uint(k)]) + 2048 * k;
+}
+
+int log2_64(uint64_t t) {
+	const uvec2 p = unpackUint2x32(t);
+	const int msb = p.y != 0u ? 32 + findMSB(p.y) : findMSB(p.x);
+	const int k = msb - 15;
+	return int(log2_table[uint(t >> uint64_t(k))]) + 2048 * k;
+}
+
+void main() {
+	const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+	int64_t num_log = 0l, den_log = 0l, num_non = 0l, den_non = 0l;
+	if (x < pc.W && y < pc.H) {
+		const int fw = fwidth(pc.scale);
+		const int col0 = x - fw / 2;
+		const int n = pc.W * pc.H, row = y * pc.W;
+		uint a_mu1 = 0u, a_mu2 = 0u;
+		uint64_t a_ref = 0ul, a_dis = 0ul, a_rd = 0ul;
+		for (int fj = 0; fj < fw; fj++) {
+			const int idx = row + mirror(col0 + fj, pc.W);
+			const uint c = coeff(pc.scale, fj);
+			a_mu1 += c * tmp[idx];
+			a_mu2 += c * tmp[n + idx];
+			a_ref += uint64_t(c) * uint64_t(tmp[2 * n + idx]);
+			a_dis += uint64_t(c) * uint64_t(tmp[3 * n + idx]);
+			a_rd += uint64_t(c) * uint64_t(tmp[4 * n + idx]);
+		}
+		const uint mu1_sq = uint(((uint64_t(a_mu1) * uint64_t(a_mu1)) + 2147483648ul) >> 32);
+		const uint mu2_sq = uint(((uint64_t(a_mu2) * uint64_t(a_mu2)) + 2147483648ul) >> 32);
+		const uint mu1_mu2 = uint(((uint64_t(a_mu1) * uint64_t(a_mu2)) + 2147483648ul) >> 32);
+		const uint xx = uint((a_ref + 32768ul) >> 16), yy = uint((a_dis + 32768ul) >> 16), xy = uint((a_rd + 32768ul) >> 16);
+		const int sigma1_sq = int(xx - mu1_sq);
+		int sigma2_sq = int(yy - mu2_sq);
+		const int sigma12 = int(xy - mu1_mu2);
+		const int sigma_nsq = 65536 << 1;
+		sigma2_sq = max(sigma2_sq, 0);
+		if (sigma1_sq >= sigma_nsq) {
+			den_log = int64_t(log2_32(uint(sigma_nsq + sigma1_sq)) - 2048 * 17);
+			if (sigma12 > 0 && sigma2_sq > 0) {
+				const double eps = 65536.0LF * 1.0e-10LF;
+				precise double g = double(sigma12) / (double(sigma1_sq) + eps);
+				precise double sv = double(sigma2_sq) - g * double(sigma12);
+				int sv_sq = int(sv);
+				sv_sq = max(sv_sq, 0);
+				g = min(g, pc.egl);
+				const uint numer1 = uint(sv_sq) + uint(sigma_nsq);
+				precise double gg = g * g;
+				precise double gs = gg * double(sigma1_sq);
+				const int64_t numer1_tmp = int64_t(gs) + int64_t(numer1);
+				num_log = int64_t(log2_64(uint64_t(numer1_tmp)) - log2_64(uint64_t(numer1)));
+			}
+		} else {
+			num_non = int64_t(sigma2_sq);
+			den_non = 1l;
+		}
+	}
+	const uint lid = gl_LocalInvocationIndex;
+	sh[0][lid] = num_log; sh[1][lid] = den_log; sh[2][lid] = num_non; sh[3][lid] = den_non;
+	barrier();
+	for (uint s = 128u; s > 0u; s >>= 1) {
+		if (lid < s) for (int q = 0; q < 4; q++) sh[q][lid] += sh[q][lid + s];
+		barrier();
+	}
+	if (lid == 0u) {
+		const uint wg = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+		for (int q = 0; q < 4; q++) part[wg * 4u + uint(q)] = sh[q][0];
+	}
+}

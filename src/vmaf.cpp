@@ -4,7 +4,11 @@
 #include <cstdio>
 #include <cstring>
 
+#include <atomic>
+#include <memory>
+
 #include "decode.h"
+#include "vk_vmaf.h"
 
 extern "C" {
 #include <libvmaf/libvmaf.h>
@@ -14,8 +18,15 @@ extern "C" {
 
 namespace {
 
-// Scores picture pairs with libvmaf in-process; every score stays in memory.
-class Scorer {
+// Scores picture pairs; every score stays in memory.
+struct Scorer {
+	virtual ~Scorer() = default;
+	virtual bool add(const Picture& ref, const Picture& dis) = 0;
+	virtual bool finish(std::vector<double>& scores) = 0;
+};
+
+// With libvmaf, in-process, on the CPU.
+class CpuScorer : public Scorer {
 	VmafContext* ctx = nullptr;
 	VmafModel* model = nullptr;
 	unsigned count = 0;
@@ -32,7 +43,7 @@ class Scorer {
 	}
 
 public:
-	~Scorer() {
+	~CpuScorer() override {
 		if (ctx) vmaf_close(ctx);
 		if (model) vmaf_model_destroy(model);
 	}
@@ -51,7 +62,7 @@ public:
 		return true;
 	}
 
-	bool add(const Picture& ref, const Picture& dis) {
+	bool add(const Picture& ref, const Picture& dis) override {
 		VmafPicture rp{}, dp{};
 		if (!to_picture(ref, rp)) return false;
 		if (!to_picture(dis, dp)) { vmaf_picture_unref(&rp); return false; }
@@ -60,7 +71,7 @@ public:
 		return true;
 	}
 
-	bool finish(std::vector<double>& scores) {
+	bool finish(std::vector<double>& scores) override {
 		if (vmaf_read_pictures(ctx, nullptr, nullptr, 0) < 0) { fprintf(stderr, "vmaf: flushing failed\n"); return false; }
 		scores.assign(count, 0);
 		for (unsigned i = 0; i < count; i++) {
@@ -68,6 +79,20 @@ public:
 		}
 		return true;
 	}
+};
+
+// On the GPU (Vulkan compute, vk_vmaf.cpp): 8 bit planar YUV, only the luma planes are looked at.
+class GpuScorer : public Scorer {
+	std::unique_ptr<GpuVmaf> gpu;
+	int w, h;
+
+public:
+	GpuScorer(std::unique_ptr<GpuVmaf> g, int w, int h) : gpu(std::move(g)), w(w), h(h) {}
+	bool add(const Picture& ref, const Picture& dis) override {
+		if (ref.width != w || ref.height != h || dis.width != w || dis.height != h) { fprintf(stderr, "vmaf: the frames are not %dx%d\n", w, h); return false; }
+		return gpu->add(ref.data[0], (size_t)ref.stride[0], dis.data[0], (size_t)dis.stride[0]);
+	}
+	bool finish(std::vector<double>& scores) override { return gpu->finish(scores); }
 };
 
 } // namespace
@@ -80,11 +105,30 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 
 	const bool convert_dis = enc.w != ref.width || enc.h != ref.height || enc.pix != score_fmt || (decoded_color.range ? decoded_color.range : 1) != ref.score_range; // scale back, change format, change range back
 
-	Scorer scorer;
+	// "gpu" needs the GPU scorer; "auto" falls back to libvmaf when it cannot be used.
+	std::unique_ptr<Scorer> scorer;
+	bool ok = true;
+	if (opt.device != "cpu") {
+		std::string why;
+		std::unique_ptr<GpuVmaf> gpu;
+		if (score_fmt.depth != 8 || !score_fmt.planar || score_fmt.rgb) why = "only 8 bit YUV is supported";
+		else if (opt.model.rfind("path=", 0) != 0) why = "the model is not a file";
+		else gpu = GpuVmaf::create(opt.model.substr(5), ref.width, ref.height, why);
+		if (gpu) scorer = std::make_unique<GpuScorer>(std::move(gpu), ref.width, ref.height);
+		else if (opt.device == "gpu") { fprintf(stderr, "vmaf: GPU scoring is not possible: %s\n", why.c_str()); ok = false; }
+		else {
+			static std::atomic<bool> told{false};
+			if (!told.exchange(true)) fprintf(stderr, "vmaf: GPU scoring is not used (%s); libvmaf scores on the CPU\n", why.c_str());
+		}
+	}
+	if (ok && !scorer) {
+		auto cpu = std::make_unique<CpuScorer>();
+		ok = cpu->open(opt);
+		scorer = std::move(cpu);
+	}
 	auto up = make_converter();
 	Picture d, u, r;
 	long long m = 0, mo = 0, k = 0; // decoded frames in, converted frames out, original frame index
-	bool ok = scorer.open(opt);
 
 	// Hold `shown` (decoded frame number mi, at the original resolution) for every original frame up to the next one.
 	auto show = [&](const Picture& pic, int64_t mi) {
@@ -93,7 +137,7 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 			int rr = next_ref(r);
 			if (rr < 0) { ok = false; break; }
 			if (rr == 0) break;
-			ok = scorer.add(r, pic);
+			ok = scorer->add(r, pic);
 			k++;
 			if (rp) rp->step();
 		}
@@ -135,5 +179,5 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 	if (ok && k == 0) { fprintf(stderr, "no frames were decoded\n"); ok = false; }
 	uint32_t extra;
 	if (ok && (shown((size_t)k, extra) || next_ref(r) == 1)) { fprintf(stderr, "encoded stream does not cover the reference frames\n"); ok = false; }
-	return ok && scorer.finish(scores);
+	return ok && scorer->finish(scores);
 }

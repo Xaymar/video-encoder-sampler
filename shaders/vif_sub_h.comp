@@ -1,0 +1,23 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "vif_common.glsl"
+// Subsample, horizontal pass and decimation: out[i][j] is the filtered plane at row 2i, column 2j.
+
+void main() {
+	const int j = int(gl_GlobalInvocationID.x), i = int(gl_GlobalInvocationID.y);
+	const int ow = pc.W / 2, oh = pc.H / 2;
+	if (j >= ow || i >= oh) return;
+	const int fw = fwidth(pc.scale);
+	const int col0 = 2 * j - fw / 2;
+	const int n = oh * pc.W;
+	uint a_ref = 0u, a_dis = 0u;
+	for (int fj = 0; fj < fw; fj++) {
+		const int idx = i * pc.W + mirror(col0 + fj, pc.W);
+		const uint c = coeff(pc.scale, fj);
+		a_ref += c * tmp[idx];
+		a_dis += c * tmp[n + idx];
+	}
+	out_ref[i * ow + j] = (a_ref + 32768u) >> 16;
+	out_dis[i * ow + j] = (a_dis + 32768u) >> 16;
+}

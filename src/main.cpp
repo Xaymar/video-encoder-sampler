@@ -257,6 +257,10 @@ static void load_config(const std::string& path, Config& cfg) {
 	if (auto* v = root.find("vmaf")) {
 		if (auto* m = v->find("model")) cfg.vo.model = m->text();
 		if (auto* t = v->find("threads")) cfg.vo.threads = atoi(t->text().c_str());
+		if (auto* d = v->find("device")) {
+			cfg.vo.device = d->text();
+			if (cfg.vo.device != "cpu" && cfg.vo.device != "gpu" && cfg.vo.device != "auto") throw std::runtime_error("vmaf.device must be cpu, gpu or auto");
+		}
 		if (auto* p = v->find("over_penalty")) over_penalty = atof(p->text().c_str());
 	}
 	auto off = [](const Json* v) { return v && (v->text() == "0" || v->text() == "false"); };
@@ -324,6 +328,8 @@ Paths
 Scoring
         --vmaf-model <spec> libvmaf model, e.g. path=models/vmaf_4k_v0.6.1neg.json
         --vmaf-threads <n>
+        --vmaf-device <cpu|gpu|auto>  where VMAF is computed (default: cpu). gpu: on the GPU with Vulkan compute (8 bit input; scores within 1e-4 of libvmaf's);
+                            auto: the GPU where it can be used (8 bit YUV, a model file, a Vulkan GPU), else the CPU. These scores are kept apart from libvmaf's in the cache
         --over-penalty <p>  VMAF points deducted per percent for a run just over the target bitrate (default: 0.025); it grows exponentially, like the website's
 
 Quick run (replaces the encoders and scenarios of the config file)
@@ -363,6 +369,7 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 		std::string k = a.substr(0, eq), v = a.substr(eq + 1);
 		if (k == "vmaf.model") cfg.vo.model = v;
 		else if (k == "vmaf.threads") cfg.vo.threads = atoi(v.c_str());
+		else if (k == "vmaf.device") cfg.vo.device = v;
 		else if (k == "over.penalty") over_penalty = atof(v.c_str());
 		else if (k == "cache") cfg.cache_dir = v == "off" ? "" : v;
 		else if (k == "output") cfg.output_dir = v;
@@ -420,6 +427,10 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "-c" || a == "--cache") cache = value();
 		else if (a == "--vmaf-model") model = value();
 		else if (a == "--vmaf-threads") threads = atoi(value().c_str());
+		else if (a == "--vmaf-device") {
+			cfg.vo.device = value();
+			if (cfg.vo.device != "cpu" && cfg.vo.device != "gpu" && cfg.vo.device != "auto") throw std::runtime_error("--vmaf-device must be cpu, gpu or auto");
+		}
 		else if (a == "--over-penalty") penalty = atof(value().c_str());
 		else if (a == "-enc" || a == "--encoder") { job.encoder = value(); quick = true; }
 		else if (a == "-cd" || a == "--codec") job.codec = value();

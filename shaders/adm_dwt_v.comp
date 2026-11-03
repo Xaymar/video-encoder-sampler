@@ -1,0 +1,41 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "adm_common.glsl"
+// DWT, vertical pass (reference and distorted), for every source column and every output row.
+
+int byte_at(bool ref, int idx) {
+	const uint w = ref ? raw_ref[idx >> 2] : raw_dis[idx >> 2];
+	return int((w >> ((idx & 3) * 8)) & 255u);
+}
+
+void main() {
+	const int x = int(gl_GlobalInvocationID.x), i = int(gl_GlobalInvocationID.y);
+	if (x >= pc.SW || i >= pc.BH) return;
+	int ind[4];
+	src_idx(i, pc.SH, ind);
+	const int T = pc.BH * pc.SW;
+	for (int p = 0; p < 2; p++) {
+		int s[4];
+		for (int k = 0; k < 4; k++)
+			s[k] = pc.scale == 0 ? byte_at(p == 0, ind[k] * pc.SW + x) : prev[(p == 0 ? RA : DA) * pc.prevN + ind[k] * pc.SW + x];
+		int tl, th;
+		if (pc.scale == 0) {
+			int lo = 0, hi = 0;
+			for (int k = 0; k < 4; k++) { lo += LO[k] * s[k]; hi += HI[k] * s[k]; }
+			lo -= 46342 * 128;
+			tl = sext16((lo + 128) >> 8);
+			th = sext16((hi + 128) >> 8);
+		} else {
+			const int64_t add = pc.scale == 1 ? 0l : 32768l;
+			const int sh = pc.scale == 1 ? 0 : 16;
+			int64_t lo = 0l, hi = 0l;
+			for (int k = 0; k < 4; k++) { lo += int64_t(LO[k]) * int64_t(s[k]); hi += int64_t(HI[k]) * int64_t(s[k]); }
+			tl = int((lo + add) >> sh);
+			th = int((hi + add) >> sh);
+		}
+		tmp[(2 * p) * T + i * pc.SW + x] = tl;
+		tmp[(2 * p + 1) * T + i * pc.SW + x] = th;
+	}
+}

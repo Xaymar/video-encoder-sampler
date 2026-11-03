@@ -84,6 +84,8 @@ std::string key_settings(const ScaleOptions& scale, const VmafOptions& vmaf) {
 		}
 		k << ' ' << it->second;
 	}
+	// The GPU scorer's scores differ from libvmaf's in the fourth decimal; "cpu" adds nothing, which keeps the keys of earlier results valid.
+	if (vmaf.device != "cpu") k << " scorer=" << vmaf.device << "-1";
 	k << '\n';
 	return k.str();
 }

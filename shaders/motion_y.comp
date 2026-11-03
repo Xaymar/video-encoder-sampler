@@ -1,0 +1,32 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// VMAF motion, pass 1: the vertical convolution of the difference of two frames (libvmaf's integer_motion.c, 8 bit).
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, binding = 0) readonly buffer Prev { uint prev[]; };
+layout(std430, binding = 1) readonly buffer Cur { uint cur[]; };
+layout(std430, binding = 2) buffer Tmp { int ytmp[]; };
+layout(push_constant) uniform PC { int W; int H; } pc;
+
+const int F[5] = int[5](3571, 16004, 26386, 16004, 3571);
+
+int mirror(int i, int n) {
+	if (i < 0) return -i;
+	if (i >= n) return 2 * n - i - 2;
+	return i;
+}
+
+int byte_at(bool a, int idx) {
+	uint w = a ? prev[idx >> 2] : cur[idx >> 2];
+	return int((w >> ((idx & 3) * 8)) & 255u);
+}
+
+void main() {
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	if (p.x >= pc.W || p.y >= pc.H) return;
+	int acc = 0;
+	for (int k = 0; k < 5; k++) {
+		const int row = mirror(p.y - 2 + k, pc.H);
+		acc += F[k] * (byte_at(true, row * pc.W + p.x) - byte_at(false, row * pc.W + p.x));
+	}
+	ytmp[p.y * pc.W + p.x] = (acc + 128) >> 8;
+}

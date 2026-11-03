@@ -1,0 +1,34 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// VMAF motion, pass 2: the horizontal convolution, the absolute value and the sum of a workgroup.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, binding = 2) readonly buffer Tmp { int ytmp[]; };
+layout(std430, binding = 3) writeonly buffer Part { uint part[]; };
+layout(push_constant) uniform PC { int W; int H; } pc;
+
+const int F[5] = int[5](3571, 16004, 26386, 16004, 3571);
+shared uint sh[256];
+
+int mirror(int i, int n) {
+	if (i < 0) return -i;
+	if (i >= n) return 2 * n - i - 2;
+	return i;
+}
+
+void main() {
+	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+	uint a = 0u;
+	if (p.x < pc.W && p.y < pc.H) {
+		int64_t acc = 0;
+		for (int k = 0; k < 5; k++) acc += int64_t(F[k]) * int64_t(ytmp[p.y * pc.W + mirror(p.x - 2 + k, pc.W)]);
+		a = uint(abs(int((acc + 32768) >> 16)));
+	}
+	const uint lid = gl_LocalInvocationIndex;
+	sh[lid] = a;
+	barrier();
+	for (uint s = 128u; s > 0u; s >>= 1) {
+		if (lid < s) sh[lid] += sh[lid + s];
+		barrier();
+	}
+	if (lid == 0u) part[gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x] = sh[0];
+}

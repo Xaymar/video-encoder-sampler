@@ -1,0 +1,66 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "adm_common.glsl"
+// Contrast masking: one workgroup per row; writes the row's three inner sums (h, v, d).
+
+shared int64_t sh[3][256];
+
+void main() {
+	const int row = pc.srow + int(gl_WorkGroupID.y);
+	const uint lid = gl_LocalInvocationIndex;
+	const int N = pc.BW * pc.BH;
+	int64_t acc[3] = int64_t[3](0l, 0l, 0l);
+	for (int j = pc.scol + int(lid); j < pc.ecol; j += 256) {
+		const int o = row * pc.BW + j;
+		int thr = 0;
+		for (int theta = 0; theta < 3; theta++) {
+			int sum = 0;
+			for (int di = -1; di <= 1; di++) {
+				for (int dj = -1; dj <= 1; dj++) {
+					const int q = (row + di) * pc.BW + j + dj;
+					if (di == 0 && dj == 0) {
+						const int c = abs(cur[(CAH + theta) * N + q]);
+						sum += pc.scale == 0 ? sext16((8738 * c + 2048) >> 12) : int(((286331153l * int64_t(c)) + 2147483648l) >> 32);
+					} else {
+						sum += cur[(CFH + theta) * N + q];
+					}
+				}
+			}
+			thr += sum;
+		}
+		for (int band = 0; band < 3; band++) {
+			const int src = cur[(XH + band) * N + o];
+			int x;
+			int64_t val;
+			if (pc.scale == 0) {
+				const int rf = band == 0 ? pc.rf0 : band == 1 ? pc.rf1 : pc.rf2;
+				x = src * rf;
+				const int sub = band == 2 ? 12 : 10;
+				x = abs(x) - (thr << sub);
+				x = x < 0 ? 0 : x;
+				const int sq_sh = band == 2 ? 30 : 29;
+				const int64_t sq_add = band == 2 ? 536870912l : 268435456l;
+				const int x_sq = int(((int64_t(x) * int64_t(x)) + sq_add) >> sq_sh);
+				const int cub = band == 0 ? pc.shc0 : band == 1 ? pc.shc1 : pc.shc2;
+				val = ((int64_t(x_sq) * int64_t(x)) + (1l << (cub - 1))) >> cub;
+			} else {
+				const int rf = band == 0 ? pc.rf0 : band == 1 ? pc.rf1 : pc.rf2;
+				x = int(((int64_t(src) * int64_t(uint(rf))) + 134217728l) >> 28);
+				x = abs(x) - thr;
+				x = x < 0 ? 0 : x;
+				const int x_sq = int(((int64_t(x) * int64_t(x)) + 536870912l) >> 30);
+				val = ((int64_t(x_sq) * int64_t(x)) + (1l << (pc.shc0 - 1))) >> pc.shc0;
+			}
+			acc[band] += val;
+		}
+	}
+	for (int band = 0; band < 3; band++) sh[band][lid] = acc[band];
+	barrier();
+	for (uint s = 128u; s > 0u; s >>= 1) {
+		if (lid < s) for (int q = 0; q < 3; q++) sh[q][lid] += sh[q][lid + s];
+		barrier();
+	}
+	if (lid == 0u) for (int q = 0; q < 3; q++) cm_rows[int(gl_WorkGroupID.y) * 3 + q] = sh[q][0];
+}

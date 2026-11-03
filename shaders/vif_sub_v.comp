@@ -1,0 +1,25 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "vif_common.glsl"
+// Subsample, vertical pass: the source plane filtered with the filter of scale pc.scale, for the even rows only (the others are dropped by the decimation).
+// tmp[0], tmp[1]: reference and distorted, (H/2) rows of W.
+
+void main() {
+	const int x = int(gl_GlobalInvocationID.x), i = int(gl_GlobalInvocationID.y);
+	if (x >= pc.W || i >= pc.H / 2) return;
+	const int fw = fwidth(pc.scale);
+	const int row0 = 2 * i - fw / 2;
+	uint a_ref = 0u, a_dis = 0u;
+	for (int fi = 0; fi < fw; fi++) {
+		const int idx = mirror(row0 + fi, pc.H) * pc.W + x;
+		const uint c = coeff(pc.scale, fi);
+		a_ref += c * px(true, idx);
+		a_dis += c * px(false, idx);
+	}
+	uint add = 32768u, sh = 16u;
+	if (pc.scale == 1) { sh = uint(pc.bpc); add = 1u << (sh - 1u); }
+	const int n = (pc.H / 2) * pc.W;
+	tmp[i * pc.W + x] = (a_ref + add) >> sh;
+	tmp[n + i * pc.W + x] = (a_dis + add) >> sh;
+}

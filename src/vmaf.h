@@ -12,6 +12,7 @@
 struct VmafOptions {
 	std::string model = "path=models/vmaf_4k_v0.6.1neg.json"; // "path=<json model>", relative to the working directory, or "version=<builtin>" if libvmaf has it
 	int threads = 0; // 0: all cores, shared between the scorers that run at the same time
+	std::string device = "cpu"; // "cpu": libvmaf; "gpu": Vulkan compute (8 bit input, an error where it cannot be used); "auto": the GPU where it can be used, else the CPU
 };
 
 // What scoring needs to know about the original video; its frames come from a feed.

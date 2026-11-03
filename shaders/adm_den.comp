@@ -1,0 +1,37 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 256) in;
+#include "adm_common.glsl"
+// The denominator: cubes of the reference bands, one workgroup per row.
+
+shared int64_t sh[3][256];
+
+void main() {
+	const int row = pc.ct + int(gl_WorkGroupID.y);
+	const uint lid = gl_LocalInvocationIndex;
+	const int N = pc.BW * pc.BH;
+	int64_t acc[3] = int64_t[3](0l, 0l, 0l);
+	for (int j = pc.cl + int(lid); j < pc.cr; j += 256) {
+		for (int band = 0; band < 3; band++) {
+			const int src = cur[(RH + band) * N + row * pc.BW + j];
+			uint64_t val;
+			if (pc.scale == 0) {
+				const uint64_t a = uint64_t(uint(abs(src)) & 65535u);
+				val = a * a * a;
+			} else {
+				const uint64_t a = uint64_t(uint(abs(src)));
+				const int shift_sq = pc.scale == 2 ? 30 : 31;
+				val = ((((a * a) + uint64_t(1u << uint(shift_sq))) >> shift_sq) * a + uint64_t(1ul << uint(pc.shc0 - 1))) >> pc.shc0;
+			}
+			acc[band] += int64_t(val);
+		}
+	}
+	for (int band = 0; band < 3; band++) sh[band][lid] = acc[band];
+	barrier();
+	for (uint s = 128u; s > 0u; s >>= 1) {
+		if (lid < s) for (int q = 0; q < 3; q++) sh[q][lid] += sh[q][lid + s];
+		barrier();
+	}
+	if (lid == 0u) for (int q = 0; q < 3; q++) den_rows[int(gl_WorkGroupID.y) * 3 + q] = sh[q][0];
+}

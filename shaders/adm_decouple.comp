@@ -1,0 +1,58 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "adm_common.glsl"
+// Splits the distorted bands into the part that follows the reference (restored) and the rest (additive impairment).
+
+// The restored value for one band, from the reference value o and the distorted value t.
+int restore(int o, int t, bool angle_flag) {
+	int64_t k;
+	if (pc.scale == 0) {
+		k = o == 0 ? 32768l : ((int64_t(div_lookup[o + 32768]) * int64_t(t) + 16384l) >> 15);
+	} else if (o == 0) {
+		k = 32768l;
+	} else {
+		const uint a = uint(abs(o));
+		int shift = 0;
+		uint msb = a;
+		if (a >= 32768u) {
+			shift = findMSB(a) - 14;                       // 17 - clz
+			msb = (a + (1u << uint(shift - 1))) >> uint(shift);
+		}
+		const int64_t sign = o < 0 ? -1l : 1l;
+		k = ((int64_t(div_lookup[int(msb) + 32768]) * int64_t(t)) * sign + (1l << (14 + shift))) >> (15 + shift);
+	}
+	k = k < 0l ? 0l : (k > 32768l ? 32768l : k);
+	int rst = int(((k * int64_t(o)) + 16384l) >> 15);
+	if (pc.scale == 0) rst = sext16(rst);
+	const float rst_f = (float(k) / 32768.0) * (float(o) / 64.0);
+	if (angle_flag && rst_f > 0.0) {
+		precise double m = double(rst) * pc.egl;     // C: MIN of a double and an int is a double, converted back when assigned
+		rst = (m < double(t)) ? int(m) : t;
+	} else if (angle_flag && rst_f < 0.0) {
+		precise double m = double(rst) * pc.egl;
+		rst = (m > double(t)) ? int(m) : t;
+	}
+	if (pc.scale == 0) rst = sext16(rst);
+	return rst;
+}
+
+void main() {
+	const int j = int(gl_GlobalInvocationID.x), i = int(gl_GlobalInvocationID.y);
+	if (j < pc.dl || j >= pc.dr || i < pc.dt || i >= pc.db) return;
+	const int N = pc.BW * pc.BH, o = i * pc.BW + j;
+	const int oh = cur[RH * N + o], ov = cur[RV * N + o], od = cur[RD * N + o];
+	const int th = cur[DH * N + o], tv = cur[DV * N + o], td = cur[DD * N + o];
+	const int64_t ot_dp = int64_t(oh) * int64_t(th) + int64_t(ov) * int64_t(tv);
+	const int64_t o_mag_sq = int64_t(oh) * int64_t(oh) + int64_t(ov) * int64_t(ov);
+	const int64_t t_mag_sq = int64_t(th) * int64_t(th) + int64_t(tv) * int64_t(tv);
+	precise double dp = double(float(ot_dp)) / 4096.0;
+	precise double rhs = (double(pc.cos1sq) * (double(float(o_mag_sq)) / 4096.0)) * (double(float(t_mag_sq)) / 4096.0);
+	const bool angle_flag = (dp >= 0.0) && (dp * dp >= rhs);
+	const int rh = restore(oh, th, angle_flag), rv = restore(ov, tv, angle_flag), rd = restore(od, td, angle_flag);
+	cur[XH * N + o] = rh; cur[XV * N + o] = rv; cur[XD * N + o] = rd;
+	int ah = th - rh, av = tv - rv, ad = td - rd;
+	if (pc.scale == 0) { ah = sext16(ah); av = sext16(av); ad = sext16(ad); }
+	cur[AH * N + o] = ah; cur[AV * N + o] = av; cur[AD * N + o] = ad;
+}

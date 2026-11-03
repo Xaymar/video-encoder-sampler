@@ -1,0 +1,39 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+#include "vif_common.glsl"
+// VIF statistic, vertical pass: tmp[0..4] = mu1, mu2, ref*ref, dis*dis, ref*dis, each W*H words.
+
+void main() {
+	const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+	if (x >= pc.W || y >= pc.H) return;
+	const int fw = fwidth(pc.scale);
+	const int row0 = y - fw / 2;
+	uint a_mu1 = 0u, a_mu2 = 0u;
+	uint64_t a_ref = 0ul, a_dis = 0ul, a_rd = 0ul;
+	for (int fi = 0; fi < fw; fi++) {
+		const int idx = mirror(row0 + fi, pc.H) * pc.W + x;
+		const uint c = coeff(pc.scale, fi);
+		const uint r = px(true, idx), d = px(false, idx);
+		const uint cr = c * r, cd = c * d;
+		a_mu1 += cr;
+		a_mu2 += cd;
+		a_ref += uint64_t(cr) * uint64_t(r);
+		a_dis += uint64_t(cd) * uint64_t(d);
+		a_rd += uint64_t(cr) * uint64_t(d);
+	}
+	uint sh_vp = 16u, add_vp = 32768u, sh_sq = 16u;
+	uint64_t add_sq = 32768ul;
+	if (pc.scale == 0) {
+		sh_vp = uint(pc.bpc);
+		add_vp = 1u << (sh_vp - 1u);
+		sh_sq = uint((pc.bpc - 8) * 2);
+		add_sq = pc.bpc == 8 ? 0ul : (1ul << (sh_sq - 1u));
+	}
+	const int n = pc.W * pc.H, o = y * pc.W + x;
+	tmp[o] = (a_mu1 + add_vp) >> sh_vp;
+	tmp[n + o] = (a_mu2 + add_vp) >> sh_vp;
+	tmp[2 * n + o] = uint((a_ref + add_sq) >> sh_sq);
+	tmp[3 * n + o] = uint((a_dis + add_sq) >> sh_sq);
+	tmp[4 * n + o] = uint((a_rd + add_sq) >> sh_sq);
+}

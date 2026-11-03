@@ -1,0 +1,48 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "adm_common.glsl"
+// DWT, horizontal pass: the four bands a (lo,lo), v (hi,lo), h (lo,hi), d (hi,hi) of the reference and the distorted frame.
+
+void main() {
+	const int j = int(gl_GlobalInvocationID.x), i = int(gl_GlobalInvocationID.y);
+	if (j >= pc.BW || i >= pc.BH) return;
+	int ind[4];
+	src_idx(j, pc.SW, ind);
+	const int T = pc.BH * pc.SW, N = pc.BW * pc.BH;
+	for (int p = 0; p < 2; p++) {
+		int vl[4], vh[4];
+		for (int k = 0; k < 4; k++) {
+			vl[k] = tmp[(2 * p) * T + i * pc.SW + ind[k]];
+			vh[k] = tmp[(2 * p + 1) * T + i * pc.SW + ind[k]];
+		}
+		int out_a, out_v, out_h, out_d;
+		if (pc.scale == 0) {
+			int al = 0, bl = 0, ah = 0, bh = 0;
+			for (int k = 0; k < 4; k++) { al += LO[k] * vl[k]; bl += HI[k] * vl[k]; ah += LO[k] * vh[k]; bh += HI[k] * vh[k]; }
+			out_a = sext16((al + 32768) >> 16);
+			out_v = sext16((bl + 32768) >> 16);
+			out_h = sext16((ah + 32768) >> 16);
+			out_d = sext16((bh + 32768) >> 16);
+		} else {
+			const int64_t add = pc.scale == 2 ? 32768l : 16384l;
+			const int sh = pc.scale == 2 ? 16 : 15;
+			int64_t al = 0l, bl = 0l, ah = 0l, bh = 0l;
+			for (int k = 0; k < 4; k++) {
+				al += int64_t(LO[k]) * int64_t(vl[k]); bl += int64_t(HI[k]) * int64_t(vl[k]);
+				ah += int64_t(LO[k]) * int64_t(vh[k]); bh += int64_t(HI[k]) * int64_t(vh[k]);
+			}
+			out_a = int((al + add) >> sh);
+			out_v = int((bl + add) >> sh);
+			out_h = int((ah + add) >> sh);
+			out_d = int((bh + add) >> sh);
+		}
+		const int b0 = p == 0 ? RA : DA;
+		const int o = i * pc.BW + j;
+		cur[(b0 + 0) * N + o] = out_a;
+		cur[(b0 + 2) * N + o] = out_v;
+		cur[(b0 + 1) * N + o] = out_h;
+		cur[(b0 + 3) * N + o] = out_d;
+	}
+}
