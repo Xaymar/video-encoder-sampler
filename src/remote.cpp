@@ -28,12 +28,13 @@
 #include "hash.h"
 #include "json.h"
 #include "net.h"
+#include "ui.h"
 
 namespace fs = std::filesystem;
 
 namespace {
 
-enum : uint8_t { M_HELLO = 1, M_JOB = 2, M_NEED = 3, M_FILE_DATA = 4, M_FILE_END = 5, M_RESULT = 6, M_DONE = 7 };
+enum : uint8_t { M_HELLO = 1, M_JOB = 2, M_NEED = 3, M_FILE_DATA = 4, M_FILE_END = 5, M_RESULT = 6, M_DONE = 7, M_PROGRESS = 8 };
 constexpr int kVersion = 3;
 constexpr size_t kChunk = 1 << 20;
 constexpr int kTries = 3;
@@ -288,6 +289,18 @@ struct RemoteHost::Impl {
 					std::lock_guard lock(m);
 					active[id].stored++;
 				}
+			} else if (type == M_PROGRESS) {
+				if (payload.size() < 5) continue;
+				const size_t id = id_of(payload);
+				try {
+					Json rows = Json::parse(payload.substr(4));
+					std::vector<ui::Row> list;
+					for (auto& r : rows.a) {
+						if (r.a.size() < 4) continue;
+						list.push_back({"[" + worker->name + "] " + r.a[0].text(), r.a[1].text(), r.a[2].text(), atof(r.a[3].text().c_str())});
+					}
+					ui::set_remote(worker->name + "#" + std::to_string(id), list);
+				} catch (const std::exception&) {}
 			} else if (type == M_DONE) {
 				bool ok = false;
 				std::string log_tail;
@@ -305,6 +318,7 @@ struct RemoteHost::Impl {
 					if (it == active.end()) continue;
 					stored = it->second.stored;
 					active.erase(it);
+					ui::set_remote(worker->name + "#" + std::to_string(id), {});
 					imported += stored;
 					left--;
 				}
@@ -322,6 +336,7 @@ struct RemoteHost::Impl {
 		for (auto& t : senders) t.join();
 		std::lock_guard lock(m);
 		for (auto& [id, a] : active) {
+			ui::set_remote(worker->name + "#" + std::to_string(id), {});
 			const RemoteJobSpec& job = (*jobs)[id];
 			log("job " + job.name + " lost with " + who);
 			if (tries[id] < kTries) queue.push_front(id);
@@ -513,6 +528,21 @@ std::string inventory_json(int only_gpu) {
 	return out + "]";
 }
 
+// The last complete line of a file that is being appended to.
+std::string last_line(const fs::path& p) {
+	std::ifstream f(p, std::ios::binary | std::ios::ate);
+	if (!f) return "";
+	const std::streamoff size = f.tellg();
+	const std::streamoff from = size > 65536 ? size - 65536 : 0;
+	f.seekg(from);
+	std::string tail((size_t)(size - from), '\0');
+	f.read(tail.data(), (std::streamsize)tail.size());
+	const size_t end = tail.rfind('\n');
+	if (end == std::string::npos) return "";
+	const size_t start = tail.rfind('\n', end == 0 ? 0 : end - 1);
+	return tail.substr(start == std::string::npos || start == end ? 0 : start + 1, end - (start == std::string::npos || start == end ? 0 : start + 1));
+}
+
 // What the reader thread hands to a job: the pieces of an input being fetched.
 struct Inbox {
 	std::mutex m;
@@ -661,9 +691,22 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 					f << job.find("config")->text();
 				}
 				std::vector<std::string> args{"--plain", "--config", (dir / "config.jsonc").string(), "--input", input, "--output", (dir / "out").string(), "--no-videos",
-				                               "--cache", (fs::path(workdir) / "cache").string(), "--upload", "off"};
+				                               "--cache", (fs::path(workdir) / "cache").string(), "--upload", "off", "--progress-file", (dir / "progress.jsonl").string()};
 				args.insert(args.end(), extra_args.begin(), extra_args.end());
+				// Once a second, the newest rows of the run go to the host.
+				std::atomic<bool> running{true};
+				std::thread monitor([&] {
+					std::string sent;
+					for (int tick = 0; running; tick++) {
+						std::this_thread::sleep_for(std::chrono::milliseconds(100));
+						if (tick % 10 != 9) continue;
+						const std::string line = last_line(dir / "progress.jsonl");
+						if (!line.empty() && line != sent) { sent = line; send(M_PROGRESS, id_bytes(id) + line); }
+					}
+				});
 				const int code = run_process(exe, args, (dir / "log.txt").string());
+				running = false;
+				monitor.join();
 				log_text = tail_of(read_file(dir / "log.txt"), 12);
 				ok = code == 0;
 				if (!ok) log("job " + jname + " failed with code " + std::to_string(code));

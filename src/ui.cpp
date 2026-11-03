@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <deque>
+#include <fstream>
 #include <fcntl.h>
 #include <map>
 #include <mutex>
@@ -45,6 +46,9 @@ std::deque<std::string> pending; // permanent lines not printed yet
 int next_handle = 1, live_lines = 0, runs_done = 0, runs_total = 0, uploads_done = 0, uploads_total = 0;
 bool is_live = false, running = false;
 Clock::time_point t0;
+std::string progress_file;
+int64_t last_snapshot = 0;
+std::map<std::string, std::vector<ui::Row>> remote_rows; // by worker and job
 std::thread renderer, stderr_reader;
 int saved_stderr = -1, pipe_read = -1;
 #ifdef _WIN32
@@ -125,11 +129,7 @@ std::string bar(double fraction, int width) {
 	return o + repeat("\xC2\xB7", width - used);
 }
 
-// What a run in flight shows: its task, speed, status and how far it is.
-struct Row {
-	std::string task, speed, status;
-	double fraction = 0;
-};
+using Row = ui::Row;
 
 Row make_row(const Entry& e) {
 	static const char* names[] = {"wait", "encode", "score", "decode", "upload", "download"};
@@ -180,6 +180,7 @@ void render() {
 
 	std::vector<Row> rows;
 	for (auto& [h, e] : entries) rows.push_back(make_row(e));
+	for (auto& [key, list] : remote_rows) rows.insert(rows.end(), list.begin(), list.end());
 	// Rows that fit: the frame has a top border, a header, a rule and a bottom border around them.
 	const size_t room = (size_t)std::max(1, term_h - 6);
 	size_t hidden = 0;
@@ -259,7 +260,35 @@ void plain_status() {
 		const int ws = e.p->state;
 		printf("  %s %s: %lld%% (%lld/%lld frames)%s  %s\n", e.p->stage == 1 ? "encoding" : e.p->stage == 3 ? "decoding" : "scoring", e.pool.c_str(), done * 100 / total, done, total, waits[ws >= 0 && ws < 3 ? ws : 0], e.label.c_str());
 	}
+	for (auto& [key, list] : remote_rows)
+		for (auto& r : list) printf("  %s: %.0f%% %s %s\n", r.status.c_str(), r.fraction * 100, r.speed.c_str(), r.task.c_str());
 	fflush(stdout);
+}
+
+std::string json_string(const std::string& s) {
+	std::string o = "\"";
+	for (unsigned char c : s) {
+		if (c == '"' || c == '\\') { o += '\\'; o += (char)c; }
+		else if (c < 0x20) { char b[8]; snprintf(b, sizeof b, "\\u%04x", c); o += b; }
+		else o += (char)c;
+	}
+	return o + "\"";
+}
+
+// One line: the rows of the runs in flight as [task, speed, status, fraction] lists.
+void write_snapshot() {
+	std::string line = "[";
+	bool first = true;
+	for (auto& [h, e] : entries) {
+		const Row r = make_row(e);
+		char frac[32];
+		snprintf(frac, sizeof frac, "%.4f", r.fraction);
+		line += std::string(first ? "" : ",") + "[" + json_string(r.task) + "," + json_string(r.speed) + "," + json_string(r.status) + "," + frac + "]";
+		first = false;
+	}
+	line += "]\n";
+	std::ofstream f(progress_file, std::ios::app | std::ios::binary);
+	f << line;
 }
 
 void render_loop() {
@@ -267,6 +296,7 @@ void render_loop() {
 		std::this_thread::sleep_for(std::chrono::milliseconds(200));
 		std::lock_guard lock(m);
 		if (!running) return;
+		if (!progress_file.empty() && now_ms() - last_snapshot >= 1000) { last_snapshot = now_ms(); write_snapshot(); }
 		if (is_live) render(); else plain_status();
 	}
 }
@@ -360,6 +390,17 @@ void stop() {
 }
 
 bool live() { return is_live; }
+
+void set_progress_file(const std::string& path) {
+	std::lock_guard lock(m);
+	progress_file = path;
+}
+
+void set_remote(const std::string& key, const std::vector<Row>& rows) {
+	std::lock_guard lock(m);
+	if (rows.empty()) remote_rows.erase(key);
+	else remote_rows[key] = rows;
+}
 
 int attach(RunProgress* p, const std::string& label, const std::string& pool) {
 	std::lock_guard lock(m);

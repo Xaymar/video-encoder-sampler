@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 // How far one run has got. Written by the run's threads, read by the UI.
 struct RunProgress {
@@ -23,6 +24,13 @@ struct RunProgress {
 };
 
 namespace ui {
+// What a run in flight shows: its task, speed, status and how far it is (0 to 1).
+struct Row {
+	std::string task, speed, status;
+	double fraction = 0;
+};
+void set_progress_file(const std::string& path); // once a second, a line with the rows of the runs in flight is appended to this file (a worker's host reads it)
+void set_remote(const std::string& key, const std::vector<Row>& rows); // rows of runs on another machine, shown with the local ones; no rows remove them
 void start(bool plain);
 void stop();                                   // clears the live area, restores stderr
 bool live();                                   // true when the live area is on

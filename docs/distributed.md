@@ -51,10 +51,16 @@ Several jobs that need the same input fetch it once.
 An input travels from the host to a worker the first time a job of that worker needs it, and stays in the worker's `--worker-dir`. The host sends a worker the jobs whose input it already
 has before any other, so with several inputs each worker settles on a few of them and fetches each at most once. URL inputs are never sent; every worker downloads them itself.
 
+## Progress
+
+Once a second the host gets the rows a worker's runs would show on its own screen (encode, score and decode lines with speed, status and a bar) and shows them with its own rows, tagged
+`[worker name]`. They are the same rows as in a local sweep, one set per running job; they disappear when the job is done or the worker is lost. In plain mode (no terminal) they are listed every
+15 seconds like local runs. A worker's `ves` writes them to a file (`--progress-file`), which the worker reads and forwards.
+
 ## Protocol
 
 TCP, each message is a type byte, a 32-bit big-endian length and a payload. `HELLO` (version, token, name, slots, GPUs) in both directions; `JOB` (id, name, config, input) from the host;
-`NEED` / `FILE_DATA` / `FILE_END` to fetch an input; `RESULT` (file name and contents) and `DONE` (ok, tail of the log) from the worker. Everything after `JOB` carries the job id, so a worker's jobs share one connection.
+`NEED` / `FILE_DATA` / `FILE_END` to fetch an input; `RESULT` (file name and contents) `PROGRESS` (rows) and `DONE` (ok, tail of the log) from the worker. Everything after `JOB` carries the job id, so a worker's jobs share one connection.
 
 ## Not done yet
 
@@ -64,4 +70,3 @@ TCP, each message is a type byte, a 32-bit big-endian length and a payload. `HEL
 * **Inputs are sent whole**, once per worker, from the host; a transfer cannot resume.
 * **Workers are expected to be there when the host plans.** A worker that connects later takes jobs it matches but does not add GPU models to the plan.
 * **CPU encoders** are keyed by the host's library versions; workers should run the same build.
-* **No live view** of the workers' runs on the host; it logs when a job goes out and comes back.
