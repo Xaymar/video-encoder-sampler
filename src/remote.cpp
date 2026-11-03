@@ -378,8 +378,8 @@ struct RemoteHost::Impl {
 					std::string text = "remote: " + std::to_string(dropped) + " jobs are left out because the input cannot do what they ask for:";
 					for (auto& [why, n] : why_count) text += " " + std::to_string(n) + " x " + why + ";";
 					log(text);
-					cv.notify_all();
 				}
+				cv.notify_all(); // the input is known: the jobs of it that waited for that can go out, to every worker
 			} else if (type == M_PROGRESS) {
 				if (payload.size() < 5) continue;
 				const size_t id = id_of(payload);
