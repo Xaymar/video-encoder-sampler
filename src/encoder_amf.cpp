@@ -32,6 +32,8 @@ using Microsoft::WRL::ComPtr;
 
 namespace {
 
+thread_local bool probing = false; // set while amf_supports() tries a codec out
+
 struct Names { // property names differ per codec
 	const wchar_t *component, *usage, *target, *peak, *size, *rate, *rc, *gop, *bitdepth;
 	int64_t usage_transcoding, rc_cbr;
@@ -64,6 +66,7 @@ class Amf : public Encoder {
 	int b_delay = 0;
 
 	bool fail(AMF_RESULT r, const char* what) {
+		if (probing) return false; // asking whether a codec works is not an error when it does not
 		fprintf(stderr, "amf: %s failed (result %d)\n", what, (int)r);
 		return false;
 	}
@@ -349,7 +352,10 @@ bool amf_supports(const std::string& codec, int chroma, int depth) {
 		p.width = 1280; p.height = 720; p.bitrate = 5000000; p.gop = 60;
 		p.pix = planar_fmt(420, depth > 8 ? 10 : 8);
 		p.codec = codec;
-		it = cache.emplace(key, make_encoder_amf()->open(p, nullptr)).first;
+		probing = true;
+		const bool ok = make_encoder_amf()->open(p, nullptr);
+		probing = false;
+		it = cache.emplace(key, ok).first;
 	}
 	return it->second;
 }
