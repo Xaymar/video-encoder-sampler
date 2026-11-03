@@ -881,7 +881,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 					f << job.find("config")->text();
 				}
 				std::vector<std::string> args{"--plain", "--progress", "--config", (dir / "config.jsonc").string(), "--input", input, "--output", (dir / "out").string(), "--no-videos",
-				                               "--cache", (fs::path(workdir) / "cache").string(), "--upload", "off", "--trust-downloads"};
+				                               "--cache", (fs::path(workdir) / "cache").string(), "--upload", "off", "--trust-downloads", "--short-names"};
 				args.insert(args.end(), extra_args.begin(), extra_args.end());
 				if (const Json* only = job.find("only"); only && !only->a.empty()) {
 					std::ofstream f(dir / "only.txt", std::ios::binary);

@@ -66,6 +66,7 @@ config file, `ves --worker worker.jsonc`:
   too few free, while other resources of the worker keep working, so a worker with an NVIDIA and an AMD GPU uses both.
 * `host`, `token`, `dir` and `gpu` in the file are the same as `--worker host:port`, `--token`, `--worker-dir` and `--worker-gpu`; the flags win. `ves --worker host:port` with no file offers everything detected.
 * Several jobs that need the same input fetch it once.
+* A worker names its result files and the input's folder by hashes (`--short-names`), so the path stays far below the 260 characters Windows allows however long the input's name or a run's label is. The host matches the results by their options and stores them under its own readable names.
 * A job holds only the runs the host still lacks (the rest are in its output folder or cache from earlier sweeps); the worker leaves the others out, so a re-run does not redo finished work.
 
 ## Inputs

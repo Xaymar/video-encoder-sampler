@@ -84,6 +84,7 @@ struct Scenario {
 };
 
 struct Config {
+	bool short_names = false;            // --short-names: result files and the input's folder are named by hashes (a worker's: its names are not seen, and the path stays short)
 	bool only_runs_set = false;          // --only-runs: a worker runs only what the host asked for
 	std::set<std::string> only_runs;      // the option lines (see run_options_of) of those runs
 	std::vector<std::string> inputs;
@@ -423,6 +424,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	std::optional<double> penalty;
 	bool videos = true, all_videos = false, upload_videos = true, quick = false, upscale = false;
 	std::set<std::string> only_lines; // --only-runs
+	bool short_names = false;
 	bool only_set = false;
 	Job job;
 	for (int i = 1; i < argc; i++) {
@@ -451,6 +453,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--host") cfg.host_port = atoi(value().c_str());
 		else if (a == "--progress") ui::set_progress_stdout(true);
 		else if (a == "--trust-downloads") set_trust_downloads(true);
+		else if (a == "--short-names") short_names = true;
 		else if (a == "--only-runs") { std::ifstream f(value()); for (std::string l; std::getline(f, l);) { if (!l.empty() && l.back() == '\r') l.pop_back(); only_lines.insert(l); } only_set = true; }
 		else if (a == "--token") cfg.token = value();
 		else if (a == "--min-workers") cfg.min_workers = std::max(1, atoi(value().c_str()));
@@ -513,6 +516,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	if (cache) cfg.cache_dir = *cache == "off" ? "" : *cache;
 	if (model) cfg.vo.model = *model;
 	if (only_set) { cfg.only_runs_set = true; cfg.only_runs = only_lines; }
+	if (short_names) cfg.short_names = true;
 	if (threads) cfg.vo.threads = *threads;
 	if (penalty) over_penalty = *penalty;
 	// A relative model is looked for where the program is as well (a worker's jobs run wherever the worker was started), and in the folder above it, where a build sits.
@@ -861,7 +865,7 @@ int main(int argc, char** argv) {
 
 	for (auto& input : cfg.inputs) {
 		const std::string key_head = key_input(input);
-		const std::string folder = sanitize(fs::path(file_name(input)).stem().string());
+		const std::string folder = cfg.short_names ? key_hash(key_input(input)).substr(0, 8) : sanitize(fs::path(file_name(input)).stem().string());
 		const std::string folder_path = cfg.output_dir.empty() ? std::string() : (fs::path(cfg.output_dir) / folder).string() + sep;
 		bool folder_made = false;
 		for (auto& job : cfg.jobs) {
@@ -891,7 +895,7 @@ int main(int argc, char** argv) {
 							t.key = key_head + v.key + key_run_text + key_tail;
 						if (cfg.only_runs_set && !cfg.only_runs.count(run_options_of(t.key))) continue; // the host has this one already
 							if (!cfg.output_dir.empty()) {
-								const std::string base = result_name(t.r.label + " " + std::to_string(br) + "k kf" + kf_text, t.key);
+								const std::string base = cfg.short_names ? key_hash(t.key).substr(0, 16) : result_name(t.r.label + " " + std::to_string(br) + "k kf" + kf_text, t.key);
 								t.result_file = folder_path + base + ".json";
 								t.r.result = folder + "/" + base + ".json";
 								if (cfg.save_videos) {
