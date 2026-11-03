@@ -824,6 +824,7 @@ int main(int argc, char** argv) {
 		remote->wait_for_workers(cfg.min_workers);
 	}
 
+	struct LazyGroup;
 	struct Task {
 		Run r;
 		const Job* job;
@@ -838,6 +839,9 @@ int main(int argc, char** argv) {
 		const Scenario* sc = nullptr;    // the scenario it comes from, and which of its sizes: where a remote job is cut
 		std::string model;               // distributed GPU runs: the GPU model of the worker that runs it
 		size_t shape_i = 0;
+		size_t index = 0;                // its place in `tasks`
+		LazyGroup* group = nullptr;      // lazy planning: the group of runs it was made for, and which combination of its entry it is
+		uint32_t combo = 0;
 	};
 	struct Pool {
 		std::vector<size_t> tasks;
@@ -847,7 +851,7 @@ int main(int argc, char** argv) {
 		int fallback = 1;  // the highest default of the entries that asked for nothing
 		std::string name;
 	};
-	std::vector<Task> tasks;
+	std::deque<Task> tasks; // a deque: runs are made between rounds, and pointers to tasks stay valid
 	std::map<std::string, Pool> pools;
 	int failed = 0;
 	for (auto& job : cfg.jobs) for (auto& want : job.scenarios) {
@@ -881,6 +885,37 @@ int main(int argc, char** argv) {
 		std::string model;     // distributed: the GPU model of the worker that runs it
 	};
 	std::map<std::pair<const Job*, const Scenario*>, std::vector<Variant>> variants;
+	// One variant of an encoder entry from its options (the scenario's chroma, bit depth and range already among them): the label, the cache key, the GPU it runs
+	// on and the pool it counts against.
+	auto build_variant = [&](const Job& job, Options opts) {
+		Variant v;
+		v.opts = std::move(opts);
+		for (auto& [k, val] : v.opts) v.label += " " + k + "=" + val;
+		v.key = key_encoder(job.encoder, job.codec, v.opts);
+		// Every GPU is a pool of its own, so GPUs work in parallel; CPU encoders share one pool.
+		v.gpu_index = v.opts.count("gpu") ? v.opts.at("gpu") : "0";
+		if (is_gpu_encoder(job.encoder)) {
+			v.gpu = gpu_description(encoder_vendor(job.encoder), atoi(v.gpu_index.c_str()));
+			static std::map<std::string, std::string> gpu_known; // asked once per vendor and GPU; the runs only point at the text
+			const std::string gpu_key = job.encoder + "/" + v.gpu_index;
+			auto gpu_at = gpu_known.find(gpu_key);
+			if (gpu_at == gpu_known.end()) gpu_at = gpu_known.emplace(gpu_key, gpu_json(encoder_vendor(job.encoder), atoi(v.gpu_index.c_str()))).first;
+			v.gpu_json = &gpu_at->second;
+			static std::map<std::string, std::string> caps_known; // asked once per encoder, codec and GPU
+			const std::string caps_key = job.encoder + "/" + job.codec + "/" + v.gpu_index;
+			auto known = caps_known.find(caps_key);
+			if (known == caps_known.end()) known = caps_known.emplace(caps_key, encoder_caps_json(job.encoder, job.codec, atoi(v.gpu_index.c_str()))).first;
+			v.caps_json = &known->second;
+		}
+		const std::string pool = !job.pool.empty() ? job.pool : is_gpu_encoder(job.encoder) ? job.encoder + ":" + v.gpu_index : "cpu";
+		v.pool = &pools[pool];
+		// A "parallel" that is written down wins over the defaults of other entries of the pool (several codecs of one GPU share it).
+		if (job.parallel > 0) v.pool->limit = v.pool->limit ? std::min(v.pool->limit, job.parallel) : job.parallel;
+		else v.pool->fallback = std::max(v.pool->fallback, is_gpu_encoder(job.encoder) ? 2 : 1);
+		v.pool->parallel = v.pool->limit ? v.pool->limit : v.pool->fallback;
+		v.pool->name = pool;
+		return v;
+	};
 	auto variants_of = [&](const Job& job, const Scenario& sc) -> const std::vector<Variant>& {
 		auto found = variants.find({&job, &sc});
 		if (found != variants.end()) return found->second;
@@ -898,35 +933,11 @@ int main(int argc, char** argv) {
 		}
 		for (const Options& base : expand(job.encoder, remote_gpu ? axes_no_gpu : job.axes))
 			for (auto& chroma : axis(sc.chroma)) for (auto& bitdepth : axis(sc.bitdepth)) for (auto& range : axis(sc.range)) {
-				Variant v;
-				v.opts = base;
-				if (!chroma.empty()) v.opts["chroma"] = chroma;
-				if (!bitdepth.empty()) v.opts["bitdepth"] = bitdepth;
-				if (!range.empty()) v.opts["range"] = range;
-				for (auto& [k, val] : v.opts) v.label += " " + k + "=" + val;
-				v.key = key_encoder(job.encoder, job.codec, v.opts);
-				// Every GPU is a pool of its own, so GPUs work in parallel; CPU encoders share one pool.
-				v.gpu_index = v.opts.count("gpu") ? v.opts.at("gpu") : "0";
-				if (is_gpu_encoder(job.encoder)) {
-					v.gpu = gpu_description(encoder_vendor(job.encoder), atoi(v.gpu_index.c_str()));
-					static std::map<std::string, std::string> gpu_known; // asked once per vendor and GPU; the runs only point at the text
-					const std::string gpu_key = job.encoder + "/" + v.gpu_index;
-					auto gpu_at = gpu_known.find(gpu_key);
-					if (gpu_at == gpu_known.end()) gpu_at = gpu_known.emplace(gpu_key, gpu_json(encoder_vendor(job.encoder), atoi(v.gpu_index.c_str()))).first;
-					v.gpu_json = &gpu_at->second;
-					static std::map<std::string, std::string> caps_known; // asked once per encoder, codec and GPU
-					const std::string caps_key = job.encoder + "/" + job.codec + "/" + v.gpu_index;
-					auto known = caps_known.find(caps_key);
-					if (known == caps_known.end()) known = caps_known.emplace(caps_key, encoder_caps_json(job.encoder, job.codec, atoi(v.gpu_index.c_str()))).first;
-					v.caps_json = &known->second;
-				}
-				const std::string pool = !job.pool.empty() ? job.pool : is_gpu_encoder(job.encoder) ? job.encoder + ":" + v.gpu_index : "cpu";
-				v.pool = &pools[pool];
-				// A "parallel" that is written down wins over the defaults of other entries of the pool (several codecs of one GPU share it).
-				if (job.parallel > 0) v.pool->limit = v.pool->limit ? std::min(v.pool->limit, job.parallel) : job.parallel;
-				else v.pool->fallback = std::max(v.pool->fallback, is_gpu_encoder(job.encoder) ? 2 : 1);
-				v.pool->parallel = v.pool->limit ? v.pool->limit : v.pool->fallback;
-				v.pool->name = pool;
+				Options opts = base;
+				if (!chroma.empty()) opts["chroma"] = chroma;
+				if (!bitdepth.empty()) opts["bitdepth"] = bitdepth;
+				if (!range.empty()) opts["range"] = range;
+				Variant v = build_variant(job, std::move(opts));
 				if (!remote_gpu) { out.push_back(std::move(v)); continue; }
 				for (auto& m : models) {
 					Variant w = v;
@@ -952,18 +963,67 @@ int main(int argc, char** argv) {
 		else if (job.encoder == "svtav1") job.codec = "av1";
 	}
 
-	for (auto& input : cfg.inputs) {
+	// Lazy planning. A big config has hundreds of thousands of combinations of an entry's options, for every input, bit rate and size, and pruning leaves a few of
+	// them. So the combinations are not made into runs up front: first the probes (each prunable option at the ends of its range) and everything of the options that
+	// are not pruned. A combination with options in the middle of their range is made into a run when, for each of those options, the two ends of its line scored
+	// differently (see advance below); until then it costs nothing but a row of integers.
+	struct LazyTable {
+		ComboTable table;
+		std::unordered_map<uint32_t, const Variant*> made; // the variants made so far, by combination
+		LazyTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune) : table(encoder, axes, free_axes, fixed, prune) {}
+	};
+	struct LazyGroup {
+		LazyTable* lt = nullptr;
+		const Job* job = nullptr;
+		std::string input;
+		std::vector<uint8_t> status;                   // per combination: 0 not run (yet), 1 ran, 2 left out or failed
+		std::unordered_map<uint32_t, size_t> task;     // combination -> its task
+		size_t layer = 0;                              // the layers made into runs so far
+		bool expanding = true;                         // more runs of it may come: its streams are not judged yet
+		std::set<std::string> groups;                  // the groups (see Run::group) its runs are in
+		std::function<bool(const Variant&, LazyGroup*, uint32_t)> make; // makes the task of a combination: false if it is not wanted
+	};
+	std::map<std::pair<const Job*, const Scenario*>, std::unique_ptr<LazyTable>> lazy_tables;
+	std::deque<Variant> lazy_variants;                 // stable addresses: a task points at its variant's options
+	std::deque<LazyGroup> lazy_groups;
+	std::map<std::string, std::vector<LazyGroup*>> lazy_of_input;
+	std::map<std::string, std::map<std::string, size_t>> left_out; // input -> option -> combinations never made into runs because it showed no effect
+	auto is_lazy = [&](const Job& job) { return job.prune && !remote && !cfg.only_runs_set; };
+	auto lazy_table_of = [&](const Job& job, const Scenario& sc) -> LazyTable& {
+		auto& slot = lazy_tables[{&job, &sc}];
+		if (!slot) {
+			std::vector<Axis> free_axes;
+			if (!sc.chroma.empty()) free_axes.push_back(Axis{"chroma", sc.chroma, {}, {}});
+			if (!sc.bitdepth.empty()) free_axes.push_back(Axis{"bitdepth", sc.bitdepth, {}, {}});
+			if (!sc.range.empty()) free_axes.push_back(Axis{"range", sc.range, {}, {}});
+			slot = std::make_unique<LazyTable>(job.encoder, job.axes, free_axes, job.fixed, job.prune);
+		}
+		return *slot;
+	};
+	auto lazy_variant = [&](LazyTable& lt, const Job& job, uint32_t combo) -> const Variant& {
+		auto it = lt.made.find(combo);
+		if (it != lt.made.end()) return *it->second;
+		lazy_variants.push_back(build_variant(job, lt.table.options(combo)));
+		return *(lt.made[combo] = &lazy_variants.back());
+	};
+	int total = 0;
+
+	// The runs of one input. With lazy planning only the first input is made up front and each next one when its turn comes: a big config has over a million runs
+	// at the start, and holding those of every input at once costs gigabytes.
+	auto create_input_tasks = [&](const std::string& input) {
 		const std::string key_head = key_input(input);
 		const std::string folder = cfg.short_names ? key_hash(key_input(input)).substr(0, 8) : sanitize(fs::path(file_name(input)).stem().string());
 		const std::string folder_path = cfg.output_dir.empty() ? std::string() : (fs::path(cfg.output_dir) / folder).string() + sep;
-		bool folder_made = false;
+		const auto folder_made = std::make_shared<bool>(false);
 		for (auto& job : cfg.jobs) {
 			const Codec id = codec_of(job.encoder, job.codec);
 			if (id == Codec::None) { fprintf(stderr, "unknown encoder/codec '%s'/'%s'\n", job.encoder.c_str(), job.codec.c_str()); failed++; continue; }
 			const std::string encoder_label = is_gpu_encoder(job.encoder) ? job.encoder + "/" + job.codec : job.encoder;
 			for (auto& sc : cfg.scenarios) if (takes_part(job, sc)) {
 				ui::log("Preparing " + job.encoder + "/" + job.codec + ", scenario " + (sc.name.empty() ? "(unnamed)" : sc.name) + ", " + file_name(input));
-				const std::vector<Variant>& sets = variants_of(job, sc);
+				const bool lazy_job = is_lazy(job);
+				LazyTable* lt = lazy_job ? &lazy_table_of(job, sc) : nullptr;
+				const std::vector<Variant>* sets = lazy_job ? nullptr : &variants_of(job, sc);
 				for (int64_t br : sc.bitrates) for (double kf : sc.kfs) {
 					const std::string kf_text = std::to_string((double)kf).substr(0, std::to_string((double)kf).find('.') + 2);
 					for (auto& shape : sc.shapes) {
@@ -972,9 +1032,11 @@ int main(int argc, char** argv) {
 						if (shape.fps.num) head += " @" + std::to_string(shape.fps.value()).substr(0, 6);
 						const std::string key_run_text = key_run(br, kf, shape);
 						const std::string group_head = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|";
-						for (const Variant& v : sets) {
+						// Makes the run of one variant. A lazy group keeps it, to make more runs later.
+						auto make_task = [jobp = &job, scp = &sc, shape_i = (size_t)(&shape - sc.shapes.data()), id, input, br, kf, shape, head, key_head, key_run_text, kf_text, group_head, folder, folder_path, folder_made, &tasks, &cfg, &key_tail](const Variant& v, LazyGroup* lg, uint32_t combo) {
+							const Job& job = *jobp;
 							Task t;
-							t.job = &job; t.id = id; t.sc = &sc; t.shape_i = (size_t)(&shape - sc.shapes.data()); t.model = v.model;
+							t.job = jobp; t.id = id; t.sc = scp; t.shape_i = shape_i; t.model = v.model;
 							t.r.input = input; t.r.bitrate = br; t.r.kf = kf; t.r.shape = shape;
 							t.r.label = head + v.label;
 							t.opts = &v.opts;
@@ -982,7 +1044,7 @@ int main(int argc, char** argv) {
 							// The run's result (.json) and stream (.mp4) share a name made from the run and a hash of everything its outcome depends on, so a
 							// run that comes up again finds its result straight away. They go to the output folder; without one, results are kept in the cache.
 							t.key = key_head + v.key + key_run_text + key_tail;
-						if (cfg.only_runs_set && !cfg.only_runs.count(run_options_of(t.key))) continue; // the host has this one already
+							if (cfg.only_runs_set && !cfg.only_runs.count(run_options_of(t.key))) return false; // the host has this one already
 							if (!cfg.output_dir.empty()) {
 								const std::string base = cfg.short_names ? key_hash(t.key).substr(0, 16) : result_name(t.r.label + " " + std::to_string(br) + "k kf" + kf_text, t.key);
 								t.result_file = folder_path + base + ".json";
@@ -991,19 +1053,39 @@ int main(int argc, char** argv) {
 									t.r.video = folder + "/" + base + ".mp4";
 									t.r.video_file = folder_path + base + ".mp4";
 								}
-								if (!folder_made) { std::error_code ec; fs::create_directories(fs::path(cfg.output_dir) / folder, ec); folder_made = true; }
+								if (!*folder_made) { std::error_code ec; fs::create_directories(fs::path(cfg.output_dir) / folder, ec); *folder_made = true; }
 							} else if (!cfg.cache_dir.empty()) t.result_file = (fs::path(cfg.cache_dir) / "results" / (key_hash(t.key) + ".json")).string();
 							t.r.group = group_head + v.gpu_index + (v.model.empty() ? std::string() : "|" + v.model);
 							t.r.gpu = v.gpu; t.r.gpu_json = v.gpu_json; t.r.caps_json = v.caps_json;
 							t.pool = v.pool->name;
+							t.group = lg; t.combo = combo;
+							if (lg) { lg->task[combo] = tasks.size(); lg->groups.insert(t.r.group); }
+							t.index = tasks.size();
 							v.pool->tasks.push_back(tasks.size());
 							tasks.push_back(std::move(t));
+							return true;
+						};
+						if (!lazy_job) { for (const Variant& v : *sets) make_task(v, nullptr, 0); continue; }
+						lazy_groups.emplace_back();
+						LazyGroup& g = lazy_groups.back();
+						g.lt = lt; g.job = &job; g.input = input; g.make = make_task;
+						g.status.assign(lt->table.size(), 0);
+						lazy_of_input[input].push_back(&g);
+						for (uint32_t c : lt->table.layer(0)) {
+							if (!g.make(lazy_variant(*lt, job, c), &g, c)) g.status[c] = 2;
 						}
 					}
 				}
 			}
 		}
+	};
+	const bool all_inputs_now = remote || std::any_of(cfg.jobs.begin(), cfg.jobs.end(), [&](const Job& job) { return !is_lazy(job); });
+	std::set<std::string> created_inputs;
+	for (auto& input : cfg.inputs) {
+		if (!all_inputs_now && !created_inputs.empty()) break;
+		if (created_inputs.insert(input).second) create_input_tasks(input);
 	}
+	total = (int)tasks.size();
 
 	// What is about to happen.
 	{
@@ -1033,18 +1115,17 @@ int main(int argc, char** argv) {
 		for (auto& job : cfg.jobs) {
 			size_t runs_here = 0;
 			for (auto& t : tasks) runs_here += t.job == &job;
-			put("  %s%s%s: %zu runs\n", job.encoder.c_str(), is_gpu_encoder(job.encoder) ? "/" : "", is_gpu_encoder(job.encoder) ? job.codec.c_str() : "", runs_here);
+			put("  %s%s%s: %zu%s runs\n", job.encoder.c_str(), is_gpu_encoder(job.encoder) ? "/" : "", is_gpu_encoder(job.encoder) ? job.codec.c_str() : "", runs_here, is_lazy(job) ? "+" : "");
 		}
 		put("Pools:");
 		for (auto& [name, pl] : pools) put(" %s x%d (%zu runs)", name.c_str(), pl.parallel, pl.tasks.size());
-		put("\nCache: %s   Output: %s%s\n\n%zu runs in total\n", cfg.cache_dir.empty() ? "off" : cfg.cache_dir.c_str(), cfg.output_dir.empty() ? "off" : cfg.output_dir.c_str(),
-		    cfg.output_dir.empty() || !cfg.save_videos ? "" : " (with encoded streams)", tasks.size());
+		put("\nCache: %s   Output: %s%s\n\n%zu%s runs in total\n", cfg.cache_dir.empty() ? "off" : cfg.cache_dir.c_str(), cfg.output_dir.empty() ? "off" : cfg.output_dir.c_str(),
+		    cfg.output_dir.empty() || !cfg.save_videos ? "" : " (with encoded streams)", tasks.size(), lazy_groups.empty() ? "" : "+");
 		ui::log(text);
 	}
 
 	// A run is finished when its result is known, however it came about: print it, count it.
 	std::atomic<int> finished{0};
-	const int total = (int)tasks.size();
 	ui::overall(0, total);
 	std::map<std::string, SourceInfo> infos;
 	// The file behind an input. A URL is downloaded when it is first needed (its folder is under the cache folder, or the temp folder if there is
@@ -1122,13 +1203,11 @@ int main(int argc, char** argv) {
 		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.enc_busy_s, r.enc_starved_s, r.decode_blocked_s, r.score_starved_s);
 		ui::log(line);
 	};
-	auto finish = [&](Task& t) {
-		t.done = true;
-		finish_run(t);
-		if (!cfg.best_videos || --group_left[t.r.group] > 0) return;
-		// The group is complete. The winner is ranked as in the summary: the run that is at least as good as all the others (after the overshoot penalty)
+	// The group is complete: the stream of its winner stays, the others go (see below).
+	auto complete_group = [&](const std::string& group) {
+		// The winner is ranked as in the summary: the run that is at least as good as all the others (after the overshoot penalty)
 		// in the most frames; ties go to the higher mean. Only runs that still have a stream can keep it.
-		auto& runs_ok = group_ok[t.r.group];
+		auto& runs_ok = group_ok[group];
 		const size_t frames = runs_ok.empty() ? 0 : runs_ok.front()->r.scores.size();
 		std::vector<double> top(frames, 0.0);
 		for (Task* x : runs_ok) if (x->r.scores.size() == frames) for (size_t f = 0; f < frames; f++) top[f] = std::max(top[f], x->r.scores[f] - x->r.penalty);
@@ -1165,6 +1244,14 @@ int main(int argc, char** argv) {
 		it.label = kept->r.label;
 		it.late = true;
 		uploader->add(std::move(it));
+	};
+	auto finish = [&](Task& t) {
+		t.done = true;
+		if (t.group) t.group->status[t.combo] = t.ok ? 1 : 2;
+		finish_run(t);
+		if (!cfg.best_videos || --group_left[t.r.group] > 0) return;
+		if (t.group && t.group->expanding) return; // more runs of its group may come; they are judged when it is done
+		complete_group(t.r.group);
 	};
 
 	// The source files, probed once each. A run that asks for no particular resolution or frame rate gets the source's, which is what its result records.
@@ -1274,7 +1361,7 @@ int main(int argc, char** argv) {
 	// same input, resolution, frame rate and pixel format share one decode.
 	std::map<std::string, std::vector<size_t>> uncached; // by input: the runs that have to be done, planned when their input comes up
 	std::vector<std::string> input_order;
-	for (size_t i = 0; i < tasks.size(); i++) {
+	auto settle = [&](size_t i) -> bool { // true: the run was done before, and is finished from its result
 		Task& t = tasks[i];
 		Run& r = t.r;
 		char tag[48];
@@ -1301,12 +1388,18 @@ int main(int argc, char** argv) {
 					result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
 				r.video_file.clear();
 				finish(t);
-				continue;
+				return true;
 			}
 		}
-		if (!uncached.count(r.input)) input_order.push_back(r.input);
-		uncached[r.input].push_back(i);
+		return false;
+	};
+	for (size_t i = 0; i < tasks.size(); i++) if (!settle(i)) {
+		const std::string& in = tasks[i].r.input;
+		if (!uncached.count(in)) input_order.push_back(in);
+		uncached[in].push_back(i);
 	}
+
+	if (!all_inputs_now) input_order = cfg.inputs; // the others are made when their turn comes
 
 	// Pruning, after encoding: an option that shows no effect is not swept further. Within a group (and with every other option at the same values) the
 	// runs that differ only in one option form a line. Its lowest and its highest value run first; when their scores match on every
@@ -1320,7 +1413,7 @@ int main(int argc, char** argv) {
 		std::map<const Job*, std::vector<std::tuple<size_t, std::string, std::string>>> samples; // per job: axis, lowest, highest
 		for (auto& t : tasks) {
 			const Job& job = *t.job;
-			if (!job.prune) continue;
+			if (!job.prune || t.group) continue;
 			auto sm = samples.find(&job);
 			if (sm == samples.end()) {
 				sm = samples.emplace(&job, decltype(sm->second){}).first;
@@ -1378,6 +1471,34 @@ int main(int argc, char** argv) {
 		return state;
 	};
 
+	// Lazy planning, the next layer of a group: the combinations with one more prunable option in the middle of its range. Each is on a line along every one
+	// of those options, with the two ends of the line in the layer before. It is made into a run when none of the lines shows "no effect" (both ends ran and scored the
+	// same on every frame, as with pruning of the whole list); an end that did not run or is missing counts as an effect. The new runs that are not already done go
+	// to `added`. False when the group has no more layers.
+	auto advance = [&](LazyGroup& g, std::vector<size_t>& added) -> bool {
+		if (g.layer + 1 >= g.lt->table.layers()) return false;
+		const size_t k = ++g.layer;
+		std::vector<ComboTable::Line> lines_of;
+		for (uint32_t c : g.lt->table.layer(k)) {
+			g.lt->table.mid_lines(c, lines_of);
+			const char* no_effect = nullptr;
+			for (auto& L : lines_of) {
+				if (L.lo < 0 || L.hi < 0 || g.status[(size_t)L.lo] != 1 || g.status[(size_t)L.hi] != 1) continue; // an end is missing or did not run: the line is run in full
+				const Run &x = tasks[g.task.at((uint32_t)L.lo)].r, &y = tasks[g.task.at((uint32_t)L.hi)].r;
+				bool same = x.scores.size() == y.scores.size() && std::abs(x.kbps - y.kbps) <= 1e-6 * std::max(1.0, x.kbps);
+				for (size_t f = 0; same && f < x.scores.size(); f++) same = std::abs(x.scores[f] - y.scores[f]) <= 1e-6;
+				if (same) { no_effect = g.lt->table.axis_key(L.axis).c_str(); break; }
+			}
+			if (no_effect) { g.status[c] = 2; left_out[g.input][no_effect]++; continue; }
+			const size_t at = tasks.size();
+			if (!g.make(lazy_variant(*g.lt, *g.job, c), &g, c)) { g.status[c] = 2; continue; }
+			total = (int)tasks.size();
+			if (cfg.best_videos) group_left[tasks[at].r.group]++;
+			if (!settle(at)) added.push_back(at);
+		}
+		return true;
+	};
+
 	// A wave is the runs that are encoded at the same time from one decode: up to `parallel` of each pool. Each run is scored while it is
 	// being encoded, from the packets as they come out, so a wave is done when its slowest encoder and scorer are.
 	// Encoded packets are muxed to disk as they arrive; scratch files go next to the results if there are any, else in the temp folder.
@@ -1396,11 +1517,21 @@ int main(int argc, char** argv) {
 		return parent / ".ves-tmp";
 	}();
 	for (const std::string& input_name : input_order) {
+	if (created_inputs.insert(input_name).second) { // lazy planning: the runs of this input are made now
+		const size_t first = tasks.size();
+		create_input_tasks(input_name);
+		total = (int)tasks.size();
+		for (size_t i = first; i < tasks.size(); i++) {
+			if (cfg.best_videos) group_left[tasks[i].r.group]++;
+			if (!settle(i)) uncached[input_name].push_back(i);
+		}
+	}
+	auto run_round = [&](const std::vector<size_t>& todo) {
 	// Plan the runs of this input: opening the source is where a URL is downloaded. Runs that cannot work are finished right away; the rest is
 	// sorted by the frames it needs, and runs with the same resolution, frame rate and pixel format share one decode.
 	std::map<std::string, std::vector<Task*>> by_feed;
 	std::vector<std::string> feed_order;
-	for (size_t i : uncached[input_name]) {
+	for (size_t i : todo) {
 		Task& t = tasks[i];
 		Run& r = t.r;
 		if (!t.model.empty()) { r.ignored = true; r.expected = true; r.reason = "no worker produced it (on " + t.model + ")"; finish(t); continue; } // not on this machine's GPU: the key says another one
@@ -1460,7 +1591,7 @@ int main(int argc, char** argv) {
 				t.r.score_progress = std::make_shared<RunProgress>();
 				ej.encoder = t.job->encoder; ej.codec = t.job->codec; ej.plan = &t.plan;
 				ej.bitrate = t.r.bitrate * 1000; ej.kf = t.r.kf; ej.rp = t.r.progress.get();
-				ej.file = !t.r.video_file.empty() ? t.r.video_file : (spool_dir / ("run" + std::to_string(&t - tasks.data()) + ".mp4")).string();
+				ej.file = !t.r.video_file.empty() ? t.r.video_file : (spool_dir / ("run" + std::to_string(t.index) + ".mp4")).string();
 				ej.id = t.id; ej.color = t.plan.color;
 				run.codec = t.id; run.score_rp = t.r.score_progress.get();
 				ptrs.push_back(&run);
@@ -1496,6 +1627,22 @@ int main(int argc, char** argv) {
 				finish(t);
 			}
 		}
+	}
+	};
+	// Round after round: the runs of this input that were made so far, then the next layer of every group of it, until no group has a run to make.
+	std::vector<size_t> todo = uncached[input_name];
+	for (;;) {
+		run_round(todo);
+		todo.clear();
+		for (bool progress = true; progress && todo.empty();) {
+			progress = false;
+			for (LazyGroup* g : lazy_of_input[input_name]) progress |= advance(*g, todo);
+		}
+		if (todo.empty()) break;
+	}
+	for (LazyGroup* g : lazy_of_input[input_name]) { // nothing more to make: the streams of the groups can be judged
+		g->expanding = false;
+		if (cfg.best_videos) for (const std::string& grp : g->groups) if (group_left[grp] == 0) complete_group(grp);
 	}
 	}
 	{ std::error_code ec; fs::remove_all(spool_dir, ec); }
@@ -1586,7 +1733,10 @@ int main(int argc, char** argv) {
 			for (size_t i = 0; i < ignored_runs[input].size(); i++) f << (i ? "," : "") << ignored_runs[input][i];
 			f << "],\"pruned\":[";
 			for (size_t i = 0; i < pruned_runs[input].size(); i++) f << (i ? "," : "") << pruned_runs[input][i];
-			f << "],\"groups\":[";
+			f << "],\"left_out\":{";
+			bool first_option = true;
+			for (auto& [option, n] : left_out[input]) { f << (first_option ? "" : ",") << jq(option) << ":" << n; first_option = false; }
+			f << "},\"groups\":[";
 			for (size_t i = 0; i < group_json[input].size(); i++) f << (i ? "," : "") << group_json[input][i];
 			f << "]}\n";
 			if (f) printf("%sResults: %s\n", &input == &cfg.inputs.front() ? "\n" : "", file.string().c_str());
@@ -1595,6 +1745,15 @@ int main(int argc, char** argv) {
 	}
 	printf("\nPeak memory use: %lld MB\n", ui::peak_memory_mb());
 	if (pruned) printf("\n%d runs were not run: an option showed no effect (see \"pruned\" in the result files)\n", pruned);
+	{
+		std::map<std::string, size_t> by_option;
+		size_t left = 0;
+		for (auto& [in, options] : left_out) for (auto& [option, n] : options) { by_option[option] += n; left += n; }
+		if (left) {
+			printf("\n%zu runs were never made: an option showed no effect, its lowest and highest value scored the same on every frame (see \"left_out\" in the result files)\n", left);
+			for (auto& [option, n] : by_option) printf("  %s: %zu\n", option.c_str(), n);
+		}
+	}
 	if (ignored) {
 		printf("\n%d runs were ignored: they cannot work with the input or the encoder (see the result files)\n", ignored);
 		for (auto& [why, n] : ignored_why) printf("  %d: %s\n", n, why.c_str());
