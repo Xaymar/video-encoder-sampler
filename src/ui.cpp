@@ -314,10 +314,10 @@ void write_snapshot() {
 
 void render_loop() {
 	for (;;) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(200));
+		std::this_thread::sleep_for(std::chrono::milliseconds(250));
 		std::lock_guard lock(m);
 		if (!running) return;
-		if (progress_stdout && now_ms() - last_snapshot >= 1000) { last_snapshot = now_ms(); write_snapshot(); }
+		if (progress_stdout && now_ms() - last_snapshot >= 250) { last_snapshot = now_ms(); write_snapshot(); }
 		if (is_live) render(); else plain_status();
 	}
 }
