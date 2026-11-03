@@ -114,6 +114,7 @@ struct Run {
 	double kbps = 0;        // actual
 	std::vector<double> scores; // per frame, display order
 	bool cached = false;    // taken from the result cache instead of being run
+	bool imported = false;  // its result came from a worker: written again with this sweep's details (the input's name and URL are the host's, not the worker's copy)
 	std::vector<std::string> identical; // labels of the runs that produced exactly the same stream (left out of the ranking, see below)
 	std::string group;      // what runs must share for identical output to mean identical scores
 	std::string encoder, codec;
@@ -1003,7 +1004,7 @@ int main(int argc, char** argv) {
 		std::vector<double> sc = r.scores;
 		std::sort(sc.begin(), sc.end());
 		const double mean = std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size();
-		if (!t.result_file.empty() && !r.cached) result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
+		if (!t.result_file.empty() && (!r.cached || r.imported)) result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
 		if (uploader && !r.result.empty() && (r.video_sha256.empty() || sent_streams.insert(r.group + "|" + r.video_sha256).second)) {
 			UploadItem it;
 			it.result_file = (fs::path(cfg.output_dir) / r.result).string();
@@ -1086,6 +1087,7 @@ int main(int argc, char** argv) {
 	// could not do (runs that cannot work with their input, a job given up) is run here as usual.
 	if (remote) {
 		std::map<std::string, RemoteJobSpec> groups;
+		std::vector<Task*> asked; // the runs that were handed to workers
 		std::vector<std::string> order;
 		std::map<std::string, std::vector<std::pair<Options, Shape>>> job_runs; // the options and size of each run of a job, for telling whether the input allows any
 		for (auto& t : tasks) {
@@ -1106,6 +1108,7 @@ int main(int argc, char** argv) {
 				it = groups.emplace(g, std::move(spec)).first;
 			}
 			it->second.runs.push_back({t.result_file, t.key});
+			asked.push_back(&t);
 			job_runs[g].push_back({t.p.options, t.r.shape});
 		}
 		std::vector<RemoteJobSpec> jobs;
@@ -1140,6 +1143,7 @@ int main(int argc, char** argv) {
 		ui::overall((int)already, total);
 		const size_t stored = remote->run_jobs(jobs, [&](size_t n) { ui::overall((int)(already + n), total); });
 		ui::log("remote: " + std::to_string(stored) + " results from the workers");
+		for (Task* t : asked) t->r.imported = fs::exists(t->result_file);
 	}
 
 	// Whatever cannot work, or was done before, is finished right away. The rest is sorted by the frames it needs: runs with the

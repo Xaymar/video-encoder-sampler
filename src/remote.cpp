@@ -604,6 +604,16 @@ int parallel_of(const std::vector<WorkerResource>& resources, const std::string&
 	return default_parallel > 0 ? default_parallel : encoder == "cpu" ? 1 : 2;
 }
 
+// What names a GPU model to the host: the adapter's name and driver and its PCI ids, because different chips can have the same name (every recent AMD integrated GPU is
+// "AMD Radeon(TM) Graphics") and encode differently.
+std::string model_description(unsigned vendor, int index) {
+	auto all = list_gpus(vendor);
+	if (index < 0 || index >= (int)all.size()) return "none";
+	char ids[48];
+	snprintf(ids, sizeof ids, " [%04x:%04x r%02x]", all[(size_t)index].vendor_id, all[(size_t)index].device_id, all[(size_t)index].revision);
+	return all[(size_t)index].describe() + ids;
+}
+
 std::string inventory_json(int only_gpu, const std::vector<WorkerResource>& resources, int default_parallel, int& total) {
 	std::string out = "[";
 	total = parallel_of(resources, "cpu", 0, default_parallel);
@@ -629,7 +639,7 @@ std::string inventory_json(int only_gpu, const std::vector<WorkerResource>& reso
 			const int parallel = parallel_of(resources, encoder, (int)i, default_parallel);
 			if (parallel <= 0) continue; // written down as not offered
 			total += parallel;
-			out += std::string(first ? "" : ",") + "{\"encoder\":" + jq(encoder) + ",\"index\":" + std::to_string(i) + ",\"description\":" + jq(gpu_description(vendor, (int)i)) +
+			out += std::string(first ? "" : ",") + "{\"encoder\":" + jq(encoder) + ",\"index\":" + std::to_string(i) + ",\"description\":" + jq(model_description(vendor, (int)i)) +
 			       ",\"info\":" + jq(gpu_json(vendor, (int)i)) + ",\"parallel\":" + std::to_string(parallel) + ",\"codecs\":[" + codecs + "],\"caps\":{" + caps + "}}";
 			first = false;
 		}
