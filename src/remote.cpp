@@ -319,6 +319,10 @@ struct RemoteHost::Impl {
 						now = ++stored_now;
 					}
 					if (on_stored) on_stored(now);
+				} else if (id < jobs->size()) {
+					std::string wanted;
+					for (auto& r : (*jobs)[id].runs) wanted += "\n  " + result_prefix(fs::path(r.result_file).filename().string());
+					log("remote: the result " + result_prefix(name) + " from " + who + " is not one of the runs of the job " + (*jobs)[id].name + ", which are:" + wanted);
 				}
 			} else if (type == M_SOURCE) {
 				if (payload.size() < 5) continue;
