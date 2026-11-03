@@ -870,6 +870,13 @@ int main(int argc, char** argv) {
 	const std::string key_tail = key_settings(cfg.scale, cfg.vo);
 	const char sep = (char)fs::path::preferred_separator;
 
+	// The software encoders make one codec each, whatever the entry says: results and the site go by the codec, and an entry without one carries the default ("h264").
+	for (auto& job : cfg.jobs) {
+		if (job.encoder == "x264") job.codec = "h264";
+		else if (job.encoder == "x265") job.codec = "hevc";
+		else if (job.encoder == "svtav1") job.codec = "av1";
+	}
+
 	for (auto& input : cfg.inputs) {
 		const std::string key_head = key_input(input);
 		const std::string folder = cfg.short_names ? key_hash(key_input(input)).substr(0, 8) : sanitize(fs::path(file_name(input)).stem().string());
