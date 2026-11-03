@@ -172,13 +172,22 @@ std::string fetch_url(const std::string& url, const std::string& dir, RunProgres
 	fs::create_directories(fs::path(dir) / folder, ec);
 	const fs::path file = fs::path(dir) / folder / file_name_of(url);
 	const fs::path part = file.string() + ".part", meta_file = file.string() + ".meta";
-	if (trust_downloads && fs::exists(file) && fs::exists(meta_file)) return file.string();
+	// A copy whose size is not the one written down is damaged (two writers at once, an interrupted move): start over.
+	auto intact = [&] {
+		if (!fs::exists(file) || !fs::exists(meta_file)) return false;
+		if (fs::file_size(file, ec) == read_meta(meta_file).size && !ec) return true;
+		fs::remove(file, ec);
+		fs::remove(meta_file, ec);
+		return false;
+	};
+	const bool have_copy = intact();
+	if (trust_downloads && have_copy) return file.string();
 
 	Transfer t;
 	t.name = file_name_of(url);
 	t.rp = progress;
 	t.part = part;
-	t.have = fs::exists(file) && fs::exists(meta_file);
+	t.have = have_copy;
 	if (t.have) t.old = read_meta(meta_file);
 
 	static const bool curl_ready = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
