@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <csignal>
 #include <deque>
 #include <fcntl.h>
 #include <map>
@@ -418,6 +419,21 @@ void set_title(const std::string& title) {
 	std::lock_guard lock(m);
 	custom_title = title;
 }
+
+#ifdef _WIN32
+static BOOL WINAPI on_interrupt(DWORD type) {
+	if (type != CTRL_C_EVENT && type != CTRL_BREAK_EVENT && type != CTRL_CLOSE_EVENT) return FALSE;
+	TerminateProcess(GetCurrentProcess(), 130);
+	return TRUE;
+}
+void end_on_interrupt() { SetConsoleCtrlHandler(on_interrupt, TRUE); }
+#else
+static void on_interrupt(int) { _exit(130); }
+void end_on_interrupt() {
+	signal(SIGINT, on_interrupt);
+	signal(SIGTERM, on_interrupt);
+}
+#endif
 
 void emit_record(char kind, const std::string& payload) {
 	std::lock_guard lock(m);

@@ -680,6 +680,7 @@ static int run_worker(int argc, char** argv) {
 }
 
 int main(int argc, char** argv) {
+	ui::end_on_interrupt();
 #if defined(_WIN32) && defined(_DEBUG)
 	// A failed assertion of the debug runtime goes to stderr and aborts, instead of opening a dialog that offers to start a debugger.
 	_set_error_mode(_OUT_TO_STDERR);

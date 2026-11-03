@@ -34,6 +34,9 @@ struct Progress {
 	int state = 0;           // 0 working, 1 starved, 2 backed up
 	bool finished = false, failed = false;
 };
+// Ctrl-C ends the process at once. The normal exit waits for threads that are in the middle of an encode, a transfer or an upload, and could hang for good. What is left
+// behind is safe: results are written whole, downloads and uploads continue where they stopped, and a worker's jobs are given back by the host.
+void end_on_interrupt();
 void emit_record(char kind, const std::string& payload); // with --progress: print a line of its own, the control character `kind` and then the payload, for the process that started this one
 void set_title(const std::string& title);        // replaces the header (the run counter and elapsed time); a worker has no runs of its own. Empty: the usual header
 void set_progress_stdout(bool on);               // once a second, print a line with the numbers of the runs in flight (a record separator, then JSON) for the process that started this one
