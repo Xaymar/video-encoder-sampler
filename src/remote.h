@@ -60,6 +60,9 @@ private:
 // The path of this program.
 std::string executable_path();
 
+// The option line of a run's key without the GPU index: what tells the runs of one job apart on the host and on the worker that runs them.
+std::string run_options_of(const std::string& key);
+
 // What a worker offers: "cpu", or a GPU encoder ("nvenc", "amf", "qsv") with the GPU's index (-1: every GPU of that encoder), and how many encodes run on it at the same
 // time (0: not offered, -1: the default).
 struct WorkerResource {

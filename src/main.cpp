@@ -84,6 +84,8 @@ struct Scenario {
 };
 
 struct Config {
+	bool only_runs_set = false;          // --only-runs: a worker runs only what the host asked for
+	std::set<std::string> only_runs;      // the option lines (see run_options_of) of those runs
 	std::vector<std::string> inputs;
 	std::vector<Scenario> scenarios;
 	VmafOptions vo;
@@ -420,6 +422,8 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	std::optional<int> threads;
 	std::optional<double> penalty;
 	bool videos = true, all_videos = false, upload_videos = true, quick = false, upscale = false;
+	std::set<std::string> only_lines; // --only-runs
+	bool only_set = false;
 	Job job;
 	for (int i = 1; i < argc; i++) {
 		std::string a = argv[i], v;
@@ -447,6 +451,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--host") cfg.host_port = atoi(value().c_str());
 		else if (a == "--progress") ui::set_progress_stdout(true);
 		else if (a == "--trust-downloads") set_trust_downloads(true);
+		else if (a == "--only-runs") { std::ifstream f(value()); for (std::string l; std::getline(f, l);) { if (!l.empty() && l.back() == '\r') l.pop_back(); only_lines.insert(l); } only_set = true; }
 		else if (a == "--token") cfg.token = value();
 		else if (a == "--min-workers") cfg.min_workers = std::max(1, atoi(value().c_str()));
 		else if (a == "--decode-threads") cfg.decode_threads = atoi(value().c_str());
@@ -507,6 +512,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	cfg.upload.videos = cfg.upload.videos && upload_videos;
 	if (cache) cfg.cache_dir = *cache == "off" ? "" : *cache;
 	if (model) cfg.vo.model = *model;
+	if (only_set) { cfg.only_runs_set = true; cfg.only_runs = only_lines; }
 	if (threads) cfg.vo.threads = *threads;
 	if (penalty) over_penalty = *penalty;
 	// A relative model is looked for where the program is as well (a worker's jobs run wherever the worker was started), and in the folder above it, where a build sits.
@@ -883,6 +889,7 @@ int main(int argc, char** argv) {
 							// The run's result (.json) and stream (.mp4) share a name made from the run and a hash of everything its outcome depends on, so a
 							// run that comes up again finds its result straight away. They go to the output folder; without one, results are kept in the cache.
 							t.key = key_head + v.key + key_run_text + key_tail;
+						if (cfg.only_runs_set && !cfg.only_runs.count(run_options_of(t.key))) continue; // the host has this one already
 							if (!cfg.output_dir.empty()) {
 								const std::string base = result_name(t.r.label + " " + std::to_string(br) + "k kf" + kf_text, t.key);
 								t.result_file = folder_path + base + ".json";

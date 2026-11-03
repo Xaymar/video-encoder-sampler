@@ -300,8 +300,10 @@ struct RemoteHost::Impl {
 					size = std::to_string(fs::file_size(file));
 					std::string config = job.config;
 					for (size_t at; (at = config.find("@GPU@")) != std::string::npos;) config.replace(at, 5, std::to_string(std::max(gpu, 0)));
+					std::string only; // the runs the host still needs: the worker leaves the others of the job out (it has the same option lists as the host)
+					for (auto& r : job.runs) only += (only.empty() ? "" : ",") + jq(options_of(r.key));
 					const std::string msg = "{\"id\":" + std::to_string(id) + ",\"name\":" + jq(job.name) + ",\"config\":" + jq(config) + ",\"input\":{\"url\":false" +
-					                        ",\"name\":" + jq(fs::path(file).filename().string()) + ",\"sha256\":" + jq(sha) + ",\"size\":" + size + "},\"parallel\":" + std::to_string(weight) + "}";
+					                        ",\"name\":" + jq(fs::path(file).filename().string()) + ",\"sha256\":" + jq(sha) + ",\"size\":" + size + "},\"parallel\":" + std::to_string(weight) + ",\"only\":[" + only + "]}";
 					log("job " + job.name + " -> " + who + (job.model.empty() ? "" : " on " + job.model));
 					if (!send(M_JOB, msg)) throw std::runtime_error("connection lost");
 				} catch (const std::exception&) {
@@ -752,6 +754,8 @@ bool fetch_input(const std::function<bool(uint8_t, const std::string&)>& send, I
 
 std::string executable_path() { return self_exe(); }
 
+std::string run_options_of(const std::string& key) { return options_of(key); }
+
 int remote_worker(const std::string& host, int port, const std::string& token, const std::string& workdir, int only_gpu, int default_parallel, const std::vector<WorkerResource>& resources,
                   const std::vector<std::string>& extra_args, const RemoteLog& log) {
 	std::error_code ec;
@@ -874,6 +878,12 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 				std::vector<std::string> args{"--plain", "--progress", "--config", (dir / "config.jsonc").string(), "--input", input, "--output", (dir / "out").string(), "--no-videos",
 				                               "--cache", (fs::path(workdir) / "cache").string(), "--upload", "off", "--trust-downloads"};
 				args.insert(args.end(), extra_args.begin(), extra_args.end());
+				if (const Json* only = job.find("only"); only && !only->a.empty()) {
+					std::ofstream f(dir / "only.txt", std::ios::binary);
+					for (auto& o : only->a) f << o.text() << "\n";
+					args.push_back("--only-runs");
+					args.push_back((dir / "only.txt").string());
+				}
 				if (const Json* pj = job.find("parallel"); pj && atoi(pj->text().c_str()) > 0) { args.push_back("--parallel"); args.push_back(pj->text()); } // the encodes of the resource the host gave this job
 				// The run results are the .json files in the input's folder; the sweep summary next to it is not one. Each is sent when it appears, so that the host has it (and
 				// submits it) when its run is scored, not when the whole job is.
