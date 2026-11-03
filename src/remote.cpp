@@ -66,6 +66,20 @@ std::string result_prefix(const std::string& file_name) {
 	return p;
 }
 
+// The option line of a run's key without the GPU index: what tells the runs of one job apart, the same on the host and on the worker that ran it. File names do not do
+// that: they are cut at 100 characters and the worker's carry "gpu=N", so the two cut in different places.
+std::string options_of(const std::string& key) {
+	const size_t i = key.find("\noptions=");
+	if (i == std::string::npos) return std::string();
+	std::string o = key.substr(i + 9, key.find('\n', i + 1) - (i + 9));
+	for (size_t g = 0; (g = o.find("gpu=", g)) != std::string::npos;) {
+		if (g != 0 && o[g - 1] != ';') { g += 4; continue; }
+		const size_t e = o.find(';', g);
+		o.erase(g, e == std::string::npos ? std::string::npos : e - g + 1);
+	}
+	return o;
+}
+
 // The stored result starts {"key":"...",...}; the host's own key goes in place of the worker's.
 bool replace_key(std::string& content, const std::string& key) {
 	static const std::string head = "{\"key\":\"";
@@ -181,9 +195,11 @@ struct RemoteHost::Impl {
 
 	// Stores a result file the worker sent. Returns whether it belonged to the job.
 	bool import_result(const RemoteJobSpec& job, const std::string& name, std::string content, std::string& stored_file) {
+		std::string worker_options;
+		try { worker_options = options_of(Json::parse(content).find("key")->text()); } catch (const std::exception&) {}
 		const std::string want = result_prefix(name);
 		for (auto& r : job.runs) {
-			if (result_prefix(fs::path(r.result_file).filename().string()) != want) continue;
+			if (worker_options.empty() ? result_prefix(fs::path(r.result_file).filename().string()) != want : options_of(r.key) != worker_options) continue;
 			if (!replace_key(content, r.key)) return false;
 			std::error_code ec;
 			fs::create_directories(fs::path(r.result_file).parent_path(), ec);
