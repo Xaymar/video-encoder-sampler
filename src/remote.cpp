@@ -849,6 +849,25 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 				                               "--cache", (fs::path(workdir) / "cache").string(), "--upload", "off", "--trust-downloads"};
 				args.insert(args.end(), extra_args.begin(), extra_args.end());
 				if (const Json* pj = job.find("parallel"); pj && atoi(pj->text().c_str()) > 0) { args.push_back("--parallel"); args.push_back(pj->text()); } // the encodes of the resource the host gave this job
+				// The run results are the .json files in the input's folder; the sweep summary next to it is not one. Each is sent when it appears, so that the host has it (and
+				// submits it) when its run is scored, not when the whole job is.
+				std::set<std::string> sent_names;
+				auto send_results = [&] {
+					std::error_code ec3;
+					for (auto& folder : fs::directory_iterator(dir / "out", ec3)) {
+						if (!folder.is_directory()) continue;
+						for (auto& f : fs::directory_iterator(folder.path(), ec3)) {
+							if (f.path().extension() != ".json") continue;
+							const std::string n = f.path().filename().string();
+							if (!sent_names.insert(n).second) continue;
+							std::string msg = id_bytes(id);
+							msg += (char)(n.size() & 255);
+							msg += (char)(n.size() >> 8);
+							msg += n + read_file(f.path());
+							if (send(M_RESULT, msg)) sent_results++;
+						}
+					}
+				};
 				// Once a second the job's `ves` prints the numbers of its runs; they go to the host and to this worker's own display. Its other lines are kept for a failure.
 				std::deque<std::string> tail;
 				const int code = run_process(exe, args, [&](const std::string& text) {
@@ -856,6 +875,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 						send(M_SOURCE, id_bytes(id) + text.substr(1));
 					} else if (!text.empty() && text[0] == (char)30) {
 						send(M_PROGRESS, id_bytes(id) + text.substr(1));
+						send_results();
 						ui::set_remote(rows_key, jname + ": ", ui::parse_progress(text.substr(1)));
 					} else if (!text.empty()) {
 						tail.push_back(text);
@@ -865,20 +885,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 				for (auto& l : tail) log_text += l + "\n";
 				ok = code == 0;
 				if (!ok) log("job " + jname + " failed with code " + std::to_string(code) + (log_text.empty() ? std::string() : ":\n" + log_text));
-				// The run results are the .json files in the input's folder; the sweep summary next to it is not one.
-				for (auto& folder : fs::directory_iterator(dir / "out")) {
-					if (!folder.is_directory()) continue;
-					for (auto& f : fs::directory_iterator(folder.path())) {
-						if (f.path().extension() != ".json") continue;
-						const std::string n = f.path().filename().string();
-						std::string msg = id_bytes(id);
-						msg += (char)(n.size() & 255);
-						msg += (char)(n.size() >> 8);
-						msg += n + read_file(f.path());
-						if (!send(M_RESULT, msg)) break;
-						sent_results++;
-					}
-				}
+				send_results(); // what the last progress line did not see
 			}
 			fs::remove_all(dir, ec2);
 			if (ok && sent_results == 0) log("job " + jname + " made no results:\n" + log_text);
