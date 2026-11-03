@@ -1,12 +1,13 @@
 #include "ui.h"
 
+#include "json.h"
+
 #define NOMINMAX
 
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <deque>
-#include <fstream>
 #include <fcntl.h>
 #include <map>
 #include <mutex>
@@ -46,9 +47,10 @@ std::deque<std::string> pending; // permanent lines not printed yet
 int next_handle = 1, live_lines = 0, runs_done = 0, runs_total = 0, uploads_done = 0, uploads_total = 0;
 bool is_live = false, running = false;
 Clock::time_point t0;
-std::string progress_file;
+std::string custom_title;
+bool progress_stdout = false;
 int64_t last_snapshot = 0;
-std::map<std::string, std::vector<ui::Row>> remote_rows; // by worker and job
+std::map<std::string, std::pair<std::string, std::vector<ui::Progress>>> remote_rows; // by worker and job: the prefix of their labels, and the runs
 std::thread renderer, stderr_reader;
 int saved_stderr = -1, pipe_read = -1;
 #ifdef _WIN32
@@ -129,28 +131,42 @@ std::string bar(double fraction, int width) {
 	return o + repeat("\xC2\xB7", width - used);
 }
 
-using Row = ui::Row;
+// What a run in flight shows: its task, speed, status and how far it is.
+struct Row {
+	std::string task, speed, status;
+	double fraction = 0;
+};
 
-Row make_row(const Entry& e) {
+Row row_of(const ui::Progress& p, const std::string& prefix) {
 	static const char* names[] = {"wait", "encode", "score", "decode", "upload", "download"};
 	static const char* waits[] = {"working", "starved", "backed up"};
-	const int st = e.p->stage;
-	const long long done = e.p->done, total = e.p->total;
-	const int64_t end = e.p->end_ms;
-	const double secs = std::max(0.001, ((end ? end : now_ms()) - e.p->since_ms) / 1000.0);
 	Row r;
-	const std::string& label = e.label;
-	const std::string stage = names[st >= 0 && st < 6 ? st : 0];
-	r.task = label.find(stage) != std::string::npos ? label : stage + " " + label; // some labels already begin with it (decode+convert ..)
-	r.fraction = total > 0 ? (double)done / total : 0;
+	const std::string stage = names[p.stage >= 0 && p.stage < 6 ? p.stage : 0];
+	r.task = prefix + (p.label.find(stage) != std::string::npos ? p.label : stage + " " + p.label); // some labels already begin with it (decode+convert ..)
+	r.fraction = p.total > 0 ? (double)p.done / p.total : 0;
 	char b[32];
-	if (st == 4 || st == 5) snprintf(b, sizeof b, "%.1f MB/s", done / secs / 1048576.0);
-	else snprintf(b, sizeof b, "%.1f fps", done / secs);
+	if (p.stage == 4 || p.stage == 5) snprintf(b, sizeof b, "%.1f MB/s", p.rate / 1048576.0);
+	else snprintf(b, sizeof b, "%.1f fps", p.rate);
 	r.speed = b;
-	const int ws = e.p->state;
-	r.status = end ? "done" : st == 0 ? "waiting" : waits[ws >= 0 && ws < 3 ? ws : 0];
+	r.status = p.finished ? "done" : p.stage == 0 ? "waiting" : waits[p.state >= 0 && p.state < 3 ? p.state : 0];
 	return r;
 }
+
+ui::Progress progress_of(const Entry& e) {
+	ui::Progress p;
+	const int64_t end = e.p->end_ms;
+	const double secs = std::max(0.001, ((end ? end : now_ms()) - e.p->since_ms) / 1000.0);
+	p.stage = e.p->stage;
+	p.label = e.label;
+	p.done = e.p->done;
+	p.total = e.p->total;
+	p.rate = p.done / secs;
+	p.state = e.p->state;
+	p.finished = end != 0;
+	return p;
+}
+
+Row make_row(const Entry& e) { return row_of(progress_of(e), ""); }
 
 // The live area: a frame with the overall progress in its top border and one row per run in flight. It takes the width of the terminal: the
 // task column and the bar share what the fixed columns leave, and columns drop out when the terminal is too narrow for them.
@@ -177,10 +193,11 @@ void render() {
 	else snprintf(head, sizeof head, "ves  preparing  %s elapsed", span(elapsed).c_str());
 	std::string title = head;
 	if (uploads_total > 0) title += "  |  uploads " + std::to_string(uploads_done) + "/" + std::to_string(uploads_total);
+	if (!custom_title.empty()) title = custom_title;
 
 	std::vector<Row> rows;
 	for (auto& [h, e] : entries) rows.push_back(make_row(e));
-	for (auto& [key, list] : remote_rows) rows.insert(rows.end(), list.begin(), list.end());
+	for (auto& [key, group] : remote_rows) for (auto& p : group.second) rows.push_back(row_of(p, group.first));
 	// Rows that fit: the frame has a top border, a header, a rule and a bottom border around them.
 	const size_t room = (size_t)std::max(1, term_h - 6);
 	size_t hidden = 0;
@@ -260,8 +277,11 @@ void plain_status() {
 		const int ws = e.p->state;
 		printf("  %s %s: %lld%% (%lld/%lld frames)%s  %s\n", e.p->stage == 1 ? "encoding" : e.p->stage == 3 ? "decoding" : "scoring", e.pool.c_str(), done * 100 / total, done, total, waits[ws >= 0 && ws < 3 ? ws : 0], e.label.c_str());
 	}
-	for (auto& [key, list] : remote_rows)
-		for (auto& r : list) printf("  %s: %.0f%% %s %s\n", r.status.c_str(), r.fraction * 100, r.speed.c_str(), r.task.c_str());
+	for (auto& [key, group] : remote_rows)
+		for (auto& p : group.second) {
+			const Row r = row_of(p, group.first);
+			printf("  %s: %.0f%% %s %s\n", r.status.c_str(), r.fraction * 100, r.speed.c_str(), r.task.c_str());
+		}
 	fflush(stdout);
 }
 
@@ -275,20 +295,21 @@ std::string json_string(const std::string& s) {
 	return o + "\"";
 }
 
-// One line: the rows of the runs in flight as [task, speed, status, fraction] lists.
+// One line for the process that started this one: a record separator, then [stage, label, done, total, rate, state, finished] for every run in flight.
 void write_snapshot() {
-	std::string line = "[";
+	std::string line(1, (char)30);
+	line += "[";
 	bool first = true;
 	for (auto& [h, e] : entries) {
-		const Row r = make_row(e);
-		char frac[32];
-		snprintf(frac, sizeof frac, "%.4f", r.fraction);
-		line += std::string(first ? "" : ",") + "[" + json_string(r.task) + "," + json_string(r.speed) + "," + json_string(r.status) + "," + frac + "]";
+		const ui::Progress p = progress_of(e);
+		char numbers[160];
+		snprintf(numbers, sizeof numbers, ",%lld,%lld,%.3f,%d,%d]", p.done, p.total, p.rate, p.state, p.finished ? 1 : 0);
+		line += std::string(first ? "" : ",") + "[" + std::to_string(p.stage) + "," + json_string(p.label) + numbers;
 		first = false;
 	}
 	line += "]\n";
-	std::ofstream f(progress_file, std::ios::app | std::ios::binary);
-	f << line;
+	fwrite(line.data(), 1, line.size(), stdout);
+	fflush(stdout);
 }
 
 void render_loop() {
@@ -296,7 +317,7 @@ void render_loop() {
 		std::this_thread::sleep_for(std::chrono::milliseconds(200));
 		std::lock_guard lock(m);
 		if (!running) return;
-		if (!progress_file.empty() && now_ms() - last_snapshot >= 1000) { last_snapshot = now_ms(); write_snapshot(); }
+		if (progress_stdout && now_ms() - last_snapshot >= 1000) { last_snapshot = now_ms(); write_snapshot(); }
 		if (is_live) render(); else plain_status();
 	}
 }
@@ -391,15 +412,40 @@ void stop() {
 
 bool live() { return is_live; }
 
-void set_progress_file(const std::string& path) {
+void set_title(const std::string& title) {
 	std::lock_guard lock(m);
-	progress_file = path;
+	custom_title = title;
 }
 
-void set_remote(const std::string& key, const std::vector<Row>& rows) {
+void set_progress_stdout(bool on) {
 	std::lock_guard lock(m);
-	if (rows.empty()) remote_rows.erase(key);
-	else remote_rows[key] = rows;
+	progress_stdout = on;
+}
+
+std::vector<Progress> parse_progress(const std::string& json) {
+	std::vector<Progress> list;
+	try {
+		Json rows = Json::parse(json);
+		for (auto& r : rows.a) {
+			if (r.a.size() < 7) continue;
+			Progress p;
+			p.stage = atoi(r.a[0].text().c_str());
+			p.label = r.a[1].text();
+			p.done = atoll(r.a[2].text().c_str());
+			p.total = atoll(r.a[3].text().c_str());
+			p.rate = atof(r.a[4].text().c_str());
+			p.state = atoi(r.a[5].text().c_str());
+			p.finished = r.a[6].text() != "0";
+			list.push_back(std::move(p));
+		}
+	} catch (const std::exception&) {}
+	return list;
+}
+
+void set_remote(const std::string& key, const std::string& prefix, const std::vector<Progress>& list) {
+	std::lock_guard lock(m);
+	if (list.empty()) remote_rows.erase(key);
+	else remote_rows[key] = {prefix, list};
 }
 
 int attach(RunProgress* p, const std::string& label, const std::string& pool) {

@@ -292,15 +292,7 @@ struct RemoteHost::Impl {
 			} else if (type == M_PROGRESS) {
 				if (payload.size() < 5) continue;
 				const size_t id = id_of(payload);
-				try {
-					Json rows = Json::parse(payload.substr(4));
-					std::vector<ui::Row> list;
-					for (auto& r : rows.a) {
-						if (r.a.size() < 4) continue;
-						list.push_back({"[" + worker->name + "] " + r.a[0].text(), r.a[1].text(), r.a[2].text(), atof(r.a[3].text().c_str())});
-					}
-					ui::set_remote(worker->name + "#" + std::to_string(id), list);
-				} catch (const std::exception&) {}
+				ui::set_remote(worker->name + "#" + std::to_string(id), "[" + worker->name + "] ", ui::parse_progress(payload.substr(4)));
 			} else if (type == M_DONE) {
 				bool ok = false;
 				std::string log_tail;
@@ -318,7 +310,7 @@ struct RemoteHost::Impl {
 					if (it == active.end()) continue;
 					stored = it->second.stored;
 					active.erase(it);
-					ui::set_remote(worker->name + "#" + std::to_string(id), {});
+					ui::set_remote(worker->name + "#" + std::to_string(id), "", {});
 					imported += stored;
 					left--;
 				}
@@ -336,7 +328,7 @@ struct RemoteHost::Impl {
 		for (auto& t : senders) t.join();
 		std::lock_guard lock(m);
 		for (auto& [id, a] : active) {
-			ui::set_remote(worker->name + "#" + std::to_string(id), {});
+			ui::set_remote(worker->name + "#" + std::to_string(id), "", {});
 			const RemoteJobSpec& job = (*jobs)[id];
 			log("job " + job.name + " lost with " + who);
 			if (tries[id] < kTries) queue.push_front(id);
@@ -433,8 +425,18 @@ std::string self_exe() {
 #endif
 }
 
-// Runs a program with its output in `log_file`; returns its exit code, or -1 if it could not be started.
-int run_process(const std::string& exe, const std::vector<std::string>& args, const std::string& log_file) {
+// Runs a program and hands every line it prints (output and errors together) to `on_line`; returns its exit code, or -1 if it could not be started.
+int run_process(const std::string& exe, const std::vector<std::string>& args, const std::function<void(const std::string&)>& on_line) {
+	std::string pending;
+	auto feed = [&](const char* data, size_t n) {
+		pending.append(data, n);
+		for (size_t at; (at = pending.find('\n')) != std::string::npos;) {
+			std::string line = pending.substr(0, at);
+			if (!line.empty() && line.back() == '\r') line.pop_back();
+			pending.erase(0, at + 1);
+			on_line(line);
+		}
+	};
 #ifdef _WIN32
 	auto quote = [](const std::string& a) {
 		std::string o = "\"";
@@ -451,18 +453,25 @@ int run_process(const std::string& exe, const std::vector<std::string>& args, co
 	for (auto& a : args) line += " " + quote(a);
 	const std::wstring cmd = fs::path(line).wstring();
 	SECURITY_ATTRIBUTES sa{sizeof sa, nullptr, TRUE};
-	HANDLE log = CreateFileW(fs::path(log_file).wstring().c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	HANDLE rd = nullptr, wr = nullptr;
+	if (!CreatePipe(&rd, &wr, &sa, 1 << 16)) return -1;
+	SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
 	STARTUPINFOW si{};
 	si.cb = sizeof si;
 	si.dwFlags = STARTF_USESTDHANDLES;
-	si.hStdOutput = si.hStdError = log;
+	si.hStdOutput = si.hStdError = wr;
 	si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
 	PROCESS_INFORMATION pi{};
 	std::vector<wchar_t> mutable_cmd(cmd.begin(), cmd.end());
 	mutable_cmd.push_back(0);
 	const BOOL ok = CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi);
-	if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
-	if (!ok) return -1;
+	CloseHandle(wr);
+	if (!ok) { CloseHandle(rd); return -1; }
+	char buf[4096];
+	DWORD got;
+	while (ReadFile(rd, buf, sizeof buf, &got, nullptr) && got) feed(buf, got);
+	CloseHandle(rd);
+	if (!pending.empty()) on_line(pending);
 	WaitForSingleObject(pi.hProcess, INFINITE);
 	DWORD code = 1;
 	GetExitCodeProcess(pi.hProcess, &code);
@@ -470,11 +479,15 @@ int run_process(const std::string& exe, const std::vector<std::string>& args, co
 	CloseHandle(pi.hThread);
 	return (int)code;
 #else
+	int fds[2];
+	if (pipe(fds) != 0) return -1;
 	const pid_t pid = fork();
-	if (pid < 0) return -1;
+	if (pid < 0) { close(fds[0]); close(fds[1]); return -1; }
 	if (pid == 0) {
-		const int fd = open(log_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-		if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); }
+		close(fds[0]);
+		dup2(fds[1], 1);
+		dup2(fds[1], 2);
+		close(fds[1]);
 		std::vector<char*> argv;
 		argv.push_back(const_cast<char*>(exe.c_str()));
 		for (auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
@@ -482,6 +495,12 @@ int run_process(const std::string& exe, const std::vector<std::string>& args, co
 		execv(exe.c_str(), argv.data());
 		_exit(127);
 	}
+	close(fds[1]);
+	char buf[4096];
+	ssize_t got;
+	while ((got = read(fds[0], buf, sizeof buf)) > 0) feed(buf, (size_t)got);
+	close(fds[0]);
+	if (!pending.empty()) on_line(pending);
 	int status = 0;
 	waitpid(pid, &status, 0);
 	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
@@ -526,21 +545,6 @@ std::string inventory_json(int only_gpu) {
 		}
 	}
 	return out + "]";
-}
-
-// The last complete line of a file that is being appended to.
-std::string last_line(const fs::path& p) {
-	std::ifstream f(p, std::ios::binary | std::ios::ate);
-	if (!f) return "";
-	const std::streamoff size = f.tellg();
-	const std::streamoff from = size > 65536 ? size - 65536 : 0;
-	f.seekg(from);
-	std::string tail((size_t)(size - from), '\0');
-	f.read(tail.data(), (std::streamsize)tail.size());
-	const size_t end = tail.rfind('\n');
-	if (end == std::string::npos) return "";
-	const size_t start = tail.rfind('\n', end == 0 ? 0 : end - 1);
-	return tail.substr(start == std::string::npos || start == end ? 0 : start + 1, end - (start == std::string::npos || start == end ? 0 : start + 1));
 }
 
 // What the reader thread hands to a job: the pieces of an input being fetched.
@@ -648,6 +652,12 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 			continue;
 		}
 		log("connected to " + conn->peer + ", " + std::to_string(slots) + " job" + (slots == 1 ? "" : "s") + " at a time");
+		std::atomic<int> running_jobs{0};
+		auto show_title = [&](bool connected) {
+			ui::set_title("ves worker " + name + "  " + (connected ? "connected to " + conn->peer + "  " + std::to_string(running_jobs.load()) + " of " + std::to_string(slots) + " jobs running"
+			                                                       : std::string("waiting for the host")));
+		};
+		show_title(true);
 
 		std::mutex send_m;
 		auto send = [&](uint8_t t, const std::string& p) {
@@ -664,6 +674,9 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 			const std::string jname = job.find("name")->text();
 			const Json& in = *job.find("input");
 			const fs::path dir = fs::path(workdir) / ("job-" + std::to_string(id));
+			const std::string rows_key = "job#" + std::to_string(id);
+			running_jobs++;
+			show_title(true);
 			std::error_code ec2;
 			fs::remove_all(dir, ec2);
 			fs::create_directories(dir / "out", ec2);
@@ -690,24 +703,21 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 					std::ofstream f(dir / "config.jsonc", std::ios::binary);
 					f << job.find("config")->text();
 				}
-				std::vector<std::string> args{"--plain", "--config", (dir / "config.jsonc").string(), "--input", input, "--output", (dir / "out").string(), "--no-videos",
-				                               "--cache", (fs::path(workdir) / "cache").string(), "--upload", "off", "--progress-file", (dir / "progress.jsonl").string()};
+				std::vector<std::string> args{"--plain", "--progress", "--config", (dir / "config.jsonc").string(), "--input", input, "--output", (dir / "out").string(), "--no-videos",
+				                               "--cache", (fs::path(workdir) / "cache").string(), "--upload", "off"};
 				args.insert(args.end(), extra_args.begin(), extra_args.end());
-				// Once a second, the newest rows of the run go to the host.
-				std::atomic<bool> running{true};
-				std::thread monitor([&] {
-					std::string sent;
-					for (int tick = 0; running; tick++) {
-						std::this_thread::sleep_for(std::chrono::milliseconds(100));
-						if (tick % 10 != 9) continue;
-						const std::string line = last_line(dir / "progress.jsonl");
-						if (!line.empty() && line != sent) { sent = line; send(M_PROGRESS, id_bytes(id) + line); }
+				// Once a second the job's `ves` prints the numbers of its runs; they go to the host and to this worker's own display. Its other lines are kept for a failure.
+				std::deque<std::string> tail;
+				const int code = run_process(exe, args, [&](const std::string& text) {
+					if (!text.empty() && text[0] == (char)30) {
+						send(M_PROGRESS, id_bytes(id) + text.substr(1));
+						ui::set_remote(rows_key, jname + ": ", ui::parse_progress(text.substr(1)));
+					} else if (!text.empty()) {
+						tail.push_back(text);
+						if (tail.size() > 12) tail.pop_front();
 					}
 				});
-				const int code = run_process(exe, args, (dir / "log.txt").string());
-				running = false;
-				monitor.join();
-				log_text = tail_of(read_file(dir / "log.txt"), 12);
+				for (auto& l : tail) log_text += l + "\n";
 				ok = code == 0;
 				if (!ok) log("job " + jname + " failed with code " + std::to_string(code));
 				// The run results are the .json files in the input's folder; the sweep summary next to it is not one.
@@ -725,6 +735,9 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 				}
 			}
 			fs::remove_all(dir, ec2);
+			ui::set_remote(rows_key, "", {});
+			running_jobs--;
+			show_title(true);
 			send(M_DONE, "{\"id\":" + std::to_string(id) + ",\"ok\":" + std::string(ok ? "true" : "false") + ",\"log\":" + jq(log_text) + "}");
 		};
 
@@ -752,6 +765,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 			for (auto& [id, inbox] : inboxes) inbox->close();
 		}
 		for (auto& t : jobs) t.join();
+		show_title(false);
 		log("lost the connection; trying again in 5 s");
 		std::this_thread::sleep_for(std::chrono::seconds(5));
 	}

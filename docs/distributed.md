@@ -53,9 +53,11 @@ has before any other, so with several inputs each worker settles on a few of the
 
 ## Progress
 
-Once a second the host gets the rows a worker's runs would show on its own screen (encode, score and decode lines with speed, status and a bar) and shows them with its own rows, tagged
-`[worker name]`. They are the same rows as in a local sweep, one set per running job; they disappear when the job is done or the worker is lost. In plain mode (no terminal) they are listed every
-15 seconds like local runs. A worker's `ves` writes them to a file (`--progress-file`), which the worker reads and forwards.
+A worker shows the same table as a sweep: its log lines above, and below them the rows of the jobs it runs, with a header that says whether it is connected and how many jobs are running.
+The host shows the workers' rows with its own, tagged `[worker name]`; they go away when the job is done or the worker is lost. In plain mode (no terminal) they are listed every 15 seconds like local runs.
+
+What travels is numbers, once a second, per running stage: the stage, the frame count done and in total (bytes for uploads and downloads), the rate, and whether it is working, starved or backed up.
+The host and the worker draw the rows from them with the same code. A job's `ves` prints them on a line of its own (`--progress`) and the worker reads that line from the pipe it runs the job on; no file is involved.
 
 ## Protocol
 

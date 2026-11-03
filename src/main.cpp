@@ -343,7 +343,7 @@ Scoring
 Distributed (see docs/distributed.md)
         --host <port>       decide what is run, and hand the runs that are not done to the workers that connect to this port. The host runs nothing
                             itself, except what no worker could do; it needs an output or cache folder
-        --progress-file <path>  once a second, append the rows of the runs in flight to this file (a worker sends them to its host this way)
+        --progress          once a second, print the numbers of the runs in flight on a line of their own (a worker reads them from the `ves` that runs its job)
         --token <secret>    what workers must present (or the VES_TOKEN environment variable); use it on both sides
         --min-workers <n>   jobs start when this many workers have connected (default: 1)
         --worker <host:port>  be a worker: connect to a host and run the jobs it sends, until stopped. Every other flag (--priority, --hw-decode,
@@ -441,7 +441,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--plain") cfg.plain = true;
 		else if (a == "--low-memory") cfg.low_memory = true;
 		else if (a == "--host") cfg.host_port = atoi(value().c_str());
-		else if (a == "--progress-file") ui::set_progress_file(value());
+		else if (a == "--progress") ui::set_progress_stdout(true);
 		else if (a == "--token") cfg.token = value();
 		else if (a == "--min-workers") cfg.min_workers = std::max(1, atoi(value().c_str()));
 		else if (a == "--decode-threads") cfg.decode_threads = atoi(value().c_str());
@@ -598,7 +598,9 @@ static int run_worker(int argc, char** argv) {
 	}
 	const size_t colon = target.rfind(':');
 	if (colon == std::string::npos) { fprintf(stderr, "error: --worker takes host:port\n"); return 1; }
-	return remote_worker(target.substr(0, colon), atoi(target.c_str() + colon + 1), token, dir, only_gpu, slots, pass, [](const std::string& line) { printf("%s\n", line.c_str()); fflush(stdout); });
+	// The worker has the same display as a sweep: its log lines above, and the rows of the jobs it runs. --plain turns it off.
+	ui::start(std::find(pass.begin(), pass.end(), "--plain") != pass.end());
+	return remote_worker(target.substr(0, colon), atoi(target.c_str() + colon + 1), token, dir, only_gpu, slots, pass, [](const std::string& line) { ui::log(line); });
 }
 
 int main(int argc, char** argv) {

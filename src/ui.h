@@ -24,13 +24,19 @@ struct RunProgress {
 };
 
 namespace ui {
-// What a run in flight shows: its task, speed, status and how far it is (0 to 1).
-struct Row {
-	std::string task, speed, status;
-	double fraction = 0;
+// The numbers of a run in flight: what a worker sends its host, which shows them as a row of its own.
+struct Progress {
+	int stage = 0;           // as RunProgress::stage
+	std::string label;
+	long long done = 0, total = 0; // frames (bytes for uploads and downloads)
+	double rate = 0;         // frames per second (bytes per second), over the time since the stage began
+	int state = 0;           // 0 working, 1 starved, 2 backed up
+	bool finished = false;
 };
-void set_progress_file(const std::string& path); // once a second, a line with the rows of the runs in flight is appended to this file (a worker's host reads it)
-void set_remote(const std::string& key, const std::vector<Row>& rows); // rows of runs on another machine, shown with the local ones; no rows remove them
+void set_title(const std::string& title);        // replaces the header (the run counter and elapsed time); a worker has no runs of its own. Empty: the usual header
+void set_progress_stdout(bool on);               // once a second, print a line with the numbers of the runs in flight (a record separator, then JSON) for the process that started this one
+std::vector<Progress> parse_progress(const std::string& json); // reads such a line (without the record separator)
+void set_remote(const std::string& key, const std::string& prefix, const std::vector<Progress>& list); // runs on another machine, shown with the local ones; no runs remove them
 void start(bool plain);
 void stop();                                   // clears the live area, restores stderr
 bool live();                                   // true when the live area is on
