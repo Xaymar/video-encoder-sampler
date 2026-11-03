@@ -328,8 +328,8 @@ Paths
 Scoring
         --vmaf-model <spec> libvmaf model, e.g. path=models/vmaf_4k_v0.6.1neg.json
         --vmaf-threads <n>
-        --vmaf-device <cpu|gpu|auto>  where VMAF is computed (default: cpu). gpu: on the GPU with Vulkan compute (8 bit input; scores within 1e-4 of libvmaf's);
-                            auto: the GPU where it can be used (8 bit YUV, a model file, a Vulkan GPU), else the CPU. These scores are kept apart from libvmaf's in the cache
+        --vmaf-device <cpu|gpu|auto>  where VMAF is computed (default: cpu). gpu: on the GPU with Vulkan compute (8 and 10 bit input; scores within 1e-4 of libvmaf's);
+                            auto: the GPU where it can be used (8 or 10 bit YUV, a model file, a Vulkan GPU), else the CPU. These scores are kept apart from libvmaf's in the cache
         --over-penalty <p>  VMAF points deducted per percent for a run just over the target bitrate (default: 0.025); it grows exponentially, like the website's
 
 Quick run (replaces the encoders and scenarios of the config file)

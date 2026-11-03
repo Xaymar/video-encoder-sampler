@@ -4,7 +4,7 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 layout(std430, binding = 2) readonly buffer Tmp { int ytmp[]; };
 layout(std430, binding = 3) writeonly buffer Part { uint part[]; };
-layout(push_constant) uniform PC { int W; int H; } pc;
+layout(push_constant) uniform PC { int W; int H; int bpc; } pc;
 
 const int F[5] = int[5](3571, 16004, 26386, 16004, 3571);
 shared uint sh[256];

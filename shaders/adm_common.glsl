@@ -11,6 +11,7 @@ layout(push_constant) uniform PC {
 	int cl, ct, cr, cb;  // region of the denominator
 	int srow, erow, scol, ecol; // region of the contrast masking
 	int shc0, shc1, shc2;       // cubing shifts of the contrast masking (scale 0: per band; else shc0) / of the denominator
+	int bpc;                    // bits per sample of the frame (scale 0)
 } pc;
 
 layout(std430, binding = 0) buffer Cur { int cur[]; };            // 20 blocks of BW*BH

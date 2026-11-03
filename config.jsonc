@@ -69,7 +69,7 @@
 		"model": "path=models/vmaf_4k_v0.6.1neg.json",
 		// Threads per run being scored; 0 shares all cores between the runs that are scored at the same time.
 		"threads": 0,
-		// Where VMAF is computed: "cpu" (libvmaf), "gpu" (Vulkan compute: about ten times faster, 8 bit input only, scores within 1e-4 of libvmaf's;
+		// Where VMAF is computed: "cpu" (libvmaf), "gpu" (Vulkan compute: about ten times faster, 8 and 10 bit input, scores within 1e-4 of libvmaf's;
 		// a run it cannot score fails) or "auto" (the GPU where it can be used, else the CPU). Scores from the GPU are cached apart from the CPU's.
 		"device": "cpu",
 	},

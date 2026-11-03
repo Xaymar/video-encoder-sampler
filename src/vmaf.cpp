@@ -81,7 +81,7 @@ public:
 	}
 };
 
-// On the GPU (Vulkan compute, vk_vmaf.cpp): 8 bit planar YUV, only the luma planes are looked at.
+// On the GPU (Vulkan compute, vk_vmaf.cpp): 8 and 10 bit planar YUV, only the luma planes are looked at.
 class GpuScorer : public Scorer {
 	std::unique_ptr<GpuVmaf> gpu;
 	int w, h;
@@ -111,9 +111,9 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 	if (opt.device != "cpu") {
 		std::string why;
 		std::unique_ptr<GpuVmaf> gpu;
-		if (score_fmt.depth != 8 || !score_fmt.planar || score_fmt.rgb) why = "only 8 bit YUV is supported";
+		if ((score_fmt.depth != 8 && score_fmt.depth != 10) || !score_fmt.planar || score_fmt.rgb) why = "only 8 and 10 bit YUV is supported";
 		else if (opt.model.rfind("path=", 0) != 0) why = "the model is not a file";
-		else gpu = GpuVmaf::create(opt.model.substr(5), ref.width, ref.height, why);
+		else gpu = GpuVmaf::create(opt.model.substr(5), ref.width, ref.height, score_fmt.depth, why);
 		if (gpu) scorer = std::make_unique<GpuScorer>(std::move(gpu), ref.width, ref.height);
 		else if (opt.device == "gpu") { fprintf(stderr, "vmaf: GPU scoring is not possible: %s\n", why.c_str()); ok = false; }
 		else {

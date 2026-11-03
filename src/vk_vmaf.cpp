@@ -14,7 +14,7 @@
 #include "json.h"
 #include "vk_compute.h"
 
-// VMAF on Vulkan compute: motion, VIF and ADM on the luma planes (8 bit), and the model's score step on the CPU. Ported from libvmaf's CPU code
+// VMAF on Vulkan compute: motion, VIF and ADM on the luma planes (8 and 10 bit), and the model's score step on the CPU. Ported from libvmaf's CPU code
 // (integer_motion.c, integer_vif.c, integer_adm.c, predict.c); the shaders are in shaders/. The scores match libvmaf's within 1e-4.
 
 namespace {
@@ -45,15 +45,17 @@ struct AdmPC {
 	int cl, ct, cr, cb;
 	int srow, erow, scol, ecol;
 	int shc0, shc1, shc2;
+	int bpc;
 };
 }
 
 class VkVmaf {
 public:
-	VkVmaf(int W, int H, double adm_egl, double vif_egl) : W(W), H(H), vif_egl(vif_egl) {
+	VkVmaf(int W, int H, int depth, double adm_egl, double vif_egl) : W(W), H(H), bpc(depth), bps(depth > 8 ? 2 : 1), vif_egl(vif_egl) {
 		using namespace vkvmaf_detail;
 		ysize = (size_t)W * H;
-		raw_size = (ysize + 3) / 4 * 4 + 4;
+		plane_bytes = ysize * bps;
+		raw_size = (plane_bytes + 3) / 4 * 4 + 4;
 		raw_ref = vk.buffer(raw_size, 0);
 		raw_dis = vk.buffer(raw_size, 0);
 		// motion
@@ -102,7 +104,7 @@ public:
 			AdmPC& pc = apc[s];
 			memset(&pc, 0, sizeof pc);
 			AdmHost& hs = ah[s];
-			pc.SW = sw[s]; pc.SH = sh[s]; pc.BW = bw[s]; pc.BH = bh[s]; pc.scale = s;
+			pc.SW = sw[s]; pc.SH = sh[s]; pc.BW = bw[s]; pc.BH = bh[s]; pc.scale = s; pc.bpc = depth;
 			pc.prevN = s ? bw[s - 1] * bh[s - 1] : 0;
 			pc.egl = adm_egl; pc.cos1sq = cos_1deg_sq;
 			const int w = bw[s], h = bh[s];
@@ -157,8 +159,8 @@ public:
 	Features process(const uint8_t* ref_y, size_t ref_stride, const uint8_t* dis_y, size_t dis_stride, size_t index) {
 		using namespace vkvmaf_detail;
 		auto put = [&](void* dst, const uint8_t* src, size_t stride) {
-			if (stride == (size_t)W) memcpy(dst, src, ysize);
-			else for (int y = 0; y < H; y++) memcpy((uint8_t*)dst + (size_t)y * W, src + (size_t)y * stride, W);
+			if (stride == (size_t)W * bps) memcpy(dst, src, plane_bytes);
+			else for (int y = 0; y < H; y++) memcpy((uint8_t*)dst + (size_t)y * W * bps, src + (size_t)y * stride, (size_t)W * bps);
 		};
 		put(raw_ref.map, ref_y, ref_stride);
 		put(raw_dis.map, dis_y, dis_stride);
@@ -167,7 +169,7 @@ public:
 		vk.begin();
 		const bool with_motion = index > 0;
 		if (with_motion) {
-			const int pc[2] = {W, H};
+			const int pc[3] = {W, H, bpc};
 			vk.push(pc, sizeof pc);
 			vk.bind(my[prev]); vk.dispatch(gx, gy); vk.barrier();
 			vk.bind(mx[prev]); vk.dispatch(gx, gy); vk.barrier();
@@ -175,7 +177,7 @@ public:
 		auto groups = [](int a, int b) { return std::make_pair((uint32_t)((a + 15) / 16), (uint32_t)((b + 15) / 16)); };
 		for (int s = 0; s < 4; s++) {
 			if (s > 0) {
-				VifPC pc{vw[s - 1], vh[s - 1], s, s == 1 ? 0 : 2, 8, 0, vif_egl};
+				VifPC pc{vw[s - 1], vh[s - 1], s, s == 1 ? (bps == 2 ? 1 : 0) : 2, bpc, 0, vif_egl};
 				vk.push(&pc, sizeof pc);
 				vk.bind(vsub_v[s]);
 				auto g = groups(vw[s - 1], vh[s - 1] / 2);
@@ -184,7 +186,7 @@ public:
 				g = groups(vw[s - 1] / 2, vh[s - 1] / 2);
 				vk.dispatch(g.first, g.second); vk.barrier();
 			}
-			VifPC pc{vw[s], vh[s], s, s == 0 ? 0 : 2, 8, 0, vif_egl};
+			VifPC pc{vw[s], vh[s], s, s == 0 ? (bps == 2 ? 1 : 0) : 2, bpc, 0, vif_egl};
 			vk.push(&pc, sizeof pc);
 			auto g = groups(vw[s], vh[s]);
 			vk.bind(vstat_v[s]); vk.dispatch(g.first, g.second); vk.barrier();
@@ -283,7 +285,8 @@ private:
 	Vk vk; // first: it releases the buffers and sets below when it goes away
 	int W, H;
 	double vif_egl, noise_weight = 0.03125;
-	size_t ysize = 0, raw_size = 0;
+	int bpc = 8, bps = 1; // bits per sample, bytes per sample
+	size_t ysize = 0, plane_bytes = 0, raw_size = 0;
 	Buf raw_ref, raw_dis;
 	uint32_t gx = 0, gy = 0;
 	Buf mfr[2], mtmp, mpart;
@@ -410,7 +413,8 @@ static Model load_model(const std::string& path, double& adm_egl, double& vif_eg
 	return m;
 }
 
-bool GpuVmaf::supported(const std::string& model_path, int w, int h, std::string& why) {
+bool GpuVmaf::supported(const std::string& model_path, int w, int h, int depth, std::string& why) {
+	if (depth != 8 && depth != 10) { why = "only 8 and 10 bit input is supported"; return false; }
 	if (!Vk::available(why)) return false;
 	if (w < 160 || h < 90) { why = "the frame is too small"; return false; }
 	try {
@@ -420,13 +424,13 @@ bool GpuVmaf::supported(const std::string& model_path, int w, int h, std::string
 	return true;
 }
 
-std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::string& model_path, int w, int h, std::string& why) {
-	if (!supported(model_path, w, h, why)) return nullptr;
+std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::string& model_path, int w, int h, int depth, std::string& why) {
+	if (!supported(model_path, w, h, depth, why)) return nullptr;
 	std::unique_ptr<GpuVmaf> g(new GpuVmaf);
 	try {
 		double adm_egl, vif_egl;
 		g->impl->model = load_model(model_path, adm_egl, vif_egl);
-		g->impl->gpu = std::make_unique<VkVmaf>(w, h, adm_egl, vif_egl);
+		g->impl->gpu = std::make_unique<VkVmaf>(w, h, depth, adm_egl, vif_egl);
 	} catch (const std::exception& e) {
 		why = e.what();
 		return nullptr;
@@ -466,8 +470,8 @@ bool GpuVmaf::finish(std::vector<double>& scores) {
 
 GpuVmaf::GpuVmaf() : impl(nullptr) {}
 GpuVmaf::~GpuVmaf() {}
-bool GpuVmaf::supported(const std::string&, int, int, std::string& why) { why = "built without Vulkan"; return false; }
-std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::string&, int, int, std::string& why) { why = "built without Vulkan"; return nullptr; }
+bool GpuVmaf::supported(const std::string&, int, int, int, std::string& why) { why = "built without Vulkan"; return false; }
+std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::string&, int, int, int, std::string& why) { why = "built without Vulkan"; return nullptr; }
 bool GpuVmaf::add(const uint8_t*, size_t, const uint8_t*, size_t) { return false; }
 bool GpuVmaf::finish(std::vector<double>&) { return false; }
 
