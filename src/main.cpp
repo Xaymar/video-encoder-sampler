@@ -34,6 +34,7 @@
 #include "encoder.h"
 #include "formats.h"
 #include "gpu.h"
+#include "combos.h"
 #include "convert.h"
 #include "download.h"
 #include "json.h"
@@ -57,41 +58,6 @@ static double over_penalty_points(double kbps, double target) {
 	if (target <= 0 || kbps <= target) return 0;
 	return std::min(100.0, over_penalty * width * (std::exp((kbps / target - 1) * 100 / width) - 1));
 }
-
-// A condition on another option: that it is set, set to one of some values, or compares so with a number (">=2").
-struct Cond {
-	std::string key;
-	std::vector<std::string> any_of; // empty: any value
-	std::string op;                  // "", or ">=", ">", "<=", "<", "==", "!=": the value is read as a number
-	double num = 0;
-	static bool number(const std::string& v, double& out) {
-		char* end = nullptr;
-		out = strtod(v.c_str(), &end);
-		return !v.empty() && *end == 0;
-	}
-	bool holds(const Options& o) const {
-		const auto it = o.find(key);
-		if (it == o.end()) return false;
-		double have = 0;
-		if (!op.empty()) {
-			if (!number(it->second, have)) return false;
-			return op == ">=" ? have >= num : op == ">" ? have > num : op == "<=" ? have <= num : op == "<" ? have < num : op == "==" ? have == num : have != num;
-		}
-		if (any_of.empty()) return true;
-		double want = 0;
-		for (auto& v : any_of) if (v == it->second || (number(v, want) && number(it->second, have) && want == have)) return true;
-		return false;
-	}
-	std::string json() const; // as the config writes it: true, a list of values, or a comparison; defined after jq()
-};
-
-struct Axis { // one swept option. null is not a value: it would mean "whatever the preset gives", which is not known; leave the option out to run without it
-	std::string key;
-	std::vector<std::string> values;
-	// Options that only matter in some combinations: where the condition does not hold the option is left unset, and combinations that come out the same are one.
-	std::vector<Cond> requires_all; // it is only set when all of these hold
-	std::vector<Cond> unless_any;   // it is only set when none of these holds
-};
 
 struct Job {
 	std::string encoder, codec = "h264";
