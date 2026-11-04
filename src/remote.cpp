@@ -638,12 +638,13 @@ std::string tail_of(const std::string& text, size_t lines) {
 // Whether AMD GPU `gpu` can encode the codec, and its capabilities (JSON), asked of a process of our own: AMD's runtime can crash on a GPU its driver does not support
 // (the access violation would end the worker), and then the GPU is just not offered. An answer that came back counts even when the process crashed after giving it.
 // `why` says what went wrong otherwise: the exit code and the last lines the process printed.
-bool probe_amf(const std::string& codec, int gpu, std::string& json, std::string& why) {
+bool probe_amf(const std::string& codec, int gpu, std::string& json, std::string& why, std::string& runtime) {
 	static const std::atomic<bool> never{false};
 	std::string answer, said;
 	bool no = false;
 	const int code = run_process(self_exe(), {"--probe-amf", codec, std::to_string(gpu)}, [&](const std::string& line) {
 		if (line.rfind("ok ", 0) == 0) answer = line.substr(3);
+		else if (line.rfind("runtime ", 0) == 0) runtime = line.substr(8);
 		else if (line == "no") no = true;
 		else if (!line.empty()) said += line + "\n";
 	}, never);
@@ -694,7 +695,12 @@ std::string inventory_json(int only_gpu, const std::vector<WorkerResource>& reso
 				std::string json = "null", why;
 				bool ok;
 				if (encoder == "nvenc") { json = nvenc_caps_json(codec, (int)i); ok = json != "null" && json != "{}"; }
-				else if (encoder == "amf") ok = probe_amf(codec, (int)i, json, why);
+				else if (encoder == "amf") {
+					std::string runtime;
+					ok = probe_amf(codec, (int)i, json, why, runtime);
+					static std::set<size_t> told; // once per GPU: which AMF runtime it encodes with (its own driver's, see encoder_amf.cpp)
+					if (!runtime.empty() && told.insert(i).second) fprintf(stderr, "amf GPU %d (%s): runtime %s\n", (int)i, gpu_description(vendor, (int)i).c_str(), runtime.c_str());
+				}
 				else ok = qsv_supports(codec, 420, 8);
 				if (!ok) { if (!why.empty()) why_not += std::string(why_not.empty() ? "" : "; ") + codec + ": " + why; continue; }
 				codecs += (codecs.empty() ? "" : ",") + jq(codec);

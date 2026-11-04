@@ -42,6 +42,7 @@ namespace {
 
 thread_local bool probing = false; // set while amf_supports() tries a codec out
 
+std::string runtime_used; // "1.4.24 from C:\\...\\amfrt64.dll", once load_runtime() has loaded one in a process that serves one GPU
 int dedicated_gpu = -1; // this process serves AMD GPU n only (an encoder process, a probe): its runtime comes from that GPU's driver package
 
 // The folder of the driver package that drives an adapter (System32\DriverStore\FileRepository\<package>), asked of the kernel the way the Vulkan loader finds
@@ -126,7 +127,10 @@ HMODULE load_runtime(int gpu) {
 		amf_uint64 v = 0;
 		auto version = (AMFQueryVersion_Fn)GetProcAddress(dll, AMF_QUERY_VERSION_FUNCTION_NAME);
 		if (version) version(&v);
-		fprintf(stderr, "amf: GPU %d uses runtime %u.%u.%u from %s\n", gpu, (unsigned)AMF_GET_MAJOR_VERSION(v), (unsigned)AMF_GET_MINOR_VERSION(v), (unsigned)AMF_GET_SUBMINOR_VERSION(v), from.string().c_str());
+		char b[64];
+		snprintf(b, sizeof b, "%u.%u.%u", (unsigned)AMF_GET_MAJOR_VERSION(v), (unsigned)AMF_GET_MINOR_VERSION(v), (unsigned)AMF_GET_SUBMINOR_VERSION(v));
+		runtime_used = std::string(b) + " from " + from.string();
+		fprintf(stderr, "amf: GPU %d uses runtime %s\n", gpu, runtime_used.c_str());
 	}
 	return dll;
 }
@@ -467,6 +471,7 @@ public:
 std::unique_ptr<Encoder> make_encoder_amf() { return std::make_unique<Amf>(); }
 
 void amf_dedicate_process(int gpu) { dedicated_gpu = gpu; }
+std::string amf_runtime() { return runtime_used; }
 
 // Whether this machine's AMD GPU can encode the codec at that bit depth, found by initializing a throwaway encoder once.
 bool amf_supports(const std::string& codec, int chroma, int depth, int gpu) {
@@ -543,4 +548,5 @@ bool amf_supports(const std::string&, int, int, int) { return false; }
 std::string amf_caps_json(const std::string&, int) { return "null"; }
 bool amf_probe(const std::string&, int, std::string&) { fprintf(stderr, "amf: not supported on this platform\n"); return false; }
 void amf_dedicate_process(int) {}
+std::string amf_runtime() { return {}; }
 #endif
