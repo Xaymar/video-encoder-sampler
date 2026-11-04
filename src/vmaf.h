@@ -13,6 +13,9 @@ struct VmafOptions {
 	std::string model = "path=models/vmaf_4k_v0.6.1neg.json"; // "path=<json model>", relative to the working directory, or "version=<builtin>" if libvmaf has it
 	int threads = 0; // 0: all cores, shared between the scorers that run at the same time
 	std::string device = "cpu"; // "cpu": libvmaf; "gpu": Vulkan compute (8 bit input, an error where it cannot be used); "auto": the GPU where it can be used, else the CPU
+	std::string gpu;            // which Vulkan device scores (GpuVmaf::pick_device): "" or "auto" for the GPU that encodes, else the first discrete one; a Vulkan index; a name
+	unsigned encoder_vendor = 0; // set per run: the vendor (gpu.h) and GPU index of the encoder, for gpu "auto"; 0 for a CPU encoder
+	int encoder_gpu = 0;
 };
 
 // What scoring needs to know about the original video; its frames come from a feed.

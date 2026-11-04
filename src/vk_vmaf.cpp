@@ -1,8 +1,79 @@
 #define _USE_MATH_DEFINES
 #include "vk_vmaf.h"
 
-#ifndef VES_NO_VULKAN
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
+
+#include "gpu.h"
+#include "vk_compute.h"
+
+static std::string lower(std::string s) {
+	for (auto& c : s) c = (char)std::tolower((unsigned char)c);
+	return s;
+}
+
+// The first usable discrete device, -1 if there is none.
+static int first_discrete(const std::vector<VkDeviceInfo>& all) {
+	for (auto& d : all) if (d.discrete && d.usable) return d.index;
+	return -1;
+}
+
+// The Vulkan device that is the n-th GPU of `vendor` as gpu.h lists them (what gpu=n means to that vendor's encoder): the one with the same LUID where the
+// driver says, else the n-th device of that vendor in Vulkan's order if it is the same model, else the first device of that model. -1 if none matches.
+static int device_of_encoder_gpu(const std::vector<VkDeviceInfo>& all, unsigned vendor, int n) {
+	const auto gpus = list_gpus(vendor);
+	if (n < 0 || n >= (int)gpus.size()) return -1;
+	const GpuInfo& g = gpus[n];
+	if (g.luid) for (auto& d : all) if (d.luid_valid && d.luid == g.luid) return d.index;
+	int seen = 0, same_model = -1;
+	for (auto& d : all) {
+		if (d.vendor_id != vendor) continue;
+		if (d.device_id == g.device_id) {
+			if (seen == n) return d.index;
+			if (same_model < 0) same_model = d.index;
+		}
+		seen++;
+	}
+	return same_model;
+}
+
+int GpuVmaf::pick_device(const std::string& spec, unsigned encoder_vendor, int encoder_gpu, std::string& why) {
+	const auto all = Vk::devices(why);
+	if (all.empty()) { if (why.empty()) why = "there is no Vulkan device"; return -1; }
+	auto list = [&] {
+		std::string s;
+		for (auto& d : all) s += (s.empty() ? "" : ", ") + std::to_string(d.index) + ": " + d.name + (d.usable ? "" : " (unusable)");
+		return s;
+	};
+	if (spec.empty() || spec == "auto") {
+		// The GPU that encodes, so the encoded frames and the scoring stay on one GPU; then the first discrete one.
+		if (encoder_vendor) {
+			const int d = device_of_encoder_gpu(all, encoder_vendor, encoder_gpu);
+			if (d >= 0 && all[d].usable) return d;
+		}
+		const int d = first_discrete(all);
+		if (d < 0) why = "no discrete Vulkan GPU with 64 bit integer and float support (Vulkan devices: " + list() + "; vmaf.gpu picks one)";
+		return d;
+	}
+	if (std::all_of(spec.begin(), spec.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+		const int d = atoi(spec.c_str());
+		if (d < (int)all.size()) return d; // Vk::available() says why it cannot be used, if it cannot
+		why = "there is no Vulkan device " + spec + " (Vulkan devices: " + list() + ")";
+		return -1;
+	}
+	int fallback = -1;
+	for (auto& d : all) {
+		if (lower(d.name).find(lower(spec)) == std::string::npos) continue;
+		if (d.usable) return d.index;
+		if (fallback < 0) fallback = d.index;
+	}
+	if (fallback >= 0) return fallback;
+	why = "no Vulkan device is named like '" + spec + "' (Vulkan devices: " + list() + ")";
+	return -1;
+}
+
+#ifndef VES_NO_VULKAN
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -51,7 +122,7 @@ struct AdmPC {
 
 class VkVmaf {
 public:
-	VkVmaf(int W, int H, int depth, double adm_egl, double vif_egl) : W(W), H(H), bpc(depth), bps(depth > 8 ? 2 : 1), vif_egl(vif_egl) {
+	VkVmaf(int device, int W, int H, int depth, double adm_egl, double vif_egl) : vk(device), W(W), H(H), bpc(depth), bps(depth > 8 ? 2 : 1), vif_egl(vif_egl) {
 		using namespace vkvmaf_detail;
 		ysize = (size_t)W * H;
 		plane_bytes = ysize * bps;
@@ -413,9 +484,9 @@ static Model load_model(const std::string& path, double& adm_egl, double& vif_eg
 	return m;
 }
 
-bool GpuVmaf::supported(const std::string& model_path, int w, int h, int depth, std::string& why) {
+bool GpuVmaf::supported(const std::string& model_path, int device, int w, int h, int depth, std::string& why) {
 	if (depth != 8 && depth != 10) { why = "only 8 and 10 bit input is supported"; return false; }
-	if (!Vk::available(why)) return false;
+	if (!Vk::available(device, why)) return false;
 	if (w < 160 || h < 90) { why = "the frame is too small"; return false; }
 	try {
 		double a, v;
@@ -424,13 +495,13 @@ bool GpuVmaf::supported(const std::string& model_path, int w, int h, int depth, 
 	return true;
 }
 
-std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::string& model_path, int w, int h, int depth, std::string& why) {
-	if (!supported(model_path, w, h, depth, why)) return nullptr;
+std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::string& model_path, int device, int w, int h, int depth, std::string& why) {
+	if (!supported(model_path, device, w, h, depth, why)) return nullptr;
 	std::unique_ptr<GpuVmaf> g(new GpuVmaf);
 	try {
 		double adm_egl, vif_egl;
 		g->impl->model = load_model(model_path, adm_egl, vif_egl);
-		g->impl->gpu = std::make_unique<VkVmaf>(w, h, depth, adm_egl, vif_egl);
+		g->impl->gpu = std::make_unique<VkVmaf>(device, w, h, depth, adm_egl, vif_egl);
 	} catch (const std::exception& e) {
 		why = e.what();
 		return nullptr;
@@ -470,8 +541,8 @@ bool GpuVmaf::finish(std::vector<double>& scores) {
 
 GpuVmaf::GpuVmaf() : impl(nullptr) {}
 GpuVmaf::~GpuVmaf() {}
-bool GpuVmaf::supported(const std::string&, int, int, int, std::string& why) { why = "built without Vulkan"; return false; }
-std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::string&, int, int, int, std::string& why) { why = "built without Vulkan"; return nullptr; }
+bool GpuVmaf::supported(const std::string&, int, int, int, int, std::string& why) { why = "built without Vulkan"; return false; }
+std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::string&, int, int, int, int, std::string& why) { why = "built without Vulkan"; return nullptr; }
 bool GpuVmaf::add(const uint8_t*, size_t, const uint8_t*, size_t) { return false; }
 bool GpuVmaf::finish(std::vector<double>&) { return false; }
 

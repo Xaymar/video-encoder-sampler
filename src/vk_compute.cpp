@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 
@@ -17,7 +18,7 @@
 #include "shaders_spv.h"
 
 #define VK_FUNCS(X) \
-	X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) \
+	X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) \
 	X(vkGetPhysicalDeviceFeatures) X(vkCreateDevice) X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
 	X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkCreateShaderModule) X(vkCreateDescriptorSetLayout) \
 	X(vkCreatePipelineLayout) X(vkCreateComputePipelines) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) \
@@ -37,11 +38,19 @@ void chk(VkResult r, const char* what) {
 	if (r != VK_SUCCESS) throw std::runtime_error(std::string("Vulkan: ") + what + " failed (" + std::to_string((int)r) + ")");
 }
 
-// The device, shared by every user.
+// The instance and the list of devices, made once.
+struct Instance {
+	bool tried = false, ok = false;
+	std::string why;
+	VkInstance inst{};
+	std::vector<VkPhysicalDevice> phys;
+	std::vector<VkDeviceInfo> info;
+};
+
+// One device, shared by every user of it; made the first time it is asked for.
 struct Shared {
 	bool tried = false, ok = false;
 	std::string why, name;
-	VkInstance inst{};
 	VkPhysicalDevice phys{};
 	VkDevice dev{};
 	VkQueue queue{};
@@ -51,14 +60,11 @@ struct Shared {
 	VkPipelineLayout layout{};
 	std::mutex queue_lock, pipe_lock;
 	std::map<std::string, VkPipeline> pipelines;
-	int gpu = -1;
 };
 
-Shared& shared() {
-	static Shared s;
-	return s;
-}
 std::mutex init_lock;
+Instance instance;
+std::map<int, std::unique_ptr<Shared>> devices_up;
 
 bool load_loader(PFN_vkGetInstanceProcAddr& gipa, std::string& why) {
 #ifdef _WIN32
@@ -74,43 +80,68 @@ bool load_loader(PFN_vkGetInstanceProcAddr& gipa, std::string& why) {
 	return true;
 }
 
-// Brings the device up once; later calls return the first outcome.
-bool bring_up(int gpu, std::string& why) {
-	std::lock_guard lock(init_lock);
-	Shared& s = shared();
-	if (s.tried) { why = s.why; return s.ok; }
-	s.tried = true;
-	s.gpu = gpu;
+// Loads Vulkan and lists its devices once; init_lock must be held.
+bool instance_up(std::string& why) {
+	Instance& in = instance;
+	if (in.tried) { why = in.why; return in.ok; }
+	in.tried = true;
 	try {
 		PFN_vkGetInstanceProcAddr gipa = nullptr;
-		if (!load_loader(gipa, s.why)) return false;
+		if (!load_loader(gipa, in.why)) { why = in.why; return false; }
 		auto create_instance = (PFN_vkCreateInstance)gipa(nullptr, "vkCreateInstance");
 		VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
 		ai.apiVersion = VK_API_VERSION_1_2;
 		VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
 		ici.pApplicationInfo = &ai;
-		chk(create_instance(&ici, nullptr, &s.inst), "vkCreateInstance");
-#define X(n) n = (PFN_##n)gipa(s.inst, #n);
+		chk(create_instance(&ici, nullptr, &in.inst), "vkCreateInstance");
+#define X(n) n = (PFN_##n)gipa(in.inst, #n);
 		VK_FUNCS(X)
 #undef X
 		uint32_t n = 0;
-		vkEnumeratePhysicalDevices(s.inst, &n, nullptr);
-		std::vector<VkPhysicalDevice> devs(n);
-		vkEnumeratePhysicalDevices(s.inst, &n, devs.data());
-		int pick = -1;
-		for (uint32_t i = 0; i < n && pick < 0; i++) {
-			VkPhysicalDeviceProperties p;
-			vkGetPhysicalDeviceProperties(devs[i], &p);
+		vkEnumeratePhysicalDevices(in.inst, &n, nullptr);
+		in.phys.resize(n);
+		vkEnumeratePhysicalDevices(in.inst, &n, in.phys.data());
+		in.phys.resize(n);
+		for (uint32_t i = 0; i < n; i++) {
+			VkPhysicalDeviceIDProperties idp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+			VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+			p2.pNext = &idp;
+			if (vkGetPhysicalDeviceProperties2) vkGetPhysicalDeviceProperties2(in.phys[i], &p2);
+			else vkGetPhysicalDeviceProperties(in.phys[i], &p2.properties);
 			VkPhysicalDeviceFeatures f;
-			vkGetPhysicalDeviceFeatures(devs[i], &f);
-			const bool wanted = gpu < 0 ? p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU : (int)i == gpu;
-			if (wanted && f.shaderInt64 && f.shaderFloat64) pick = (int)i;
+			vkGetPhysicalDeviceFeatures(in.phys[i], &f);
+			VkDeviceInfo d;
+			d.index = (int)i;
+			d.name = p2.properties.deviceName;
+			d.discrete = p2.properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+			d.usable = f.shaderInt64 && f.shaderFloat64;
+			d.vendor_id = p2.properties.vendorID;
+			d.device_id = p2.properties.deviceID;
+			if (vkGetPhysicalDeviceProperties2 && idp.deviceLUIDValid) { memcpy(&d.luid, idp.deviceLUID, sizeof d.luid); d.luid_valid = true; }
+			in.info.push_back(d);
 		}
-		if (pick < 0) { s.why = gpu < 0 ? "no discrete Vulkan GPU with 64 bit integer and float support" : "the chosen Vulkan device is missing or lacks 64 bit integer and float support"; return false; }
-		s.phys = devs[pick];
-		VkPhysicalDeviceProperties props;
-		vkGetPhysicalDeviceProperties(s.phys, &props);
-		s.name = props.deviceName;
+		in.ok = true;
+	} catch (const std::exception& e) {
+		in.why = e.what();
+	}
+	why = in.why;
+	return in.ok;
+}
+
+// Brings device `index` up once; later calls return the first outcome. nullptr (and `why`) if it cannot be had.
+Shared* bring_up(int index, std::string& why) {
+	std::lock_guard lock(init_lock);
+	if (!instance_up(why)) return nullptr;
+	if (index < 0 || index >= (int)instance.info.size()) { why = "there is no Vulkan device " + std::to_string(index); return nullptr; }
+	auto& slot = devices_up[index];
+	if (!slot) slot = std::make_unique<Shared>();
+	Shared& s = *slot;
+	if (s.tried) { why = s.why; return s.ok ? &s : nullptr; }
+	s.tried = true;
+	try {
+		if (!instance.info[index].usable) throw std::runtime_error("Vulkan device " + std::to_string(index) + " (" + instance.info[index].name + ") lacks 64 bit integer and float support");
+		s.phys = instance.phys[index];
+		s.name = instance.info[index].name;
 		vkGetPhysicalDeviceMemoryProperties(s.phys, &s.mem);
 		uint32_t qn = 0;
 		vkGetPhysicalDeviceQueueFamilyProperties(s.phys, &qn, nullptr);
@@ -118,7 +149,7 @@ bool bring_up(int gpu, std::string& why) {
 		vkGetPhysicalDeviceQueueFamilyProperties(s.phys, &qn, qf.data());
 		bool found = false;
 		for (uint32_t i = 0; i < qn; i++) if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { s.family = i; found = true; break; }
-		if (!found) { s.why = "no compute queue"; return false; }
+		if (!found) throw std::runtime_error("no compute queue");
 		float prio = 1.0f;
 		VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
 		qci.queueFamilyIndex = s.family;
@@ -152,12 +183,13 @@ bool bring_up(int gpu, std::string& why) {
 		s.ok = false;
 	}
 	why = s.why;
-	return s.ok;
+	return s.ok ? &s : nullptr;
 }
 
 } // namespace
 
 struct Vk::Impl {
+	Shared* s = nullptr;
 	VkCommandPool pool{};
 	VkCommandBuffer cmd{};
 	VkFence fence{};
@@ -165,14 +197,19 @@ struct Vk::Impl {
 	std::vector<std::pair<VkBuffer, VkDeviceMemory>> owned;
 };
 
-bool Vk::available(std::string& why, int gpu) { return bring_up(gpu, why); }
+std::vector<VkDeviceInfo> Vk::devices(std::string& why) {
+	std::lock_guard lock(init_lock);
+	if (!instance_up(why)) return {};
+	return instance.info;
+}
 
-std::string Vk::device_name() { return shared().name; }
+bool Vk::available(int device, std::string& why) { return bring_up(device, why) != nullptr; }
 
-Vk::Vk() : impl(new Impl) {
+Vk::Vk(int device) : impl(new Impl) {
 	std::string why;
-	if (!bring_up(-1, why)) { delete impl; throw std::runtime_error("Vulkan: " + why); }
-	Shared& s = shared();
+	impl->s = bring_up(device, why);
+	if (!impl->s) { delete impl; impl = nullptr; throw std::runtime_error("Vulkan: " + why); }
+	Shared& s = *impl->s;
 	try {
 		VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * 128};
 		VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
@@ -201,7 +238,7 @@ Vk::~Vk() { release(); }
 
 void Vk::release() {
 	if (!impl) return;
-	Shared& s = shared();
+	Shared& s = *impl->s;
 	if (impl->fence) vkDestroyFence(s.dev, impl->fence, nullptr);
 	if (impl->pool) vkDestroyCommandPool(s.dev, impl->pool, nullptr);
 	if (impl->dpool) vkDestroyDescriptorPool(s.dev, impl->dpool, nullptr);
@@ -211,7 +248,7 @@ void Vk::release() {
 }
 
 Buf Vk::buffer(VkDeviceSize size, int kind) {
-	Shared& s = shared();
+	Shared& s = *impl->s;
 	Buf b;
 	b.size = size;
 	VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
@@ -243,7 +280,7 @@ Buf Vk::buffer(VkDeviceSize size, int kind) {
 }
 
 Pipe Vk::pipeline(const char* name, const std::vector<Buf*>& bindings) {
-	Shared& s = shared();
+	Shared& s = *impl->s;
 	Pipe p;
 	{
 		std::lock_guard lock(s.pipe_lock);
@@ -297,10 +334,10 @@ void Vk::begin() {
 
 void Vk::bind(const Pipe& p) {
 	vkCmdBindPipeline(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
-	vkCmdBindDescriptorSets(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, shared().layout, 0, 1, &p.set, 0, nullptr);
+	vkCmdBindDescriptorSets(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, impl->s->layout, 0, 1, &p.set, 0, nullptr);
 }
 
-void Vk::push(const void* data, uint32_t size) { vkCmdPushConstants(impl->cmd, shared().layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, size, data); }
+void Vk::push(const void* data, uint32_t size) { vkCmdPushConstants(impl->cmd, impl->s->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, size, data); }
 
 void Vk::dispatch(uint32_t x, uint32_t y) { vkCmdDispatch(impl->cmd, x, y, 1); }
 
@@ -313,7 +350,7 @@ void Vk::barrier() {
 }
 
 void Vk::submit_wait() {
-	Shared& s = shared();
+	Shared& s = *impl->s;
 	chk(vkEndCommandBuffer(impl->cmd), "end");
 	VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
 	si.commandBufferCount = 1;

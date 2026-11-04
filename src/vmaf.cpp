@@ -6,8 +6,11 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
+#include <set>
 
 #include "decode.h"
+#include "vk_compute.h"
 #include "vk_vmaf.h"
 
 extern "C" {
@@ -113,7 +116,16 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 		std::unique_ptr<GpuVmaf> gpu;
 		if ((score_fmt.depth != 8 && score_fmt.depth != 10) || !score_fmt.planar || score_fmt.rgb) why = "only 8 and 10 bit YUV is supported";
 		else if (opt.model.rfind("path=", 0) != 0) why = "the model is not a file";
-		else gpu = GpuVmaf::create(opt.model.substr(5), ref.width, ref.height, score_fmt.depth, why);
+		else if (const int device = GpuVmaf::pick_device(opt.gpu, opt.encoder_vendor, opt.encoder_gpu, why); device >= 0) {
+			gpu = GpuVmaf::create(opt.model.substr(5), device, ref.width, ref.height, score_fmt.depth, why);
+			if (gpu) { // say once for each device which one scores
+				static std::mutex m;
+				static std::set<int> told;
+				std::lock_guard lock(m);
+				std::string e;
+				if (told.insert(device).second) fprintf(stderr, "vmaf: scoring on Vulkan device %d (%s)\n", device, Vk::devices(e)[device].name.c_str());
+			}
+		}
 		if (gpu) scorer = std::make_unique<GpuScorer>(std::move(gpu), ref.width, ref.height);
 		else if (opt.device == "gpu") { fprintf(stderr, "vmaf: GPU scoring is not possible: %s\n", why.c_str()); ok = false; }
 		else {

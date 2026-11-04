@@ -1,9 +1,20 @@
 #pragma once
-// A minimal Vulkan compute layer for the GPU VMAF scorer (vk_vmaf.cpp). One Vulkan device is shared by every scorer in the process; each `Vk`
-// object is one user of it, with its own buffers, descriptor sets and command buffer, all released when it goes away.
+// A minimal Vulkan compute layer for the GPU VMAF scorer (vk_vmaf.cpp). Each Vulkan device that is used is brought up once and shared by every
+// scorer in the process that uses it; each `Vk` object is one user of one device, with its own buffers, descriptor sets and command buffer, all released when it goes away.
 #include <cstdint>
 #include <string>
 #include <vector>
+
+// A Vulkan device as the loader lists it.
+struct VkDeviceInfo {
+	int index = 0;                 // in the loader's order: what a number in vmaf.gpu means
+	std::string name;
+	bool discrete = false;
+	bool usable = false;           // has the 64 bit integers and floats the scorer needs
+	uint32_t vendor_id = 0, device_id = 0;
+	uint64_t luid = 0;             // the adapter LUID (Windows), the same number as GpuInfo::luid
+	bool luid_valid = false;
+};
 
 #ifndef VES_NO_VULKAN
 #define VK_NO_PROTOTYPES
@@ -23,11 +34,12 @@ struct Pipe {
 
 class Vk {
 public:
-	// Whether the device can run the scorer (a GPU with 64 bit integers and floats); `why` says what is missing when it cannot. `gpu`: index among the Vulkan devices, -1 for the first discrete one.
-	static bool available(std::string& why, int gpu = -1);
-	static std::string device_name();
+	// Every Vulkan device; empty (and `why`) when Vulkan cannot be loaded.
+	static std::vector<VkDeviceInfo> devices(std::string& why);
+	// Whether device `device` (an index into devices()) can run the scorer; `why` says what is missing when it cannot.
+	static bool available(int device, std::string& why);
 
-	Vk();   // throws std::runtime_error if the device cannot be had
+	explicit Vk(int device); // throws std::runtime_error if the device cannot be had
 	~Vk();
 	Vk(const Vk&) = delete;
 	Vk& operator=(const Vk&) = delete;
@@ -51,7 +63,7 @@ private:
 #else
 class Vk {
 public:
-	static bool available(std::string& why, int = -1) { why = "built without Vulkan"; return false; }
-	static std::string device_name() { return ""; }
+	static std::vector<VkDeviceInfo> devices(std::string& why) { why = "built without Vulkan"; return {}; }
+	static bool available(int, std::string& why) { why = "built without Vulkan"; return false; }
 };
 #endif

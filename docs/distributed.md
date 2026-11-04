@@ -61,10 +61,11 @@ config file, `ves --worker worker.jsonc`:
 ```
 
 * A resource that is left out is detected and gets the default: 1 encode on the CPU, 2 on a GPU. `"parallel": 0` does not offer it. `--worker-jobs N` changes the default.
-* Scoring is not counted: it runs on the GPU (`vmaf.device`) and costs little next to an encode.
+* Scoring is not counted: it runs on the GPU (`vmaf.device`) and costs little next to an encode. Each worker picks its own scoring GPU: by default the GPU that encodes the job,
+  else its first discrete GPU; `--vmaf-gpu <n|name>` on the worker, or `"vmaf_gpu"` in its file, picks another (`ves --vmaf-gpu list` shows the devices). The host's `vmaf.gpu` is not sent.
 * A job with several runs (option combinations) takes that many of its resource's encodes, at most all of them, and the worker runs them at the same time. A job waits when its resource has
   too few free, while other resources of the worker keep working, so a worker with an NVIDIA and an AMD GPU uses both.
-* `host`, `token`, `dir` and `gpu` in the file are the same as `--worker host:port`, `--token`, `--worker-dir` and `--worker-gpu`; the flags win. `ves --worker host:port` with no file offers everything detected.
+* `host`, `token`, `dir`, `gpu` and `vmaf_gpu` in the file are the same as `--worker host:port`, `--token`, `--worker-dir`, `--worker-gpu` and `--vmaf-gpu`; the flags win. `ves --worker host:port` with no file offers everything detected.
 * Several jobs that need the same input fetch it once.
 * A worker names its result files and the input's folder by hashes (`--short-names`), so the path stays far below the 260 characters Windows allows however long the input's name or a run's label is. The host matches the results by their options and stores them under its own readable names.
 * A job holds only the runs the host still lacks (the rest are in its output folder or cache from earlier sweeps); the worker leaves the others out, so a re-run does not redo finished work.
