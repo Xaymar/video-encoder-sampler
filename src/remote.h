@@ -60,6 +60,9 @@ private:
 // The path of this program.
 std::string executable_path();
 
+// Ends this process at once, after flushing stdout and stderr: nothing is wound down, not even the loaded DLLs (for `ves --probe-amf`, see probe_amf).
+[[noreturn]] void exit_now(int code);
+
 // The option line of a run's key without the GPU index: what tells the runs of one job apart on the host and on the worker that runs them.
 std::string run_options_of(const std::string& key);
 

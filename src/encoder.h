@@ -56,6 +56,7 @@ std::string nvenc_caps_json(const std::string& codec, int gpu);
 std::string amf_caps_json(const std::string& codec, int gpu = 0); // where the encoder runs (hardware, GPU compute, software) and the SDK's capability values of AMD GPU `gpu`
 inline std::string encoder_caps_json(const std::string& encoder, const std::string& codec, int gpu) { return encoder == "nvenc" ? nvenc_caps_json(codec, gpu) : encoder == "amf" ? amf_caps_json(codec, gpu) : "null"; }
 bool amf_supports(const std::string& codec, int chroma, int depth, int gpu = 0);
+bool amf_probe(const std::string& codec, int gpu, std::string& caps); // for `ves --probe-amf`: one encoder opened, its failures said on stderr
 bool qsv_supports(const std::string& codec, int chroma, int depth);
 
 inline bool is_gpu_encoder(const std::string& name) { return name == "nvenc" || name == "amf" || name == "qsv"; }
