@@ -27,6 +27,7 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "cache.h"
 #include "hash.h"
@@ -852,7 +853,13 @@ int main(int argc, char** argv) {
 		Codec id;
 		const Options* opts = nullptr;   // its encoder options: the variant's, shared by every run of it (a task is made millions of times for a big config)
 		bool ok = false;
-		std::string key, pool; // what the run's outcome depends on (see cache_key); the pool it counts against
+		// What the run's outcome depends on (see cache_key), put together when it is needed: a big config plans hundreds of thousands of runs, and the parts are
+		// shared by the runs of an input, size and bit rate (head, and the run's part with the settings) and by the runs of a variant (its options).
+		struct KeyParts { std::string head, run_tail; };
+		std::shared_ptr<const KeyParts> key_parts;
+		const std::string* variant_key = nullptr;
+		std::string key() const { return key_parts->head + *variant_key + key_parts->run_tail; }
+		std::string pool; // the pool it counts against
 		std::string result_file; // where its result is kept, and looked for when the same run comes up again; empty: not at all
 		Plan plan;
 		bool done = false;               // finished, however it came about
@@ -1057,8 +1064,9 @@ int main(int argc, char** argv) {
 						if (shape.fps.num) head += " @" + std::to_string(shape.fps.value()).substr(0, 6);
 						const std::string key_run_text = key_run(br, kf, shape);
 						const std::string group_head = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|";
+						const auto key_parts = std::make_shared<const Task::KeyParts>(Task::KeyParts{key_head, key_run_text + key_tail});
 						// Makes the run of one variant. A lazy group keeps it, to make more runs later.
-						auto make_task = [jobp = &job, scp = &sc, shape_i = (size_t)(&shape - sc.shapes.data()), id, input, br, kf, shape, head, key_head, key_run_text, kf_text, group_head, folder, folder_path, folder_made, &tasks, &cfg, &key_tail](const Variant& v, LazyGroup* lg, ComboTable::Id combo) {
+						auto make_task = [jobp = &job, scp = &sc, shape_i = (size_t)(&shape - sc.shapes.data()), id, input, br, kf, shape, head, key_parts, kf_text, group_head, folder, folder_path, folder_made, &tasks, &cfg](const Variant& v, LazyGroup* lg, ComboTable::Id combo) {
 							const Job& job = *jobp;
 							Task t;
 							t.job = jobp; t.id = id; t.sc = scp; t.shape_i = shape_i; t.model = v.model;
@@ -1068,10 +1076,11 @@ int main(int argc, char** argv) {
 							t.r.encoder = job.encoder; t.r.codec = job.codec; t.r.options = &v.opts;
 							// The run's result (.json) and stream (.mp4) share a name made from the run and a hash of everything its outcome depends on, so a
 							// run that comes up again finds its result straight away. They go to the output folder; without one, results are kept in the cache.
-							t.key = key_head + v.key + key_run_text + key_tail;
-							if (cfg.only_runs_set && !cfg.only_runs.count(run_options_of(t.key))) return false; // the host has this one already
+							t.key_parts = key_parts; t.variant_key = &v.key;
+							const std::string key = t.key();
+							if (cfg.only_runs_set && !cfg.only_runs.count(run_options_of(key))) return false; // the host has this one already
 							if (!cfg.output_dir.empty()) {
-								const std::string base = cfg.short_names ? key_hash(t.key).substr(0, 16) : result_name(t.r.label + " " + std::to_string(br) + "k kf" + kf_text, t.key);
+								const std::string base = cfg.short_names ? key_hash(key).substr(0, 16) : result_name(t.r.label + " " + std::to_string(br) + "k kf" + kf_text, key);
 								t.result_file = folder_path + base + ".json";
 								t.r.result = folder + "/" + base + ".json";
 								if (cfg.save_videos) {
@@ -1079,7 +1088,7 @@ int main(int argc, char** argv) {
 									t.r.video_file = folder_path + base + ".mp4";
 								}
 								if (!*folder_made) { std::error_code ec; fs::create_directories(fs::path(cfg.output_dir) / folder, ec); *folder_made = true; }
-							} else if (!cfg.cache_dir.empty()) t.result_file = (fs::path(cfg.cache_dir) / "results" / (key_hash(t.key) + ".json")).string();
+							} else if (!cfg.cache_dir.empty()) t.result_file = (fs::path(cfg.cache_dir) / "results" / (key_hash(key) + ".json")).string();
 							t.r.group = group_head + v.gpu_index + (v.model.empty() ? std::string() : "|" + v.model);
 							t.r.gpu = v.gpu; t.r.gpu_json = v.gpu_json; t.r.caps_json = v.caps_json;
 							t.pool = v.pool->name;
@@ -1148,6 +1157,31 @@ int main(int argc, char** argv) {
 		ui::log(text);
 	}
 
+	// Which result files there are, by folder: one listing of a folder instead of opening the result file of every run (a big config plans hundreds of
+	// thousands of runs per input, and on Windows each open of a file that is not there costs about as much as listing a folder). A result written by this
+	// process is added; the listings are dropped when the workers have sent theirs and when the next input comes up, so files written meanwhile are seen.
+	std::unordered_map<std::string, std::unordered_set<std::string>> result_dirs;
+	auto split_file = [](const std::string& file) {
+		const size_t cut = file.find_last_of("/\\");
+		return cut == std::string::npos ? std::make_pair(std::string("."), file) : std::make_pair(file.substr(0, cut), file.substr(cut + 1));
+	};
+	auto result_listed = [&](const std::string& file) {
+		auto [dir, name] = split_file(file);
+		auto it = result_dirs.find(dir);
+		if (it == result_dirs.end()) {
+			std::unordered_set<std::string> names;
+			std::error_code ec;
+			for (fs::directory_iterator e(dir, ec), end; !ec && e != end; e.increment(ec)) names.insert(e->path().filename().string());
+			it = result_dirs.emplace(dir, std::move(names)).first;
+		}
+		return it->second.count(name) != 0;
+	};
+	auto store_result = [&](const Task& t, const std::string& file, const CachedRun& run, const std::string& details) {
+		result_store(file, t.key(), run, details);
+		auto [dir, name] = split_file(file);
+		if (auto it = result_dirs.find(dir); it != result_dirs.end()) it->second.insert(name);
+	};
+
 	// A run is finished when its result is known, however it came about: print it, count it.
 	std::atomic<int> finished{0};
 	ui::overall(0, total);
@@ -1212,7 +1246,7 @@ int main(int argc, char** argv) {
 		std::vector<double> sc = r.scores;
 		std::sort(sc.begin(), sc.end());
 		const double mean = std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size();
-		if (!t.result_file.empty() && (!r.cached || r.imported)) result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
+		if (!t.result_file.empty() && (!r.cached || r.imported)) store_result(t, t.result_file, CachedRun{r.kbps, r.scores}, run_details(t));
 		if (uploader && !r.result.empty() && !r.uploaded && (r.video_sha256.empty() || sent_streams.insert(r.group + "|" + r.video_sha256).second)) {
 			UploadItem it;
 			it.result_file = (fs::path(cfg.output_dir) / r.result).string();
@@ -1305,7 +1339,7 @@ int main(int argc, char** argv) {
 		std::vector<std::string> order;
 		std::map<std::string, std::vector<std::pair<Options, Shape>>> job_runs; // the options and size of each run of a job, for telling whether the input allows any
 		for (auto& t : tasks) {
-			if (t.result_file.empty() || fs::exists(t.result_file)) continue;
+			if (t.result_file.empty() || result_listed(t.result_file)) continue;
 			const std::string g = t.r.input + "|" + std::to_string(t.job - cfg.jobs.data()) + "|" + std::to_string(t.sc - cfg.scenarios.data()) + "|" + std::to_string(t.r.bitrate) + "|" +
 			                      std::to_string(t.r.kf) + "|" + std::to_string(t.shape_i) + "|" + t.model;
 			auto it = groups.find(g);
@@ -1321,7 +1355,7 @@ int main(int argc, char** argv) {
 				order.push_back(g);
 				it = groups.emplace(g, std::move(spec)).first;
 			}
-			it->second.runs.push_back({t.result_file, t.key});
+			it->second.runs.push_back({t.result_file, t.key()});
 			asked.push_back(&t);
 			job_runs[g].push_back({*t.opts, t.r.shape});
 		}
@@ -1365,9 +1399,9 @@ int main(int argc, char** argv) {
 			if (it == by_file.end()) return;
 			Task& t = *it->second;
 			CachedRun hit;
-			if (!result_load(file, t.key, hit)) return;
+			if (!result_load(file, t.key(), hit)) return;
 			t.r.kbps = hit.kbps; t.r.scores = std::move(hit.scores);
-			result_store(file, t.key, CachedRun{t.r.kbps, t.r.scores}, run_details(t));
+			store_result(t, file, CachedRun{t.r.kbps, t.r.scores}, run_details(t));
 			t.r.imported = false; // already rewritten
 			if (uploader && !t.r.result.empty()) {
 				UploadItem it2;
@@ -1379,6 +1413,7 @@ int main(int argc, char** argv) {
 		});
 		ui::log("remote: " + std::to_string(stored) + " results from the workers");
 		for (Task* t : asked) t->r.imported = fs::exists(t->result_file);
+		result_dirs.clear(); // the workers' results are there now
 	}
 
 	// Whatever cannot work, or was done before, is finished right away. The rest is sorted by the frames it needs: runs with the
@@ -1391,10 +1426,9 @@ int main(int argc, char** argv) {
 		char tag[48];
 		snprintf(tag, sizeof tag, "[run %zu/%d]", i + 1, total);
 		r.tag = tag;
-		r.progress = std::make_shared<RunProgress>();
-		if (!t.result_file.empty()) {
+		if (!t.result_file.empty() && result_listed(t.result_file)) {
 			CachedRun hit;
-			if (result_load(t.result_file, t.key, hit)) {
+			if (result_load(t.result_file, t.key(), hit)) {
 				r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.video_sha256 = hit.video_sha256; r.cached = t.ok = true;
 				if (!hit.reference_sha256.empty()) reference_hashes.emplace(r.input, hit.reference_sha256); // known: the file is not needed to say it
 				if (!r.shape.w && hit.width > 0 && hit.height > 0 && hit.fps > 0) { // the geometry the run was encoded at, for the summary: from its result file
@@ -1409,7 +1443,7 @@ int main(int argc, char** argv) {
 				// Result files from before the hashes existed get them now, as far as the files they describe are still there.
 				const bool new_video_hash = r.video_sha256.empty() && have_video && !(r.video_sha256 = sha256_file(r.video_file)).empty();
 				if ((new_video_hash || hit.reference_sha256.empty() || hit.input != file_name(r.input) || (hit.width <= 0 && r.shape.w > 0)) && !reference_hash(r.input).empty())
-					result_store(t.result_file, t.key, CachedRun{r.kbps, r.scores}, run_details(t));
+					store_result(t, t.result_file, CachedRun{r.kbps, r.scores}, run_details(t));
 				r.video_file.clear();
 				finish(t);
 				return true;
@@ -1543,6 +1577,7 @@ int main(int argc, char** argv) {
 	}();
 	for (const std::string& input_name : input_order) {
 	if (created_inputs.insert(input_name).second) { // lazy planning: the runs of this input are made now
+		result_dirs.clear();
 		const size_t first = tasks.size();
 		create_input_tasks(input_name);
 		total = (int)tasks.size();
@@ -1613,6 +1648,7 @@ int main(int argc, char** argv) {
 				Task& t = *wave[i];
 				WaveRun& run = wr[i];
 				EncodeJob& ej = run.enc;
+				t.r.progress = std::make_shared<RunProgress>();
 				t.r.score_progress = std::make_shared<RunProgress>();
 				ej.encoder = t.job->encoder; ej.codec = t.job->codec; ej.plan = &t.plan;
 				ej.bitrate = t.r.bitrate * 1000; ej.kf = t.r.kf; ej.rp = t.r.progress.get();
