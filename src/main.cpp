@@ -811,6 +811,7 @@ int main(int argc, char** argv) {
 		std::string caps;
 		amf_dedicate_process(atoi(argv[3]));
 		const bool ok = amf_probe(argv[2], atoi(argv[3]), caps);
+		if (!amf_runtime().empty()) printf("runtime %s\n", amf_runtime().c_str());
 		if (ok) printf("ok %s\n", caps.c_str()); else printf("no\n");
 		exit_now(0);
 	}

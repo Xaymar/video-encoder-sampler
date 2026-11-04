@@ -59,6 +59,7 @@ std::string amf_caps_json(const std::string& codec, int gpu = 0); // where the e
 std::string encoder_caps_json(const std::string& encoder, const std::string& codec, int gpu);
 bool amf_supports(const std::string& codec, int chroma, int depth, int gpu = 0);
 bool amf_probe(const std::string& codec, int gpu, std::string& caps); // for `ves --probe-amf`: one encoder opened, its failures said on stderr
+std::string amf_runtime(); // in such a process, which AMF runtime it loaded ("1.4.24 from <path>"); empty before one was loaded
 void amf_dedicate_process(int gpu); // this process serves only AMD GPU `gpu` (an encoder process, a probe): AMF's runtime comes from that GPU's own driver package
 bool qsv_supports(const std::string& codec, int chroma, int depth);
 
