@@ -23,3 +23,6 @@ public:
 };
 
 std::unique_ptr<Converter> make_converter(); // libplacebo, on the GPU through Vulkan
+// Converts a small known picture on the device `opt` names and checks what comes back: some drivers hand back nothing but zeros (an AMD Vega iGPU gave an all-green
+// video) without reporting an error. False, with what was wrong in `why`, when the device cannot be trusted with frames.
+bool converter_works(const ScaleOptions& opt, std::string& why);
