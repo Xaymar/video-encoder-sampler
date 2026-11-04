@@ -72,6 +72,7 @@ struct EncodeJob {
 	std::function<bool(const uint8_t*, size_t)> tee; // also gets every packet as it arrives (for scoring); false once nobody wants them
 	double kbps = 0;
 	bool ok = false;
+	std::string error;    // why it failed, when it ran in an encoder process: what that process printed while it ran (see encoder_process.h)
 	bool crashed = false; // the process it ran in ended under it (another run in that process may be what crashed it; see encoder_process.h)
 };
 

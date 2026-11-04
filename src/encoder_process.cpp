@@ -339,6 +339,28 @@ struct Device {
 	std::map<uint32_t, Waiter*> waiters;
 	uint32_t next_id = 1;
 	std::thread reader, errors;
+	// The last lines the process printed, numbered, so that a wave can tell which came while it ran: they are why its runs failed.
+	std::mutex lines_m;
+	std::deque<std::string> lines;
+	uint64_t line_count = 0;
+	uint64_t lines_so_far() {
+		std::lock_guard lock(lines_m);
+		return line_count;
+	}
+	std::string lines_since(uint64_t from) { // FFmpeg's own lines ("[h264_cuvid @ ...] ...") only when there is nothing else
+		std::lock_guard lock(lines_m);
+		const uint64_t first = line_count - lines.size();
+		std::vector<std::string> own, all;
+		for (uint64_t i = std::max(from, first); i < line_count; i++) {
+			const std::string& l = lines[(size_t)(i - first)];
+			all.push_back(l);
+			if (l[0] != '[' && l.rfind("hardware decoding", 0) != 0) own.push_back(l);
+		}
+		const auto& pick = own.empty() ? all : own;
+		std::string s;
+		for (size_t i = pick.size() > 4 ? pick.size() - 4 : 0; i < pick.size(); i++) s += (s.empty() ? "" : "; ") + pick[i];
+		return s;
+	}
 
 	bool send(uint8_t type, uint32_t id, const std::string& body) { return proc.write(header(type, id, body.size()), body); }
 
@@ -402,10 +424,17 @@ struct Device {
 				std::string line = pending.substr(0, at);
 				pending.erase(0, at + 1);
 				if (!line.empty() && line.back() == '\r') line.pop_back();
-				if (!line.empty()) fprintf(stderr, "[%s] %s\n", name.c_str(), line.c_str());
+				if (!line.empty()) keep(line);
 			}
 		}
-		if (!pending.empty()) fprintf(stderr, "[%s] %s\n", name.c_str(), pending.c_str());
+		if (!pending.empty()) keep(pending);
+	}
+	void keep(const std::string& line) {
+		ui::log("[" + name + "] " + line);
+		std::lock_guard lock(lines_m);
+		lines.push_back(line);
+		if (lines.size() > 64) lines.pop_front();
+		line_count++;
 	}
 
 	void stop() {
@@ -674,10 +703,18 @@ bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vect
 	std::vector<std::string> decoder_list;
 	std::vector<std::thread> threads;
 	for (auto& [where, part] : parts) threads.emplace_back([&, where = where, part = part] {
+		std::shared_ptr<Device> dev;
+		uint64_t first_line = 0;
+		auto why = [&](const std::string& fallback) {
+			std::string s = dev ? dev->lines_since(first_line) : std::string();
+			return s.empty() ? fallback : s;
+		};
 		auto fail_all = [&](bool crashed) {
+			const std::string error = why(!dev ? "its encoder process did not start" : crashed ? "its encoder process ended" : "its encoder process sent a garbled answer");
 			for (WaveRun* run : part) {
 				run->enc.ok = false;
 				run->enc.crashed = crashed;
+				run->enc.error = error;
 				run->score_ok = false;
 				if (run->enc.rp) { run->enc.rp->failed = true; run->enc.rp->finish(); }
 				if (run->score_rp) { run->score_rp->failed = true; run->score_rp->finish(); }
@@ -685,8 +722,9 @@ bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vect
 			std::lock_guard lock(m);
 			all_ok = false;
 		};
-		auto dev = device_for(where.first, where.second);
+		dev = device_for(where.first, where.second);
 		if (!dev) { fail_all(false); return; }
+		first_line = dev->lines_so_far();
 		Writer w;
 		w.str(input);
 		put(w, si);
@@ -737,6 +775,7 @@ bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vect
 			const uint32_t count = r.num<uint32_t>();
 			run->scores.clear();
 			for (uint32_t i = 0; i < count && r.ok; i++) run->scores.push_back(r.num<double>());
+			if (!ej.ok || !run->score_ok) ej.error = why(!ej.ok ? "the encoder failed and said nothing" : "scoring failed and said nothing");
 			if (ej.rp) { ej.rp->busy_ms = busy; ej.rp->starved_ms = starved; ej.rp->failed = !ej.ok; ej.rp->finish(); }
 			if (run->score_rp) { run->score_rp->starved_ms = score_starved; run->score_rp->failed = !run->score_ok; run->score_rp->finish(); }
 		}
