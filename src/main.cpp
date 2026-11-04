@@ -143,14 +143,72 @@ struct Run {
 };
 
 // What the GPU's encoder says it cannot do, against what a run asks of it: the reason the run cannot work there, or empty. Such a run is ignored, not failed.
-// AMF lists whether the encoder makes B-frames (H.264 "BFrames", AV1 "AV1BFrames"); a Vega-class GPU says no, and refuses any B-picture pattern.
-static std::string caps_refusal(const std::string& encoder, const std::string& codec, const Options& opts, const std::string& caps) {
-	if (encoder != "amf") return {};
-	auto wants = [&](const char* key) { auto it = opts.find(key); return it != opts.end() && atoi(it->second.c_str()) > 0; };
-	const char* cap = codec == "h264" ? "\"BFrames\":false" : codec == "av1" ? "\"AV1BFrames\":false" : nullptr;
-	if (cap && caps.find(cap) != std::string::npos && (wants("max_b_frames") || wants("b_pictures_pattern") || wants("max_consecutive_bpictures")))
-		return "this GPU's AMF encoder makes no B-frames (" + std::string(codec == "h264" ? "BFrames" : "AV1BFrames") + ": false)";
-	return {};
+// The capabilities are the ones the encoder reports about itself (encoder_caps_json: NVENC's NV_ENC_CAPS_*, AMF's caps properties).
+static std::string caps_refusal(const std::string& encoder, const std::string& codec, const Options& opts, const std::string* caps_text) {
+	if (!caps_text || *caps_text == "null" || caps_text->empty()) return {};
+	static std::mutex m;
+	static std::map<const std::string*, Json> parsed; // the texts are shared by every run on the GPU and live as long as the sweep
+	const Json* caps;
+	{
+		std::lock_guard lock(m);
+		auto it = parsed.find(caps_text);
+		if (it == parsed.end()) {
+			Json j;
+			try { j = Json::parse(*caps_text); } catch (const std::exception&) {}
+			it = parsed.emplace(caps_text, std::move(j)).first;
+		}
+		caps = &it->second;
+	}
+	auto cap = [&](const char* name, long long& v) {
+		const Json* c = caps->find(name);
+		if (!c || (c->type != Json::Num && c->type != Json::Bool)) return false;
+		v = atoll(c->s.c_str());
+		return true;
+	};
+	auto opt = [&](const char* key, std::string& v) { auto it = opts.find(key); if (it == opts.end()) return false; v = it->second; return true; };
+	auto num = [](const std::string& v) { return atoll(v.c_str()); };
+	std::string v;
+	long long c;
+	// An option that is on (above 0) where the capability is 0.
+	auto needs = [&](const char* key, const char* name) -> std::string {
+		if (opt(key, v) && num(v) > 0 && cap(name, c) && c == 0) return std::string(key) + "=" + v + " needs " + name + ", which this GPU's encoder does not have";
+		return {};
+	};
+	auto at_most = [&](const char* key, const char* name, long long add = 0) -> std::string {
+		if (opt(key, v) && cap(name, c) && num(v) + add > c) return std::string(key) + "=" + v + " is above this GPU's " + name + " (" + std::to_string(c) + ")";
+		return {};
+	};
+	auto in_range = [&](const char* key, const char* lo, const char* hi) -> std::string {
+		if (!opt(key, v)) return {};
+		if (cap(lo, c) && num(v) < c) return std::string(key) + "=" + v + " is below this GPU's " + lo + " (" + std::to_string(c) + ")";
+		if (cap(hi, c) && num(v) > c) return std::string(key) + "=" + v + " is above this GPU's " + hi + " (" + std::to_string(c) + ")";
+		return {};
+	};
+	std::string why;
+	auto first = [&](std::string w) { if (why.empty()) why = std::move(w); };
+	if (encoder == "nvenc") {
+		first(at_most("max_b_frames", "NUM_MAX_BFRAMES"));
+		first(needs("lookahead_frames", "SUPPORT_LOOKAHEAD"));
+		first(needs("lookahead_level", "SUPPORT_LOOKAHEAD_LEVEL"));
+		first(needs("temporal_aq", "SUPPORT_TEMPORAL_AQ"));
+		first(needs("hierarchical_p_frames", "SUPPORT_HIERARCHICAL_PFRAMES"));
+		first(needs("hierarchical_b_frames", "SUPPORT_HIERARCHICAL_BFRAMES"));
+		first(needs("enable_weighted_prediction", "SUPPORT_WEIGHTED_PREDICTION"));
+		first(needs("enable_uni_directional_b", "SUPPORT_UNIDIRECTIONAL_B"));
+		first(needs("tf_level", "SUPPORT_TEMPORAL_FILTER"));
+		first(at_most("num_ltr_frames", "NUM_MAX_LTR_FRAMES"));
+		// NV_ENC_CAPS_SUPPORT_BFRAME_REF_MODE: bit 0 each, bit 1 middle
+		if (opt("b_reference_mode", v) && (v == "each" || v == "middle") && cap("SUPPORT_BFRAME_REF_MODE", c) && !(c & (v == "each" ? 1 : 2)))
+			first("b_reference_mode=" + v + " is not in this GPU's SUPPORT_BFRAME_REF_MODE (" + std::to_string(c) + ")");
+	} else if (encoder == "amf") {
+		const bool h264 = codec == "h264", hevc = codec == "hevc", av1 = codec == "av1";
+		const char* bframes = h264 ? "BFrames" : av1 ? "AV1BFrames" : nullptr;
+		if (bframes) for (const char* key : {"max_b_frames", "b_pictures_pattern", "max_consecutive_bpictures"}) first(needs(key, bframes));
+		const char* lo = h264 ? "MinReferenceFrames" : hevc ? "HevcMinReferenceFrames" : nullptr;
+		const char* hi = h264 ? "MaxReferenceFrames" : hevc ? "HevcMaxReferenceFrames" : nullptr;
+		if (lo) for (const char* key : {"max_ref_frames", "max_num_ref_frames"}) first(in_range(key, lo, hi));
+	}
+	return why;
 }
 
 static std::vector<std::string> split(const std::string& s) {
@@ -1433,7 +1491,7 @@ int main(int argc, char** argv) {
 		for (size_t i : todo) {
 			Task& t = tasks[i];
 			if (t.done || t.result_file.empty() || result_listed(t.result_file)) continue;
-			if (std::string why = caps_refusal(t.job->encoder, t.job->codec, *t.opts, *t.r.caps_json); !why.empty()) { t.r.ignored = true; t.r.reason = why; finish(t); continue; }
+			if (std::string why = caps_refusal(t.job->encoder, t.job->codec, *t.opts, t.r.caps_json); !why.empty()) { t.r.ignored = true; t.r.reason = why; finish(t); continue; }
 			const std::string g = t.r.input + "|" + std::to_string(t.job - cfg.jobs.data()) + "|" + std::to_string(t.sc - cfg.scenarios.data()) + "|" + std::to_string(t.r.bitrate) + "|" +
 			                      std::to_string(t.r.kf) + "|" + std::to_string(t.shape_i) + "|" + t.model;
 			auto it = groups.find(g);
@@ -1692,7 +1750,7 @@ int main(int argc, char** argv) {
 		if (!src) { finish(t); continue; }
 		t.plan = make_plan(*src, t.job->encoder, t.job->codec, *t.opts, r.shape);
 		if (t.plan.ignored) { r.ignored = true; r.expected = t.plan.expected; r.reason = t.plan.reason; finish(t); continue; }
-		if (std::string why = caps_refusal(t.job->encoder, t.job->codec, *t.opts, *r.caps_json); !why.empty()) { r.ignored = true; r.reason = why; finish(t); continue; }
+		if (std::string why = caps_refusal(t.job->encoder, t.job->codec, *t.opts, r.caps_json); !why.empty()) { r.ignored = true; r.reason = why; finish(t); continue; }
 		fit_shape(t);
 		const std::string fk = r.input + "|" + t.plan.feed_key();
 		if (!by_feed.count(fk)) feed_order.push_back(fk);

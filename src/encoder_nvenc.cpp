@@ -365,7 +365,7 @@ public:
 			auto& c = cfg.encodeCodecConfig.h264Config;
 #define C(f) fields[snake_case(#f)] = [&](long long v) { c.f = (decltype(c.f))v; };
 #define CN(name, f) fields[name] = [&](long long v) { c.f = (decltype(c.f))v; };
-			C(hierarchicalBFrames) C(enableFillerDataInsertion) C(level) C(disableDeblockingFilterIDC) C(adaptiveTransformMode) C(bdirectMode)
+			C(hierarchicalPFrames) C(hierarchicalBFrames) C(enableFillerDataInsertion) C(level) C(disableDeblockingFilterIDC) C(adaptiveTransformMode) C(bdirectMode)
 			C(entropyCodingMode) C(tfLevel) CN("max_ref_frames_l0", numRefL0) CN("max_ref_frames_l1", numRefL1)
 #undef C
 		} else if (codec == NV_ENC_CODEC_HEVC_GUID) {
