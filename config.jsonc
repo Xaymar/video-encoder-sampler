@@ -106,6 +106,7 @@
 	// ---- Encoders -----------------------------------------------------------------------------------------------------------------
 	// Every option is a list of values and every combination is tested. Special values:
 	//   (null is not a value: it would mean "whatever the preset gives", which ves cannot know. To run without an option, leave it out.)
+	//   ""    leaves the option at the encoder's default (it is not passed on), so ["", "film"] tests no tune and film; for x264 and x265 that is how to run without a tune
 	//   []    ignores the option (as if it were not there), handy for switching one off without deleting it
 	// Option names are snake_case. Some are common: the same name and meaning for every encoder that can do them (an encoder that cannot fails the
 	// run with a message): max_b_frames, lookahead_frames, max_ref_frames, b_reference_mode (none | middle | each) and rate_control (cbr | vbr).

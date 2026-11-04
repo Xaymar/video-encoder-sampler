@@ -59,6 +59,8 @@ Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::str
 	// What the config asks for is used as is; what it leaves open follows the source, falling back to the closest thing the
 	// encoder takes: another chroma layout (4:2:0), then a lower depth.
 	Options o = options;
+	// An empty value means "leave it at the encoder's default" for every encoder (x264 and x265 read "tune": "" as no tune): the option is not passed on.
+	for (auto it = o.begin(); it != o.end();) it = it->second.empty() ? o.erase(it) : std::next(it);
 	const Fmt sf = src.fmt;
 	std::vector<int> chromas{sf.chroma, 420}, depths{sf.depth, 10, 8};
 	if (auto it = o.find("chroma"); it != o.end()) { chromas = {atoi(it->second.c_str())}; o.erase(it); }
