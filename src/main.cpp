@@ -825,7 +825,6 @@ int main(int argc, char** argv) {
 	if (cfg.host_port) {
 		if (cfg.output_dir.empty() && cfg.cache_dir.empty()) { fprintf(stderr, "error: --host needs an output or a cache folder to keep the workers' results in\n"); return 1; }
 		if (cfg.token.empty()) if (const char* t = getenv("VES_TOKEN")) cfg.token = t;
-		for (auto& j : cfg.jobs) j.prune = false; // pruning needs the scores of earlier runs, which are somewhere else
 	}
 	if (cfg.low_memory && cfg.vo.threads <= 0) cfg.vo.threads = 2;
 	if (cfg.priority != "low" && cfg.priority != "normal") { fprintf(stderr, "error: priority must be low or normal\n"); return 1; }
@@ -1026,13 +1025,14 @@ int main(int argc, char** argv) {
 	// differently (see advance below); until then it costs nothing but a row of integers.
 	struct LazyTable {
 		ComboTable table;
-		std::unordered_map<ComboTable::Id, const Variant*> made; // the variants made so far, by combination
+		std::map<std::pair<ComboTable::Id, size_t>, const Variant*> made; // the variants made so far, by combination and worker GPU model (see LazyGroup::model)
 		LazyTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune) : table(encoder, axes, free_axes, fixed, prune) {}
 	};
 	struct LazyGroup {
 		LazyTable* lt = nullptr;
 		const Job* job = nullptr;
 		std::string input;
+		size_t model = 0;                              // distributed GPU encoders: which of the workers' GPU models (see remote_models) its runs are for, plus one; 0: none
 		std::unordered_map<ComboTable::Id, uint8_t> status; // per combination made or judged: 1 ran, 2 left out or failed; missing or 0: not run (yet)
 		std::unordered_map<ComboTable::Id, size_t> task;    // combination -> its task
 		size_t layer = 0;                              // the layers made into runs so far
@@ -1045,7 +1045,20 @@ int main(int argc, char** argv) {
 	std::deque<LazyGroup> lazy_groups;
 	std::map<std::string, std::vector<LazyGroup*>> lazy_of_input;
 	std::map<std::string, std::map<std::string, size_t>> left_out; // input -> option -> combinations never made into runs because it showed no effect
-	auto is_lazy = [&](const Job& job) { return job.prune && !remote && !cfg.only_runs_set; };
+	auto is_lazy = [&](const Job& job) { return job.prune && !cfg.only_runs_set; };
+	// Distributed: a GPU encoder's runs are made for every GPU model the workers have that can encode the codec (as in variants_of), and its "gpu" option (which GPU of
+	// the host) has no meaning. Each model is a lazy group of its own: the runs of two GPU models are pruned by their own scores.
+	std::map<const Job*, std::vector<RemoteHost::Model>> remote_models;
+	auto models_of = [&](const Job& job) -> const std::vector<RemoteHost::Model>& {
+		auto it = remote_models.find(&job);
+		if (it != remote_models.end()) return it->second;
+		auto& m = remote_models[&job];
+		if (remote && is_gpu_encoder(job.encoder)) {
+			m = remote->models(job.encoder, job.codec);
+			if (m.empty()) ui::log("no worker has a GPU that can encode " + job.encoder + "/" + job.codec + ": those runs are skipped");
+		}
+		return m;
+	};
 	auto lazy_table_of = [&](const Job& job, const Scenario& sc) -> LazyTable& {
 		auto& slot = lazy_tables[share_key(job, sc)];
 		if (!slot) {
@@ -1053,15 +1066,28 @@ int main(int argc, char** argv) {
 			if (!sc.chroma.empty()) free_axes.push_back(Axis{"chroma", sc.chroma, {}, {}});
 			if (!sc.bitdepth.empty()) free_axes.push_back(Axis{"bitdepth", sc.bitdepth, {}, {}});
 			if (!sc.range.empty()) free_axes.push_back(Axis{"range", sc.range, {}, {}});
-			slot = std::make_unique<LazyTable>(job.encoder, job.axes, free_axes, job.fixed, job.prune);
+			std::vector<Axis> axes;
+			for (auto& ax : job.axes) if (!(remote && is_gpu_encoder(job.encoder) && ax.key == "gpu")) axes.push_back(ax);
+			slot = std::make_unique<LazyTable>(job.encoder, axes, free_axes, job.fixed, job.prune);
 		}
 		return *slot;
 	};
-	auto lazy_variant = [&](LazyTable& lt, const Job& job, ComboTable::Id combo) -> const Variant& {
-		auto it = lt.made.find(combo);
+	auto lazy_variant = [&](LazyTable& lt, const Job& job, ComboTable::Id combo, size_t model) -> const Variant& {
+		auto it = lt.made.find({combo, model});
 		if (it != lt.made.end()) return *it->second;
-		lazy_variants.push_back(build_variant(job, lt.table.options(combo)));
-		return *(lt.made[combo] = &lazy_variants.back());
+		Variant v = build_variant(job, lt.table.options(combo));
+		if (model) { // a worker's GPU model, as variants_of does it
+			const RemoteHost::Model& m = models_of(job)[model - 1];
+			v.model = m.description;
+			v.key = key_encoder(job.encoder, job.codec, v.opts, m.description);
+			v.gpu = m.description;
+			remote_texts.push_back(m.info);
+			v.gpu_json = &remote_texts.back();
+			remote_texts.push_back(m.caps);
+			v.caps_json = &remote_texts.back();
+		}
+		lazy_variants.push_back(std::move(v));
+		return *(lt.made[{combo, model}] = &lazy_variants.back());
 	};
 	int total = 0;
 
@@ -1125,19 +1151,24 @@ int main(int argc, char** argv) {
 							return true;
 						};
 						if (!lazy_job) { for (const Variant& v : *sets) make_task(v, nullptr, 0); continue; }
-						lazy_groups.emplace_back();
-						LazyGroup& g = lazy_groups.back();
-						g.lt = lt; g.job = &job; g.input = input; g.make = make_task;
-						lazy_of_input[input].push_back(&g);
-						for (ComboTable::Id c : lt->table.layer(0)) {
-							if (!g.make(lazy_variant(*lt, job, c), &g, c)) g.status[c] = 2;
+						// One group, or one per worker GPU model for a GPU encoder in a distributed sweep.
+						const size_t groups_here = remote && is_gpu_encoder(job.encoder) ? models_of(job).size() : 1;
+						for (size_t m = 0; m < groups_here; m++) {
+							lazy_groups.emplace_back();
+							LazyGroup& g = lazy_groups.back();
+							g.lt = lt; g.job = &job; g.input = input; g.make = make_task;
+							g.model = remote && is_gpu_encoder(job.encoder) ? m + 1 : 0;
+							lazy_of_input[input].push_back(&g);
+							for (ComboTable::Id c : lt->table.layer(0)) {
+								if (!g.make(lazy_variant(*lt, job, c, g.model), &g, c)) g.status[c] = 2;
+							}
 						}
 					}
 				}
 			}
 		}
 	};
-	const bool all_inputs_now = remote || std::any_of(cfg.jobs.begin(), cfg.jobs.end(), [&](const Job& job) { return !is_lazy(job); });
+	const bool all_inputs_now = std::any_of(cfg.jobs.begin(), cfg.jobs.end(), [&](const Job& job) { return !is_lazy(job); });
 	std::set<std::string> created_inputs;
 	for (auto& input : cfg.inputs) {
 		if (!all_inputs_now && !created_inputs.empty()) break;
@@ -1355,16 +1386,19 @@ int main(int argc, char** argv) {
 		if (!t.r.shape.w) { t.r.shape.w = t.plan.enc.w; t.r.shape.h = t.plan.enc.h; }
 		if (!t.r.shape.fps.num) t.r.shape.fps = t.plan.enc.fps;
 	};
-	// Distributed: the runs that are not done yet are cut into jobs (one input, encoder entry, scenario, bitrate, key frame interval and size each) for the workers
-	// that connect to --host. What they send back is stored as result files with this run's keys, so the loop below finds those runs finished. Whatever the workers
-	// could not do (runs that cannot work with their input, a job given up) is run here as usual.
-	if (remote) {
+	// Distributed: the runs of a round (an input's runs made so far, then each next layer of its lazy groups) that are not done yet are cut into jobs (one input,
+	// encoder entry, scenario, bitrate, key frame interval, size and GPU model each) for the workers that connect to --host. What they send back is stored as result
+	// files with this run's keys, so settle() finds those runs finished and their scores decide the next layer. Whatever the workers could not do (runs that cannot
+	// work with their input, a job given up) is run here as usual.
+	auto remote_round = [&](const std::vector<size_t>& todo) {
+		if (!remote) return;
 		std::map<std::string, RemoteJobSpec> groups;
 		std::vector<Task*> asked; // the runs that were handed to workers
 		std::vector<std::string> order;
 		std::map<std::string, std::vector<std::pair<Options, Shape>>> job_runs; // the options and size of each run of a job, for telling whether the input allows any
-		for (auto& t : tasks) {
-			if (t.result_file.empty() || result_listed(t.result_file)) continue;
+		for (size_t i : todo) {
+			Task& t = tasks[i];
+			if (t.done || t.result_file.empty() || result_listed(t.result_file)) continue;
 			const std::string g = t.r.input + "|" + std::to_string(t.job - cfg.jobs.data()) + "|" + std::to_string(t.sc - cfg.scenarios.data()) + "|" + std::to_string(t.r.bitrate) + "|" +
 			                      std::to_string(t.r.kf) + "|" + std::to_string(t.shape_i) + "|" + t.model;
 			auto it = groups.find(g);
@@ -1409,10 +1443,9 @@ int main(int argc, char** argv) {
 			};
 			jobs.push_back(std::move(spec));
 		}
+		if (jobs.empty()) return;
 		for (auto& j : jobs) j.name += " (" + std::to_string(j.runs.size()) + " runs)";
-		size_t in_jobs = 0;
-		for (auto& j : jobs) in_jobs += j.runs.size();
-		const size_t already = tasks.size() - in_jobs; // runs that were done before
+		const size_t already = (size_t)finished.load(); // runs that are finished so far
 		ui::overall((int)already, total);
 		std::map<std::string, Task*> by_file;
 		for (Task* t : asked) by_file[t->result_file] = t;
@@ -1439,7 +1472,7 @@ int main(int argc, char** argv) {
 		ui::log("remote: " + std::to_string(stored) + " results from the workers");
 		for (Task* t : asked) t->r.imported = fs::exists(t->result_file);
 		result_dirs.clear(); // the workers' results are there now
-	}
+	};
 
 	// Whatever cannot work, or was done before, is finished right away. The rest is sorted by the frames it needs: runs with the
 	// same input, resolution, frame rate and pixel format share one decode.
@@ -1575,7 +1608,7 @@ int main(int argc, char** argv) {
 			}
 			if (no_effect) { g.status[c] = 2; left_out[g.input][no_effect]++; continue; }
 			const size_t at = tasks.size();
-			if (!g.make(lazy_variant(*g.lt, *g.job, c), &g, c)) { g.status[c] = 2; continue; }
+			if (!g.make(lazy_variant(*g.lt, *g.job, c, g.model), &g, c)) { g.status[c] = 2; continue; }
 			total = (int)tasks.size();
 			if (cfg.best_videos) group_left[tasks[at].r.group]++;
 			if (!settle(at)) added.push_back(at);
@@ -1718,6 +1751,12 @@ int main(int argc, char** argv) {
 	// Round after round: the runs of this input that were made so far, then the next layer of every group of it, until no group has a run to make.
 	std::vector<size_t> todo = uncached[input_name];
 	for (;;) {
+		if (remote) { // the workers first; what they did is finished from its result, the rest is run here
+			remote_round(todo);
+			std::vector<size_t> left;
+			for (size_t i : todo) if (!tasks[i].done && !settle(i)) left.push_back(i);
+			todo = std::move(left);
+		}
 		run_round(todo);
 		todo.clear();
 		for (bool progress = true; progress && todo.empty();) {
