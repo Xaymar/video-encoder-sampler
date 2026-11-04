@@ -115,10 +115,14 @@ jobs:
       - name: Smoke test
         shell: pwsh
         run: |
-          third-party/ffmpeg-dev/bin/ffmpeg.exe -v error -f lavfi -i testsrc2=size=640x360:rate=30:duration=2 -pix_fmt yuv420p -c:v libx264 -qp 18 clip.mp4
+          # Each tool's exit code is checked on its own, so a failure names the tool that failed.
+          third-party/ffmpeg-dev/bin/ffmpeg.exe -hide_banner -v error -f lavfi -i testsrc2=size=640x360:rate=30:duration=2 -pix_fmt yuv420p -c:v libx264 -qp 18 clip.mp4
+          if ($LASTEXITCODE -ne 0) { throw "ffmpeg exited with $LASTEXITCODE while making the test clip" }
           Push-Location dist/ves-windows-x64
           ./ves.exe --plain --hw-decode off -c off -o off -i ../../clip.mp4 -enc x264 -br 500
+          $code = $LASTEXITCODE
           Pop-Location
+          if ($code -ne 0) { throw "ves exited with $code" }
 
       - uses: actions/upload-artifact@v4
         with:
