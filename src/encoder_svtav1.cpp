@@ -102,6 +102,8 @@ public:
 		std::string why;
 		if (!resolve_options("svtav1", p.codec, p.options, kebab_case, native, why)) { fprintf(stderr, "svtav1: %s\n", why.c_str()); return false; }
 		for (auto& [k, v] : native) {
+			// "lp" 1 makes SVT-AV1 4.x crash in one of its own threads (access violation), which would take the whole run with it; see repro/svtav1_lp1.cpp.
+			if (k == "lp" && atoi(v.c_str()) == 1) { fprintf(stderr, "svtav1: lp=1 crashes SVT-AV1 (an access violation inside the encoder); use 0 (automatic) or 2 to 6\n"); return false; }
 			if (svt_av1_enc_parse_parameter(&cfg, k.c_str(), v.c_str()) != EB_ErrorNone) { fprintf(stderr, "svtav1: bad option %s=%s\n", k.c_str(), v.c_str()); return false; }
 		}
 		if (svt_av1_enc_set_parameter(h, &cfg) != EB_ErrorNone) { fprintf(stderr, "svtav1: set_parameter rejected the configuration\n"); return false; }
