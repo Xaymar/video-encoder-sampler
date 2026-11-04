@@ -72,6 +72,7 @@ struct EncodeJob {
 	std::function<bool(const uint8_t*, size_t)> tee; // also gets every packet as it arrives (for scoring); false once nobody wants them
 	double kbps = 0;
 	bool ok = false;
+	bool crashed = false; // the encoder process ended under it (another run in that process may be what crashed it)
 };
 
 // The frame map grows while the video is read, and scoring follows it.
