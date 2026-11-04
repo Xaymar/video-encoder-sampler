@@ -93,7 +93,7 @@ TCP, each message is a type byte, a 32-bit big-endian length and a payload. `HEL
 ## Not done yet
 
 * **No encoded streams** come back (workers run with `--no-videos`), so best-videos mode keeps nothing from remote runs.
-* **Pruning is off** with `--host`: it needs the scores of earlier runs, which are on other machines.
+* **Pruning goes in rounds.** The host plans lazily as a sweep on one machine does: the probes of an input go out as jobs first, and each next layer when the workers have sent the scores of the one before (each GPU model of the workers is pruned by its own scores). A round waits for its slowest job, so workers can sit idle at the end of one.
 * **No encryption.** The token only keeps strangers out; use a VPN or an SSH tunnel on untrusted networks.
 * **Inputs are sent whole**, once per worker, from the host; a transfer cannot resume.
 * **Workers are expected to be there when the host plans.** A worker that connects later takes jobs it matches but does not add GPU models to the plan.
