@@ -142,6 +142,17 @@ struct Run {
 	double best_share = 0;  // share of frames where this run is at least as good as every other run of its group
 };
 
+// What the GPU's encoder says it cannot do, against what a run asks of it: the reason the run cannot work there, or empty. Such a run is ignored, not failed.
+// AMF lists whether the encoder makes B-frames (H.264 "BFrames", AV1 "AV1BFrames"); a Vega-class GPU says no, and refuses any B-picture pattern.
+static std::string caps_refusal(const std::string& encoder, const std::string& codec, const Options& opts, const std::string& caps) {
+	if (encoder != "amf") return {};
+	auto wants = [&](const char* key) { auto it = opts.find(key); return it != opts.end() && atoi(it->second.c_str()) > 0; };
+	const char* cap = codec == "h264" ? "\"BFrames\":false" : codec == "av1" ? "\"AV1BFrames\":false" : nullptr;
+	if (cap && caps.find(cap) != std::string::npos && (wants("max_b_frames") || wants("b_pictures_pattern") || wants("max_consecutive_bpictures")))
+		return "this GPU's AMF encoder makes no B-frames (" + std::string(codec == "h264" ? "BFrames" : "AV1BFrames") + ": false)";
+	return {};
+}
+
 static std::vector<std::string> split(const std::string& s) {
 	std::vector<std::string> out;
 	std::stringstream ss(s);
@@ -1422,6 +1433,7 @@ int main(int argc, char** argv) {
 		for (size_t i : todo) {
 			Task& t = tasks[i];
 			if (t.done || t.result_file.empty() || result_listed(t.result_file)) continue;
+			if (std::string why = caps_refusal(t.job->encoder, t.job->codec, *t.opts, *t.r.caps_json); !why.empty()) { t.r.ignored = true; t.r.reason = why; finish(t); continue; }
 			const std::string g = t.r.input + "|" + std::to_string(t.job - cfg.jobs.data()) + "|" + std::to_string(t.sc - cfg.scenarios.data()) + "|" + std::to_string(t.r.bitrate) + "|" +
 			                      std::to_string(t.r.kf) + "|" + std::to_string(t.shape_i) + "|" + t.model;
 			auto it = groups.find(g);
@@ -1680,6 +1692,7 @@ int main(int argc, char** argv) {
 		if (!src) { finish(t); continue; }
 		t.plan = make_plan(*src, t.job->encoder, t.job->codec, *t.opts, r.shape);
 		if (t.plan.ignored) { r.ignored = true; r.expected = t.plan.expected; r.reason = t.plan.reason; finish(t); continue; }
+		if (std::string why = caps_refusal(t.job->encoder, t.job->codec, *t.opts, *r.caps_json); !why.empty()) { r.ignored = true; r.reason = why; finish(t); continue; }
 		fit_shape(t);
 		const std::string fk = r.input + "|" + t.plan.feed_key();
 		if (!by_feed.count(fk)) feed_order.push_back(fk);
