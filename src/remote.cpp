@@ -513,6 +513,15 @@ size_t RemoteHost::run_jobs(const std::vector<RemoteJobSpec>& jobs, const std::f
 
 // ---- worker ----
 
+void exit_now(int code) {
+	fflush(stdout);
+	fflush(stderr);
+#ifdef _WIN32
+	TerminateProcess(GetCurrentProcess(), (UINT)code); // not even the DLLs are told: AMD's runtime has crashed when told
+#endif
+	std::_Exit(code);
+}
+
 namespace {
 
 std::string self_exe() {
@@ -615,15 +624,6 @@ int run_process(const std::string& exe, const std::vector<std::string>& args, co
 	killer.join();
 	return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 #endif
-}
-
-void exit_now(int code) {
-	fflush(stdout);
-	fflush(stderr);
-#ifdef _WIN32
-	TerminateProcess(GetCurrentProcess(), (UINT)code); // not even the DLLs are told: AMD's runtime has crashed when told
-#endif
-	std::_Exit(code);
 }
 
 std::string tail_of(const std::string& text, size_t lines) {
