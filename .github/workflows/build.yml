@@ -143,6 +143,7 @@ jobs:
       # A generated clip through the software path: no GPU is needed, but the whole chain (decode, encode, mux, VMAF) runs.
       - name: Smoke test
         shell: pwsh
+        timeout-minutes: 10 # a hang fails the build instead of holding the runner for hours
         run: |
           # libplacebo imports vulkan-1.dll, which the package leaves to the GPU driver; the runner has no GPU driver, so MSYS2's loader stands in, for this test only.
           New-Item -ItemType Directory -Force vulkan-loader | Out-Null

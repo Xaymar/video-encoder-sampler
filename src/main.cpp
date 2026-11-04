@@ -34,6 +34,7 @@
 #include "upload.h"
 #include "priority.h"
 #include "encoder.h"
+#include "encoder_process.h"
 #include "formats.h"
 #include "gpu.h"
 #include "combos.h"
@@ -100,6 +101,7 @@ struct Config {
 	int decode_threads = 0;  // 0: as many as the cores allow within a memory budget
 	std::string priority = "low"; // "low": idle CPU and lowest disk priority, see priority.h; "normal" leaves the system's default
 	bool low_memory = false; // score a wave before encoding the next, and fewer VMAF threads
+	bool in_process = false; // the encoders run inside this process instead of one process per GPU and CPU encoder (encoder_process.h)
 	int host_port = 0;       // distributed: listen on this port and hand the runs that are not done to the workers that connect (remote.h); 0: run everything here
 	std::string token;       // what a worker must present to the host
 	int min_workers = 1;     // the host starts handing out jobs when this many workers have connected
@@ -305,6 +307,7 @@ static void load_config(const std::string& path, Config& cfg) {
 	if (auto* v = setting("decode_threads")) cfg.decode_threads = atoi(v->text().c_str());
 	if (auto* v = setting("priority")) cfg.priority = v->text();
 	if (auto* v = setting("low_memory")) cfg.low_memory = v->text() == "1" || v->text() == "true";
+	if (auto* v = setting("encoder_processes")) cfg.in_process = v->text() == "0" || v->text() == "false";
 	if (auto* u = root.find("upload")) {
 		if (auto* x = u->find("url")) cfg.upload.url = x->text();
 		if (auto* x = u->find("key")) cfg.upload.key = x->text();
@@ -397,6 +400,8 @@ Paths
         --decode-threads <n> threads per decoder (default: all cores; 4 with --low-memory)
         --low-memory        score each wave before the next is encoded and use fewer VMAF threads: slower, takes much less memory
         --plain             plain lines instead of the live display (also used when stdout is not a terminal)
+        --in-process        run the encoders inside ves itself. By default every GPU (and every CPU encoder) gets a process of its own, so a driver or
+                            library that crashes fails only the runs that were in that process, and the sweep goes on ("encoder_processes": false in the config)
   -c,   --cache <dir>       finished runs are kept here and not repeated (default: cache); "off" disables it
 
 Scoring
@@ -522,6 +527,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--no-upload-videos") upload_videos = false;
 		else if (a == "--plain") cfg.plain = true;
 		else if (a == "--low-memory") cfg.low_memory = true;
+		else if (a == "--in-process") cfg.in_process = true;
 		else if (a == "--host") cfg.host_port = atoi(value().c_str());
 		else if (a == "--progress") ui::set_progress_stdout(true);
 		else if (a == "--trust-downloads") set_trust_downloads(true);
@@ -802,10 +808,13 @@ int main(int argc, char** argv) {
 	// The answer is flushed and the process ends without winding anything down: AMD's runtime has crashed on the way out, after answering, and a crash reads as "no".
 	if (argc == 4 && std::string(argv[1]) == "--probe-amf") {
 		std::string caps;
+		amf_dedicate_process(atoi(argv[3]));
 		const bool ok = amf_probe(argv[2], atoi(argv[3]), caps);
 		if (ok) printf("ok %s\n", caps.c_str()); else printf("no\n");
 		exit_now(0);
 	}
+	// `ves --encoder-process <encoder> <gpu>`: the process the encoders of one GPU (or one CPU encoder) run in, started by a sweep (see encoder_process.h).
+	if (argc >= 4 && std::string(argv[1]) == "--encoder-process") return encoder_process_main(argc, argv);
 	for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--worker") return run_worker(argc, argv);
 	Config cfg;
 	try {
@@ -829,10 +838,13 @@ int main(int argc, char** argv) {
 	if (cfg.low_memory && cfg.vo.threads <= 0) cfg.vo.threads = 2;
 	if (cfg.priority != "low" && cfg.priority != "normal") { fprintf(stderr, "error: priority must be low or normal\n"); return 1; }
 	if (cfg.priority == "low" && !set_low_priority()) fprintf(stderr, "warning: could not lower the process priority\n");
+	set_isolated_encoders(!cfg.in_process);
+	if (cfg.priority == "low") set_encoder_process_args({"--priority", "low"});
 	set_hw_decode(cfg.hw_decode);
 	set_decode_threads(cfg.decode_threads > 0 ? cfg.decode_threads : cfg.low_memory ? 4 : 0);
 	ui::start(cfg.plain);
 	struct UiGuard { ~UiGuard() { ui::stop(); } } ui_guard; // the live display is cleared on every way out
+	struct EncoderProcesses { ~EncoderProcesses() { stop_encoder_processes(); } } encoder_processes; // ended before the live display is, so that what they say still shows
 
 	// Distributed: workers connect first, because what GPU models they have decides what is planned for GPU encoders.
 	std::unique_ptr<RemoteHost> remote;
@@ -854,6 +866,7 @@ int main(int argc, char** argv) {
 		Codec id;
 		const Options* opts = nullptr;   // its encoder options: the variant's, shared by every run of it (a task is made millions of times for a big config)
 		bool ok = false;
+		bool retried = false;            // its encoder process crashed under it once, and it was run again on its own
 		// What the run's outcome depends on (see cache_key), put together when it is needed: a big config plans hundreds of thousands of runs, and the parts are
 		// shared by the runs of an input, size and bit rate (head, and the run's part with the settings) and by the runs of a variant (its options).
 		struct KeyParts { std::string head, run_tail; };
@@ -1680,9 +1693,13 @@ int main(int argc, char** argv) {
 				by_pool[pool].assign(list.begin(), list.end());
 			}
 		}
+		// Runs whose encoder process crashed while they were in it are run once more, each on its own: the crash may have been another run's, and a run that
+		// crashes alone is the one that does.
+		std::deque<Task*> alone;
 		for (;;) {
 			std::vector<Task*> wave;
-			for (auto& [pool, list] : by_pool) {
+			if (!alone.empty()) { wave.push_back(alone.front()); alone.pop_front(); }
+			else for (auto& [pool, list] : by_pool) {
 				int room = pools[pool].parallel;
 				for (auto it = list.begin(); it != list.end() && room > 0;) {
 					Task& t = **it;
@@ -1727,6 +1744,7 @@ int main(int argc, char** argv) {
 			const double wave_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_wave).count();
 			ui::detach(feed_handle);
 			for (int h : handles) ui::detach(h);
+			const size_t crashed_runs = (size_t)std::count_if(wr.begin(), wr.end(), [](const WaveRun& w) { return w.enc.crashed; });
 			for (size_t i = 0; i < wave.size(); i++) {
 				Task& t = *wave[i];
 				Run& r = t.r;
@@ -1741,6 +1759,13 @@ int main(int argc, char** argv) {
 					t.ok = true;
 				}
 				std::error_code ec;
+				if (!t.ok && wr[i].enc.crashed && !t.retried && crashed_runs > 1) { // others were in the process with it
+					t.retried = true;
+					fs::remove(wr[i].enc.file, ec);
+					ui::log(t.r.tag + " " + t.r.label + ": its encoder process crashed; it is run again on its own");
+					alone.push_back(&t);
+					continue;
+				}
 				if (t.ok) r.video_sha256 = sha256_file(wr[i].enc.file);
 					if (r.video_file.empty()) fs::remove(wr[i].enc.file, ec); // a temporary file
 				finish(t);
@@ -1771,6 +1796,7 @@ int main(int argc, char** argv) {
 	}
 	}
 	{ std::error_code ec; fs::remove_all(spool_dir, ec); }
+	stop_encoder_processes();
 	if (uploader) uploader->finish(); // the live display stays up while the last uploads go out
 	ui::stop();
 

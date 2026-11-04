@@ -36,6 +36,8 @@ public:
 	// How many frames the display order can lag behind the coding order (B-frame depth), valid after open(); only needed from encoders
 	// that report no DTS, so that a muxer can offset the display times.
 	virtual int reorder_delay() const { return 0; }
+	// The encoder ran in a process of its own (encoder_process.h), and that process ended while it was in it: the run did not fail by itself.
+	virtual bool crashed() const { return false; }
 	Stats stats;
 };
 
@@ -54,9 +56,11 @@ bool nvenc_supports(const std::string& codec, int chroma, int depth);
 // nothing about it, since a newer GPU can carry an older encoder block.
 std::string nvenc_caps_json(const std::string& codec, int gpu);
 std::string amf_caps_json(const std::string& codec, int gpu = 0); // where the encoder runs (hardware, GPU compute, software) and the SDK's capability values of AMD GPU `gpu`
-inline std::string encoder_caps_json(const std::string& encoder, const std::string& codec, int gpu) { return encoder == "nvenc" ? nvenc_caps_json(codec, gpu) : encoder == "amf" ? amf_caps_json(codec, gpu) : "null"; }
+// Asked of the GPU's encoder process when encoders run in processes of their own (encoder_process.h), so that this process never loads the vendor's runtime.
+std::string encoder_caps_json(const std::string& encoder, const std::string& codec, int gpu);
 bool amf_supports(const std::string& codec, int chroma, int depth, int gpu = 0);
 bool amf_probe(const std::string& codec, int gpu, std::string& caps); // for `ves --probe-amf`: one encoder opened, its failures said on stderr
+void amf_dedicate_process(int gpu); // this process serves only AMD GPU `gpu` (an encoder process, a probe): AMF's runtime comes from that GPU's own driver package
 bool qsv_supports(const std::string& codec, int chroma, int depth);
 
 inline bool is_gpu_encoder(const std::string& name) { return name == "nvenc" || name == "amf" || name == "qsv"; }

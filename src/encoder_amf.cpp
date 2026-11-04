@@ -22,6 +22,13 @@
 #include <d3d11.h>
 #include <dxgi.h>
 #include <wrl/client.h>
+#include <winternl.h>
+#include <d3dkmthk.h>
+
+#include <filesystem>
+#include <vector>
+
+#include "gpu.h"
 
 #include <components/PreProcessing.h>
 #include <components/VideoEncoderAV1.h>
@@ -34,6 +41,95 @@ using Microsoft::WRL::ComPtr;
 namespace {
 
 thread_local bool probing = false; // set while amf_supports() tries a codec out
+
+int dedicated_gpu = -1; // this process serves AMD GPU n only (an encoder process, a probe): its runtime comes from that GPU's driver package
+
+// The folder of the driver package that drives an adapter (System32\DriverStore\FileRepository\<package>), asked of the kernel the way the Vulkan loader finds
+// a GPU's own driver; empty when Windows cannot say. The functions are looked up at run time: they are in gdi32, which is not linked otherwise.
+std::filesystem::path driver_store_folder(uint64_t luid) {
+	HMODULE gdi = LoadLibraryW(L"gdi32.dll");
+	auto open_adapter = gdi ? (NTSTATUS(APIENTRY*)(D3DKMT_OPENADAPTERFROMLUID*))GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid") : nullptr;
+	auto query = gdi ? (NTSTATUS(APIENTRY*)(const D3DKMT_QUERYADAPTERINFO*))GetProcAddress(gdi, "D3DKMTQueryAdapterInfo") : nullptr;
+	auto close_adapter = gdi ? (NTSTATUS(APIENTRY*)(const D3DKMT_CLOSEADAPTER*))GetProcAddress(gdi, "D3DKMTCloseAdapter") : nullptr;
+	if (!open_adapter || !query || !close_adapter) return {};
+	D3DKMT_OPENADAPTERFROMLUID open{};
+	open.AdapterLuid.LowPart = (DWORD)luid;
+	open.AdapterLuid.HighPart = (LONG)(luid >> 32);
+	if (open_adapter(&open) != 0) return {};
+	std::wstring out;
+	D3DDDI_QUERYREGISTRY_INFO base{};
+	base.QueryType = D3DDDI_QUERYREGISTRY_DRIVERSTOREPATH;
+	D3DKMT_QUERYADAPTERINFO q{};
+	q.hAdapter = open.hAdapter;
+	q.Type = KMTQAITYPE_QUERYREGISTRY;
+	q.pPrivateDriverData = &base;
+	q.PrivateDriverDataSize = sizeof base;
+	// The first question only tells how long the answer is.
+	if (query(&q) == 0 && base.Status == D3DDDI_QUERYREGISTRY_STATUS_BUFFER_OVERFLOW) {
+		std::vector<uint8_t> buf(sizeof base + base.OutputValueSize);
+		auto* full = (D3DDDI_QUERYREGISTRY_INFO*)buf.data();
+		full->QueryType = D3DDDI_QUERYREGISTRY_DRIVERSTOREPATH;
+		q.pPrivateDriverData = full;
+		q.PrivateDriverDataSize = (UINT)buf.size();
+		if (query(&q) == 0 && full->Status == D3DDDI_QUERYREGISTRY_STATUS_SUCCESS) out.assign(full->OutputString, full->OutputValueSize / sizeof(wchar_t));
+	}
+	D3DKMT_CLOSEADAPTER close{};
+	close.hAdapter = open.hAdapter;
+	close_adapter(&close);
+	while (!out.empty() && out.back() == L'\0') out.pop_back();
+	// The kernel may answer with an NT path.
+	if (out.rfind(L"\\??\\", 0) == 0) out.erase(0, 4);
+	if (_wcsnicmp(out.c_str(), L"\\SystemRoot\\", 12) == 0) {
+		wchar_t windows[MAX_PATH];
+		const UINT n = GetWindowsDirectoryW(windows, MAX_PATH);
+		out = std::wstring(windows, n) + out.substr(11);
+	}
+	return out;
+}
+
+// amfrt64.dll in a driver package: at its top or in one of its folders (AMD keeps it in one); the shallowest wins.
+std::filesystem::path find_runtime(const std::filesystem::path& folder) {
+	namespace fs = std::filesystem;
+	std::error_code ec;
+	fs::path best;
+	int best_depth = 99;
+	for (fs::recursive_directory_iterator it(folder, fs::directory_options::skip_permission_denied, ec), end; !ec && it != end; it.increment(ec)) {
+		if (it.depth() > 2) { it.disable_recursion_pending(); continue; }
+		if (it->is_regular_file(ec) && _wcsicmp(it->path().filename().c_str(), AMF_DLL_NAME) == 0 && it.depth() < best_depth) { best = it->path(); best_depth = it.depth(); }
+	}
+	return best;
+}
+
+// AMD's runtime for GPU `gpu`. A process that serves that GPU alone takes the runtime of the GPU's own driver package: AMD drops older GPUs from new runtimes
+// (Vega is refused with AMF_CODEC_NOT_SUPPORTED by the 2024 ones), while the driver that still runs such a GPU came with a runtime that can encode on it. The newest
+// driver installed puts its runtime in System32 for everyone, which is what any other process gets. Loaded once per process.
+HMODULE load_runtime(int gpu) {
+	static std::mutex m;
+	static HMODULE dll = nullptr;
+	std::lock_guard lock(m);
+	if (dll) return dll;
+	std::filesystem::path from;
+	if (gpu == dedicated_gpu) {
+		const auto gpus = list_gpus(VENDOR_AMD);
+		if (gpu >= 0 && gpu < (int)gpus.size()) {
+			const auto folder = driver_store_folder(gpus[(size_t)gpu].luid);
+			if (!folder.empty()) from = find_runtime(folder);
+		}
+		if (!from.empty()) {
+			SetDllDirectoryW(from.parent_path().c_str()); // what the runtime loads by name comes from the same package
+			dll = LoadLibraryExW(from.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+			if (!dll) { fprintf(stderr, "amf: cannot load %s (error %lu); using the system's runtime\n", from.string().c_str(), GetLastError()); SetDllDirectoryW(nullptr); }
+		}
+	}
+	if (!dll) { dll = LoadLibraryW(AMF_DLL_NAME); from = AMF_DLL_NAME; }
+	if (dll && gpu == dedicated_gpu) {
+		amf_uint64 v = 0;
+		auto version = (AMFQueryVersion_Fn)GetProcAddress(dll, AMF_QUERY_VERSION_FUNCTION_NAME);
+		if (version) version(&v);
+		fprintf(stderr, "amf: GPU %d uses runtime %u.%u.%u from %s\n", gpu, (unsigned)AMF_GET_MAJOR_VERSION(v), (unsigned)AMF_GET_MINOR_VERSION(v), (unsigned)AMF_GET_SUBMINOR_VERSION(v), from.string().c_str());
+	}
+	return dll;
+}
 
 struct Names { // property names differ per codec
 	const wchar_t *component, *usage, *target, *peak, *size, *rate, *rc, *gop, *bitdepth;
@@ -263,10 +359,15 @@ public:
 		int gpu = 0;
 		if (auto it = o.find("gpu"); it != o.end()) { gpu = atoi(it->second.c_str()); o.erase(it); }
 
-		dll = LoadLibraryW(AMF_DLL_NAME);
+		dll = load_runtime(gpu);
 		auto init = dll ? (AMFInit_Fn)GetProcAddress(dll, AMF_INIT_FUNCTION_NAME) : nullptr;
 		if (!init) { fprintf(stderr, "amf: amfrt64.dll not found\n"); return false; }
 		AMF_RESULT r = init(AMF_FULL_VERSION, &factory);
+		if (r != AMF_OK) { // an older runtime (a GPU's own, see load_runtime) may want to be asked for its own version
+			amf_uint64 v = 0;
+			auto version = (AMFQueryVersion_Fn)GetProcAddress(dll, AMF_QUERY_VERSION_FUNCTION_NAME);
+			if (version && version(&v) == AMF_OK && v && v < AMF_FULL_VERSION) r = init(v, &factory);
+		}
 		if (r != AMF_OK) return fail(r, "AMFInit");
 
 		// AMF needs a D3D11 device on an AMD adapter; with several GPUs installed the default adapter is not necessarily one.
@@ -365,6 +466,8 @@ public:
 
 std::unique_ptr<Encoder> make_encoder_amf() { return std::make_unique<Amf>(); }
 
+void amf_dedicate_process(int gpu) { dedicated_gpu = gpu; }
+
 // Whether this machine's AMD GPU can encode the codec at that bit depth, found by initializing a throwaway encoder once.
 bool amf_supports(const std::string& codec, int chroma, int depth, int gpu) {
 	if (chroma != 420 || depth > 10) return false;
@@ -439,4 +542,5 @@ std::unique_ptr<Encoder> make_encoder_amf() { return std::make_unique<AmfUnavail
 bool amf_supports(const std::string&, int, int, int) { return false; }
 std::string amf_caps_json(const std::string&, int) { return "null"; }
 bool amf_probe(const std::string&, int, std::string&) { fprintf(stderr, "amf: not supported on this platform\n"); return false; }
+void amf_dedicate_process(int) {}
 #endif
