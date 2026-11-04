@@ -35,7 +35,7 @@ Make an API key on the website (*Account → API key*), then set `"upload": {"ur
 
 ## Building
 
-Windows: CMake 3.20+, Ninja and clang. The libraries come from MSYS2 packages (staged by [`scripts/stage-msys2.sh`](scripts/stage-msys2.sh)) and a shared FFmpeg development build in `third-party/ffmpeg-dev`; libcurl is a git submodule (`git submodule update --init`). [`.github/workflows/windows-x64.yml`](.github/workflows/windows-x64.yml) shows every step.
+Windows: CMake 3.20+, Ninja and clang. The libraries come from MSYS2 packages (staged by [`scripts/stage-msys2.sh`](scripts/stage-msys2.sh)) and a shared FFmpeg development build in `third-party/ffmpeg-dev`; libcurl is a git submodule (`git submodule update --init`). [`.github/workflows/build.yml`](.github/workflows/build.yml) shows every step (job `windows-x64`).
 
 ```
 cmake -G Ninja -DCMAKE_CXX_COMPILER=clang++ -B build
