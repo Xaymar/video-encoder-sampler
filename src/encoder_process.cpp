@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 
+#include "convert.h"
 #include "formats.h"
 #include "gpu.h"
 #include "pipeline.h"
@@ -600,6 +601,34 @@ void reply(uint8_t type, uint32_t id, const std::string& body) {
 unsigned process_vendor = 0; // the GPU this process serves; 0 for the process of the CPU encoders
 int process_gpu = 0;
 
+// The Vulkan device this process converts frames on: its GPU's, when a test picture comes back right from it; else the first other one that gets it right (discrete GPUs
+// first). Some drivers convert to nothing but zeros without an error: the Vega iGPU of an AMD laptop gave all-green videos. Found once per process.
+std::string scaling_device() {
+	static std::once_flag once;
+	static std::string name;
+	std::call_once(once, [] {
+		std::string why;
+		auto all = Vk::devices(why);
+		const int own = vulkan_device_of_gpu(process_vendor, process_gpu);
+		std::vector<const VkDeviceInfo*> order;
+		for (auto& d : all) if (d.index == own) order.push_back(&d);
+		for (int discrete = 1; discrete >= 0; discrete--) for (auto& d : all) if (d.index != own && d.discrete == (discrete == 1)) order.push_back(&d);
+		for (const VkDeviceInfo* d : order) {
+			ScaleOptions test;
+			test.device = d->name;
+			std::string wrong;
+			if (converter_works(test, wrong)) {
+				if (d->index != own) fprintf(stderr, "frames of this GPU are converted on %s instead%s\n", d->name.c_str(), own < 0 ? " (it has no Vulkan device of its own)" : "");
+				name = d->name;
+				return;
+			}
+			fprintf(stderr, "converting frames on %s does not work: %s\n", d->name.c_str(), wrong.c_str());
+		}
+		fprintf(stderr, "no Vulkan device converts frames right; leaving the choice to libplacebo\n");
+	});
+	return name;
+}
+
 void run_wave_here(uint32_t id, const std::string& body) {
 	Reader r(body);
 	const std::string input = r.str();
@@ -634,10 +663,7 @@ void run_wave_here(uint32_t id, const std::string& body) {
 	if (!source_info(input, si)) si = planned;
 	const int source_range = si.fmt.rgb ? 1 : (si.color.range ? si.color.range : 1);
 	for (auto& pl : plans) pl.rescale = pl.enc.w != si.width || pl.enc.h != si.height || pl.enc.pix != si.fmt || (pl.range && pl.range != source_range);
-	if (so.device.empty() && process_vendor) { // scaling on this GPU too
-		const int vk = vulkan_device_of_gpu(process_vendor, process_gpu);
-		if (vk >= 0) so.device = vulkan_device_name(vk);
-	}
+	if (so.device.empty() && process_vendor) so.device = scaling_device(); // scaling on this GPU too, where it gives the right pictures
 	std::vector<WaveRun*> ptrs;
 	std::vector<int> handles;
 	for (uint32_t i = 0; i < n; i++) {

@@ -2,6 +2,8 @@
 // ...), scales them and converts them to planar YUV.
 #include "convert.h"
 
+#include <cmath>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -241,3 +243,46 @@ public:
 } // namespace
 
 std::unique_ptr<Converter> make_converter() { return std::make_unique<PlConverter>(); }
+
+bool converter_works(const ScaleOptions& opt, std::string& why) {
+	// 64x64 8-bit 4:4:4: luma rises from left to right, Cb from top to bottom, Cr is flat; it goes to 32x32 4:2:0, which takes the same path as a real frame (scale, subsample, download).
+	const int w = 64, h = 64;
+	auto mem = std::make_shared<std::vector<uint8_t>>((size_t)w * h * 3);
+	uint8_t* y = mem->data();
+	uint8_t* u = y + w * h;
+	uint8_t* v = u + w * h;
+	for (int r = 0; r < h; r++)
+		for (int c = 0; c < w; c++) { y[r * w + c] = (uint8_t)(32 + c * 3); u[r * w + c] = (uint8_t)(64 + r * 2); v[r * w + c] = 160; }
+	Picture in;
+	in.width = w; in.height = h;
+	in.fmt = Fmt{444, 8, false, true};
+	in.layout.planes = 3;
+	for (int i = 0; i < 3; i++) { in.layout.step[i] = 1; in.layout.comp[i].plane = i; in.layout.comp[i].depth = 8; in.data[i] = y + (size_t)i * w * h; in.stride[i] = w; }
+	in.color.range = 1; in.color.space = 1; in.color.primaries = 1; in.color.trc = 1;
+	in.owner = mem;
+	auto conv = make_converter();
+	const Fmt out_fmt{420, 8, false, true};
+	if (!conv->open(in, Rational{1, 60}, 32, 32, out_fmt, opt, 1)) { why = "it cannot convert at all"; return false; }
+	Picture out;
+	bool got = false;
+	for (int i = 0; i < 3 && !got; i++) {
+		in.pts = i;
+		if (!conv->push(&in)) { why = "converting failed"; return false; }
+		got = conv->pop(out) == 1;
+	}
+	if (!got) { conv->push(nullptr); got = conv->pop(out) == 1; }
+	if (!got) { why = "no converted picture came back"; return false; }
+	auto mean = [&](int plane, int pw, int ph) {
+		double sum = 0;
+		for (int r = 0; r < ph; r++) for (int c = 0; c < pw; c++) sum += out.data[plane][(size_t)r * out.stride[plane] + c];
+		return sum / (pw * ph);
+	};
+	const double my = mean(0, 32, 32), mu = mean(1, 16, 16), mv = mean(2, 16, 16);
+	const double ey = 32 + 31.5 * 3, eu = 64 + 31.5 * 2, ev = 160; // the means of the picture that went in
+	char b[200];
+	snprintf(b, sizeof b, "a test picture came back with means Y %.0f, Cb %.0f, Cr %.0f instead of about %.0f, %.0f, %.0f", my, mu, mv, ey, eu, ev);
+	if (std::fabs(my - ey) > 8 || std::fabs(mu - eu) > 8 || std::fabs(mv - ev) > 8) { why = b; return false; }
+	const uint8_t* row = out.data[0];
+	if (row[31] <= row[0] + 40) { snprintf(b, sizeof b, "a test picture came back without its left-to-right ramp (Y %d .. %d)", row[0], row[31]); why = b; return false; }
+	return true;
+}
