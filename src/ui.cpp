@@ -301,13 +301,15 @@ std::string json_string(const std::string& s) {
 std::string snapshot() {
 	std::string line = "[";
 	bool first = true;
-	for (auto& [h, e] : entries) {
-		const ui::Progress p = progress_of(e);
+	auto add = [&](const ui::Progress& p, const std::string& prefix) {
 		char numbers[160];
 		snprintf(numbers, sizeof numbers, ",%lld,%lld,%.3f,%d,%d]", p.done, p.total, p.rate, p.state, p.finished ? (p.failed ? 2 : 1) : 0);
-		line += std::string(first ? "" : ",") + "[" + std::to_string(p.stage) + "," + json_string(p.label) + numbers;
+		line += std::string(first ? "" : ",") + "[" + std::to_string(p.stage) + "," + json_string(prefix + p.label) + numbers;
 		first = false;
-	}
+	};
+	for (auto& [h, e] : entries) add(progress_of(e), "");
+	// and the rows this process shows for others: the runs of its device processes, which a worker's host wants to see as much as the runs of this one
+	for (auto& [key, group] : remote_rows) for (auto& p : group.second) add(p, group.first);
 	return line + "]";
 }
 
