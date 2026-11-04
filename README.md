@@ -53,6 +53,7 @@ Libraries: x264, x265, SVT-AV1, libvmaf, libplacebo (needs a Vulkan driver), FFm
 * 4:1:0, 4:1:1 and 4:4:0 sources are treated as 4:2:0; 16-bit and gray sources are not supported.
 * Encoders get one constant frame rate; input videos should be properly tagged.
 * Output paths on Windows must stay under 260 characters.
+* On Windows, the [Microsoft Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) (x64) has to be installed; it is not part of the archive.
 
 ## License
 

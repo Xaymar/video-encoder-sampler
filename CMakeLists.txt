@@ -112,22 +112,7 @@ if(WIN32)
 	add_custom_command(TARGET ves POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different ${RUNTIME_DLLS} "$<TARGET_FILE_DIR:ves>")
 
-	# A Release build needs the Visual C++ runtime, which a machine without Visual Studio or the redistributable does not have: it is shipped next to the program
-	# (allowed for these three files). A Debug build uses the debug runtime, which only a machine with Visual Studio has, and cannot be shipped.
-	if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
-		set(VC_RUNTIME_DLLS)
-		foreach(l vcruntime140 vcruntime140_1 msvcp140)
-			find_file(VC_${l} ${l}.dll PATHS "$ENV{SystemRoot}/System32" NO_DEFAULT_PATH)
-			if(VC_${l})
-				list(APPEND VC_RUNTIME_DLLS "${VC_${l}}")
-			endif()
-		endforeach()
-		list(APPEND RUNTIME_DLLS ${VC_RUNTIME_DLLS})
-		if(VC_RUNTIME_DLLS)
-			add_custom_command(TARGET ves POST_BUILD
-				COMMAND ${CMAKE_COMMAND} -E copy_if_different ${VC_RUNTIME_DLLS} "$<TARGET_FILE_DIR:ves>")
-		endif()
-	endif()
+	# The Visual C++ runtime (vcruntime140, msvcp140) is not shipped: it is proprietary, and Windows users install Microsoft's redistributable instead.
 
 	# cmake --install build --prefix <dir>: the program, its DLLs, the VMAF models and an example config.
 	install(TARGETS ves RUNTIME DESTINATION .)
