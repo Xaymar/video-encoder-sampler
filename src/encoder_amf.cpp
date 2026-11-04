@@ -409,6 +409,21 @@ std::string amf_caps_json(const std::string& codec, int gpu) {
 	return it->second;
 }
 
+// What `ves --probe-amf` answers: whether AMD GPU `gpu` can encode the codec and its capabilities, from one encoder opened without hiding why it fails (the reasons go to
+// stderr, which the worker shows when the GPU is not offered).
+bool amf_probe(const std::string& codec, int gpu, std::string& caps) {
+	Params p;
+	p.width = 1280; p.height = 720; p.bitrate = 5000000; p.gop = 60;
+	p.pix = planar_fmt(420, 8);
+	p.codec = codec;
+	p.options["gpu"] = std::to_string(gpu);
+	// Never closed: the process ends right after answering (exit_now), and AMD's runtime is not trusted to wind down before the answer is out.
+	auto* probe = new Amf;
+	if (!probe->open(p, nullptr)) return false;
+	caps = probe->caps();
+	return true;
+}
+
 #else
 // AMF's Linux runtime needs a Vulkan context (AMFContext::InitVulkan); not implemented, so the encoder reports itself as unavailable.
 #include <cstdio>
@@ -423,4 +438,5 @@ struct AmfUnavailable : Encoder {
 std::unique_ptr<Encoder> make_encoder_amf() { return std::make_unique<AmfUnavailable>(); }
 bool amf_supports(const std::string&, int, int, int) { return false; }
 std::string amf_caps_json(const std::string&, int) { return "null"; }
+bool amf_probe(const std::string&, int, std::string&) { fprintf(stderr, "amf: not supported on this platform\n"); return false; }
 #endif

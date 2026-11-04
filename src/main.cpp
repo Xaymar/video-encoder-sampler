@@ -799,10 +799,12 @@ int main(int argc, char** argv) {
 #endif
 	// `ves --probe-amf <codec> <gpu>`: whether AMD GPU <gpu> can encode the codec, and its capabilities, on one line. A worker asks this in a process of its own: AMD's runtime
 	// has crashed on GPUs a newer driver no longer supports, and that must not take the worker with it.
+	// The answer is flushed and the process ends without winding anything down: AMD's runtime has crashed on the way out, after answering, and a crash reads as "no".
 	if (argc == 4 && std::string(argv[1]) == "--probe-amf") {
-	const int gpu = atoi(argv[3]);
-	if (amf_supports(argv[2], 420, 8, gpu)) printf("ok %s\n", amf_caps_json(argv[2], gpu).c_str()); else printf("no\n");
-	return 0;
+		std::string caps;
+		const bool ok = amf_probe(argv[2], atoi(argv[3]), caps);
+		if (ok) printf("ok %s\n", caps.c_str()); else printf("no\n");
+		exit_now(0);
 	}
 	for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--worker") return run_worker(argc, argv);
 	Config cfg;

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -512,6 +513,15 @@ size_t RemoteHost::run_jobs(const std::vector<RemoteJobSpec>& jobs, const std::f
 
 // ---- worker ----
 
+void exit_now(int code) {
+	fflush(stdout);
+	fflush(stderr);
+#ifdef _WIN32
+	TerminateProcess(GetCurrentProcess(), (UINT)code); // not even the DLLs are told: AMD's runtime has crashed when told
+#endif
+	std::_Exit(code);
+}
+
 namespace {
 
 std::string self_exe() {
@@ -626,17 +636,28 @@ std::string tail_of(const std::string& text, size_t lines) {
 }
 
 // Whether AMD GPU `gpu` can encode the codec, and its capabilities (JSON), asked of a process of our own: AMD's runtime can crash on a GPU its driver does not support
-// (the access violation would end the worker), and then the GPU is just not offered.
-bool probe_amf(const std::string& codec, int gpu, std::string& json) {
+// (the access violation would end the worker), and then the GPU is just not offered. An answer that came back counts even when the process crashed after giving it.
+// `why` says what went wrong otherwise: the exit code and the last lines the process printed.
+bool probe_amf(const std::string& codec, int gpu, std::string& json, std::string& why) {
 	static const std::atomic<bool> never{false};
-	std::string answer;
+	std::string answer, said;
+	bool no = false;
 	const int code = run_process(self_exe(), {"--probe-amf", codec, std::to_string(gpu)}, [&](const std::string& line) {
 		if (line.rfind("ok ", 0) == 0) answer = line.substr(3);
+		else if (line == "no") no = true;
+		else if (!line.empty()) said += line + "\n";
 	}, never);
-	if (code != 0) fprintf(stderr, "amf: asking AMD GPU %d about %s ended with code %d: not offered\n", gpu, codec.c_str(), code);
-	if (code != 0 || answer.empty()) return false;
-	json = answer;
-	return true;
+	if (!answer.empty()) { json = answer; return true; }
+	char c[64];
+	if (code == -1) snprintf(c, sizeof c, "could not be started");
+	else if (code < 0 || code > 255) snprintf(c, sizeof c, "crashed (code 0x%08x)", (unsigned)code);
+	else if (no) snprintf(c, sizeof c, "cannot encode it");
+	else snprintf(c, sizeof c, "ended with code %d without an answer", code);
+	why = c;
+	std::string last = tail_of(said, 3);
+	for (auto& ch : last) if (ch == '\n') ch = ';';
+	if (!last.empty()) { last.pop_back(); why += " (" + last + ")"; }
+	return false;
 }
 
 // The GPUs this machine offers: for each GPU encoder, its GPUs and the codecs each can encode. NVENC and AMF are asked per GPU; QuickSync only encodes on the
@@ -668,18 +689,24 @@ std::string inventory_json(int only_gpu, const std::vector<WorkerResource>& reso
 		const size_t n = list_gpus(vendor).size();
 		for (size_t i = 0; i < n; i++) {
 			if (encoder == "nvenc" ? (only_gpu >= 0 && (int)i != only_gpu) : encoder == "qsv" && i > 0) continue;
-			std::string codecs, caps;
+			std::string codecs, caps, why_not;
 			for (const char* codec : {"h264", "hevc", "av1"}) {
-				std::string json = "null";
+				std::string json = "null", why;
 				bool ok;
 				if (encoder == "nvenc") { json = nvenc_caps_json(codec, (int)i); ok = json != "null" && json != "{}"; }
-				else if (encoder == "amf") ok = probe_amf(codec, (int)i, json);
+				else if (encoder == "amf") ok = probe_amf(codec, (int)i, json, why);
 				else ok = qsv_supports(codec, 420, 8);
-				if (!ok) continue;
+				if (!ok) { if (!why.empty()) why_not += std::string(why_not.empty() ? "" : "; ") + codec + ": " + why; continue; }
 				codecs += (codecs.empty() ? "" : ",") + jq(codec);
 				caps += (caps.empty() ? "" : ",") + jq(codec) + ":" + jq(json);
 			}
-			if (codecs.empty()) continue;
+			if (codecs.empty()) {
+				// Said only when it was asked for or an encoder could not even be asked: a GPU that just has no such encoder is no news.
+				const bool asked_for = std::any_of(resources.begin(), resources.end(), [&](const WorkerResource& r) { return r.encoder == encoder && r.index == (int)i && r.parallel != 0; });
+				if (asked_for || why_not.find("crashed") != std::string::npos)
+					fprintf(stderr, "%s GPU %d (%s) is not offered: %s\n", encoder.c_str(), (int)i, gpu_description(vendor, (int)i).c_str(), why_not.empty() ? "it encodes none of h264, hevc, av1" : why_not.c_str());
+				continue;
+			}
 			const int parallel = parallel_of(resources, encoder, (int)i, default_parallel);
 			if (parallel <= 0) continue; // written down as not offered
 			total += parallel;
