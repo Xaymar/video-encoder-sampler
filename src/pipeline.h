@@ -72,7 +72,7 @@ struct EncodeJob {
 	std::function<bool(const uint8_t*, size_t)> tee; // also gets every packet as it arrives (for scoring); false once nobody wants them
 	double kbps = 0;
 	bool ok = false;
-	bool crashed = false; // the encoder process ended under it (another run in that process may be what crashed it)
+	bool crashed = false; // the process it ran in ended under it (another run in that process may be what crashed it; see encoder_process.h)
 };
 
 // The frame map grows while the video is read, and scoring follows it.
@@ -109,6 +109,7 @@ struct WaveRun {
 	RunProgress* score_rp = nullptr;
 	std::vector<double> scores;
 	bool score_ok = false;
+	std::string label, pool; // for the rows of the live display
 };
 
 // Encodes all runs (which must share a feed key) from one decode of `input`, and scores each against the original at the same time.

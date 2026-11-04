@@ -16,6 +16,10 @@ struct VkDeviceInfo {
 	bool luid_valid = false;
 };
 
+// The Vulkan device that is the n-th GPU of a vendor as gpu.h lists them (matched by LUID where the driver says), -1 if none; and a device's name.
+int vulkan_device_of_gpu(unsigned vendor, int n);
+std::string vulkan_device_name(int index);
+
 #ifndef VES_NO_VULKAN
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>

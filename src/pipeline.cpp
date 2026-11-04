@@ -11,7 +11,6 @@
 #include <mutex>
 #include <thread>
 
-#include "encoder_process.h"
 #include "formats.h"
 #include "gpu.h"
 #include "mux.h"
@@ -264,8 +263,7 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
 	p.bitrate = job.bitrate;
 	p.gop = std::max(1, (int)std::lround(job.kf * pl.enc.fps.value()));
 	p.options = pl.options;
-	auto codec = isolated_encoders() ? make_isolated_encoder(job.encoder) : make_encoder(job.encoder);
-	struct Crashed { EncodeJob& job; Encoder* e; ~Crashed() { if (e) job.crashed = e->crashed(); } } crashed{job, codec.get()};
+	auto codec = make_encoder(job.encoder);
 	// Packets arrive in coding order, which is also the order the decoder needs them.
 	// and are muxed to disk as they arrive; only the packet at hand is in memory.
 	Mp4Writer mp4;

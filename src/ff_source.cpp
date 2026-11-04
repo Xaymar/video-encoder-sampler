@@ -10,7 +10,10 @@
 #include <map>
 #include <mutex>
 
+#include "encoder.h"
 #include "ff.h"
+#include "gpu.h"
+#include "vk_compute.h"
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -183,8 +186,9 @@ public:
 
 	bool hardware() const { return hw_used; }
 
-	// hw_type: the FFmpeg name of a hardware device type ("cuda", "d3d11va", ...), or empty for software.
-	bool open(const std::string& path, const std::string& hw_type, bool do_scan) {
+	// hw_type: the FFmpeg name of a hardware device type ("cuda", "d3d11va", ...) or of a hardware decoder ("hevc_cuvid"), or empty for software.
+	// device: which GPU, in the device type's own terms (a CUDA ordinal, a DXGI adapter index, a render node, a Vulkan device); empty: the type's default.
+	bool open(const std::string& path, const std::string& hw_type, bool do_scan, const std::string& device = {}) {
 		char b[AV_ERROR_MAX_STRING_SIZE];
 		int r = avformat_open_input(&ctx, path.c_str(), nullptr, nullptr);
 		if (r < 0) { fprintf(stderr, "open '%s': %s\n", path.c_str(), av_make_error_string(b, sizeof b, r)); return false; }
@@ -214,10 +218,10 @@ public:
 			}
 			{ // one device per type for the whole run: creating it is slow, and decoders can share it
 				static std::mutex devices_mutex;
-				static std::map<int, AVBufferRef*> devices;
+				static std::map<std::string, AVBufferRef*> devices;
 				std::lock_guard lock(devices_mutex);
-				AVBufferRef*& shared = devices[(int)type];
-				if (!shared && av_hwdevice_ctx_create(&shared, type, nullptr, nullptr, 0) < 0) { shared = nullptr; return false; }
+				AVBufferRef*& shared = devices[hw_type + "|" + device];
+				if (!shared && av_hwdevice_ctx_create(&shared, type, device.empty() ? nullptr : device.c_str(), nullptr, 0) < 0) { shared = nullptr; return false; }
 				hw_dev = av_buffer_ref(shared);
 			}
 			dec->hw_device_ctx = av_buffer_ref(hw_dev);
@@ -229,7 +233,11 @@ public:
 			dec->thread_count = decode_threads(); // the library decodes on one thread unless told otherwise
 			dec->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
 		}
-		if (avcodec_open2(dec, c, nullptr) < 0) { if (hw_type.empty()) fprintf(stderr, "decoder open failed\n"); return false; }
+		AVDictionary* dec_opts = nullptr;
+		if (dedicated && !device.empty()) av_dict_set(&dec_opts, "gpu", device.c_str(), 0); // the CUDA ordinal of a *_cuvid decoder
+		const int opened = avcodec_open2(dec, c, &dec_opts);
+		av_dict_free(&dec_opts);
+		if (opened < 0) { if (hw_type.empty()) fprintf(stderr, "decoder open failed\n"); return false; }
 		width = dec->width; height = dec->height;
 		framerate = from_av(av_guess_frame_rate(ctx, st, nullptr));
 		tb = from_av(st->time_base);
@@ -249,7 +257,8 @@ public:
 			if (pending.color.range == AVCOL_RANGE_JPEG) color.range = AVCOL_RANGE_JPEG;
 		}
 		if (do_scan) scan(path);
-		decoder_name = std::string(c->name) + (hw_type.empty() ? " (software)" : dedicated ? " (hardware)" : " (" + hw_type + " hardware)");
+		decoder_name = std::string(c->name) + (hw_type.empty() ? " (software)" : dedicated ? " (hardware" : " (" + hw_type + " hardware");
+		if (!hw_type.empty()) decoder_name += (device.empty() ? "" : ", device " + device) + ")";
 		decoder = decoder_name;
 		return true;
 	}
@@ -358,9 +367,9 @@ void describe_difference(const Picture& a, const Picture& b, int frame) {
 }
 
 // Decodes the first frames both ways and compares them.
-bool verify_hardware(const std::string& path, const std::string& type) {
+bool verify_hardware(const std::string& path, const std::string& type, const std::string& device) {
 	FfSource sw, hw;
-	if (!sw.open(path, "", false) || !hw.open(path, type, false)) return false;
+	if (!sw.open(path, "", false) || !hw.open(path, type, false, device)) return false;
 	for (int i = 0; i < VERIFY_FRAMES; i++) {
 		Picture a, b;
 		const int ra = sw.next(a), rb = hw.next(b);
@@ -395,9 +404,63 @@ AVCodecID codec_id_of(const std::string& path) {
 
 std::mutex g_mutex;
 std::string g_hw;                  // "", "auto" or a device type
-std::map<std::string, bool> g_verdict; // path|type -> identical to software
+std::map<std::string, bool> g_verdict; // path|type|device -> identical to software
+unsigned g_vendor = 0;             // set_hw_decode_gpu(): decode on this GPU only
+int g_index = -1;
+
+// What hardware decoding can try, in order: a device type or a hardware decoder, and the GPU in that type's terms (empty: its default).
+struct HwChoice {
+	std::string type, device;
+};
+
+// The hardware decoders of the stream's codec whose names end in `suffix` (_cuvid, _qsv, _amf).
+std::vector<std::string> dedicated_decoders(AVCodecID id, const std::string& suffix) {
+	std::vector<std::string> out;
+	void* it = nullptr;
+	while (const AVCodec* c = av_codec_iterate(&it)) {
+		const std::string name = c->name;
+		if (av_codec_is_decoder(c) && c->id == id && (c->capabilities & AV_CODEC_CAP_HARDWARE) && name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0)
+			out.push_back(name);
+	}
+	return out;
+}
+
+std::vector<HwChoice> hw_choices(const std::string& path, const std::string& want) {
+	std::vector<HwChoice> out;
+	if (!g_vendor) { // any GPU: each type's default device
+		if (want != "auto") return {{want, ""}};
+		// The normal decoders on a hardware device first, then the dedicated hardware decoders of the stream's codec.
+		// (OpenCL is left out: it breaks more often than it works on systems with several GPUs.)
+		for (const char* t : {"cuda", "d3d11va", "d3d12va", "dxva2", "qsv", "amf", "vaapi", "vulkan"}) out.push_back({t, ""});
+		for (const char* suffix : {"_cuvid", "_qsv", "_amf"}) for (auto& d : dedicated_decoders(codec_id_of(path), suffix)) out.push_back({d, ""});
+		return out;
+	}
+	// One GPU (an encoder process): every type is pointed at that GPU, and types that cannot be pointed at it are left out, so the frames are decoded where
+	// they are encoded and scored. DXVA2 numbers adapters its own way, and FFmpeg's AMF device takes no adapter; both are left out.
+	struct Where { int cuda, dxgi, vk; std::string node; };
+	static const Where where{g_vendor == VENDOR_NVIDIA ? nvenc_cuda_ordinal(g_index) : -1, dxgi_adapter_index(g_vendor, g_index), vulkan_device_of_gpu(g_vendor, g_index), render_node(g_vendor, g_index)}; // asked once: the GPU does not change
+	const int cuda = where.cuda, dxgi = where.dxgi, vk = where.vk;
+	const std::string& node = where.node;
+	auto add = [&](const std::string& type, const std::string& device) { if (want == "auto" || want == type) out.push_back({type, device}); };
+	if (cuda >= 0) add("cuda", std::to_string(cuda));
+	if (dxgi >= 0) { add("d3d11va", std::to_string(dxgi)); add("d3d12va", std::to_string(dxgi)); }
+	if (g_vendor == VENDOR_INTEL && g_index == 0) add("qsv", "");
+	if (!node.empty()) add("vaapi", node);
+	if (vk >= 0) add("vulkan", std::to_string(vk));
+	const AVCodecID id = codec_id_of(path);
+	if (cuda >= 0) for (auto& d : dedicated_decoders(id, "_cuvid")) add(d, std::to_string(cuda));
+	if (g_index == 0 && g_vendor == VENDOR_INTEL) for (auto& d : dedicated_decoders(id, "_qsv")) add(d, "");
+	if (g_index == 0 && g_vendor == VENDOR_AMD) for (auto& d : dedicated_decoders(id, "_amf")) add(d, "");
+	return out;
+}
 
 } // namespace
+
+void set_hw_decode_gpu(unsigned vendor, int index) {
+	std::lock_guard lock(g_mutex);
+	g_vendor = vendor;
+	g_index = index;
+}
 
 void set_hw_decode(const std::string& type) {
 	std::lock_guard lock(g_mutex);
@@ -412,23 +475,8 @@ std::unique_ptr<Source> open_source(const std::string& path) {
 		want = g_hw;
 	}
 	if (!want.empty()) {
-		std::vector<std::string> types;
-		if (want == "auto") {
-			// The normal decoders on a hardware device first, then the dedicated hardware decoders of the stream's codec.
-			// (OpenCL is left out: it breaks more often than it works on systems with several GPUs.)
-			types = {"cuda", "d3d11va", "d3d12va", "dxva2", "qsv", "amf", "vaapi", "vulkan"};
-			const AVCodecID id = codec_id_of(path);
-			for (const std::string suffix : {"_cuvid", "_qsv", "_amf"}) {
-				void* it = nullptr;
-				while (const AVCodec* c = av_codec_iterate(&it)) {
-					const std::string name = c->name;
-					if (av_codec_is_decoder(c) && c->id == id && (c->capabilities & AV_CODEC_CAP_HARDWARE) && name.size() > suffix.size() &&
-					    name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) types.push_back(name);
-				}
-			}
-		} else types = {want};
-		for (const auto& type : types) {
-			const std::string key = path + "|" + type;
+		for (const auto& [type, device] : hw_choices(path, want)) {
+			const std::string key = path + "|" + type + "|" + device;
 			bool known = false, good = false;
 			{
 				std::lock_guard lock(g_mutex);
@@ -436,14 +484,14 @@ std::unique_ptr<Source> open_source(const std::string& path) {
 			}
 			if (known && !good) continue;
 			if (!known) {
-				good = verify_hardware(path, type);
-				if (good) fprintf(stderr, "hardware decoding (%s) matched software on the first %d frames of '%s'\n", type.c_str(), VERIFY_FRAMES, path.c_str());
+				good = verify_hardware(path, type, device);
+				if (good) fprintf(stderr, "hardware decoding (%s%s) matched software on the first %d frames of '%s'\n", type.c_str(), device.empty() ? "" : (", device " + device).c_str(), VERIFY_FRAMES, path.c_str());
 				std::lock_guard lock(g_mutex);
 				g_verdict[key] = good;
 				if (!good) continue;
 			}
 			auto s = std::make_unique<FfSource>();
-			if (s->open(path, type, true)) return s;
+			if (s->open(path, type, true, device)) return s;
 		}
 		static std::mutex once;
 		static std::map<std::string, bool> told;

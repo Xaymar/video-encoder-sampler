@@ -588,6 +588,15 @@ public:
 
 std::unique_ptr<Encoder> make_encoder_nvenc() { return std::make_unique<Nvenc>(); }
 
+int nvenc_cuda_ordinal(int gpu) {
+	CudaFunctions* cu = nullptr;
+	int ordinal = -1;
+	CUdevice dev;
+	if (cuda_load_functions(&cu, nullptr) >= 0 && !cu->cuInit(0) && cuda_device_for(cu, gpu, dev)) ordinal = (int)dev; // a CUdevice is CUDA's ordinal
+	cuda_free_functions(&cu);
+	return ordinal;
+}
+
 // All capabilities of the NVENC on the n-th NVIDIA GPU for a codec, as a JSON object; "null" if it cannot be asked.
 std::string nvenc_caps_json(const std::string& codec, int gpu) {
 	bool known;

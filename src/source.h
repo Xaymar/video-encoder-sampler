@@ -38,6 +38,8 @@ std::unique_ptr<Source> open_source(const std::string& path); // nullptr if it c
 // "d3d12va", "dxva2", "qsv", "amf", "vaapi", "vulkan") or dedicated hardware decoder ("hevc_cuvid", "h264_qsv", ...). A source is only decoded by hardware after its first frames matched a software decode
 // exactly; otherwise it is decoded in software. Encoded streams that are scored are always decoded in software.
 void set_hw_decode(const std::string& type);
+// Hardware decoding on the n-th GPU of a vendor only (as gpu.h lists them): set in the process of that GPU, so that its frames never cross to another device.
+void set_hw_decode_gpu(unsigned vendor, int index);
 
 // Threads per decoder: 0 for as many as there are cores. Each decodes a frame of its own, which is what makes high bitrate sources fast.
 void set_decode_threads(int threads);

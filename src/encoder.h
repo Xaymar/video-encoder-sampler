@@ -36,8 +36,6 @@ public:
 	// How many frames the display order can lag behind the coding order (B-frame depth), valid after open(); only needed from encoders
 	// that report no DTS, so that a muxer can offset the display times.
 	virtual int reorder_delay() const { return 0; }
-	// The encoder ran in a process of its own (encoder_process.h), and that process ended while it was in it: the run did not fail by itself.
-	virtual bool crashed() const { return false; }
 	Stats stats;
 };
 
@@ -50,6 +48,7 @@ std::unique_ptr<Encoder> make_encoder_x265();
 std::unique_ptr<Encoder> make_encoder_svtav1();
 
 bool nvenc_supports(const std::string& codec, int chroma, int depth);
+int nvenc_cuda_ordinal(int gpu); // CUDA's number for the n-th NVIDIA GPU (what gpu=n means to NVENC), for decoding on it; -1 without CUDA
 
 // What the encoder block of the n-th GPU reports about itself for a codec, as a JSON object (NVENC: all of its capability values), or "null"
 // if the encoder cannot tell. Together with the PCI ids of the GPU this identifies the encoder generation: the CUDA generation of a GPU says

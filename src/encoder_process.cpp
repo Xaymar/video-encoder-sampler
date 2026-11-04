@@ -16,6 +16,10 @@
 #include <vector>
 
 #include "formats.h"
+#include "gpu.h"
+#include "pipeline.h"
+#include "source.h"
+#include "vk_compute.h"
 #include "priority.h"
 #include "remote.h"
 #include "ui.h"
@@ -40,12 +44,10 @@ std::mutex args_m;
 std::vector<std::string> process_args;
 
 // ---- messages ----
-// Every message is a header (payload size, type, session) and the payload, the same way in both directions. Numbers are in the byte order of the machine: both
+// Every message is a header (payload size, type, id) and the payload, the same way in both directions. Numbers are in the byte order of the machine: both
 // ends are the same program on the same machine.
-//   to the encoder process:   'O' open (shared memory, slot size and count, Params)   'F' a picture is in a slot (slot, pts, duration)   'E' flush   'C' close
-//                             'S' supports (codec, chroma, depth)   'K' capabilities (codec)
-//   from it:                  'o' opened (ok, reorder delay)   'p' packet (pts, dts, key, data)   'f' slot free again (slot, ok)   'e' flushed (ok)
-//                             's' supports (yes/no)   'k' capabilities (JSON)
+//   to the encoder process:   'W' a wave (input, source, scaling and VMAF options, the runs)   'S' supports (codec, chroma, depth)   'K' capabilities (codec)
+//   from it:                  'P' the wave's progress rows (as ui::snapshot_json)   'w' the wave's results   's' supports (1/0)   'k' capabilities (JSON)
 constexpr size_t HEADER = 9;
 
 struct Writer {
@@ -85,131 +87,29 @@ std::string header(uint8_t type, uint32_t id, size_t size) {
 	return h;
 }
 
-void put_params(Writer& w, const Params& p) {
-	w.num(p.width).num(p.height).num(p.pix.chroma).num(p.pix.depth).num((uint8_t)p.pix.rgb).num((uint8_t)p.pix.planar);
-	w.num(p.framerate.num).num(p.framerate.den).num(p.bitrate).num(p.gop).str(p.codec);
-	w.num(p.color.range).num(p.color.space).num(p.color.primaries).num(p.color.trc);
-	w.num((uint32_t)p.options.size());
-	for (auto& [k, v] : p.options) w.str(k).str(v);
-}
+template <class T> void put_list(Writer& w, const std::vector<T>& v) { w.num((uint32_t)v.size()); for (auto& x : v) w.num(x); }
 
-Params get_params(Reader& r) {
-	Params p;
-	p.width = r.num<int>(); p.height = r.num<int>();
-	p.pix.chroma = r.num<int>(); p.pix.depth = r.num<int>(); p.pix.rgb = r.num<uint8_t>() != 0; p.pix.planar = r.num<uint8_t>() != 0;
-	p.framerate.num = r.num<int>(); p.framerate.den = r.num<int>();
-	p.bitrate = r.num<int64_t>(); p.gop = r.num<int>(); p.codec = r.str();
-	p.color.range = r.num<int>(); p.color.space = r.num<int>(); p.color.primaries = r.num<int>(); p.color.trc = r.num<int>();
+void put(Writer& w, const Fmt& f) { w.num(f.chroma).num(f.depth).num((uint8_t)f.rgb).num((uint8_t)f.planar); }
+void get(Reader& r, Fmt& f) { f.chroma = r.num<int>(); f.depth = r.num<int>(); f.rgb = r.num<uint8_t>() != 0; f.planar = r.num<uint8_t>() != 0; }
+void put(Writer& w, const Color& c) { w.num(c.range).num(c.space).num(c.primaries).num(c.trc); }
+void get(Reader& r, Color& c) { c.range = r.num<int>(); c.space = r.num<int>(); c.primaries = r.num<int>(); c.trc = r.num<int>(); }
+void put(Writer& w, const Rational& q) { w.num(q.num).num(q.den); }
+void get(Reader& r, Rational& q) { q.num = r.num<int>(); q.den = r.num<int>(); }
+void put(Writer& w, const Shape& s) { w.num(s.w).num(s.h); put(w, s.fps); put(w, s.pix); w.num((uint8_t)s.has_pix).num((uint8_t)s.upscale); }
+void get(Reader& r, Shape& s) { s.w = r.num<int>(); s.h = r.num<int>(); get(r, s.fps); get(r, s.pix); s.has_pix = r.num<uint8_t>() != 0; s.upscale = r.num<uint8_t>() != 0; }
+void put(Writer& w, const Options& o) { w.num((uint32_t)o.size()); for (auto& [k, v] : o) w.str(k).str(v); }
+void get(Reader& r, Options& o) {
 	const uint32_t n = r.num<uint32_t>();
-	for (uint32_t i = 0; i < n && r.ok; i++) {
-		std::string k = r.str();
-		p.options[k] = r.str();
-	}
-	return p;
+	for (uint32_t i = 0; i < n && r.ok; i++) { std::string k = r.str(); o[k] = r.str(); }
 }
-
-// Where the planes of a picture go in a slot: one after the other, rows without padding.
-struct SlotLayout {
-	size_t offset[3]{}, stride[3]{};
-	int rows[3]{};
-	size_t size = 0;
-	SlotLayout() = default;
-	SlotLayout(const Params& p) {
-		const size_t bps = p.pix.depth > 8 ? 2 : 1;
-		const int cw = p.pix.chroma == 444 ? p.width : (p.width + 1) / 2, ch = p.pix.chroma == 420 ? (p.height + 1) / 2 : p.height;
-		for (int i = 0; i < 3; i++) {
-			offset[i] = size;
-			stride[i] = (size_t)(i ? cw : p.width) * bps;
-			rows[i] = i ? ch : p.height;
-			size += stride[i] * (size_t)rows[i];
-		}
-		size = (size + 63) & ~(size_t)63;
-	}
-};
-
-// ---- shared memory ----
-class SharedMemory {
-public:
-	uint8_t* data = nullptr;
-	size_t size = 0;
-
-	~SharedMemory() { close(); }
-
-	bool create(const std::string& name, size_t n) {
-		size = n;
-#ifdef _WIN32
-		const std::wstring wname(name.begin(), name.end());
-		h = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, (DWORD)((uint64_t)n >> 32), (DWORD)n, wname.c_str());
-		if (!h || GetLastError() == ERROR_ALREADY_EXISTS) return false;
-		data = (uint8_t*)MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, n);
-#else
-		this->name = name;
-		fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
-		if (fd < 0) return false;
-		if (ftruncate(fd, (off_t)n) != 0) return false;
-		void* m = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-		data = m == MAP_FAILED ? nullptr : (uint8_t*)m;
-#endif
-		return data != nullptr;
-	}
-
-	bool open(const std::string& name, size_t n) {
-		size = n;
-#ifdef _WIN32
-		const std::wstring wname(name.begin(), name.end());
-		h = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, wname.c_str());
-		if (!h) return false;
-		data = (uint8_t*)MapViewOfFile(h, FILE_MAP_ALL_ACCESS, 0, 0, n);
-#else
-		fd = shm_open(name.c_str(), O_RDWR | O_CLOEXEC, 0600);
-		if (fd < 0) return false;
-		void* m = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-		data = m == MAP_FAILED ? nullptr : (uint8_t*)m;
-#endif
-		return data != nullptr;
-	}
-
-	void unlink() { // the name is not needed once both sides have the memory
-#ifndef _WIN32
-		if (!name.empty()) shm_unlink(name.c_str());
-		name.clear();
-#endif
-	}
-
-	void close() {
-		unlink();
-#ifdef _WIN32
-		if (data) UnmapViewOfFile(data);
-		if (h) CloseHandle(h);
-		h = nullptr;
-#else
-		if (data) munmap(data, size);
-		if (fd >= 0) ::close(fd);
-		fd = -1;
-#endif
-		data = nullptr;
-	}
-
-private:
-#ifdef _WIN32
-	HANDLE h = nullptr;
-#else
-	int fd = -1;
-	std::string name;
-#endif
-};
-
-std::string memory_name() {
-	static std::atomic<unsigned> counter{0};
-	static const unsigned salt = std::random_device{}();
-	char b[96];
-#ifdef _WIN32
-	snprintf(b, sizeof b, "Local\\ves-%lu-%08x-%u", (unsigned long)GetCurrentProcessId(), salt, counter++);
-#else
-	snprintf(b, sizeof b, "/ves-%ld-%08x-%u", (long)getpid(), salt, counter++);
-#endif
-	return b;
-}
+void put(Writer& w, const SourceInfo& s) { w.num(s.width).num(s.height); put(w, s.fmt); put(w, s.framerate); put(w, s.color); w.num(s.duration).str(s.decoder).num(s.frame_count); }
+void get(Reader& r, SourceInfo& s) { s.width = r.num<int>(); s.height = r.num<int>(); get(r, s.fmt); get(r, s.framerate); get(r, s.color); s.duration = r.num<double>(); s.decoder = r.str(); s.frame_count = r.num<long long>(); }
+void put(Writer& w, const Plan& p) { put(w, p.enc); put(w, p.score_fmt); w.num((uint8_t)p.convert_rate).num((uint8_t)p.rescale).num(p.range); put(w, p.color); put(w, p.options); }
+void get(Reader& r, Plan& p) { get(r, p.enc); get(r, p.score_fmt); p.convert_rate = r.num<uint8_t>() != 0; p.rescale = r.num<uint8_t>() != 0; p.range = r.num<int>(); get(r, p.color); get(r, p.options); }
+void put(Writer& w, const ScaleOptions& s) { w.str(s.upscaler).str(s.downscaler).str(s.device); }
+void get(Reader& r, ScaleOptions& s) { s.upscaler = r.str(); s.downscaler = r.str(); s.device = r.str(); }
+void put(Writer& w, const VmafOptions& v) { w.str(v.model).num(v.threads).str(v.device).str(v.gpu).num(v.encoder_vendor).num(v.encoder_gpu); }
+void get(Reader& r, VmafOptions& v) { v.model = r.str(); v.threads = r.num<int>(); v.device = r.str(); v.gpu = r.str(); v.encoder_vendor = r.num<unsigned>(); v.encoder_gpu = r.num<int>(); }
 
 // ---- the process ----
 // A child with its stdin, stdout and stderr on pipes. Only those three handles are passed on: a handle of another child's pipe that a child kept open would hide
@@ -424,7 +324,8 @@ struct Waiter {
 	virtual ~Waiter() = default;
 	virtual void on_message(uint8_t type, Reader& r) = 0;
 	virtual void on_death() = 0;
-	virtual bool counts() const { return false; } // a run that fails when the process dies
+	virtual bool counts() const { return false; } // runs that fail when the process dies
+	virtual size_t count() const { return 0; }    // how many
 };
 
 // One encoder process, and what waits for it.
@@ -477,7 +378,7 @@ struct Device {
 			std::lock_guard lock(m);
 			alive = false;
 			expected = stopping;
-			for (auto& [id, w] : waiters) { runs += w->counts(); w->on_death(); }
+			for (auto& [id, w] : waiters) { if (w->counts()) runs += w->count(); w->on_death(); }
 		}
 		if (!expected) {
 			std::string what = "The encoder process for " + name + " " + describe_exit(code);
@@ -534,7 +435,7 @@ std::map<std::string, std::shared_ptr<Device>> devices;
 // The process of a GPU (or CPU encoder), started when it is not running.
 std::shared_ptr<Device> device_for(const std::string& encoder, int gpu) {
 	const bool on_gpu = is_gpu_encoder(encoder);
-	const std::string key = on_gpu ? encoder + ":" + std::to_string(gpu) : encoder;
+	const std::string key = on_gpu ? encoder + ":" + std::to_string(gpu) : "cpu"; // the CPU encoders share one process, and with it one decode of the input
 	std::lock_guard lock(devices_m);
 	auto& d = devices[key];
 	if (d) {
@@ -543,9 +444,9 @@ std::shared_ptr<Device> device_for(const std::string& encoder, int gpu) {
 	}
 	if (d) d->reap();
 	auto fresh = std::make_shared<Device>();
-	fresh->encoder = encoder;
+	fresh->encoder = on_gpu ? encoder : "cpu";
 	fresh->gpu = on_gpu ? gpu : 0;
-	fresh->name = on_gpu ? encoder + " GPU " + std::to_string(gpu) : encoder;
+	fresh->name = on_gpu ? encoder + " GPU " + std::to_string(gpu) : "CPU encoders";
 	if (!fresh->start()) {
 		ui::log("cannot start the encoder process for " + fresh->name);
 		d = nullptr;
@@ -555,154 +456,31 @@ std::shared_ptr<Device> device_for(const std::string& encoder, int gpu) {
 	return d;
 }
 
-// ---- the encoder in this process ----
-class Isolated : public Encoder, Waiter {
-	static constexpr int SLOTS = 3; // pictures on their way: the next one is copied while the encoder works on the one before
-	const std::string name;
-	std::shared_ptr<Device> dev;
-	uint32_t id = 0;
-	Params params;
-	SlotLayout layout;
-	SharedMemory shm;
-	Sink sink;
-	// under dev->m
-	struct Packet {
-		std::string data;
-		int64_t pts, dts;
-		bool key;
-	};
+// ---- a wave in an encoder process (this side) ----
+// What the process of one device sends back while it works on its part of a wave: its progress rows, and at the end every run's result.
+struct WaveWait : Waiter {
 	std::condition_variable cv;
-	std::deque<Packet> packets;
-	bool busy[SLOTS]{};
-	bool replied = false, open_ok = false, flushed = false, flush_ok = false, failed = false, dead = false;
-	int reorder = 0;
-	bool lost = false; // the process ended while this encoder was in it
-
+	std::string key; // of its progress rows in the live display
+	bool done = false, dead = false;
+	std::string result;
+	size_t runs = 0;
 	void on_message(uint8_t type, Reader& r) override {
-		if (type == 'p') {
-			Packet k;
-			k.pts = r.num<int64_t>();
-			k.dts = r.num<int64_t>();
-			k.key = r.num<uint8_t>() != 0;
-			k.data = r.rest();
-			packets.push_back(std::move(k));
-		}
-		else if (type == 'f') {
-			const uint32_t slot = r.num<uint32_t>();
-			if (slot < SLOTS) busy[slot] = false;
-			if (!r.num<uint8_t>()) failed = true;
-		}
-		else if (type == 'o') { open_ok = r.num<uint8_t>() != 0; reorder = r.num<int32_t>(); replied = true; }
-		else if (type == 'e') { flush_ok = r.num<uint8_t>() != 0; flushed = true; }
-		cv.notify_all();
+		if (type == 'P') { ui::set_remote(key, "", ui::parse_progress(r.rest())); return; }
+		if (type == 'w') { result = r.rest(); done = true; cv.notify_all(); }
 	}
 	void on_death() override { dead = true; cv.notify_all(); }
 	bool counts() const override { return true; }
-
-	// Hands the packets that came in to the sink, on the thread that encodes (as the encoders in this process do); the lock is let go meanwhile.
-	void deliver(std::unique_lock<std::mutex>& lock) {
-		while (!packets.empty()) {
-			Packet k = std::move(packets.front());
-			packets.pop_front();
-			lock.unlock();
-			stats.packets++;
-			stats.bytes += (long long)k.data.size();
-			if (sink) sink((const uint8_t*)k.data.data(), k.data.size(), k.pts, k.key, k.dts);
-			lock.lock();
-		}
-	}
-
-public:
-	explicit Isolated(std::string n) : name(std::move(n)) {}
-
-	~Isolated() override {
-		if (!dev || !id) return;
-		bool gone;
-		{
-			std::lock_guard lock(dev->m);
-			dev->waiters.erase(id);
-			gone = dead;
-		}
-		if (!gone) dev->send('C', id, {});
-	}
-
-	bool crashed() const override { return lost; }
-
-	bool open(const Params& p, Sink s) override {
-		sink = std::move(s);
-		params = p;
-		int gpu = 0;
-		if (auto it = p.options.find("gpu"); it != p.options.end()) gpu = atoi(it->second.c_str());
-		dev = device_for(name, gpu);
-		if (!dev) return false;
-		layout = SlotLayout(p);
-		const std::string mem = memory_name();
-		if (!shm.create(mem, layout.size * SLOTS)) { fprintf(stderr, "%s: cannot set up shared memory for the encoder process\n", name.c_str()); return false; }
-		{
-			std::lock_guard lock(dev->m);
-			if (!dev->alive) { lost = true; return false; }
-			id = dev->next_id++;
-			dev->waiters[id] = this;
-		}
-		Writer w;
-		w.str(mem).num((uint64_t)layout.size).num((uint32_t)SLOTS);
-		put_params(w, p);
-		dev->send('O', id, w.s);
-		std::unique_lock lock(dev->m);
-		cv.wait(lock, [&] { return replied || dead; });
-		shm.unlink();
-		if (!replied) { lost = true; return false; }
-		return open_ok;
-	}
-
-	int reorder_delay() const override { return reorder; }
-
-	bool encode(const Picture* pic) override {
-		if (!pic) return flush();
-		if (pic->fmt != params.pix || pic->width != params.width || pic->height != params.height) {
-			fprintf(stderr, "%s: the picture is not the %dx%d %d-bit %d the encoder was opened for\n", name.c_str(), params.width, params.height, params.pix.depth, params.pix.chroma);
-			return false;
-		}
-		int slot = -1;
-		{
-			std::unique_lock lock(dev->m);
-			for (;;) {
-				deliver(lock);
-				if (dead) { lost = true; return false; }
-				if (failed) return false;
-				for (int i = 0; i < SLOTS && slot < 0; i++) if (!busy[i]) slot = i;
-				if (slot >= 0) break;
-				cv.wait(lock, [&] {
-					for (bool b : busy) if (!b) return true;
-					return !packets.empty() || dead || failed;
-				});
-			}
-			busy[slot] = true;
-		}
-		uint8_t* base = shm.data + (size_t)slot * layout.size;
-		for (int i = 0; i < 3; i++) {
-			uint8_t* d = base + layout.offset[i];
-			for (int y = 0; y < layout.rows[i]; y++) memcpy(d + (size_t)y * layout.stride[i], pic->data[i] + (size_t)y * pic->stride[i], layout.stride[i]);
-		}
-		Writer w;
-		w.num((uint32_t)slot).num(pic->pts).num(pic->duration);
-		dev->send('F', id, w.s); // a process that is gone is noticed by the reader
-		return true;
-	}
-
-	bool flush() {
-		dev->send('E', id, {});
-		std::unique_lock lock(dev->m);
-		for (;;) {
-			deliver(lock);
-			if (flushed) break;
-			if (dead) { lost = true; return false; }
-			cv.wait(lock, [&] { return !packets.empty() || flushed || dead; });
-		}
-		deliver(lock); // the packets come before the answer
-		return flush_ok && !failed;
-	}
+	size_t count() const override { return runs; }
 };
+
+// The key of the process a run belongs to: its GPU's (encoder and GPU index), or the one of the CPU encoders.
+std::pair<std::string, int> device_of(const WaveRun& run) {
+	if (!is_gpu_encoder(run.enc.encoder)) return {"cpu", 0};
+	const auto& o = run.enc.plan->options;
+	const auto it = o.find("gpu");
+	return {run.enc.encoder, it == o.end() ? 0 : atoi(it->second.c_str())};
+}
+
 
 // A question for an encoder process.
 struct Question : Waiter {
@@ -789,100 +567,88 @@ void reply(uint8_t type, uint32_t id, const std::string& body) {
 }
 
 // An encoder of the process that started this one, on a thread of its own: it gets its messages in order.
-class Session {
-	const uint32_t id;
-	const std::string encoder;
-	std::mutex m;
-	std::condition_variable cv;
-	std::deque<std::pair<uint8_t, std::string>> inbox;
-	std::thread worker;
+// ---- a wave in this process (the encoder process) ----
+unsigned process_vendor = 0; // the GPU this process serves; 0 for the process of the CPU encoders
+int process_gpu = 0;
 
-	void run() {
-		std::unique_ptr<Encoder> enc;
-		SharedMemory shm;
-		Params p;
-		SlotLayout layout;
-		uint32_t slots = 0;
-		bool failed = false;
-		for (;;) {
-			std::pair<uint8_t, std::string> msg;
-			{
-				std::unique_lock lock(m);
-				cv.wait(lock, [&] { return !inbox.empty(); });
-				msg = std::move(inbox.front());
-				inbox.pop_front();
-			}
-			Reader r(msg.second);
-			switch (msg.first) {
-			case 'O': {
-				const std::string mem = r.str();
-				const uint64_t slot_size = r.num<uint64_t>();
-				slots = r.num<uint32_t>();
-				p = get_params(r);
-				layout = SlotLayout(p);
-				bool ok = r.ok && layout.size == slot_size;
-				if (!ok) fprintf(stderr, "%s: a garbled request to open an encoder\n", encoder.c_str());
-				if (ok && !(ok = shm.open(mem, slot_size * slots))) fprintf(stderr, "%s: cannot open the shared memory of the encoder\n", encoder.c_str());
-				if (ok) {
-					enc = make_encoder(encoder);
-					const uint32_t sid = id;
-					ok = enc && enc->open(p, [sid](const uint8_t* d, size_t n, int64_t pts, bool key, int64_t dts) {
-						Writer w;
-						w.num(pts).num(dts).num((uint8_t)key).bytes(d, n);
-						reply('p', sid, w.s);
-					});
-				}
-				if (!ok) failed = true;
-				Writer w;
-				w.num((uint8_t)ok).num((int32_t)(ok ? enc->reorder_delay() : 0));
-				reply('o', id, w.s);
-				break;
-			}
-			case 'F': {
-				const uint32_t slot = r.num<uint32_t>();
-				Picture pic;
-				pic.pts = r.num<int64_t>();
-				pic.duration = r.num<int64_t>();
-				bool ok = !failed && enc && slot < slots;
-				if (ok) {
-					pic.width = p.width; pic.height = p.height;
-					pic.fmt = p.pix;
-					pic.color = p.color;
-					const uint8_t* base = shm.data + (size_t)slot * layout.size;
-					for (int i = 0; i < 3; i++) { pic.data[i] = base + layout.offset[i]; pic.stride[i] = (int)layout.stride[i]; }
-					ok = enc->encode(&pic);
-					if (!ok) failed = true;
-				}
-				Writer w;
-				w.num(slot).num((uint8_t)ok);
-				reply('f', id, w.s);
-				break;
-			}
-			case 'E': {
-				const bool ok = !failed && enc && enc->encode(nullptr);
-				Writer w;
-				w.num((uint8_t)ok);
-				reply('e', id, w.s);
-				break;
-			}
-			case 'C':
-				enc.reset();
-				return;
-			}
-		}
+void run_wave_here(uint32_t id, const std::string& body) {
+	Reader r(body);
+	const std::string input = r.str();
+	SourceInfo planned;
+	get(r, planned);
+	ScaleOptions so;
+	get(r, so);
+	VmafOptions vo;
+	get(r, vo);
+	const uint32_t n = r.num<uint32_t>();
+	std::vector<Plan> plans(n);
+	std::vector<WaveRun> runs(n);
+	std::vector<std::unique_ptr<RunProgress>> progress;
+	for (uint32_t i = 0; i < n && r.ok; i++) {
+		EncodeJob& ej = runs[i].enc;
+		ej.encoder = r.str();
+		ej.codec = r.str();
+		get(r, plans[i]);
+		ej.bitrate = r.num<int64_t>();
+		ej.kf = r.num<double>();
+		ej.file = r.str();
+		ej.id = (Codec)r.num<int>();
+		get(r, ej.color);
+		runs[i].codec = (Codec)r.num<int>();
+		runs[i].label = r.str();
+		runs[i].pool = r.str();
 	}
+	if (!r.ok) { fprintf(stderr, "a garbled wave\n"); exit_now(1); }
+	// This process decodes the input itself, on its own GPU where it can: the frames can come in another layout than the planner's software decode gave
+	// (NV12 instead of planar 4:2:0), and then they go through the converter.
+	SourceInfo si;
+	if (!source_info(input, si)) si = planned;
+	const int source_range = si.fmt.rgb ? 1 : (si.color.range ? si.color.range : 1);
+	for (auto& pl : plans) pl.rescale = pl.enc.w != si.width || pl.enc.h != si.height || pl.enc.pix != si.fmt || (pl.range && pl.range != source_range);
+	if (so.device.empty() && process_vendor) { // scaling on this GPU too
+		const int vk = vulkan_device_of_gpu(process_vendor, process_gpu);
+		if (vk >= 0) so.device = vulkan_device_name(vk);
+	}
+	std::vector<WaveRun*> ptrs;
+	std::vector<int> handles;
+	for (uint32_t i = 0; i < n; i++) {
+		WaveRun& run = runs[i];
+		run.enc.plan = &plans[i];
+		progress.push_back(std::make_unique<RunProgress>());
+		run.enc.rp = progress.back().get();
+		progress.push_back(std::make_unique<RunProgress>());
+		run.score_rp = progress.back().get();
+		handles.push_back(ui::attach(run.enc.rp, run.label, run.pool));
+		handles.push_back(ui::attach(run.score_rp, run.label, run.pool));
+		ptrs.push_back(&run);
+	}
+	RunProgress feed_rp;
+	feed_rp.begin(3, 1);
+	const size_t slash = input.find_last_of("/\\");
+	handles.push_back(ui::attach(&feed_rp, "decode+convert " + input.substr(slash == std::string::npos ? 0 : slash + 1) + " to " + std::to_string(plans[0].enc.w) + "x" + std::to_string(plans[0].enc.h), "decode"));
+	std::atomic<bool> finished{false};
+	std::thread rows([&] { // the rows of the live display, for the process that started this one
+		while (!finished) {
+			reply('P', id, ui::snapshot_json());
+			for (int i = 0; i < 5 && !finished; i++) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+		}
+	});
+	FeedResult fr;
+	run_wave(input, si, ptrs, so, vo, &feed_rp, fr);
+	finished = true;
+	rows.join();
+	for (int h : handles) ui::detach(h);
+	Writer w;
+	w.num((uint8_t)fr.ok).num(fr.frames).num((int64_t)feed_rp.blocked_ms).str(si.decoder);
+	for (auto& run : runs) {
+		const EncodeJob& ej = run.enc;
+		w.num((uint8_t)ej.ok).num(ej.kbps).num(ej.output.count).num(ej.output.bytes).num(ej.output.hash);
+		w.num((int64_t)ej.rp->busy_ms).num((int64_t)ej.rp->starved_ms).num((uint8_t)run.score_ok).num((int64_t)run.score_rp->starved_ms);
+		put_list(w, run.scores);
+	}
+	reply('w', id, w.s);
+}
 
-public:
-	Session(uint32_t id, std::string encoder) : id(id), encoder(std::move(encoder)) { worker = std::thread([this] { run(); }); }
-	~Session() { if (worker.joinable()) worker.join(); }
-	void push(uint8_t type, std::string body) {
-		{
-			std::lock_guard lock(m);
-			inbox.emplace_back(type, std::move(body));
-		}
-		cv.notify_all();
-	}
-};
 
 } // namespace
 
@@ -894,9 +660,100 @@ void set_encoder_process_args(const std::vector<std::string>& args) {
 	process_args = args;
 }
 
-std::unique_ptr<Encoder> make_isolated_encoder(const std::string& name) {
-	if (!is_native_encoder(name)) return nullptr;
-	return std::make_unique<Isolated>(name);
+bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vector<WaveRun*>& runs, const ScaleOptions& so, const VmafOptions& vo, RunProgress* feed_rp, FeedResult& fr,
+                       std::string& decoders) {
+	std::map<std::pair<std::string, int>, std::vector<WaveRun*>> parts;
+	for (WaveRun* run : runs) parts[device_of(*run)].push_back(run);
+	VmafOptions shared_vo = vo;
+	if (shared_vo.threads <= 0) shared_vo.threads = std::max(2, (int)std::thread::hardware_concurrency() / (int)runs.size()); // shared by every scorer of the wave, in all processes
+	static std::atomic<unsigned> wave_counter{0};
+	std::mutex m;
+	bool all_ok = true;
+	long long frames = -1;
+	int64_t blocked = 0;
+	std::vector<std::string> decoder_list;
+	std::vector<std::thread> threads;
+	for (auto& [where, part] : parts) threads.emplace_back([&, where = where, part = part] {
+		auto fail_all = [&](bool crashed) {
+			for (WaveRun* run : part) {
+				run->enc.ok = false;
+				run->enc.crashed = crashed;
+				run->score_ok = false;
+				if (run->enc.rp) { run->enc.rp->failed = true; run->enc.rp->finish(); }
+				if (run->score_rp) { run->score_rp->failed = true; run->score_rp->finish(); }
+			}
+			std::lock_guard lock(m);
+			all_ok = false;
+		};
+		auto dev = device_for(where.first, where.second);
+		if (!dev) { fail_all(false); return; }
+		Writer w;
+		w.str(input);
+		put(w, si);
+		put(w, so);
+		put(w, shared_vo);
+		w.num((uint32_t)part.size());
+		for (WaveRun* run : part) {
+			const EncodeJob& ej = run->enc;
+			w.str(ej.encoder).str(ej.codec);
+			put(w, *ej.plan);
+			w.num((int64_t)ej.bitrate).num(ej.kf).str(ej.file).num((int)ej.id);
+			put(w, ej.color);
+			w.num((int)run->codec).str(run->label).str(run->pool);
+		}
+		WaveWait ww;
+		ww.key = "process " + dev->name + " " + std::to_string(wave_counter++);
+		ww.runs = part.size();
+		uint32_t id;
+		{
+			std::lock_guard lock(dev->m);
+			if (!dev->alive) { fail_all(true); return; }
+			id = dev->next_id++;
+			dev->waiters[id] = &ww;
+		}
+		dev->send('W', id, w.s);
+		{
+			std::unique_lock lock(dev->m);
+			ww.cv.wait(lock, [&] { return ww.done || ww.dead; });
+			dev->waiters.erase(id);
+		}
+		ui::set_remote(ww.key, "", {});
+		if (!ww.done) { fail_all(true); return; }
+		Reader r(ww.result);
+		const bool feed_ok = r.num<uint8_t>() != 0;
+		const long long part_frames = r.num<long long>();
+		const int64_t part_blocked = r.num<int64_t>();
+		const std::string decoder = r.str();
+		for (WaveRun* run : part) {
+			EncodeJob& ej = run->enc;
+			ej.ok = r.num<uint8_t>() != 0;
+			ej.kbps = r.num<double>();
+			ej.output.count = r.num<long long>();
+			ej.output.bytes = r.num<long long>();
+			ej.output.hash = r.num<uint64_t>();
+			const int64_t busy = r.num<int64_t>(), starved = r.num<int64_t>();
+			run->score_ok = r.num<uint8_t>() != 0;
+			const int64_t score_starved = r.num<int64_t>();
+			const uint32_t count = r.num<uint32_t>();
+			run->scores.clear();
+			for (uint32_t i = 0; i < count && r.ok; i++) run->scores.push_back(r.num<double>());
+			if (ej.rp) { ej.rp->busy_ms = busy; ej.rp->starved_ms = starved; ej.rp->failed = !ej.ok; ej.rp->finish(); }
+			if (run->score_rp) { run->score_rp->starved_ms = score_starved; run->score_rp->failed = !run->score_ok; run->score_rp->finish(); }
+		}
+		if (!r.ok) { fail_all(false); return; }
+		std::lock_guard lock(m);
+		all_ok = all_ok && feed_ok;
+		frames = std::max(frames, part_frames);
+		blocked = std::max(blocked, part_blocked);
+		if (std::find(decoder_list.begin(), decoder_list.end(), decoder) == decoder_list.end()) decoder_list.push_back(decoder);
+	});
+	for (auto& t : threads) t.join();
+	fr.ok = all_ok;
+	fr.frames = std::max(0LL, frames);
+	if (feed_rp) feed_rp->blocked_ms = blocked;
+	decoders.clear();
+	for (auto& d : decoder_list) decoders += (decoders.empty() ? "" : ", ") + d;
+	return fr.ok;
 }
 
 bool isolated_supports(const std::string& encoder, const std::string& codec, int chroma, int depth, int gpu, bool& answer) {
@@ -948,10 +805,15 @@ int encoder_process_main(int argc, char** argv) {
 	if (argc < 4) { fprintf(stderr, "usage: ves --encoder-process <encoder> <gpu>\n"); return 1; }
 	const std::string encoder = argv[2];
 	const int gpu = atoi(argv[3]);
-	for (int i = 4; i < argc; i++) {
-		const std::string a = argv[i];
-		if (a == "--priority" && i + 1 < argc && std::string(argv[++i]) == "low") set_low_priority();
+	for (int i = 4; i + 1 < argc; i++) {
+		const std::string a = argv[i], v = argv[++i];
+		if (a == "--priority" && v == "low") set_low_priority();
+		else if (a == "--hw-decode") set_hw_decode(v);
+		else if (a == "--decode-threads") set_decode_threads(atoi(v.c_str()));
 	}
+	process_vendor = encoder_vendor(encoder); // a GPU's process decodes, scales and scores on that GPU
+	process_gpu = gpu;
+	if (process_vendor) set_hw_decode_gpu(process_vendor, gpu);
 	// The messages travel on stdin and stdout; whatever a library prints goes to stderr, where it cannot get in their way.
 #ifdef _WIN32
 	// Copies of their own: the C runtime's stdout owns the original handle and closes it below, and the next handle Windows makes (the copy of stderr) can get the
@@ -970,7 +832,6 @@ int encoder_process_main(int argc, char** argv) {
 	setvbuf(stderr, nullptr, _IONBF, 0);
 	if (encoder == "amf") amf_dedicate_process(gpu);
 
-	std::map<uint32_t, std::unique_ptr<Session>> sessions;
 	std::string head(HEADER, '\0'), body;
 	for (;;) {
 		if (!channel_read(head.data(), HEADER)) break;
@@ -992,14 +853,7 @@ int encoder_process_main(int argc, char** argv) {
 			}).detach();
 			continue;
 		}
-		if (type == 'O') sessions[id] = std::make_unique<Session>(id, encoder);
-		auto it = sessions.find(id);
-		if (it == sessions.end()) continue;
-		it->second->push(type, body);
-		if (type == 'C') { // the encoder closes on a thread of its own, which can take a while; meanwhile the others get their messages
-			std::thread([s = std::move(it->second)]() mutable { s.reset(); }).detach();
-			sessions.erase(it);
-		}
+		if (type == 'W') std::thread([id, body] { run_wave_here(id, body); }).detach(); // meanwhile questions still get answers, and the end of stdin is still seen
 	}
 	// The process that started this one is gone or done: whatever is still encoding is of no use to anyone. Nothing is wound down (see exit_now).
 	exit_now(0);
