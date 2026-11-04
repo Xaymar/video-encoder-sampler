@@ -954,8 +954,10 @@ int encoder_process_main(int argc, char** argv) {
 	}
 	// The messages travel on stdin and stdout; whatever a library prints goes to stderr, where it cannot get in their way.
 #ifdef _WIN32
-	channel_in = GetStdHandle(STD_INPUT_HANDLE);
-	channel_out = GetStdHandle(STD_OUTPUT_HANDLE);
+	// Copies of their own: the C runtime's stdout owns the original handle and closes it below, and the next handle Windows makes (the copy of stderr) can get the
+	// very same number, which would send the messages to stderr.
+	DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_INPUT_HANDLE), GetCurrentProcess(), &channel_in, 0, FALSE, DUPLICATE_SAME_ACCESS);
+	DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_OUTPUT_HANDLE), GetCurrentProcess(), &channel_out, 0, FALSE, DUPLICATE_SAME_ACCESS);
 	SetStdHandle(STD_OUTPUT_HANDLE, GetStdHandle(STD_ERROR_HANDLE));
 	_dup2(2, 1);
 #else
