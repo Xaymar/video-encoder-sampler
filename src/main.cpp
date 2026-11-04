@@ -955,6 +955,29 @@ int main(int argc, char** argv) {
 		if (found != variants.end()) return found->second;
 		std::vector<Variant>& out = variants[share_key(job, sc)];
 		auto axis = [](const std::vector<std::string>& v) { return v.empty() ? std::vector<std::string>{""} : v; }; // "": the source's
+		// A worker's job: the host listed the runs it still needs by their options (see run_options_of), which already carry the scenario's chroma, bit depth and
+		// range. Those are the variants, with the GPU the host put in, instead of every combination of the entry's options: a job of a big config has hundreds of
+		// thousands of runs out of millions of combinations.
+		if (cfg.only_runs_set) {
+			std::vector<std::string> gpus;
+			for (auto& ax : job.axes) if (ax.key == "gpu") gpus = ax.values;
+			for (const std::string& line : cfg.only_runs) {
+				Options base;
+				for (size_t at = 0; at < line.size();) {
+					size_t end = line.find(';', at);
+					if (end == std::string::npos) end = line.size();
+					const size_t eq = line.find('=', at);
+					if (eq != std::string::npos && eq < end) base[line.substr(at, eq - at)] = line.substr(eq + 1, end - eq - 1);
+					at = end + 1;
+				}
+				for (auto& gpu : axis(gpus)) {
+					Options opts = base;
+					if (!gpu.empty()) opts["gpu"] = gpu;
+					out.push_back(build_variant(job, std::move(opts)));
+				}
+			}
+			return out;
+		}
 		// Distributed: a GPU encoder's runs are planned once for every GPU model the workers have that can encode the codec, and the "gpu" option (which GPU of the
 		// host) has no meaning.
 		const bool remote_gpu = remote && is_gpu_encoder(job.encoder);
