@@ -1316,7 +1316,11 @@ int main(int argc, char** argv) {
 		char line[1024];
 		if (r.pruned) { snprintf(line, sizeof line, "%s pruned  %s: %s", r.tag.c_str(), r.label.c_str(), r.reason.c_str()); ui::log(line); return; }
 		if (r.ignored) { if (!r.expected) { snprintf(line, sizeof line, "%s IGNORED  %s: %s", r.tag.c_str(), r.label.c_str(), r.reason.c_str()); ui::log(line); } return; }
-		if (!t.ok) { snprintf(line, sizeof line, "%s FAILED  %s  (%s, %lld kbps)", r.tag.c_str(), r.label.c_str(), r.input.c_str(), (long long)r.bitrate); ui::log(line); return; }
+		if (!t.ok) {
+			snprintf(line, sizeof line, "%s FAILED  %s  (%s, %lld kbps)", r.tag.c_str(), r.label.c_str(), r.input.c_str(), (long long)r.bitrate);
+			ui::log(std::string(line) + (r.reason.empty() ? "" : ": " + r.reason));
+			return;
+		}
 		r.penalty = over_penalty_points(r.kbps, (double)r.bitrate);
 		std::vector<double> sc = r.scores;
 		std::sort(sc.begin(), sc.end());
@@ -1776,6 +1780,7 @@ int main(int argc, char** argv) {
 					r.scores = std::move(wr[i].scores);
 					t.ok = true;
 				}
+				if (!t.ok) r.reason = wr[i].enc.error;
 				std::error_code ec;
 				if (!t.ok && wr[i].enc.crashed && !t.retried && crashed_runs > 1) { // others were in the process with it
 					t.retried = true;
