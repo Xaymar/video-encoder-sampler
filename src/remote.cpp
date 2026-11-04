@@ -383,7 +383,7 @@ struct RemoteHost::Impl {
 					log(text);
 				}
 				cv.notify_all(); // the input is known: the jobs of it that waited for that can go out, to every worker
-			} else if (type == M_LOG) { // a line of a job that says why runs did not work, as it comes
+			} else if (type == M_LOG) { // a line a job printed, as it comes
 				if (payload.size() < 5) continue;
 				log("[" + worker->name + "] " + payload.substr(4));
 			} else if (type == M_PROGRESS) {
@@ -415,7 +415,6 @@ struct RemoteHost::Impl {
 				}
 				const RemoteJobSpec& job = (*jobs)[id];
 				log("job " + job.name + " done on " + who + ": " + std::to_string(stored) + " of " + std::to_string(job.runs.size()) + " results" + (ok ? "" : " (the worker reported a failure)"));
-				if (!log_tail.empty() && (!ok || stored < job.runs.size())) log(log_tail); // what the job printed last: why runs failed or were left out
 				cv.notify_all();
 			}
 		}
@@ -969,21 +968,20 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 						send_results();
 						ui::set_remote(rows_key, jname + ": ", ui::parse_progress(text.substr(1)));
 					} else if (!text.empty()) {
-						// Why runs fail (and what an encoder process says) goes to the host straight away: the job can take hours.
-						if (text.find(" FAILED ") != std::string::npos || text.rfind("The encoder process", 0) == 0 || text.find(": its encoder process crashed") != std::string::npos ||
-						    text.rfind("cannot start the encoder process", 0) == 0)
-						{ send(M_LOG, id_bytes(id) + text); log(jname + ": " + text); }
+						// Everything the job says goes to the host and to this worker's log as it is said, not when the job ends: a job can take hours.
+						send(M_LOG, id_bytes(id) + text);
+						log(jname + ": " + text);
 						tail.push_back(text);
 						if (tail.size() > 12) tail.pop_front();
 					}
 				}, lost);
 				for (auto& l : tail) log_text += l + "\n";
 				ok = code == 0;
-				if (!ok) log("job " + jname + " failed with code " + std::to_string(code) + (log_text.empty() ? std::string() : ":\n" + log_text));
+				if (!ok) log("job " + jname + " failed with code " + std::to_string(code)); // what it said came as it said it
 				send_results(); // what the last progress line did not see
 			}
 			fs::remove_all(dir, ec2);
-			if (ok && sent_results == 0) log("job " + jname + " made no results:\n" + log_text);
+			if (ok && sent_results == 0) log("job " + jname + " made no results");
 			ui::set_remote(rows_key, "", {});
 			running_jobs--;
 			show_title(true);
