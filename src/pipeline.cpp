@@ -347,22 +347,23 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 			const bool convert = src->fmt != g.fmt;
 			auto conv = make_converter();
 			Picture t, o;
-			bool ok = true, first = true;
+			bool ok = true, first = true, conv_failed = false;
 			int r;
 			auto flush_converted = [&] {
 				int got;
 				while (ok && (got = conv->pop(o)) == 1) ok = g.bc->push(o, &g.ref_rp);
-				ok = ok && got >= 0;
+				if (ok && got < 0) ok = false, conv_failed = true;
 			};
 			while (ok && (r = src->next(t)) == 1) {
 				g.ref_rp.step();
 				if (!convert) { ok = g.bc->push(t, &g.ref_rp); continue; }
 				t.duration = 1;
-				if (first) { ok = conv->open(t, src->framerate.inverse(), src->width, src->height, g.fmt, so); first = false; }
-				ok = ok && conv->push(&t);
+				if (first) { ok = conv->open(t, src->framerate.inverse(), src->width, src->height, g.fmt, so); first = false; conv_failed = !ok; }
+				if (ok && !conv->push(&t)) ok = false, conv_failed = true;
 				flush_converted();
 			}
 			if (ok && convert) { ok = conv->push(nullptr); flush_converted(); }
+			if (conv_failed) fprintf(stderr, "the original frames could not be converted to %d-bit %d for scoring\n", g.fmt.depth, g.fmt.chroma);
 			g.ref_rp.finish();
 			g.bc->close();
 		});

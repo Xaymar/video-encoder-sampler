@@ -36,7 +36,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-enum : uint8_t { M_HELLO = 1, M_JOB = 2, M_NEED = 3, M_FILE_DATA = 4, M_FILE_END = 5, M_RESULT = 6, M_DONE = 7, M_PROGRESS = 8, M_SOURCE = 9 };
+enum : uint8_t { M_HELLO = 1, M_JOB = 2, M_NEED = 3, M_FILE_DATA = 4, M_FILE_END = 5, M_RESULT = 6, M_DONE = 7, M_PROGRESS = 8, M_SOURCE = 9, M_LOG = 10 };
 constexpr int kVersion = 3;
 constexpr size_t kChunk = 1 << 20;
 constexpr int kTries = 3;
@@ -383,6 +383,9 @@ struct RemoteHost::Impl {
 					log(text);
 				}
 				cv.notify_all(); // the input is known: the jobs of it that waited for that can go out, to every worker
+			} else if (type == M_LOG) { // a line of a job that says why runs did not work, as it comes
+				if (payload.size() < 5) continue;
+				log("[" + worker->name + "] " + payload.substr(4));
 			} else if (type == M_PROGRESS) {
 				if (payload.size() < 5) continue;
 				const size_t id = id_of(payload);
@@ -966,6 +969,10 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 						send_results();
 						ui::set_remote(rows_key, jname + ": ", ui::parse_progress(text.substr(1)));
 					} else if (!text.empty()) {
+						// Why runs fail (and what an encoder process says) goes to the host straight away: the job can take hours.
+						if (text.find(" FAILED ") != std::string::npos || text.rfind("The encoder process", 0) == 0 || text.find(": its encoder process crashed") != std::string::npos ||
+						    text.rfind("cannot start the encoder process", 0) == 0)
+						{ send(M_LOG, id_bytes(id) + text); log(jname + ": " + text); }
 						tail.push_back(text);
 						if (tail.size() > 12) tail.pop_front();
 					}

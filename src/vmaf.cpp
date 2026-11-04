@@ -147,9 +147,10 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 		uint32_t on_screen;
 		while (ok && shown((size_t)k, on_screen) && on_screen == mi) {
 			int rr = next_ref(r);
-			if (rr < 0) { ok = false; break; }
+			if (rr < 0) { fprintf(stderr, "vmaf: the original frames stopped coming (frame %lld)\n", k); ok = false; break; }
 			if (rr == 0) break;
 			ok = scorer->add(r, pic);
+			if (!ok) fprintf(stderr, "vmaf: the scorer refused frame %lld (original %dx%d %d-bit %d%s, encoded %dx%d %d-bit %d%s)\n", k, r.width, r.height, r.fmt.depth, r.fmt.chroma, r.fmt.planar ? "" : " packed", pic.width, pic.height, pic.fmt.depth, pic.fmt.chroma, pic.fmt.planar ? "" : " packed");
 			k++;
 			if (rp) rp->step();
 		}
@@ -158,6 +159,7 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 	auto collect_converted = [&] {
 		int got;
 		while (ok && (got = up->pop(u)) == 1) show(u, mo++);
+		if (ok && got < 0) fprintf(stderr, "vmaf: scaling the encoded frames back failed\n");
 		ok = ok && got >= 0;
 	};
 	auto pump = [&] {
@@ -173,17 +175,19 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 			else {
 				d.pts = m;
 				d.duration = 1; // libplacebo needs it to know when the last frame ends; the packets carry none
-				if (m == 0 && !up->open(d, enc.fps.inverse(), ref.width, ref.height, score_fmt, scale, ref.score_range)) { ok = false; break; }
+				if (m == 0 && !up->open(d, enc.fps.inverse(), ref.width, ref.height, score_fmt, scale, ref.score_range)) { fprintf(stderr, "vmaf: cannot scale the encoded frames back to %dx%d\n", ref.width, ref.height); ok = false; break; }
 				if (!up->push(&d)) { fprintf(stderr, "scaling the decoded frame back failed\n"); ok = false; break; }
 				collect_converted();
 			}
 			m++;
 		}
+		if (ok && got < 0) fprintf(stderr, "vmaf: decoding the encoded stream failed after %lld frames\n", m);
 		ok = ok && got >= 0;
 	};
 
 	for (std::vector<uint8_t> packet; ok && next_packet(packet);) {
 		ok = decoder->send(packet.data(), packet.size());
+		if (!ok) fprintf(stderr, "vmaf: the encoded stream does not decode (packet of %zu bytes, after %lld frames)\n", packet.size(), m);
 		if (ok) pump();
 	}
 	if (ok) { decoder->flush(); pump(); }
@@ -191,5 +195,7 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 	if (ok && k == 0) { fprintf(stderr, "no frames were decoded\n"); ok = false; }
 	uint32_t extra;
 	if (ok && (shown((size_t)k, extra) || next_ref(r) == 1)) { fprintf(stderr, "encoded stream does not cover the reference frames\n"); ok = false; }
-	return ok && scorer->finish(scores);
+	if (!ok) return false;
+	if (!scorer->finish(scores)) { fprintf(stderr, "vmaf: the scorer could not finish\n"); return false; }
+	return true;
 }
