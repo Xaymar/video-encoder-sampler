@@ -27,3 +27,8 @@ std::string gpu_description(unsigned vendor, int index);
 
 // The vendor behind an encoder name, 0 for encoders that do not run on a GPU.
 unsigned encoder_vendor(const std::string& encoder);
+
+// Where the n-th GPU of a vendor is to other APIs, for decoding on that very GPU: its index among all DXGI adapters (what FFmpeg's d3d11va and d3d12va
+// devices take; Windows, -1 elsewhere or when it is not found), and its DRM render node (/dev/dri/renderD128, what vaapi takes; Linux, empty elsewhere).
+int dxgi_adapter_index(unsigned vendor, int index);
+std::string render_node(unsigned vendor, int index);

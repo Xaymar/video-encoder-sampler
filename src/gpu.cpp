@@ -117,3 +117,43 @@ std::string gpu_description(unsigned vendor, int index) {
 }
 
 unsigned encoder_vendor(const std::string& encoder) { return encoder == "nvenc" ? VENDOR_NVIDIA : encoder == "amf" ? VENDOR_AMD : encoder == "qsv" ? VENDOR_INTEL : 0; }
+
+#ifdef _WIN32
+int dxgi_adapter_index(unsigned vendor, int index) {
+	const auto gpus = list_gpus(vendor);
+	if (index < 0 || index >= (int)gpus.size()) return -1;
+	Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
+	if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return -1;
+	Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
+	for (UINT i = 0; factory->EnumAdapters1(i, &adapter) == S_OK; i++, adapter.Reset()) {
+		DXGI_ADAPTER_DESC1 d;
+		adapter->GetDesc1(&d);
+		if (((uint64_t)d.AdapterLuid.LowPart | ((uint64_t)(uint32_t)d.AdapterLuid.HighPart << 32)) == gpus[(size_t)index].luid) return (int)i;
+	}
+	return -1;
+}
+std::string render_node(unsigned, int) { return {}; }
+#else
+int dxgi_adapter_index(unsigned, int) { return -1; }
+std::string render_node(unsigned vendor, int index) {
+	namespace fs = std::filesystem;
+	std::vector<fs::path> cards;
+	std::error_code ec;
+	for (auto& e : fs::directory_iterator("/sys/class/drm", ec)) {
+		const std::string n = e.path().filename().string();
+		if (n.rfind("card", 0) == 0 && n.find('-') == std::string::npos) cards.push_back(e.path() / "device");
+	}
+	std::sort(cards.begin(), cards.end()); // the order enumerate_gpus() lists them in
+	int seen = 0;
+	for (auto& dev : cards) {
+		if ((unsigned)strtoul(sysfs_text(dev / "vendor").c_str(), nullptr, 16) != vendor) continue;
+		if (seen++ != index) continue;
+		for (auto& e : fs::directory_iterator(dev / "drm", ec)) {
+			const std::string n = e.path().filename().string();
+			if (n.rfind("renderD", 0) == 0) return "/dev/dri/" + n;
+		}
+		return {};
+	}
+	return {};
+}
+#endif

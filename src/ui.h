@@ -41,6 +41,7 @@ void emit_record(char kind, const std::string& payload); // with --progress: pri
 void set_title(const std::string& title);        // replaces the header (the run counter and elapsed time); a worker has no runs of its own. Empty: the usual header
 void set_progress_stdout(bool on);               // once a second, print a line with the numbers of the runs in flight (a record separator, then JSON) for the process that started this one
 std::vector<Progress> parse_progress(const std::string& json); // reads such a line (without the record separator)
+std::string snapshot_json();                     // the numbers of the runs in flight as such a line has them (without the record separator)
 void set_remote(const std::string& key, const std::string& prefix, const std::vector<Progress>& list); // runs on another machine, shown with the local ones; no runs remove them
 void start(bool plain);
 void stop();                                   // clears the live area, restores stderr

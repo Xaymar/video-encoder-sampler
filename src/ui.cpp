@@ -298,9 +298,8 @@ std::string json_string(const std::string& s) {
 }
 
 // One line for the process that started this one: a record separator, then [stage, label, done, total, rate, state, finished] for every run in flight.
-void write_snapshot() {
-	std::string line(1, (char)30);
-	line += "[";
+std::string snapshot() {
+	std::string line = "[";
 	bool first = true;
 	for (auto& [h, e] : entries) {
 		const ui::Progress p = progress_of(e);
@@ -309,7 +308,11 @@ void write_snapshot() {
 		line += std::string(first ? "" : ",") + "[" + std::to_string(p.stage) + "," + json_string(p.label) + numbers;
 		first = false;
 	}
-	line += "]\n";
+	return line + "]";
+}
+
+void write_snapshot() {
+	const std::string line = std::string(1, (char)30) + snapshot() + "\n";
 	fwrite(line.data(), 1, line.size(), stdout);
 	fflush(stdout);
 }
@@ -441,6 +444,11 @@ void emit_record(char kind, const std::string& payload) {
 	const std::string line = std::string(1, kind) + payload + "\n";
 	fwrite(line.data(), 1, line.size(), stdout);
 	fflush(stdout);
+}
+
+std::string snapshot_json() {
+	std::lock_guard lock(m);
+	return snapshot();
 }
 
 void set_progress_stdout(bool on) {

@@ -400,8 +400,9 @@ Paths
         --decode-threads <n> threads per decoder (default: all cores; 4 with --low-memory)
         --low-memory        score each wave before the next is encoded and use fewer VMAF threads: slower, takes much less memory
         --plain             plain lines instead of the live display (also used when stdout is not a terminal)
-        --in-process        run the encoders inside ves itself. By default every GPU (and every CPU encoder) gets a process of its own, so a driver or
-                            library that crashes fails only the runs that were in that process, and the sweep goes on ("encoder_processes": false in the config)
+        --in-process        run everything inside ves itself. By default every GPU gets a process of its own that decodes, encodes and scores its runs
+                            on that GPU (the CPU encoders share one), so a driver or library that crashes fails only the runs that were in that process, and
+                            the sweep goes on ("encoder_processes": false in the config)
   -c,   --cache <dir>       finished runs are kept here and not repeated (default: cache); "off" disables it
 
 Scoring
@@ -839,8 +840,12 @@ int main(int argc, char** argv) {
 	if (cfg.priority != "low" && cfg.priority != "normal") { fprintf(stderr, "error: priority must be low or normal\n"); return 1; }
 	if (cfg.priority == "low" && !set_low_priority()) fprintf(stderr, "warning: could not lower the process priority\n");
 	set_isolated_encoders(!cfg.in_process);
-	if (cfg.priority == "low") set_encoder_process_args({"--priority", "low"});
-	set_hw_decode(cfg.hw_decode);
+	{ // the processes decode on their GPUs as asked; this one only reads what the inputs are, which needs no GPU
+		std::vector<std::string> args{"--hw-decode", cfg.hw_decode.empty() ? "off" : cfg.hw_decode, "--decode-threads", std::to_string(cfg.decode_threads > 0 ? cfg.decode_threads : cfg.low_memory ? 4 : 0)};
+		if (cfg.priority == "low") { args.push_back("--priority"); args.push_back("low"); }
+		set_encoder_process_args(args);
+	}
+	set_hw_decode(cfg.in_process ? cfg.hw_decode : "");
 	set_decode_threads(cfg.decode_threads > 0 ? cfg.decode_threads : cfg.low_memory ? 4 : 0);
 	ui::start(cfg.plain);
 	struct UiGuard { ~UiGuard() { ui::stop(); } } ui_guard; // the live display is cleared on every way out
@@ -1391,7 +1396,7 @@ int main(int argc, char** argv) {
 			if (!source_info(local_path(input), si)) { source_failed.insert(input); return nullptr; }
 		} catch (const std::exception& e) { ui::log("Input " + file_name(input) + ": " + e.what()); source_failed.insert(input); return nullptr; }
 		it = infos.emplace(input, si).first;
-		ui::log("Source " + file_name(input) + ": " + std::to_string(si.width) + "x" + std::to_string(si.height) + " decoded by " + si.decoder);
+		ui::log("Source " + file_name(input) + ": " + std::to_string(si.width) + "x" + std::to_string(si.height) + (cfg.in_process ? " decoded by " + si.decoder : std::string()));
 		ui::emit_record((char)29, source_json(it->second));
 		return &it->second;
 	};
@@ -1732,17 +1737,29 @@ int main(int argc, char** argv) {
 				run.codec = t.id; run.score_rp = t.r.score_progress.get();
 				ptrs.push_back(&run);
 				ui::log_plain(t.r.tag + " encoding and scoring  " + t.r.label + "  (" + file_name(input) + ", " + std::to_string(t.r.bitrate) + " kbps, pool " + t.pool + ")");
-				handles.push_back(ui::attach(t.r.progress.get(), t.r.label, t.pool));
-				handles.push_back(ui::attach(t.r.score_progress.get(), t.r.label, t.pool));
+				run.label = t.r.label;
+				run.pool = t.pool;
+				if (cfg.in_process) { // otherwise the processes show these rows
+					handles.push_back(ui::attach(t.r.progress.get(), t.r.label, t.pool));
+					handles.push_back(ui::attach(t.r.score_progress.get(), t.r.label, t.pool));
+				}
 			}
 			RunProgress feed_rp;
 			feed_rp.begin(3, 1);
-			const int feed_handle = ui::attach(&feed_rp, "decode+convert " + file_name(input) + " to " + std::to_string(wave[0]->plan.enc.w) + "x" + std::to_string(wave[0]->plan.enc.h), "decode");
+			const int feed_handle = cfg.in_process ? ui::attach(&feed_rp, "decode+convert " + file_name(input) + " to " + std::to_string(wave[0]->plan.enc.w) + "x" + std::to_string(wave[0]->plan.enc.h), "decode") : -1;
 			FeedResult fr;
 			const auto t_wave = std::chrono::steady_clock::now();
-			run_wave(local_path(input), si, ptrs, cfg.scale, cfg.vo, &feed_rp, fr);
+			if (cfg.in_process) run_wave(local_path(input), si, ptrs, cfg.scale, cfg.vo, &feed_rp, fr);
+			else {
+				std::string decoders;
+				run_wave_isolated(local_path(input), si, ptrs, cfg.scale, cfg.vo, &feed_rp, fr, decoders);
+				if (!decoders.empty() && infos.at(input).decoder != decoders) { // what the result file says decoded the input
+					infos.at(input).decoder = decoders;
+					ui::log("Source " + file_name(input) + " decoded by " + decoders);
+				}
+			}
 			const double wave_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_wave).count();
-			ui::detach(feed_handle);
+			if (feed_handle >= 0) ui::detach(feed_handle);
 			for (int h : handles) ui::detach(h);
 			const size_t crashed_runs = (size_t)std::count_if(wr.begin(), wr.end(), [](const WaveRun& w) { return w.enc.crashed; });
 			for (size_t i = 0; i < wave.size(); i++) {

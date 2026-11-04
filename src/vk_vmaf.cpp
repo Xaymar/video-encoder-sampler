@@ -38,6 +38,17 @@ static int device_of_encoder_gpu(const std::vector<VkDeviceInfo>& all, unsigned 
 	return same_model;
 }
 
+int vulkan_device_of_gpu(unsigned vendor, int n) {
+	std::string why;
+	return device_of_encoder_gpu(Vk::devices(why), vendor, n);
+}
+
+std::string vulkan_device_name(int index) {
+	std::string why;
+	for (auto& d : Vk::devices(why)) if (d.index == index) return d.name;
+	return {};
+}
+
 int GpuVmaf::pick_device(const std::string& spec, unsigned encoder_vendor, int encoder_gpu, std::string& why) {
 	const auto all = Vk::devices(why);
 	if (all.empty()) { if (why.empty()) why = "there is no Vulkan device"; return -1; }
