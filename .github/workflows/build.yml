@@ -70,6 +70,7 @@ jobs:
 
       # The encoder and scaler libraries come from MSYS2's UCRT64 repository, FFmpeg's headers and import libraries from gyan.dev's shared build.
       - uses: msys2/setup-msys2@v2
+        id: msys2
         with:
           msystem: UCRT64
           update: false
@@ -85,6 +86,7 @@ jobs:
             mingw-w64-ucrt-x86_64-shaderc
             mingw-w64-ucrt-x86_64-spirv-cross
             mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-vulkan-loader
             mingw-w64-ucrt-x86_64-libgcc
             mingw-w64-ucrt-x86_64-libstdc++
             mingw-w64-ucrt-x86_64-libwinpthread
@@ -115,7 +117,11 @@ jobs:
       - name: Smoke test
         shell: pwsh
         run: |
-          # Each tool's exit code is checked on its own, so a failure names the tool that failed.
+          # libplacebo imports vulkan-1.dll, which the package leaves to the GPU driver; the runner has no GPU driver, so MSYS2's loader stands in, for this test only.
+          New-Item -ItemType Directory -Force vulkan-loader | Out-Null
+          Copy-Item "${{ steps.msys2.outputs.msys2-location }}\ucrt64\bin\vulkan-1.dll" vulkan-loader
+          $env:PATH = "$PWD\vulkan-loader;$env:PATH"
+          # Each tool's exit code is checked on its own, so a failure names the tool that failed (-1073741515 is a missing DLL).
           third-party/ffmpeg-dev/bin/ffmpeg.exe -hide_banner -v error -f lavfi -i testsrc2=size=640x360:rate=30:duration=2 -pix_fmt yuv420p -c:v libx264 -qp 18 clip.mp4
           if ($LASTEXITCODE -ne 0) { throw "ffmpeg exited with $LASTEXITCODE while making the test clip" }
           Push-Location dist/ves-windows-x64
