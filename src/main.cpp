@@ -842,7 +842,7 @@ int main(int argc, char** argv) {
 		size_t shape_i = 0;
 		size_t index = 0;                // its place in `tasks`
 		LazyGroup* group = nullptr;      // lazy planning: the group of runs it was made for, and which combination of its entry it is
-		uint32_t combo = 0;
+		ComboTable::Id combo = 0;
 	};
 	struct Pool {
 		std::vector<size_t> tasks;
@@ -885,7 +885,11 @@ int main(int argc, char** argv) {
 		Pool* pool = nullptr;
 		std::string model;     // distributed: the GPU model of the worker that runs it
 	};
-	std::map<std::pair<const Job*, const Scenario*>, std::vector<Variant>> variants;
+	// What an entry's options are made of in a scenario: the scenario only adds its chroma, bit depth and range, so scenarios that list the same ones share the
+	// entry's variants and option table (the sizes and bit rates are put around them later).
+	using ShareKey = std::tuple<const Job*, std::vector<std::string>, std::vector<std::string>, std::vector<std::string>>;
+	auto share_key = [](const Job& job, const Scenario& sc) { return ShareKey{&job, sc.chroma, sc.bitdepth, sc.range}; };
+	std::map<ShareKey, std::vector<Variant>> variants;
 	// One variant of an encoder entry from its options (the scenario's chroma, bit depth and range already among them): the label, the cache key, the GPU it runs
 	// on and the pool it counts against.
 	auto build_variant = [&](const Job& job, Options opts) {
@@ -918,9 +922,9 @@ int main(int argc, char** argv) {
 		return v;
 	};
 	auto variants_of = [&](const Job& job, const Scenario& sc) -> const std::vector<Variant>& {
-		auto found = variants.find({&job, &sc});
+		auto found = variants.find(share_key(job, sc));
 		if (found != variants.end()) return found->second;
-		std::vector<Variant>& out = variants[{&job, &sc}];
+		std::vector<Variant>& out = variants[share_key(job, sc)];
 		auto axis = [](const std::vector<std::string>& v) { return v.empty() ? std::vector<std::string>{""} : v; }; // "": the source's
 		// Distributed: a GPU encoder's runs are planned once for every GPU model the workers have that can encode the codec, and the "gpu" option (which GPU of the
 		// host) has no meaning.
@@ -970,28 +974,28 @@ int main(int argc, char** argv) {
 	// differently (see advance below); until then it costs nothing but a row of integers.
 	struct LazyTable {
 		ComboTable table;
-		std::unordered_map<uint32_t, const Variant*> made; // the variants made so far, by combination
+		std::unordered_map<ComboTable::Id, const Variant*> made; // the variants made so far, by combination
 		LazyTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune) : table(encoder, axes, free_axes, fixed, prune) {}
 	};
 	struct LazyGroup {
 		LazyTable* lt = nullptr;
 		const Job* job = nullptr;
 		std::string input;
-		std::vector<uint8_t> status;                   // per combination: 0 not run (yet), 1 ran, 2 left out or failed
-		std::unordered_map<uint32_t, size_t> task;     // combination -> its task
+		std::unordered_map<ComboTable::Id, uint8_t> status; // per combination made or judged: 1 ran, 2 left out or failed; missing or 0: not run (yet)
+		std::unordered_map<ComboTable::Id, size_t> task;    // combination -> its task
 		size_t layer = 0;                              // the layers made into runs so far
 		bool expanding = true;                         // more runs of it may come: its streams are not judged yet
 		std::set<std::string> groups;                  // the groups (see Run::group) its runs are in
-		std::function<bool(const Variant&, LazyGroup*, uint32_t)> make; // makes the task of a combination: false if it is not wanted
+		std::function<bool(const Variant&, LazyGroup*, ComboTable::Id)> make; // makes the task of a combination: false if it is not wanted
 	};
-	std::map<std::pair<const Job*, const Scenario*>, std::unique_ptr<LazyTable>> lazy_tables;
+	std::map<ShareKey, std::unique_ptr<LazyTable>> lazy_tables; // shared by the scenarios with the same chroma, bit depth and range
 	std::deque<Variant> lazy_variants;                 // stable addresses: a task points at its variant's options
 	std::deque<LazyGroup> lazy_groups;
 	std::map<std::string, std::vector<LazyGroup*>> lazy_of_input;
 	std::map<std::string, std::map<std::string, size_t>> left_out; // input -> option -> combinations never made into runs because it showed no effect
 	auto is_lazy = [&](const Job& job) { return job.prune && !remote && !cfg.only_runs_set; };
 	auto lazy_table_of = [&](const Job& job, const Scenario& sc) -> LazyTable& {
-		auto& slot = lazy_tables[{&job, &sc}];
+		auto& slot = lazy_tables[share_key(job, sc)];
 		if (!slot) {
 			std::vector<Axis> free_axes;
 			if (!sc.chroma.empty()) free_axes.push_back(Axis{"chroma", sc.chroma, {}, {}});
@@ -1001,7 +1005,7 @@ int main(int argc, char** argv) {
 		}
 		return *slot;
 	};
-	auto lazy_variant = [&](LazyTable& lt, const Job& job, uint32_t combo) -> const Variant& {
+	auto lazy_variant = [&](LazyTable& lt, const Job& job, ComboTable::Id combo) -> const Variant& {
 		auto it = lt.made.find(combo);
 		if (it != lt.made.end()) return *it->second;
 		lazy_variants.push_back(build_variant(job, lt.table.options(combo)));
@@ -1034,7 +1038,7 @@ int main(int argc, char** argv) {
 						const std::string key_run_text = key_run(br, kf, shape);
 						const std::string group_head = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|";
 						// Makes the run of one variant. A lazy group keeps it, to make more runs later.
-						auto make_task = [jobp = &job, scp = &sc, shape_i = (size_t)(&shape - sc.shapes.data()), id, input, br, kf, shape, head, key_head, key_run_text, kf_text, group_head, folder, folder_path, folder_made, &tasks, &cfg, &key_tail](const Variant& v, LazyGroup* lg, uint32_t combo) {
+						auto make_task = [jobp = &job, scp = &sc, shape_i = (size_t)(&shape - sc.shapes.data()), id, input, br, kf, shape, head, key_head, key_run_text, kf_text, group_head, folder, folder_path, folder_made, &tasks, &cfg, &key_tail](const Variant& v, LazyGroup* lg, ComboTable::Id combo) {
 							const Job& job = *jobp;
 							Task t;
 							t.job = jobp; t.id = id; t.sc = scp; t.shape_i = shape_i; t.model = v.model;
@@ -1070,9 +1074,8 @@ int main(int argc, char** argv) {
 						lazy_groups.emplace_back();
 						LazyGroup& g = lazy_groups.back();
 						g.lt = lt; g.job = &job; g.input = input; g.make = make_task;
-						g.status.assign(lt->table.size(), 0);
 						lazy_of_input[input].push_back(&g);
-						for (uint32_t c : lt->table.layer(0)) {
+						for (ComboTable::Id c : lt->table.layer(0)) {
 							if (!g.make(lazy_variant(*lt, job, c), &g, c)) g.status[c] = 2;
 						}
 					}
@@ -1476,16 +1479,17 @@ int main(int argc, char** argv) {
 	// of those options, with the two ends of the line in the layer before. It is made into a run when none of the lines shows "no effect" (both ends ran and scored the
 	// same on every frame, as with pruning of the whole list); an end that did not run or is missing counts as an effect. The new runs that are not already done go
 	// to `added`. False when the group has no more layers.
+	auto status_of = [](const LazyGroup& g, ComboTable::Id c) { auto it = g.status.find(c); return it == g.status.end() ? 0 : (int)it->second; };
 	auto advance = [&](LazyGroup& g, std::vector<size_t>& added) -> bool {
 		if (g.layer + 1 >= g.lt->table.layers()) return false;
 		const size_t k = ++g.layer;
 		std::vector<ComboTable::Line> lines_of;
-		for (uint32_t c : g.lt->table.layer(k)) {
+		for (ComboTable::Id c : g.lt->table.layer(k)) {
 			g.lt->table.mid_lines(c, lines_of);
 			const char* no_effect = nullptr;
 			for (auto& L : lines_of) {
-				if (L.lo < 0 || L.hi < 0 || g.status[(size_t)L.lo] != 1 || g.status[(size_t)L.hi] != 1) continue; // an end is missing or did not run: the line is run in full
-				const Run &x = tasks[g.task.at((uint32_t)L.lo)].r, &y = tasks[g.task.at((uint32_t)L.hi)].r;
+				if (L.lo < 0 || L.hi < 0 || status_of(g, (ComboTable::Id)L.lo) != 1 || status_of(g, (ComboTable::Id)L.hi) != 1) continue; // an end is missing or did not run: the line is run in full
+				const Run &x = tasks[g.task.at((ComboTable::Id)L.lo)].r, &y = tasks[g.task.at((ComboTable::Id)L.hi)].r;
 				bool same = x.scores.size() == y.scores.size() && std::abs(x.kbps - y.kbps) <= 1e-6 * std::max(1.0, x.kbps);
 				for (size_t f = 0; same && f < x.scores.size(); f++) same = std::abs(x.scores[f] - y.scores[f]) <= 1e-6;
 				if (same) { no_effect = g.lt->table.axis_key(L.axis).c_str(); break; }
