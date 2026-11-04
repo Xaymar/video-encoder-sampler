@@ -33,12 +33,6 @@ bool Cond::holds(const Options& o) const {
 	return holds_value(it == o.end() ? nullptr : &it->second);
 }
 
-uint64_t ComboTable::hash(const uint8_t* r, size_t n) {
-	uint64_t h = 1469598103934665603ull;
-	for (size_t i = 0; i < n; i++) h = (h ^ r[i]) * 1099511628211ull;
-	return h;
-}
-
 ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune) {
 	// The values of every option, without repeats (gpu=all is every GPU of the encoder's vendor).
 	std::vector<Ax> config;
@@ -72,6 +66,22 @@ ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes
 	}
 	std::map<std::string, int> position;
 	for (size_t k = 0; k < axes_.size(); k++) position[axes_[k].key] = (int)k;
+	for (auto& a : axes_) {
+		auto at = [&](const Cond& c) { auto it = position.find(c.key); return it == position.end() ? -1 : it->second; };
+		for (auto& c : a.requires_all) a.conds.push_back({at(c), &c});
+		a.requires_n = a.conds.size();
+		for (auto& c : a.unless_any) a.conds.push_back({at(c), &c});
+	}
+
+	// A combination's number: one digit per option, the first option the highest, so that numbers go in the order the combinations are made in.
+	Id weight = 1;
+	for (size_t k = axes_.size(); k-- > 0;) {
+		Ax& a = axes_[k];
+		a.radix = a.values.size() + 1;
+		a.weight = weight;
+		if (weight > (Id)INT64_MAX / a.radix) throw std::runtime_error("the options of encoder '" + encoder + "' have too many combinations to count");
+		weight *= a.radix;
+	}
 
 	// Which options can be pruned: those with something between their lowest and highest value.
 	for (size_t k = 0; k < axes_.size(); k++) {
@@ -85,68 +95,79 @@ ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes
 			for (int i = 1; i < (int)a.values.size(); i++) { if (less(i, lo)) lo = i; if (less(hi, i)) hi = i; }
 			a.lo = lo; a.hi = hi;
 		} else { a.lo = 0; a.hi = (int)a.values.size() - 1; } // not numbers (presets): the order of the list
+		a.prunable = true;
 		prunable_.push_back((int)k);
 	}
-
-	// Every valid combination, depth first.
-	const size_t n = axes_.size();
-	std::vector<uint8_t> current(n, UNSET);
-	auto value_of = [&](const std::string& key) -> const std::string* {
-		auto it = position.find(key);
-		if (it == position.end() || current[(size_t)it->second] == UNSET) return nullptr;
-		return &axes_[(size_t)it->second].values[current[(size_t)it->second]];
-	};
-	auto applies = [&](const Ax& a) {
-		for (auto& c : a.requires_all) if (!c.holds_value(value_of(c.key))) return false;
-		for (auto& c : a.unless_any) if (c.holds_value(value_of(c.key))) return false;
-		return true;
-	};
-	auto emit = [&] {
-		rows_.insert(rows_.end(), current.begin(), current.end());
-		count_++;
-	};
-	std::function<void(size_t)> generate = [&](size_t level) {
-		if (level == n) { emit(); return; }
-		const Ax& a = axes_[level];
-		if (!applies(a)) { current[level] = UNSET; generate(level + 1); return; } // the option stays unset, in one branch
-		for (size_t v = 0; v < a.values.size(); v++) { current[level] = (uint8_t)v; generate(level + 1); }
-		current[level] = UNSET;
-	};
-	generate(0);
-
-	// Layers and the way back from a row to its combination.
-	index_.reserve(count_);
-	std::vector<uint32_t> mid_of;
-	for (uint32_t c = 0; c < count_; c++) {
-		const uint8_t* r = row(c);
-		size_t mids = 0;
-		for (int p : prunable_) {
-			const uint8_t v = r[p];
-			mids += v != UNSET && (int)v != axes_[(size_t)p].lo && (int)v != axes_[(size_t)p].hi;
-		}
-		if (layers_.size() <= mids) layers_.resize(mids + 1);
-		layers_[mids].push_back(c);
-		index_[hash(r, n)] = c;
-	}
-	if (layers_.empty()) layers_.emplace_back();
+	layers_.resize(layers());
+	listed_.assign(layers(), false);
 }
 
-Options ComboTable::options(uint32_t c) const {
+std::vector<uint8_t> ComboTable::row(Id c) const {
+	std::vector<uint8_t> r(axes_.size());
+	for (size_t k = 0; k < axes_.size(); k++) {
+		const Id d = c / axes_[k].weight % axes_[k].radix;
+		r[k] = d == axes_[k].radix - 1 ? UNSET : (uint8_t)d;
+	}
+	return r;
+}
+
+ComboTable::Id ComboTable::id(const std::vector<uint8_t>& r) const {
+	Id c = 0;
+	for (size_t k = 0; k < axes_.size(); k++) c += (r[k] == UNSET ? axes_[k].radix - 1 : (Id)r[k]) * axes_[k].weight;
+	return c;
+}
+
+// An option is set when its conditions hold for the options before it; one that comes later (a circle) or is not set counts as not set.
+bool ComboTable::applies(size_t k, const std::vector<uint8_t>& r) const {
+	const Ax& a = axes_[k];
+	for (size_t i = 0; i < a.conds.size(); i++) {
+		const auto [at, c] = a.conds[i];
+		const std::string* have = at < 0 || (size_t)at >= k || r[(size_t)at] == UNSET ? nullptr : &axes_[(size_t)at].values[r[(size_t)at]];
+		if (c->holds_value(have) != (i < a.requires_n)) return false;
+	}
+	return true;
+}
+
+bool ComboTable::valid(const std::vector<uint8_t>& r) const {
+	for (size_t k = 0; k < axes_.size(); k++) if ((r[k] != UNSET) != applies(k, r)) return false;
+	return true;
+}
+
+const std::vector<ComboTable::Id>& ComboTable::layer(size_t want) const {
+	if (listed_[want]) return layers_[want];
+	listed_[want] = true;
+	std::vector<Id>& out = layers_[want];
+	// Depth first, as the combinations are made, keeping only branches that can still end with `want` options in the middle of their range.
+	const size_t n = axes_.size();
+	std::vector<size_t> prunable_after(n + 1, 0); // prunable options from k on
+	for (size_t k = n; k-- > 0;) prunable_after[k] = prunable_after[k + 1] + axes_[k].prunable;
+	std::vector<uint8_t> current(n, UNSET);
+	std::function<void(size_t, size_t, Id)> generate = [&](size_t level, size_t mids, Id c) {
+		if (mids > want || mids + prunable_after[level] < want) return;
+		if (level == n) { out.push_back(c); return; }
+		const Ax& a = axes_[level];
+		if (!applies(level, current)) { current[level] = UNSET; generate(level + 1, mids, c + (a.radix - 1) * a.weight); return; } // the option stays unset, in one branch
+		for (size_t v = 0; v < a.values.size(); v++) {
+			current[level] = (uint8_t)v;
+			const bool mid = a.prunable && (int)v != a.lo && (int)v != a.hi;
+			generate(level + 1, mids + mid, c + v * a.weight);
+		}
+		current[level] = UNSET;
+	};
+	generate(0, 0, 0);
+	return out;
+}
+
+Options ComboTable::options(Id c) const {
 	Options o;
-	const uint8_t* r = row(c);
+	const std::vector<uint8_t> r = row(c);
 	for (size_t k = 0; k < axes_.size(); k++) if (r[k] != UNSET) o[axes_[k].key] = axes_[k].values[r[k]];
 	return o;
 }
 
-int64_t ComboTable::find(const std::vector<uint8_t>& r) const {
-	auto it = index_.find(hash(r.data(), r.size()));
-	if (it == index_.end() || memcmp(row(it->second), r.data(), r.size()) != 0) return -1;
-	return it->second;
-}
-
-void ComboTable::mid_lines(uint32_t c, std::vector<Line>& out) const {
+void ComboTable::mid_lines(Id c, std::vector<Line>& out) const {
 	out.clear();
-	std::vector<uint8_t> r(row(c), row(c) + axes_.size());
+	std::vector<uint8_t> r = row(c);
 	for (int p : prunable_) {
 		const Ax& a = axes_[(size_t)p];
 		const uint8_t v = r[(size_t)p];
