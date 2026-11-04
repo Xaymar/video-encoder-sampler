@@ -34,6 +34,33 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y flatpak flatpak-builder
           flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y --noninteractive flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08
+          echo "SDK_COMMIT=$(flatpak info --user --show-commit org.freedesktop.Sdk//25.08)" >> "$GITHUB_ENV"
+
+      # flatpak-builder keeps every finished module in .flatpak-builder/cache, checksummed over the module's definition, the ones before it and the SDK.
+      # Kept between runs, only modules whose definition (or the SDK) changed are built again; ves itself, the last module, always is.
+      # The key follows the manifest and the SDK commit; an older cache is still restored, and flatpak-builder reuses what of it still matches.
+      - name: Restore the dependency cache
+        id: deps-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .flatpak-builder
+          key: flatpak-deps-${{ env.SDK_COMMIT }}-${{ hashFiles('flatpak/com.xaymar.ves.yml') }}
+          restore-keys: |
+            flatpak-deps-${{ env.SDK_COMMIT }}-
+            flatpak-deps-
+
+      # The dependencies alone, so the saved cache does not carry this run's build of ves.
+      - name: Build the dependencies
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: flatpak-builder --user --disable-rofiles-fuse --install-deps-from=flathub --force-clean --stop-at=ves build-flatpak flatpak/com.xaymar.ves.yml
+
+      - name: Save the dependency cache
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .flatpak-builder # (the same path as the restore: it is part of what a cache is found by)
+          key: ${{ steps.deps-cache.outputs.cache-primary-key }}
 
       - name: Build com.xaymar.ves
         run: |
