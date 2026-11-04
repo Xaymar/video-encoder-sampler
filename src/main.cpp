@@ -808,7 +808,10 @@ static SourceInfo source_from_json(const std::string& text) {
 // A resource that is left out is detected and gets the default (1 encode on the CPU, 2 on a GPU); "parallel": 0 does not offer it. Every other flag is passed on to the `ves`
 // that runs a job, so --priority, --hw-decode, --vmaf-device and so on work as they do for a sweep started by hand.
 static int run_worker(int argc, char** argv) {
-	std::string vmaf_gpu; // from the worker config; a --vmaf-gpu flag is passed on as it is and wins
+	// Settings of the runs from the worker config, as the flags they stand for; a flag on the command line is passed on as it is and wins.
+	static const std::pair<const char*, const char*> run_settings[] = {
+		{"vmaf_gpu", "--vmaf-gpu"}, {"vmaf_device", "--vmaf-device"}, {"hw_decode", "--hw-decode"}, {"decode_threads", "--decode-threads"}, {"priority", "--priority"}};
+	std::vector<std::pair<std::string, std::string>> from_file; // flag, value
 	int only_gpu = -1, default_parallel = 0;
 	std::string target, dir, token = getenv("VES_TOKEN") ? getenv("VES_TOKEN") : "";
 	bool dir_given = false, token_given = false;
@@ -836,7 +839,7 @@ static int run_worker(int argc, char** argv) {
 			if (auto* v = root.find("token"); v && !token_given) token = v->text();
 			if (auto* v = root.find("dir"); v && !dir_given) { dir = v->text(); dir_given = true; }
 			if (auto* v = root.find("gpu"); v && only_gpu < 0) only_gpu = atoi(v->text().c_str());
-			if (auto* v = root.find("vmaf_gpu")) vmaf_gpu = v->text();
+			for (auto& [key, flag] : run_settings) if (auto* v = root.find(key)) from_file.push_back({flag, v->text()});
 			if (auto* v = root.find("parallel"); v && !default_parallel) default_parallel = std::max(1, atoi(v->text().c_str()));
 			if (auto* rs = root.find("resources")) {
 				for (auto& [name, v] : rs->o) {
@@ -854,7 +857,7 @@ static int run_worker(int argc, char** argv) {
 		} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
 	}
 	if (dir.empty()) dir = "ves-worker";
-	if (!vmaf_gpu.empty() && std::find(pass.begin(), pass.end(), "--vmaf-gpu") == pass.end()) { pass.push_back("--vmaf-gpu"); pass.push_back(vmaf_gpu); }
+	for (auto& [flag, v] : from_file) if (std::find(pass.begin(), pass.end(), flag) == pass.end()) { pass.push_back(flag); pass.push_back(v); }
 	const size_t colon = target.rfind(':');
 	if (colon == std::string::npos) { fprintf(stderr, "error: --worker takes host:port or a config file\n"); return 1; }
 	// The worker has the same display as a sweep: its log lines above, and the rows of the jobs it runs. --plain turns it off.
