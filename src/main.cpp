@@ -43,6 +43,7 @@
 #include "mux.h"
 #include "pipeline.h"
 #include "ui.h"
+#include "vk_compute.h"
 #include "remote.h"
 #include "vmaf.h"
 
@@ -320,6 +321,7 @@ static void load_config(const std::string& path, Config& cfg) {
 			cfg.vo.device = d->text();
 			if (cfg.vo.device != "cpu" && cfg.vo.device != "gpu" && cfg.vo.device != "auto") throw std::runtime_error("vmaf.device must be cpu, gpu or auto");
 		}
+		if (auto* g = v->find("gpu")) cfg.vo.gpu = g->text();
 		if (auto* p = v->find("over_penalty")) over_penalty = atof(p->text().c_str());
 	}
 	auto off = [](const Json* v) { return v && (v->text() == "0" || v->text() == "false"); };
@@ -401,6 +403,8 @@ Scoring
         --vmaf-threads <n>
         --vmaf-device <cpu|gpu|auto>  where VMAF is computed (default: cpu). gpu: on the GPU with Vulkan compute (8 and 10 bit input; scores within 1e-4 of libvmaf's);
                             auto: the GPU where it can be used (8 or 10 bit YUV, a model file, a Vulkan GPU), else the CPU. These scores are kept apart from libvmaf's in the cache
+        --vmaf-gpu <auto|n|name>  the Vulkan device that scores (default: auto, the GPU that encodes the run, else the first discrete GPU); n: Vulkan device n;
+                            name: the first device whose name contains it. --vmaf-gpu list shows the Vulkan devices
         --over-penalty <p>  VMAF points deducted per percent for a run just over the target bitrate (default: 0.025); it grows exponentially, like the website's
 
 Distributed (see docs/distributed.md)
@@ -434,6 +438,14 @@ Quick run (replaces the encoders and scenarios of the config file)
 }
 
 // Command line made of --flags. Sets `quit` when there is nothing left to do (--help, --version).
+// `--vmaf-gpu list`: the Vulkan devices, by the numbers --vmaf-gpu takes.
+static void list_vulkan_devices() {
+	std::string why;
+	const auto all = Vk::devices(why);
+	if (all.empty()) { printf("no Vulkan devices%s%s\n", why.empty() ? "" : ": ", why.c_str()); return; }
+	for (auto& d : all) printf("%d: %s (%s%s)\n", d.index, d.name.c_str(), d.discrete ? "discrete" : "not discrete", d.usable ? "" : ", cannot score: no 64 bit integers and floats");
+}
+
 static void parse_flags(int argc, char** argv, Config& cfg, bool& quit);
 
 // Legacy one-liner: ves <input> <encoder> <codec> <kbps[,..]> [key=a,b ...]
@@ -454,6 +466,7 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 		if (k == "vmaf.model") cfg.vo.model = v;
 		else if (k == "vmaf.threads") cfg.vo.threads = atoi(v.c_str());
 		else if (k == "vmaf.device") cfg.vo.device = v;
+		else if (k == "vmaf.gpu") cfg.vo.gpu = v;
 		else if (k == "over.penalty") over_penalty = atof(v.c_str());
 		else if (k == "cache") cfg.cache_dir = v == "off" ? "" : v;
 		else if (k == "output") cfg.output_dir = v;
@@ -524,6 +537,10 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--vmaf-device") {
 			cfg.vo.device = value();
 			if (cfg.vo.device != "cpu" && cfg.vo.device != "gpu" && cfg.vo.device != "auto") throw std::runtime_error("--vmaf-device must be cpu, gpu or auto");
+		}
+		else if (a == "--vmaf-gpu") {
+			cfg.vo.gpu = value();
+			if (cfg.vo.gpu == "list") { list_vulkan_devices(); quit = true; return; }
 		}
 		else if (a == "--over-penalty") penalty = atof(value().c_str());
 		else if (a == "-enc" || a == "--encoder") { job.encoder = value(); quick = true; }
@@ -714,6 +731,7 @@ static SourceInfo source_from_json(const std::string& text) {
 // A resource that is left out is detected and gets the default (1 encode on the CPU, 2 on a GPU); "parallel": 0 does not offer it. Every other flag is passed on to the `ves`
 // that runs a job, so --priority, --hw-decode, --vmaf-device and so on work as they do for a sweep started by hand.
 static int run_worker(int argc, char** argv) {
+	std::string vmaf_gpu; // from the worker config; a --vmaf-gpu flag is passed on as it is and wins
 	int only_gpu = -1, default_parallel = 0;
 	std::string target, dir, token = getenv("VES_TOKEN") ? getenv("VES_TOKEN") : "";
 	bool dir_given = false, token_given = false;
@@ -741,6 +759,7 @@ static int run_worker(int argc, char** argv) {
 			if (auto* v = root.find("token"); v && !token_given) token = v->text();
 			if (auto* v = root.find("dir"); v && !dir_given) { dir = v->text(); dir_given = true; }
 			if (auto* v = root.find("gpu"); v && only_gpu < 0) only_gpu = atoi(v->text().c_str());
+			if (auto* v = root.find("vmaf_gpu")) vmaf_gpu = v->text();
 			if (auto* v = root.find("parallel"); v && !default_parallel) default_parallel = std::max(1, atoi(v->text().c_str()));
 			if (auto* rs = root.find("resources")) {
 				for (auto& [name, v] : rs->o) {
@@ -758,6 +777,7 @@ static int run_worker(int argc, char** argv) {
 		} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
 	}
 	if (dir.empty()) dir = "ves-worker";
+	if (!vmaf_gpu.empty() && std::find(pass.begin(), pass.end(), "--vmaf-gpu") == pass.end()) { pass.push_back("--vmaf-gpu"); pass.push_back(vmaf_gpu); }
 	const size_t colon = target.rfind(':');
 	if (colon == std::string::npos) { fprintf(stderr, "error: --worker takes host:port or a config file\n"); return 1; }
 	// The worker has the same display as a sweep: its log lines above, and the rows of the jobs it runs. --plain turns it off.

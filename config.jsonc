@@ -72,6 +72,10 @@
 		// Where VMAF is computed: "cpu" (libvmaf), "gpu" (Vulkan compute: about ten times faster, 8 and 10 bit input, scores within 1e-4 of libvmaf's;
 		// a run it cannot score fails) or "auto" (the GPU where it can be used, else the CPU). Scores from the GPU are cached apart from the CPU's.
 		"device": "cpu",
+		// Which Vulkan device scores on the GPU: "auto" (the GPU that encodes the run, so frames do not cross between GPUs; for CPU encoders, or where that
+		// GPU cannot score, the first discrete GPU), a number (Vulkan's device order, which can differ from the encoders' "gpu" numbers), or part of
+		// the device's name, e.g. "RX 7600". `ves --vmaf-gpu list` shows the devices.
+		"gpu": "auto",
 	},
 
 	// ---- Uploading results to a VES website, as the runs are scored ----------------------------------------------------------------------

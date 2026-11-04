@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "formats.h"
+#include "gpu.h"
 #include "mux.h"
 #include "source.h"
 
@@ -375,7 +376,10 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 			const FrameFeed feed = [&rq, rp = run.score_rp](Picture& out) { return rq.pop(out, rp) ? 1 : 0; };
 			const PacketFeed next_packet = [&pq, rp = run.score_rp](std::vector<uint8_t>& out) { return pq.pop(out, rp); };
 			const ShownFeed shown = [&fr](size_t k, uint32_t& v) { return fr.shown.get(k, v); };
-			run.score_ok = vmaf_score(ref, feed, run.codec, next_packet, {}, run.enc.plan->enc, run.enc.plan->color, shown, g.fmt, group_vo, so, run.scores, run.score_rp);
+			VmafOptions run_vo = group_vo; // scoring follows the run's encoder to its GPU (vmaf.gpu "auto")
+			run_vo.encoder_vendor = encoder_vendor(run.enc.encoder);
+			if (auto it = run.enc.plan->options.find("gpu"); it != run.enc.plan->options.end()) run_vo.encoder_gpu = atoi(it->second.c_str());
+			run.score_ok = vmaf_score(ref, feed, run.codec, next_packet, {}, run.enc.plan->enc, run.enc.plan->color, shown, g.fmt, run_vo, so, run.scores, run.score_rp);
 			if (run.score_ok && (long long)run.scores.size() != fr.frames) { fprintf(stderr, "%zu scores for %lld frames\n", run.scores.size(), fr.frames); run.score_ok = false; }
 			if (run.score_rp) { run.score_rp->failed = !run.score_ok; run.score_rp->finish(); }
 			rq.cancel(); // done with the original frames: do not hold the reference decode back
