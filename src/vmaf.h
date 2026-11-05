@@ -49,3 +49,7 @@ using PacketFeed = std::function<bool(std::vector<uint8_t>&)>; // the next encod
 // `scores` receives one VMAF value per original frame.
 bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const PacketFeed& next_packet, const std::vector<uint8_t>& extradata, const Shape& enc,
                 const Color& decoded_color, const ShownFeed& shown, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp = nullptr);
+// The same, for frames that are already decoded (at `enc`, in coding = display order): vmaf_score() decodes the packets into this. The ceiling of a shape
+// (see pipeline.h) is scored this way, with the frames the encoders would get.
+bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const FrameFeed& next_dis, const Shape& enc, const Color& decoded_color, const ShownFeed& shown,
+                       Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp = nullptr);

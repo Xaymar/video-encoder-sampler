@@ -11,6 +11,7 @@
 #include <mutex>
 #include <thread>
 
+#include "ff.h"
 #include "formats.h"
 #include "gpu.h"
 #include "mux.h"
@@ -293,6 +294,34 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
 	job.kbps = codec->stats.bytes * 8 / si.duration / 1000;
 }
 
+// Decodes the original and converts it to `fmt` for scoring, for every consumer of `bc`.
+void feed_reference(const std::string& input, Fmt fmt, const ScaleOptions& so, Broadcast& bc, RunProgress& rp) {
+	auto src = open_source(input);
+	if (!src) { fprintf(stderr, "cannot open %s\n", input.c_str()); bc.close(); return; }
+	const bool convert = src->fmt != fmt;
+	auto conv = make_converter();
+	Picture t, o;
+	bool ok = true, first = true, conv_failed = false;
+	int r;
+	auto flush_converted = [&] {
+		int got;
+		while (ok && (got = conv->pop(o)) == 1) ok = bc.push(o, &rp);
+		if (ok && got < 0) ok = false, conv_failed = true;
+	};
+	while (ok && (r = src->next(t)) == 1) {
+		rp.step();
+		if (!convert) { ok = bc.push(t, &rp); continue; }
+		t.duration = 1;
+		if (first) { ok = conv->open(t, src->framerate.inverse(), src->width, src->height, fmt, so); first = false; conv_failed = !ok; }
+		if (ok && !conv->push(&t)) ok = false, conv_failed = true;
+		flush_converted();
+	}
+	if (ok && convert) { ok = conv->push(nullptr); flush_converted(); }
+	if (conv_failed) fprintf(stderr, "the original frames could not be converted to %d-bit %d for scoring\n", fmt.depth, fmt.chroma);
+	rp.finish();
+	bc.close();
+}
+
 } // namespace
 
 bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRun*>& runs, const ScaleOptions& so, const VmafOptions& vo, RunProgress* feed_rp, FeedResult& fr) {
@@ -343,33 +372,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 	ref.score_range = si.fmt.rgb ? 1 : (si.color.range ? si.color.range : 1); // the reference side is converted to YUV without changing the range (RGB: limited)
 	for (auto& gp : groups) {
 		Group& g = *gp;
-		threads.emplace_back([&, gptr = &g] {
-			Group& g = *gptr;
-			auto src = open_source(input);
-			if (!src) { fprintf(stderr, "cannot open %s\n", input.c_str()); g.bc->close(); return; }
-			const bool convert = src->fmt != g.fmt;
-			auto conv = make_converter();
-			Picture t, o;
-			bool ok = true, first = true, conv_failed = false;
-			int r;
-			auto flush_converted = [&] {
-				int got;
-				while (ok && (got = conv->pop(o)) == 1) ok = g.bc->push(o, &g.ref_rp);
-				if (ok && got < 0) ok = false, conv_failed = true;
-			};
-			while (ok && (r = src->next(t)) == 1) {
-				g.ref_rp.step();
-				if (!convert) { ok = g.bc->push(t, &g.ref_rp); continue; }
-				t.duration = 1;
-				if (first) { ok = conv->open(t, src->framerate.inverse(), src->width, src->height, g.fmt, so); first = false; conv_failed = !ok; }
-				if (ok && !conv->push(&t)) ok = false, conv_failed = true;
-				flush_converted();
-			}
-			if (ok && convert) { ok = conv->push(nullptr); flush_converted(); }
-			if (conv_failed) fprintf(stderr, "the original frames could not be converted to %d-bit %d for scoring\n", g.fmt.depth, g.fmt.chroma);
-			g.ref_rp.finish();
-			g.bc->close();
-		});
+		threads.emplace_back([&, gptr = &g] { feed_reference(input, gptr->fmt, so, *gptr->bc, gptr->ref_rp); });
 		VmafOptions group_vo = vo;
 		if (group_vo.threads <= 0) group_vo.threads = std::max(2, (int)std::thread::hardware_concurrency() / (int)runs.size());
 		for (size_t m = 0; m < g.members.size(); m++) threads.emplace_back([&, gptr = &g, m, group_vo] {
@@ -396,4 +399,36 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 	for (auto& g : groups) ui::detach(g->handle);
 	for (auto* r : runs) r->enc.ok = r->enc.ok && fr.ok;
 	return fr.ok;
+}
+
+bool ceiling_wave(const std::string& input, const SourceInfo& si, const Plan& pl, const ScaleOptions& so, const VmafOptions& vo, std::vector<double>& scores, RunProgress* rp) {
+	// The frames the encoders of this feed get, scored as if an encoder had passed them through untouched: what is lost here is lost before any encoder.
+	Broadcast feed(1), ref_bc(1);
+	FeedResult fr;
+	RunProgress feed_rp, ref_rp;
+	feed_rp.begin(3, 1);
+	ref_rp.begin(3, std::max<long long>(1, si.frame_count));
+	std::thread producer([&] { produce(input, si, pl, so, feed, fr, &feed_rp); });
+	std::thread reference([&] { feed_reference(input, pl.score_fmt, so, ref_bc, ref_rp); });
+	RefInfo ref;
+	ref.width = si.width; ref.height = si.height; ref.framerate = si.framerate; ref.color = si.color; ref.frames = si.frame_count;
+	ref.score_range = si.fmt.rgb ? 1 : (si.color.range ? si.color.range : 1);
+	FrameQueue& fq = feed.at(0);
+	FrameQueue& rq = ref_bc.at(0);
+	const FrameFeed next_ref = [&rq](Picture& out) { return rq.pop(out) ? 1 : 0; };
+	const FrameFeed next_dis = [&fq, rp](Picture& out) {
+		if (!fq.pop(out, rp)) return 0;
+		if (out.layout.planes == 0 && out.fmt.planar) out.layout = layout_of(av_planar_format(out.fmt.chroma, out.fmt.depth)); // the scaler's frames say only their format; scaling back reads the layout
+		return 1;
+	};
+	const ShownFeed shown = [&fr](size_t k, uint32_t& v) { return fr.shown.get(k, v); };
+	VmafOptions o = vo;
+	if (o.threads <= 0) o.threads = std::max(2, (int)std::thread::hardware_concurrency());
+	bool ok = vmaf_score_frames(ref, next_ref, next_dis, pl.enc, pl.color, shown, pl.score_fmt, o, so, scores, rp);
+	fq.cancel(); rq.cancel();
+	producer.join();
+	reference.join();
+	if (ok && (!fr.ok || (long long)scores.size() != fr.frames)) { fprintf(stderr, "ceiling: %zu scores for %lld frames\n", scores.size(), fr.frames); ok = false; }
+	if (rp) { rp->failed = !ok; rp->finish(); }
+	return ok;
 }

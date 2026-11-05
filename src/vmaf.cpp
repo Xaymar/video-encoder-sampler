@@ -199,9 +199,27 @@ public:
 
 bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const PacketFeed& next_packet, const std::vector<uint8_t>& extradata, const Shape& enc,
                 const Color& decoded_color, const ShownFeed& shown, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp) {
-	if (rp) rp->begin(2, std::max<long long>(1, ref.frames));
 	auto decoder = make_decoder();
 	if (!decoder->open(codec, extradata)) return false;
+	long long m = 0;
+	bool flushed = false;
+	const FrameFeed next_dis = [&](Picture& d) -> int {
+		for (;;) {
+			const int got = decoder->receive(d);
+			if (got < 0) { fprintf(stderr, "vmaf: decoding the encoded stream failed after %lld frames\n", m); return -1; }
+			if (got == 1) { m++; return 1; }
+			if (flushed) return 0;
+			std::vector<uint8_t> packet;
+			if (!next_packet(packet)) { decoder->flush(); flushed = true; continue; }
+			if (!decoder->send(packet.data(), packet.size())) { fprintf(stderr, "vmaf: the encoded stream does not decode (packet of %zu bytes, after %lld frames)\n", packet.size(), m); return -1; }
+		}
+	};
+	return vmaf_score_frames(ref, next_ref, next_dis, enc, decoded_color, shown, score_fmt, opt, scale, scores, rp);
+}
+
+bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const FrameFeed& next_dis, const Shape& enc, const Color& decoded_color, const ShownFeed& shown,
+                       Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp) {
+	if (rp) rp->begin(2, std::max<long long>(1, ref.frames));
 
 	const bool convert_dis = enc.w != ref.width || enc.h != ref.height || enc.pix != score_fmt || (decoded_color.range ? decoded_color.range : 1) != ref.score_range; // scale back, change format, change range back
 
@@ -263,35 +281,24 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 		if (ok && got < 0) fprintf(stderr, "vmaf: scaling the encoded frames back failed\n");
 		ok = ok && got >= 0;
 	};
-	auto pump = [&] {
-		int got;
-		while (ok && (got = decoder->receive(d)) == 1) {
-			if (d.width != enc.w || d.height != enc.h || d.fmt != enc.pix) {
-				fprintf(stderr, "decoded stream is %dx%d %d-bit %d, expected %dx%d %d-bit %d\n", d.width, d.height, d.fmt.depth, d.fmt.chroma, enc.w, enc.h, enc.pix.depth, enc.pix.chroma);
-				ok = false; break;
-			}
-			// Encoders do not necessarily write the colour description, so use the one the encoder was given before converting.
-			d.color = decoded_color;
-			if (!convert_dis) show(d, m);
-			else {
-				d.pts = m;
-				d.duration = 1; // libplacebo needs it to know when the last frame ends; the packets carry none
-				if (m == 0 && !up->open(d, enc.fps.inverse(), ref.width, ref.height, score_fmt, scale, ref.score_range)) { fprintf(stderr, "vmaf: cannot scale the encoded frames back to %dx%d\n", ref.width, ref.height); ok = false; break; }
-				if (!up->push(&d)) { fprintf(stderr, "scaling the decoded frame back failed\n"); ok = false; break; }
-				collect_converted();
-			}
-			m++;
+	for (int got; ok && (got = next_dis(d)) != 0;) {
+		if (got < 0) { ok = false; break; }
+		if (d.width != enc.w || d.height != enc.h || d.fmt != enc.pix) {
+			fprintf(stderr, "decoded stream is %dx%d %d-bit %d, expected %dx%d %d-bit %d\n", d.width, d.height, d.fmt.depth, d.fmt.chroma, enc.w, enc.h, enc.pix.depth, enc.pix.chroma);
+			ok = false; break;
 		}
-		if (ok && got < 0) fprintf(stderr, "vmaf: decoding the encoded stream failed after %lld frames\n", m);
-		ok = ok && got >= 0;
-	};
-
-	for (std::vector<uint8_t> packet; ok && next_packet(packet);) {
-		ok = decoder->send(packet.data(), packet.size());
-		if (!ok) fprintf(stderr, "vmaf: the encoded stream does not decode (packet of %zu bytes, after %lld frames)\n", packet.size(), m);
-		if (ok) pump();
+		// Encoders do not necessarily write the colour description, so use the one the encoder was given before converting.
+		d.color = decoded_color;
+		if (!convert_dis) show(d, m);
+		else {
+			d.pts = m;
+			d.duration = 1; // libplacebo needs it to know when the last frame ends; the packets carry none
+			if (m == 0 && !up->open(d, enc.fps.inverse(), ref.width, ref.height, score_fmt, scale, ref.score_range)) { fprintf(stderr, "vmaf: cannot scale the encoded frames back to %dx%d\n", ref.width, ref.height); ok = false; break; }
+			if (!up->push(&d)) { fprintf(stderr, "scaling the decoded frame back failed\n"); ok = false; break; }
+			collect_converted();
+		}
+		m++;
 	}
-	if (ok) { decoder->flush(); pump(); }
 	if (ok && convert_dis) { ok = up->push(nullptr); collect_converted(); }
 	if (ok && k == 0) { fprintf(stderr, "no frames were decoded\n"); ok = false; }
 	uint32_t extra;

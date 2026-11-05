@@ -118,3 +118,9 @@ struct WaveRun {
 // Encodes all runs (which must share a feed key) from one decode of `input`, and scores each against the original at the same time.
 // Runs that compare in the same format share one decode of the original.
 bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRun*>& runs, const ScaleOptions& so, const VmafOptions& vo, RunProgress* feed_rp, FeedResult& fr);
+
+// The ceiling of a feed: the original against the frames every run of this plan's feed key is given (scaled, frame rate dropped, converted), scaled back
+// and scored like a run's, with no encoder in between. A run's score can only come close to it; how far it stays below is what its encoder lost.
+// One score per original frame.
+bool ceiling_wave(const std::string& input, const SourceInfo& si, const Plan& pl, const ScaleOptions& so, const VmafOptions& vo, std::vector<double>& scores, RunProgress* rp = nullptr);
+

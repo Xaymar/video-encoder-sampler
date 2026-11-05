@@ -142,6 +142,9 @@ bool result_load(const std::string& file, const std::string& key, CachedRun& out
 		out.reference_sha256 = ref && ref->type == Json::Str ? ref->text() : std::string();
 		out.scores.clear();
 		for (auto& s : scores->a) out.scores.push_back(atof(s.text().c_str()));
+		out.ceiling.clear();
+		if (auto* c = vmaf ? vmaf->find("ceiling") : nullptr; c && c->type == Json::Arr) for (auto& s : c->a) out.ceiling.push_back(atof(s.text().c_str()));
+		if (out.ceiling.size() != out.scores.size()) out.ceiling.clear();
 		return !out.scores.empty();
 	} catch (const std::exception&) { return false; }
 }
@@ -159,8 +162,51 @@ void result_store(const std::string& file, const std::string& key, const CachedR
 		if (!details.empty()) f << "," << details;
 		f << ",\"vmaf\":{\"model\":\"" << json_escape(vmaf_model_display_name(model)) << "\",\"model_generation\":\"" << json_escape(vmaf_model_generation(model)) << "\",\"scores\":[";
 		for (size_t i = 0; i < run.scores.size(); i++) { snprintf(b, sizeof b, "%.17g", run.scores[i]); f << (i ? "," : "") << b; }
-		f << "]}}\n";
+		f << "]";
+		if (!run.ceiling.empty() && run.ceiling.size() == run.scores.size()) { // what the frames could score at all at this size, frame rate and format
+			f << ",\"ceiling\":[";
+			for (size_t i = 0; i < run.ceiling.size(); i++) { snprintf(b, sizeof b, "%.17g", run.ceiling[i]); f << (i ? "," : "") << b; }
+			f << "]";
+		}
+		f << "}}\n";
 		if (!f) { fprintf(stderr, "cannot write the result %s (is the path too long?)\n", file.c_str()); fs::remove(tmp, ec); return; }
 	}
 	fs::rename(tmp, file, ec); // atomic, so an interrupted run never leaves a half-written file
+}
+
+std::string ceiling_key(const std::string& input, const std::string& feed_key, const Fmt& score_fmt, const ScaleOptions& scale, const VmafOptions& vmaf) {
+	std::ostringstream k;
+	k << key_input(input) << "ceiling-1 feed=" << feed_key << " score=" << score_fmt.chroma << '/' << score_fmt.depth << '\n' << key_settings(scale, vmaf);
+	return k.str();
+}
+
+bool ceiling_load(const std::string& file, const std::string& key, std::vector<double>& scores) {
+	std::ifstream f(file);
+	if (!f) return false;
+	try {
+		std::stringstream ss; ss << f.rdbuf();
+		Json j = Json::parse(ss.str());
+		auto* k = j.find("key");
+		auto* s = j.find("scores");
+		if (!k || !s || k->text() != key || s->type != Json::Arr) return false;
+		scores.clear();
+		for (auto& v : s->a) scores.push_back(atof(v.text().c_str()));
+		return !scores.empty();
+	} catch (const std::exception&) { return false; }
+}
+
+void ceiling_store(const std::string& file, const std::string& key, const std::vector<double>& scores) {
+	std::error_code ec;
+	fs::create_directories(fs::path(file).parent_path(), ec);
+	fs::path tmp = file;
+	tmp += ".tmp";
+	{
+		std::ofstream f(tmp, std::ios::binary);
+		char b[32];
+		f << "{\"key\":\"" << json_escape(key) << "\",\"scores\":[";
+		for (size_t i = 0; i < scores.size(); i++) { snprintf(b, sizeof b, "%.17g", scores[i]); f << (i ? "," : "") << b; }
+		f << "]}\n";
+		if (!f) { fs::remove(tmp, ec); return; }
+	}
+	fs::rename(tmp, file, ec);
 }
