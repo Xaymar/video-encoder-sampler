@@ -255,6 +255,8 @@ struct Uploader::Impl {
 			std::string body = "{\"key_sha256\":\"" + sha256_bytes(k->s) + "\"";
 			if (!reference_hash.empty()) body += ",\"reference_sha256\":\"" + reference_hash + "\""; // the site wants it for the score as well
 			if (with_video) body += ",\"video_sha256\":\"" + video_hash + "\",\"video_size\":" + std::to_string(video_size);
+			const Json* vm = result.find("vmaf");
+			if (const Json* c = vm ? vm->find("ceiling") : nullptr; c && c->type == Json::Arr && !c->a.empty()) body += ",\"ceiling\":true"; // a run stored without it can get it now
 			body += "}";
 			const Reply check = site->request(true, "/api/v1/check", "application/json", body.data(), body.size(), 120);
 			if (check.status != 200) { log(who + "check failed (" + Site::why(check) + ")"); problems++; return; }
@@ -279,7 +281,7 @@ struct Uploader::Impl {
 				if (up.status == 200 || up.status == 201) {
 					run = text_of(up.json, "uuid");
 					(flag_of(up.json, "new") ? scores_new : scores_known)++;
-					done = "score stored";
+					done = flag_of(up.json, "ceiling_added") ? "ceiling added to the stored score" : "score stored";
 				} else { log(who + "the score was refused (" + Site::why(up) + ")"); problems++; return; }
 			} else if (score && text_of(*score, "status") == "exists") {
 				if (!item.late) scores_known++;

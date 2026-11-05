@@ -12,6 +12,7 @@
 struct CachedRun {
 	double kbps = 0;
 	std::vector<double> scores;
+	std::vector<double> ceiling; // per frame: the score the run's feed reaches with no encoder (see ceiling_wave); empty if unknown
 	int width = 0, height = 0; // of the encoded video; 0 in files from before it was recorded
 	double fps = 0;
 	std::string input, video_sha256, reference_sha256; // of the encoded stream and the input; empty if the file predates them; "input" is whatever name was stored
@@ -38,6 +39,12 @@ bool result_load(const std::string& file, const std::string& key, CachedRun& out
 // `details` are JSON members ("\"encoder\":\"x264\",...") that go into the file besides the key, the bitrate and the scores.
 // `model` is the VMAF model spec (VmafOptions::model): the file names it and its generation next to the scores.
 void result_store(const std::string& file, const std::string& key, const CachedRun& run, const std::string& details, const std::string& model);
+
+// The ceiling of a feed (see ceiling_wave in pipeline.h), kept in <cache>/ceilings/<hash>.json: the input, what the feed key says about the frames the
+// encoders get, the format both sides are scored in, and the scaler and scorer settings.
+std::string ceiling_key(const std::string& input, const std::string& feed_key, const Fmt& score_fmt, const ScaleOptions& scale, const VmafOptions& vmaf);
+bool ceiling_load(const std::string& file, const std::string& key, std::vector<double>& scores);
+void ceiling_store(const std::string& file, const std::string& key, const std::vector<double>& scores);
 
 std::string encoder_library_version(const std::string& encoder); // versions.cpp
 std::string decoder_library_version();
