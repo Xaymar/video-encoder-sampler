@@ -143,7 +143,7 @@
 				// "b_reference_mode": { "values": ["none", "middle"], "requires": { "max_b_frames": ">=2" } },
 				// "weighted_prediction": { "values": [0, 1], "unless": { "max_b_frames": ">=1" } },
 				// "b_adapt": { "values": [0, 1], "requires": "max_b_frames" },                          // only with max_b_frames set
-				// "spatial_aq": [0, 1, 8, 15],             // 0 is off, 1..15 is on with that strength
+				// "spatial_aq": [0, "auto", 1, 8, 15],     // 0 is off, "auto" is on with the driver picking the strength, 1..15 is on with that strength
 				// "gpu": [0],                                    // which NVIDIA GPU; ["all"] uses every one, each in a pool of its own
 			},
 			// "scenarios": ["mid", "low"],  // only these scenarios; left out, the encoder takes part in all of them

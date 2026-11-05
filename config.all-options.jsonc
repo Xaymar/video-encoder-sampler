@@ -37,7 +37,7 @@
 				"rate_control": ["cbr", "vbr"],   // rate control
 				"max_b_frames": [0, 1, 2, 3, 4],   // B-frames
 				"lookahead_frames": [0, 8, 16, 32],   // frames of lookahead
-				"spatial_aq": [0, 1, 8, 15],   // 0 is off, 1..15 is on with that strength
+				"spatial_aq": [0, "auto", 1, 8, 15],   // 0 is off, "auto" lets the driver pick, 1..15 is that strength
 				"temporal_aq": [0, 1],
 				"vbv_buffer_size": [0, 500000, 2000000],   // bits; 0 is the encoder's default
 				"vbv_initial_delay": [0, 250000],   // bits
@@ -81,7 +81,7 @@
 				"rate_control": ["cbr", "vbr"],   // rate control
 				"max_b_frames": [0, 1, 2, 3, 4],   // B-frames
 				"lookahead_frames": [0, 8, 16, 32],   // frames of lookahead
-				"spatial_aq": [0, 1, 8, 15],   // 0 is off, 1..15 is on with that strength
+				"spatial_aq": [0, "auto", 1, 8, 15],   // 0 is off, "auto" lets the driver pick, 1..15 is that strength
 				"temporal_aq": [0, 1],
 				"vbv_buffer_size": [0, 500000, 2000000],   // bits; 0 is the encoder's default
 				"vbv_initial_delay": [0, 250000],   // bits
@@ -125,7 +125,7 @@
 				"rate_control": ["cbr", "vbr"],   // rate control
 				"max_b_frames": [0, 1, 2, 3, 4],   // B-frames
 				"lookahead_frames": [0, 8, 16, 32],   // frames of lookahead
-				"spatial_aq": [0, 1, 8, 15],   // 0 is off, 1..15 is on with that strength
+				"spatial_aq": [0, "auto", 1, 8, 15],   // 0 is off, "auto" lets the driver pick, 1..15 is that strength
 				"temporal_aq": [0, 1],
 				"vbv_buffer_size": [0, 500000, 2000000],   // bits; 0 is the encoder's default
 				"vbv_initial_delay": [0, 250000],   // bits
