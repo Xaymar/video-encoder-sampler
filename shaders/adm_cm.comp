@@ -3,7 +3,8 @@
 #extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 256) in;
 #include "adm_common.glsl"
-// Contrast masking: one workgroup per row; writes the row's three inner sums (h, v, d).
+// Contrast masking: one workgroup per row; writes the row's three inner sums (h, v, d). DLM: the restored part above the masking threshold of the
+// additive impairment; AIM (pc.aim): the additive impairment above the threshold of the restored part.
 
 shared int64_t sh[3][256];
 
@@ -22,7 +23,7 @@ void main() {
 					const int q = (row + di) * pc.BW + j + dj;
 					if (di == 0 && dj == 0) {
 						const int c = abs(cur[(CAH + theta) * N + q]);
-						sum += pc.scale == 0 ? sext16((8738 * c + 2048) >> 12) : int(((286331153l * int64_t(c)) + 2147483648l) >> 32);
+						sum += pc.scale == 0 ? sext16((8738 * c + 2048) >> 12) : int(((286331153l * int64_t(c)) - 2147483648l) >> 32); // -2^31: see adm_csf.comp
 					} else {
 						sum += cur[(CFH + theta) * N + q];
 					}
@@ -31,7 +32,7 @@ void main() {
 			thr += sum;
 		}
 		for (int band = 0; band < 3; band++) {
-			const int src = cur[(XH + band) * N + o];
+			const int src = cur[((pc.aim != 0 ? AH : XH) + band) * N + o];
 			int x;
 			int64_t val;
 			if (pc.scale == 0) {

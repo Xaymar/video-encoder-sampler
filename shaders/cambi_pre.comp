@@ -1,0 +1,24 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "cambi_common.glsl"
+// The distorted frame at the encoded size (nearest neighbour, with the source positions libvmaf works out in float, from `idx`), as 10 bit values.
+layout(std430, binding = 0) readonly buffer Raw { uint raw[]; };
+layout(std430, binding = 1) readonly buffer Idx { int idx[]; };   // OW column positions, then OH row positions
+layout(std430, binding = 2) writeonly buffer Out { uint img[]; };
+
+int sample_at(int i) {
+	if (pc.bpc > 8) return int((raw[i >> 1] >> ((i & 1) * 16)) & 65535u);
+	return int((raw[i >> 2] >> ((i & 3) * 8)) & 255u);
+}
+
+void main() {
+	const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+	if (x >= pc.OW || y >= pc.OH) return;
+	const int v = sample_at(idx[pc.OW + y] * pc.W + idx[x]);
+	int o;
+	if (pc.bpc < 10) o = v << (10 - pc.bpc);
+	else if (pc.bpc == 10) o = v;
+	else { const int sh = pc.bpc - 10; o = (v + (1 << (sh - 1))) >> sh; }
+	img[y * pc.OW + x] = uint(o);
+}

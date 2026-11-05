@@ -146,7 +146,7 @@ bool result_load(const std::string& file, const std::string& key, CachedRun& out
 	} catch (const std::exception&) { return false; }
 }
 
-void result_store(const std::string& file, const std::string& key, const CachedRun& run, const std::string& details) {
+void result_store(const std::string& file, const std::string& key, const CachedRun& run, const std::string& details, const std::string& model) {
 	std::error_code ec;
 	fs::create_directories(fs::path(file).parent_path(), ec);
 	fs::path tmp = file;
@@ -157,7 +157,7 @@ void result_store(const std::string& file, const std::string& key, const CachedR
 		snprintf(b, sizeof b, "%.17g", run.kbps);
 		f << "{\"key\":\"" << json_escape(key) << "\",\"kbps\":" << b;
 		if (!details.empty()) f << "," << details;
-		f << ",\"vmaf\":{\"scores\":[";
+		f << ",\"vmaf\":{\"model\":\"" << json_escape(vmaf_model_display_name(model)) << "\",\"model_generation\":\"" << json_escape(vmaf_model_generation(model)) << "\",\"scores\":[";
 		for (size_t i = 0; i < run.scores.size(); i++) { snprintf(b, sizeof b, "%.17g", run.scores[i]); f << (i ? "," : "") << b; }
 		f << "]}}\n";
 		if (!f) { fprintf(stderr, "cannot write the result %s (is the path too long?)\n", file.c_str()); fs::remove(tmp, ec); return; }

@@ -10,13 +10,24 @@
 #include "source.h"
 
 struct VmafOptions {
-	std::string model = "path=models/vmaf_4k_v0.6.1neg.json"; // "path=<json model>", relative to the working directory, or "version=<builtin>" if libvmaf has it
+	std::string model = "path=models/vmaf_v1.0.16_1d5h_2160.json"; // "path=<json model>", relative to the working directory, or "version=<builtin>" if libvmaf has it
 	int threads = 0; // 0: all cores, shared between the scorers that run at the same time
 	std::string device = "cpu"; // "cpu": libvmaf; "gpu": Vulkan compute (8 bit input, an error where it cannot be used); "auto": the GPU where it can be used, else the CPU
 	std::string gpu;            // which Vulkan device scores (GpuVmaf::pick_device): "" or "auto" for the GPU that encodes, else the first discrete one; a Vulkan index; a name
 	unsigned encoder_vendor = 0; // set per run: the vendor (gpu.h) and GPU index of the encoder, for gpu "auto"; 0 for a CPU encoder
 	int encoder_gpu = 0;
 };
+
+// Whether libvmaf can score with this model: it loads and every feature it uses is there (VMAF v1's chroma feature needs libvmaf 3.2.1, or 3.2.0
+// built with enable_float). `why` says what is missing.
+bool vmaf_check_model(const std::string& model, std::string& why);
+// The lowest bit depth runs are scored at with this model: 10 for VMAF v1 (its banding feature, CAMBI, works on 10 bit values, and Netflix
+// scores v1 at 10 bit even for 8 bit encodes), else 8 (whatever the source and the encode have).
+int vmaf_model_min_depth(const std::string& model);
+// The model's name as results carry it ("vmaf_v1.0.16_1d5h_2160", the file name without .json) and its generation ("v0", "v1"; "" if unknown).
+// v0 and v1 scores are on different scales.
+std::string vmaf_model_display_name(const std::string& model);
+std::string vmaf_model_generation(const std::string& model);
 
 // What scoring needs to know about the original video; its frames come from a feed.
 struct RefInfo {

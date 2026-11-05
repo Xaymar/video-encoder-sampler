@@ -1,0 +1,16 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "cambi_common.glsl"
+// The next scale: every second sample of the image and of the mask.
+layout(std430, binding = 0) readonly buffer Img { uint img[]; };
+layout(std430, binding = 1) readonly buffer Mask { uint mask[]; };
+layout(std430, binding = 2) writeonly buffer OImg { uint oimg[]; };
+layout(std430, binding = 3) writeonly buffer OMask { uint omask[]; };
+
+void main() {
+	const int j = int(gl_GlobalInvocationID.x), i = int(gl_GlobalInvocationID.y);
+	if (j >= pc.OW || i >= pc.OH) return;
+	oimg[i * pc.OW + j] = img[(2 * i) * pc.W + 2 * j];
+	omask[i * pc.OW + j] = mask[(2 * i) * pc.W + 2 * j];
+}

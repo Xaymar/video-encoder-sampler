@@ -3,14 +3,15 @@
 #extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 16, local_size_y = 16) in;
 #include "adm_common.glsl"
-// Contrast sensitivity weighting of the additive impairment, and its filtered absolute value (the masking threshold's input).
+// Contrast sensitivity weighting of the additive impairment (for the AIM: of the restored part), and its filtered absolute value (the masking
+// threshold's input).
 
 void main() {
 	const int j = int(gl_GlobalInvocationID.x), i = int(gl_GlobalInvocationID.y);
 	if (j < pc.dl || j >= pc.dr || i < pc.dt || i >= pc.db) return;
 	const int N = pc.BW * pc.BH, o = i * pc.BW + j;
 	for (int theta = 0; theta < 3; theta++) {
-		const int src = cur[(AH + theta) * N + o];
+		const int src = cur[((pc.aim != 0 ? XH : AH) + theta) * N + o];
 		const int rf = theta == 0 ? pc.rf0 : theta == 1 ? pc.rf1 : pc.rf2;
 		int dst, flt;
 		if (pc.scale == 0) {
@@ -20,7 +21,8 @@ void main() {
 			flt = sext16((4369 * abs(dst) + 2048) >> 12);
 		} else {
 			dst = int(((int64_t(uint(rf)) * int64_t(src)) + 134217728l) >> 28);
-			flt = int(((143165577l * int64_t(abs(dst))) + 2147483648l) >> 32);
+			// libvmaf keeps the rounding term 1u << 31 in an int32_t, so it adds -2^31 (and rounds down); so must this
+			flt = int(((143165577l * int64_t(abs(dst))) - 2147483648l) >> 32);
 		}
 		cur[(CAH + theta) * N + o] = dst;
 		cur[(CFH + theta) * N + o] = flt;

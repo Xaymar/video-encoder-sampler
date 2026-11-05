@@ -1,0 +1,24 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "cambi_common.glsl"
+// The spatial mask: a pixel counts when more than mask_index pixels of the 7x7 window around it equal their right and lower neighbours
+// (the last column and row count as equal; outside the image counts as not).
+layout(std430, binding = 0) readonly buffer Img { uint img[]; };
+layout(std430, binding = 1) writeonly buffer Mask { uint mask[]; };
+
+int zero_deriv(int r, int c) {
+	if (r < 0 || c < 0 || r >= pc.H || c >= pc.W) return 0;
+	const uint v = img[r * pc.W + c];
+	const bool hz = c == pc.W - 1 || v == img[r * pc.W + c + 1];
+	const bool vt = r == pc.H - 1 || v == img[(r + 1) * pc.W + c];
+	return (hz && vt) ? 1 : 0;
+}
+
+void main() {
+	const int c = int(gl_GlobalInvocationID.x), r = int(gl_GlobalInvocationID.y);
+	if (c >= pc.W || r >= pc.H) return;
+	int n = 0;
+	for (int dr = -3; dr <= 3; dr++) for (int dc = -3; dc <= 3; dc++) n += zero_deriv(r + dr, c + dc);
+	mask[r * pc.W + c] = n > pc.mask_index ? 1u : 0u;
+}

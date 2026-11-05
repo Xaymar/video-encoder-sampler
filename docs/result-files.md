@@ -29,6 +29,8 @@ This describes version 0.2.0. Fields are only added, so a reader should ignore o
 | `video_sha256` | string or null | SHA-256 (hex) of that stream. |
 | `reference_sha256` | string | SHA-256 (hex) of the input file the run was scored against. A website only accepts scores against reference videos it knows. |
 | `vmaf.scores` | array of numbers | The VMAF score of every frame, in display order. |
+| `vmaf.model` | string | The VMAF model the scores are from, as its file name without `.json` (`vmaf_v1.0.16_1d5h_2160`, `vmaf_4k_v0.6.1neg`). Added after 0.2.0 shipped; older files do not have it, and their `key` has the model on its `vmaf=` line. |
+| `vmaf.model_generation` | string | `v0` or `v1`, empty if it is not known. The two generations score on different scales, so a site keeps them apart. Older files do not have it; they are v0 unless the `vmaf=` line names a v1 model. |
 
 ### Software encoders
 
@@ -64,7 +66,7 @@ decoder=<ffmpeg version>
 vmaf=<libvmaf version> <model> <model hash> [scorer=<device>-1]
 ```
 
-`scorer=` is only there when the GPU scorer produced the scores (`scorer=gpu-1`). The scores of the CPU and GPU scorers agree to about a thousandth of a point.
+`scorer=` is only there when the GPU scorer produced the scores (`scorer=gpu-1`). The scores of the CPU and GPU scorers agree to about a billionth of a point (before November 2026 the GPU scorer scored v0 models about 4e-4 points low).
 
 ## Distributed sweeps
 

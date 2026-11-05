@@ -475,9 +475,9 @@ Paths
   -c,   --cache <dir>       finished runs are kept here and not repeated (default: cache); "off" disables it
 
 Scoring
-        --vmaf-model <spec> libvmaf model, e.g. path=models/vmaf_4k_v0.6.1neg.json
+        --vmaf-model <spec> libvmaf model (default: path=models/vmaf_v1.0.16_1d5h_2160.json; models/ has the others)
         --vmaf-threads <n>
-        --vmaf-device <cpu|gpu|auto>  where VMAF is computed (default: cpu). gpu: on the GPU with Vulkan compute (8 and 10 bit input; scores within 1e-4 of libvmaf's);
+        --vmaf-device <cpu|gpu|auto>  where VMAF is computed (default: cpu). gpu: on the GPU with Vulkan compute (8 and 10 bit input; v0 and v1 models; scores within 1e-9 of libvmaf's);
                             auto: the GPU where it can be used (8 or 10 bit YUV, a model file, a Vulkan GPU), else the CPU. These scores are kept apart from libvmaf's in the cache
         --vmaf-gpu <auto|n|name>  the Vulkan device that scores (default: auto, the GPU that encodes the run, else the first discrete GPU); n: Vulkan device n;
                             name: the first device whose name contains it. --vmaf-gpu list shows the Vulkan devices
@@ -910,6 +910,11 @@ int main(int argc, char** argv) {
 		if (cfg.token.empty()) if (const char* t = getenv("VES_TOKEN")) cfg.token = t;
 	}
 	if (cfg.low_memory && cfg.vo.threads <= 0) cfg.vo.threads = 2;
+	{ // a model libvmaf cannot use would fail every run
+		std::string why;
+		if (!vmaf_check_model(cfg.vo.model, why)) { fprintf(stderr, "error: %s\n", why.c_str()); return 1; }
+		set_min_score_depth(vmaf_model_min_depth(cfg.vo.model));
+	}
 	if (cfg.priority != "low" && cfg.priority != "normal") { fprintf(stderr, "error: priority must be low or normal\n"); return 1; }
 	if (cfg.priority == "low" && !set_low_priority()) fprintf(stderr, "warning: could not lower the process priority\n");
 	set_isolated_encoders(!cfg.in_process);
@@ -1324,7 +1329,7 @@ int main(int argc, char** argv) {
 		return it->second.count(name) != 0;
 	};
 	auto store_result = [&](const Task& t, const std::string& file, const CachedRun& run, const std::string& details) {
-		result_store(file, t.key(), run, details);
+		result_store(file, t.key(), run, details, cfg.vo.model);
 		auto [dir, name] = split_file(file);
 		if (auto it = result_dirs.find(dir); it != result_dirs.end()) it->second.insert(name);
 	};

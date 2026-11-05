@@ -5,6 +5,22 @@ layout(local_size_x = 16, local_size_y = 16) in;
 #include "adm_common.glsl"
 // Splits the distorted bands into the part that follows the reference (restored) and the rest (additive impairment).
 
+// (float)v as C has it: rounded once. Above 2^53, float(v) may go through double and round twice (llvmpipe does), which flips the
+// angle test of a few samples at scales 1 to 3; so the low bits are folded into a sticky bit first, which double holds exactly.
+float to_float(int64_t v) {
+	const uint64_t a = uint64_t(v < 0l ? -v : v);
+	const uint hi = uint(a >> 32);
+	float f;
+	if (hi < (1u << 21)) f = float(double(a)); // below 2^53: exact as a double
+	else {
+		const int s = 32 + findMSB(hi) - 52;
+		uint64_t q = a >> s;
+		if ((a & ((1ul << s) - 1ul)) != 0ul) q |= 1ul;
+		f = float(double(q) * double(1ul << s));
+	}
+	return v < 0l ? -f : f;
+}
+
 // The restored value for one band, from the reference value o and the distorted value t.
 int restore(int o, int t, bool angle_flag) {
 	int64_t k;
@@ -47,8 +63,8 @@ void main() {
 	const int64_t ot_dp = int64_t(oh) * int64_t(th) + int64_t(ov) * int64_t(tv);
 	const int64_t o_mag_sq = int64_t(oh) * int64_t(oh) + int64_t(ov) * int64_t(ov);
 	const int64_t t_mag_sq = int64_t(th) * int64_t(th) + int64_t(tv) * int64_t(tv);
-	precise double dp = double(float(ot_dp)) / 4096.0;
-	precise double rhs = (double(pc.cos1sq) * (double(float(o_mag_sq)) / 4096.0)) * (double(float(t_mag_sq)) / 4096.0);
+	precise double dp = double(to_float(ot_dp)) / 4096.0;
+	precise double rhs = (double(pc.cos1sq) * (double(to_float(o_mag_sq)) / 4096.0)) * (double(to_float(t_mag_sq)) / 4096.0);
 	const bool angle_flag = (dp >= 0.0) && (dp * dp >= rhs);
 	const int rh = restore(oh, th, angle_flag), rv = restore(ov, tv, angle_flag), rd = restore(od, td, angle_flag);
 	cur[XH * N + o] = rh; cur[XV * N + o] = rv; cur[XD * N + o] = rd;

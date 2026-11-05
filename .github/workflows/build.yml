@@ -71,7 +71,7 @@ jobs:
       - name: Smoke test
         run: |
           python3 - <<'EOF'
-          w, h, n = 320, 180, 48
+          w, h, n = 640, 360, 48
           with open("clip.y4m", "wb") as f:
               f.write(b"YUV4MPEG2 W%d H%d F30:1 Ip A1:1 C420jpeg" % (w, h) + bytes([10]))
               for i in range(n):
@@ -80,7 +80,7 @@ jobs:
                   f.write(bytes(128 for _ in range(w * h // 2)))
           EOF
           flatpak --user install -y --noninteractive ./ves-linux-x64.flatpak
-          flatpak run --filesystem="$PWD" com.xaymar.ves --plain --hw-decode off -c "$PWD/cache" -o "$PWD/out" -i "$PWD/clip.y4m" -enc x264 -br 500 --vmaf-model path=/app/share/ves/models/vmaf_v0.6.1.json
+          flatpak run --filesystem="$PWD" com.xaymar.ves --plain --hw-decode off -c "$PWD/cache" -o "$PWD/out" -i "$PWD/clip.y4m" -enc x264 -br 500 --vmaf-model path=/app/share/ves/models/vmaf_v1.0.16_1d5h_2160.json
 
       - uses: actions/upload-artifact@v4
         with:

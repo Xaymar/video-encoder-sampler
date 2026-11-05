@@ -1,0 +1,82 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "cambi_common.glsl"
+// The banding value (c value) of every pixel of one scale (calculate_c_values in cambi.c): from how many flat pixels of the window around it have
+// its value and values a few steps above and below it. Each workgroup also writes how many of its values are not 0, and their sum.
+layout(std430, binding = 0) readonly buffer Img { uint img[]; };
+layout(std430, binding = 1) readonly buffer Mask { uint mask[]; };
+layout(std430, binding = 2) writeonly buffer CVal { float cval[]; };
+layout(std430, binding = 3) readonly buffer Tables { int tvi[32]; int weight[32]; float recip[]; } tb;
+layout(std430, binding = 4) writeonly buffer Part { double part[]; }; // per workgroup: count of values that are not 0, their sum
+
+const int MAXD = 8; // nd <= 8 (max_log_contrast <= 3)
+const int TILE = 16;
+const int MAXPAD = 16;
+shared int tile[(TILE + 2 * MAXPAD) * (TILE + 2 * MAXPAD)];
+shared double ssum[256];
+shared uint scnt[256];
+
+// A sample as the histograms see it: its value if it is flat and within the band, else -1.
+int counted(int r, int c) {
+	if (r < 0 || c < 0 || r >= pc.H || c >= pc.W) return -1;
+	const int o = r * pc.W + c;
+	if (mask[o] == 0u) return -1;
+	const int v = int(img[o]);
+	return (v - pc.band_base) >= 0 && (v - pc.band_base) < pc.band_size ? v : -1;
+}
+
+void main() {
+	const int j = int(gl_GlobalInvocationID.x), i = int(gl_GlobalInvocationID.y);
+	const int pad = pc.pad, nd = pc.nd;
+	const bool tiled = pad <= MAXPAD;
+	const int tw = TILE + 2 * pad;
+	if (tiled) {
+		const int r0 = int(gl_WorkGroupID.y) * TILE - pad, c0 = int(gl_WorkGroupID.x) * TILE - pad;
+		for (int k = int(gl_LocalInvocationIndex); k < tw * tw; k += 256) tile[k] = counted(r0 + k / tw, c0 + k % tw);
+		barrier();
+	}
+	float c_value = 0.0;
+	if (j < pc.W && i < pc.H && mask[i * pc.W + j] != 0u) {
+		const int v = int(img[i * pc.W + j]);
+		const int compact = v - pc.band_base;
+		if (compact >= 0 && compact < pc.band_size) {
+			int cnt[2 * MAXD + 1];
+			for (int k = 0; k <= 2 * nd; k++) cnt[k] = 0;
+			for (int dr = -pad; dr <= pad; dr++) {
+				for (int dc = -pad; dc <= pad; dc++) {
+					const int q = tiled ? tile[(int(gl_LocalInvocationID.y) + pad + dr) * tw + int(gl_LocalInvocationID.x) + pad + dc] : counted(i + dr, j + dc);
+					const int k = q - v + nd;
+					if (q >= 0 && k >= 0 && k <= 2 * nd) cnt[k]++;
+				}
+			}
+			const int p0 = cnt[nd];
+			const int value = v + nd; // as cambi.c has it: tvi[] is in the same offset space
+			for (int d = 0; d < nd; d++) {
+				if (value <= tb.tvi[d] && value + d + 1 > pc.vlt_luma) {
+					const int p1 = cnt[nd + d + 1];
+					const int p2 = compact - d - 1 >= 0 ? cnt[nd - d - 1] : 0;
+					precise float val;
+					if (p1 > p2) val = float(tb.weight[d] * p0 * p1) * tb.recip[p1 + p0];
+					else val = float(tb.weight[d] * p0 * p2) * tb.recip[p2 + p0];
+					if (val > c_value) c_value = val;
+				}
+			}
+		}
+	}
+	if (j < pc.W && i < pc.H) cval[i * pc.W + j] = c_value;
+	const uint lid = gl_LocalInvocationIndex;
+	ssum[lid] = double(c_value);
+	scnt[lid] = c_value != 0.0 ? 1u : 0u;
+	barrier();
+	for (uint s = 128u; s > 0u; s >>= 1) {
+		if (lid < s) { ssum[lid] += ssum[lid + s]; scnt[lid] += scnt[lid + s]; }
+		barrier();
+	}
+	if (lid == 0u) {
+		const uint g = gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x;
+		part[2 * g] = double(scnt[0]);
+		part[2 * g + 1] = ssum[0];
+	}
+}
