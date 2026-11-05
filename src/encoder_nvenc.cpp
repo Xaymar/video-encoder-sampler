@@ -317,10 +317,14 @@ public:
 		}
 		if (take("max_b_frames", v)) cfg.frameIntervalP = atoi(v.c_str()) + 1;
 		if (take("lookahead_frames", v)) { rc.lookaheadDepth = (uint16_t)atoi(v.c_str()); rc.enableLookahead = rc.lookaheadDepth > 0; }
-		if (take("spatial_aq", v)) { // 0 switches it off, 1..15 switches it on with that strength
-			const int n = atoi(v.c_str());
-			rc.enableAQ = n > 0;
-			rc.aqStrength = n > 0 ? n : 0;
+		if (take("spatial_aq", v)) { // 0 switches it off, "auto" on with the driver picking the strength per frame, 1..15 on with that strength
+			if (v == "auto") { rc.enableAQ = 1; rc.aqStrength = 0; }
+			else {
+				const int n = atoi(v.c_str());
+				if (n < 0 || n > 15 || (n == 0 && v != "0")) { fprintf(stderr, "nvenc: bad spatial_aq '%s' (0, auto or 1..15)\n", v.c_str()); return false; }
+				rc.enableAQ = n > 0;
+				rc.aqStrength = n;
+			}
 		}
 		if (take("temporal_aq", v)) rc.enableTemporalAQ = atoi(v.c_str()) != 0;
 		if (take("b_reference_mode", v)) {
