@@ -41,6 +41,9 @@ std::string Plan::feed_key() const {
 	return b;
 }
 
+static int min_score_depth = 8;
+void set_min_score_depth(int depth) { min_score_depth = depth; }
+
 Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::string& codec, const Options& options, const Shape& want) {
 	Plan pl;
 	auto ignore = [&](std::string why) { pl.ignored = true; pl.reason = std::move(why); return pl; };
@@ -91,9 +94,9 @@ Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::str
 	else if (src.fmt.rgb) pl.color.range = 1;
 	enc.pix = planar_fmt(chroma, depth);
 	enc.has_pix = true;
-	// Both sides are scored in the source's chroma layout at the higher of the two bit depths.
+	// Both sides are scored in the source's chroma layout at the higher of the two bit depths, and at least at the model's (10 bit for VMAF v1).
 	// 4:2:2 sources are scored as 4:4:4, which holds all of their chroma.
-	pl.score_fmt = planar_fmt(sf.chroma == 422 ? 444 : sf.chroma, std::max(sf.depth, depth));
+	pl.score_fmt = planar_fmt(sf.chroma == 422 ? 444 : sf.chroma, std::max({sf.depth, depth, min_score_depth}));
 	if (!valid(enc.pix) || !valid(pl.score_fmt)) return ignore("unsupported chroma " + std::to_string(chroma) + " / bit depth " + std::to_string(depth));
 	pl.convert_rate = want.fps.num != 0 && !same_rate;
 	pl.rescale = enc.w != src.width || enc.h != src.height || enc.pix != src.fmt || (pl.range && pl.range != source_range); // scale, convert and/or change the range

@@ -85,7 +85,8 @@ modules:
     sources:
       - type: git
         url: https://github.com/Netflix/vmaf.git
-        tag: v3.2.0
+        # 3.2.1 or later: 3.2.0 builds the VMAF v1 chroma feature (speed_chroma) only with -Denable_float=true
+        tag: v3.2.1
 
   # shortcut: shaderc is taken from the SDK; if it is missing there, add a shaderc (or glslang) module before this one
   - name: libplacebo

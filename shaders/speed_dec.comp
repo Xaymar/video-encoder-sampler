@@ -1,0 +1,53 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8) in;
+// SpEED (VMAF v1's chroma feature, libvmaf speed.c): one chroma plane as floats (v / scaler - 128), prescaled (bilinear or nearest, with the
+// source positions and weights libvmaf works out, from `tb`), filtered with the antialiasing filter and kept at every 16th row and column
+// (vif_filter1d_dec16_s). The rest (a 3x3 blur, the block statistics) is done on the CPU, on what this writes.
+layout(std430, binding = 0) readonly buffer Raw { uint raw[]; };
+layout(std430, binding = 1) readonly buffer Tables { int idx[]; } tb;    // SW x1, SW x2, SH y1, SH y2, then SW dx, SH dy (as float bits)
+layout(std430, binding = 2) readonly buffer Filter { float f[]; };
+layout(std430, binding = 3) writeonly buffer Out { float dst[]; };
+layout(push_constant) uniform PC {
+	int W, H;      // the plane
+	int SW, SH;    // after the prescale
+	int DW, DH;    // the output: SW / 16 x SH / 16
+	int bpc;
+	int fw;        // filter taps
+	int scaled;    // 0: no prescale
+	int out_off;   // where this plane's output starts in dst
+	float scaler;  // 1 (8 bit), 4 (10 bit)
+} pc;
+
+float conv(int r, int c) {
+	const int i = r * pc.W + c;
+	int v;
+	if (pc.bpc > 8) v = int((raw[i >> 1] >> ((i & 1) * 16)) & 65535u);
+	else v = int((raw[i >> 2] >> ((i & 3) * 8)) & 255u);
+	precise float o = float(v) / pc.scaler + -128.0;
+	return o;
+}
+
+float sample_at(int r, int c) {
+	if (pc.scaled == 0) return conv(r, c);
+	const int x1 = tb.idx[c], x2 = tb.idx[pc.SW + c];
+	const int y1 = tb.idx[2 * pc.SW + r], y2 = tb.idx[2 * pc.SW + pc.SH + r];
+	const float dx = intBitsToFloat(tb.idx[2 * pc.SW + 2 * pc.SH + c]);
+	const float dy = intBitsToFloat(tb.idx[3 * pc.SW + 2 * pc.SH + r]);
+	precise float v = (1.0 - dy) * (1.0 - dx) * conv(y1, x1) + (1.0 - dy) * dx * conv(y1, x2) + dy * (1.0 - dx) * conv(y2, x1) + dy * dx * conv(y2, x2);
+	return v;
+}
+
+int mirror(int i, int n) { return i < 0 ? -i : (i >= n ? 2 * n - i - 2 : i); }
+
+void main() {
+	const int J = int(gl_GlobalInvocationID.x), I = int(gl_GlobalInvocationID.y);
+	if (J >= pc.DW || I >= pc.DH) return;
+	precise float acc = 0.0;
+	for (int fj = 0; fj < pc.fw; fj++) {
+		const int jj = mirror(J * 16 - pc.fw / 2 + fj, pc.SW);
+		precise float col = 0.0;
+		for (int fi = 0; fi < pc.fw; fi++) col += f[fi] * sample_at(mirror(I * 16 - pc.fw / 2 + fi, pc.SH), jj);
+		acc += f[fj] * col;
+	}
+	dst[pc.out_off + I * pc.DW + J] = acc;
+}

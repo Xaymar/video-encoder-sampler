@@ -211,9 +211,9 @@ Vk::Vk(int device) : impl(new Impl) {
 	if (!impl->s) { delete impl; impl = nullptr; throw std::runtime_error("Vulkan: " + why); }
 	Shared& s = *impl->s;
 	try {
-		VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * 128};
+		VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * 256};
 		VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-		dpi.maxSets = 128;
+		dpi.maxSets = 256;
 		dpi.poolSizeCount = 1;
 		dpi.pPoolSizes = &ps;
 		chk(vkCreateDescriptorPool(s.dev, &dpi, nullptr, &impl->dpool), "descriptor pool");

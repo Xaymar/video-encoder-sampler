@@ -64,12 +64,18 @@
 		// (2% over loses 0.07, 10% 1.9, 20% 59). The default is about what 3000 -> 6000 kbit/s gains.
 		"over_penalty": 0.025,
 		// Model file, relative to the working directory ("path=..."), or a built-in one ("version=..."), which the libvmaf we ship has none of.
-		// The "neg" models (no enhancement gain) do not reward sharpening or contrast changes; vmaf_4k_v0.6.1neg is meant for 4K viewing,
-		// vmaf_v0.6.1neg for 1080p. models/ also has the plain ones (vmaf_4k_v0.6.1.json, vmaf_v0.6.1.json).
-		"model": "path=models/vmaf_4k_v0.6.1neg.json",
+		// VMAF v1 (vmaf_v1.0.16_*) is Netflix's current generation: besides luma it looks at banding (CAMBI) and at the chroma planes, and it does not
+		// reward sharpening. Runs scored with a v1 model are scored at 10 bit or more, as Netflix recommends. Its models, by viewing condition:
+		//   vmaf_v1.0.16_1d5h_2160  4K display at 1.5 screen heights, the 4K default (scores 0-100)
+		//   vmaf_v1.0.16_3d0h       1080p display at 3 screen heights (0-100)
+		//   vmaf_v1.0.16_5d0h       phone, 1080p at 5 screen heights (0-100)
+		//   vmaf_v1.0.16_3d0h_2160  4K TV at 3 screen heights (0-110: room for what 4K adds over 1080p)
+		// and vmaf_v1.0.16_hfr_* for 50/60 fps content. The v0 models are still there: vmaf_4k_v0.6.1neg and vmaf_v0.6.1neg (no enhancement gain),
+		// vmaf_4k_v0.6.1 and vmaf_v0.6.1. v0 and v1 scores are on different scales, so results of the two are kept apart.
+		"model": "path=models/vmaf_v1.0.16_1d5h_2160.json",
 		// Threads per run being scored; 0 shares all cores between the runs that are scored at the same time.
 		"threads": 0,
-		// Where VMAF is computed: "cpu" (libvmaf), "gpu" (Vulkan compute: about ten times faster, 8 and 10 bit input, scores within 1e-4 of libvmaf's;
+		// Where VMAF is computed: "cpu" (libvmaf), "gpu" (Vulkan compute: about ten times faster, 8 and 10 bit input, v0 and v1 models, scores within 1e-9 of libvmaf's;
 		// a run it cannot score fails) or "auto" (the GPU where it can be used, else the CPU). Scores from the GPU are cached apart from the CPU's.
 		"device": "cpu",
 		// Which Vulkan device scores on the GPU: "auto" (the GPU that encodes the run, so frames do not cross between GPUs; for CPU encoders, or where that

@@ -57,6 +57,8 @@ struct Plan {
 	std::string feed_key() const; // runs with equal keys (and the same input) can share one decode
 };
 Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::string& codec, const Options& options, const Shape& want);
+// The lowest bit depth make_plan() scores at (vmaf_model_min_depth() of the model; 8 by default).
+void set_min_score_depth(int depth);
 
 struct EncodeJob {
 	std::string encoder, codec;

@@ -36,7 +36,8 @@ std::string key_hash(const std::string& key);
 
 bool result_load(const std::string& file, const std::string& key, CachedRun& out);
 // `details` are JSON members ("\"encoder\":\"x264\",...") that go into the file besides the key, the bitrate and the scores.
-void result_store(const std::string& file, const std::string& key, const CachedRun& run, const std::string& details);
+// `model` is the VMAF model spec (VmafOptions::model): the file names it and its generation next to the scores.
+void result_store(const std::string& file, const std::string& key, const CachedRun& run, const std::string& details, const std::string& model);
 
 std::string encoder_library_version(const std::string& encoder); // versions.cpp
 std::string decoder_library_version();

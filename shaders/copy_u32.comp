@@ -1,0 +1,10 @@
+#version 450
+layout(local_size_x = 256) in;
+// Copies pc.n words (to read a device buffer back).
+layout(std430, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { uint dst[]; };
+layout(push_constant) uniform PC { int n; } pc;
+void main() {
+	const int k = int(gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u + gl_GlobalInvocationID.x);
+	if (k < pc.n) dst[k] = src[k];
+}
