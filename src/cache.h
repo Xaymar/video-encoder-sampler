@@ -44,7 +44,7 @@ void result_store(const std::string& file, const std::string& key, const CachedR
 std::string model_id(const std::string& model);
 
 // The ceiling of a feed (see ceiling_wave in pipeline.h), kept in <cache>/ceilings/<hash>.json: the input, what the feed key says about the frames the
-// encoders get, the format both sides are scored in, and the scaler and scorer settings.
+// encoders get, the format both sides are scored in, and the scaler and scorer settings. One per model: the key names vmaf.model only.
 std::string ceiling_key(const std::string& input, const std::string& feed_key, const Fmt& score_fmt, const ScaleOptions& scale, const VmafOptions& vmaf);
 bool ceiling_load(const std::string& file, const std::string& key, std::vector<double>& scores);
 void ceiling_store(const std::string& file, const std::string& key, const std::vector<double>& scores);

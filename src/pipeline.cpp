@@ -401,7 +401,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 	return fr.ok;
 }
 
-bool ceiling_wave(const std::string& input, const SourceInfo& si, const Plan& pl, const ScaleOptions& so, const VmafOptions& vo, std::vector<double>& scores, RunProgress* rp) {
+bool ceiling_wave(const std::string& input, const SourceInfo& si, const Plan& pl, const ScaleOptions& so, const VmafOptions& vo, std::vector<double>& scores, RunProgress* rp, std::vector<std::vector<double>>* extra) {
 	// The frames the encoders of this feed get, scored as if an encoder had passed them through untouched: what is lost here is lost before any encoder.
 	Broadcast feed(1), ref_bc(1);
 	FeedResult fr;
@@ -423,9 +423,16 @@ bool ceiling_wave(const std::string& input, const SourceInfo& si, const Plan& pl
 	};
 	const ShownFeed shown = [&fr](size_t k, uint32_t& v) { return fr.shown.get(k, v); };
 	VmafOptions o = vo;
-	o.extra_models.clear(); // the ceiling is the first model's
+	if (!extra) o.extra_models.clear();
 	if (o.threads <= 0) o.threads = std::max(2, (int)std::thread::hardware_concurrency());
-	bool ok = vmaf_score_frames(ref, next_ref, next_dis, pl.enc, pl.color, shown, pl.score_fmt, o, so, scores, rp);
+	VmafDetail detail;
+	bool ok = vmaf_score_frames(ref, next_ref, next_dis, pl.enc, pl.color, shown, pl.score_fmt, o, so, scores, rp, extra ? &detail : nullptr);
+	if (extra) {
+		extra->clear();
+		for (auto& e : detail.extra) extra->push_back(std::move(e.scores));
+		if (ok && extra->size() != o.extra_models.size()) ok = false;
+		for (auto& e : *extra) if (e.size() != scores.size()) ok = false;
+	}
 	fq.cancel(); rq.cancel();
 	producer.join();
 	reference.join();

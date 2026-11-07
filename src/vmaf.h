@@ -28,6 +28,7 @@ std::vector<std::string> vmaf_models(const VmafOptions& o);
 // U and V values (lower is better; empty for a model without it).
 struct ModelScores {
 	std::vector<double> scores, chroma_u, chroma_v;
+	std::vector<double> ceiling; // this model's ceiling of the run's feed (see ceiling_wave), per frame; empty if unknown
 };
 struct VmafDetail {
 	std::vector<double> chroma_u, chroma_v; // of `model`

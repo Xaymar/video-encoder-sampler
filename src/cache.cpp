@@ -170,7 +170,8 @@ bool result_load(const std::string& file, const std::string& key, CachedRun& out
 			if (const Json* ex = vmaf->find("extra_models"); ex && ex->type == Json::Arr)
 				for (auto& e : ex->a) {
 					ModelScores m;
-					list(e.find("scores"), m.scores); list(e.find("chroma_u"), m.chroma_u); list(e.find("chroma_v"), m.chroma_v);
+					list(e.find("scores"), m.scores); list(e.find("chroma_u"), m.chroma_u); list(e.find("chroma_v"), m.chroma_v); list(e.find("ceiling"), m.ceiling);
+					if (m.ceiling.size() != m.scores.size()) m.ceiling.clear();
 					out.detail.extra.push_back(std::move(m));
 				}
 		}
@@ -202,7 +203,7 @@ void result_store(const std::string& file, const std::string& key, const CachedR
 		};
 		f << ",\"vmaf\":{";
 		model(vo.model, run.scores, run.detail.chroma_u, run.detail.chroma_v);
-		if (!run.ceiling.empty() && run.ceiling.size() == run.scores.size()) list("ceiling", run.ceiling, "%.17g"); // what the frames could score at all at this size, frame rate and format (the first model)
+		if (!run.ceiling.empty() && run.ceiling.size() == run.scores.size()) list("ceiling", run.ceiling, "%.17g"); // what the frames could score at all at this size, frame rate and format
 		const std::vector<std::string> all = vmaf_models(vo);
 		if (all.size() > 1 && run.detail.extra.size() == all.size() - 1) {
 			f << ",\"extra_models\":[";
@@ -210,6 +211,7 @@ void result_store(const std::string& file, const std::string& key, const CachedR
 				const ModelScores& e = run.detail.extra[i - 1];
 				f << (i > 1 ? "," : "") << "{";
 				model(all[i], e.scores, e.chroma_u, e.chroma_v);
+				if (!e.ceiling.empty() && e.ceiling.size() == e.scores.size()) list("ceiling", e.ceiling, "%.17g");
 				f << "}";
 			}
 			f << "]";
@@ -222,7 +224,7 @@ void result_store(const std::string& file, const std::string& key, const CachedR
 
 std::string ceiling_key(const std::string& input, const std::string& feed_key, const Fmt& score_fmt, const ScaleOptions& scale, const VmafOptions& vmaf) {
 	std::ostringstream k;
-	VmafOptions first = vmaf; // the ceiling is scored with the first model only
+	VmafOptions first = vmaf; // one model's ceiling: each model's is kept on its own, so adding or dropping a model keeps the others
 	first.extra_models.clear();
 	k << key_input(input) << "ceiling-1 feed=" << feed_key << " score=" << score_fmt.chroma << '/' << score_fmt.depth << '\n' << key_settings(scale, first);
 	return k.str();

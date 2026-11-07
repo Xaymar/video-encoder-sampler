@@ -1473,6 +1473,7 @@ int main(int argc, char** argv) {
 		char rel[96] = "";
 		if (const auto d = vs_ceiling(r); !d.empty()) { const FrameStats st = frame_stats(d); snprintf(rel, sizeof rel, ", vs ceiling mean %.3f p5 %.3f", st.mean, st.p5); }
 		if (!t.result_file.empty() && (!r.cached || r.imported || r.ceiling_new)) store_result(t, t.result_file, cached_of(r), run_details(t));
+		r.detail = VmafDetail{}; // in the result file now; nothing else reads it, and a sweep holds many runs
 		if (uploader && !r.result.empty() && !r.uploaded && (r.video_sha256.empty() || sent_streams.insert(r.group + "|" + r.video_sha256).second)) {
 			UploadItem it;
 			it.result_file = (fs::path(cfg.output_dir) / r.result).string();
@@ -1556,10 +1557,17 @@ int main(int argc, char** argv) {
 		if (!t.r.shape.w) { t.r.shape.w = t.plan.enc.w; t.r.shape.h = t.plan.enc.h; }
 		if (!t.r.shape.fps.num) t.r.shape.fps = t.plan.enc.fps;
 	};
-	std::map<std::string, std::shared_ptr<const std::vector<double>>> ceilings; // by ceiling_key; null: could not be scored (not tried again)
+	// One ceiling per model, index 0 the first (vmaf_models order); each model's is cached on its own (see ceiling_key), so a model added later
+	// scores only its own. By the first model's ceiling_key; null: could not be scored (not tried again).
+	using Ceilings = std::vector<std::vector<double>>;
+	std::map<std::string, std::shared_ptr<const Ceilings>> ceilings;
+	const std::vector<std::string> all_models = vmaf_models(cfg.vo);
+	auto model_opts = [&](const std::string& m) { VmafOptions o = cfg.vo; o.model = m; o.extra_models.clear(); return o; };
 	attach_ceiling = [&](Task& t) {
 		Run& r = t.r;
-		if (!cfg.ceiling || !t.ok || r.ceiling) return;
+		if (!cfg.ceiling || !t.ok) return;
+		const bool have_extra = r.detail.extra.size() == all_models.size() - 1 && std::all_of(r.detail.extra.begin(), r.detail.extra.end(), [](const ModelScores& m) { return !m.ceiling.empty(); });
+		if (r.ceiling && have_extra) return;
 		Plan pl = t.plan;
 		if (!pl.enc.w) { // a run taken from its result file: planned now, from the shape it asked for (the file's frame rate is rounded)
 			const SourceInfo* src = source_of(r.input);
@@ -1567,28 +1575,42 @@ int main(int argc, char** argv) {
 			pl = make_plan(*src, t.job->encoder, t.job->codec, *t.opts, t.sc && t.shape_i < t.sc->shapes.size() ? t.sc->shapes[t.shape_i] : r.shape);
 			if (pl.ignored) return;
 		}
-		const std::string key = ceiling_key(r.input, pl.feed_key(), pl.score_fmt, cfg.scale, cfg.vo);
-		auto it = ceilings.find(key);
+		std::vector<std::string> keys;
+		for (auto& m : all_models) keys.push_back(ceiling_key(r.input, pl.feed_key(), pl.score_fmt, cfg.scale, model_opts(m)));
+		auto it = ceilings.find(keys[0]);
 		if (it == ceilings.end()) {
-			const std::string file = cfg.cache_dir.empty() ? std::string() : (fs::path(cfg.cache_dir) / "ceilings" / (key_hash(key) + ".json")).string();
-			std::vector<double> sc;
-			bool ok = !file.empty() && ceiling_load(file, key, sc);
-			if (!ok) if (const SourceInfo* src = source_of(r.input)) {
-				const std::string what = file_name(r.input) + " at " + std::to_string(pl.enc.w) + "x" + std::to_string(pl.enc.h) + " " + pl.feed_key().substr(pl.feed_key().find(' ') + 1);
-				RunProgress rp;
-				const int h = ui::attach(&rp, "ceiling " + what, "decode");
-				const auto t0 = std::chrono::steady_clock::now();
-				ok = ceiling_wave(local_path(r.input), *src, pl, cfg.scale, cfg.vo, sc, &rp);
-				ui::detach(h);
-				char line[512];
-				if (ok) snprintf(line, sizeof line, "Ceiling %s: vmaf mean %.3f min %.3f  (%.1fs)", what.c_str(), frame_stats(sc).mean, frame_stats(sc).min, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-				else snprintf(line, sizeof line, "Ceiling %s could not be scored; its runs have no score against it", what.c_str());
-				ui::log(line);
-				if (ok && !file.empty()) ceiling_store(file, key, sc);
+			auto file_of = [&](const std::string& key) { return cfg.cache_dir.empty() ? std::string() : (fs::path(cfg.cache_dir) / "ceilings" / (key_hash(key) + ".json")).string(); };
+			Ceilings sc(all_models.size());
+			std::vector<size_t> missing;
+			for (size_t m = 0; m < all_models.size(); m++) { const std::string file = file_of(keys[m]); if (file.empty() || !ceiling_load(file, keys[m], sc[m])) missing.push_back(m); }
+			bool ok = true;
+			if (!missing.empty()) {
+				ok = false;
+				if (const SourceInfo* src = source_of(r.input)) {
+					const std::string what = file_name(r.input) + " at " + std::to_string(pl.enc.w) + "x" + std::to_string(pl.enc.h) + " " + pl.feed_key().substr(pl.feed_key().find(' ') + 1);
+					VmafOptions o = model_opts(all_models[missing[0]]); // only the models whose ceiling is not cached yet
+					for (size_t k = 1; k < missing.size(); k++) o.extra_models.push_back(all_models[missing[k]]);
+					RunProgress rp;
+					const int h = ui::attach(&rp, "ceiling " + what, "decode");
+					const auto t0 = std::chrono::steady_clock::now();
+					std::vector<std::vector<double>> extra;
+					ok = ceiling_wave(local_path(r.input), *src, pl, cfg.scale, o, sc[missing[0]], &rp, &extra);
+					ui::detach(h);
+					for (size_t k = 1; ok && k < missing.size(); k++) sc[missing[k]] = std::move(extra[k - 1]);
+					char line[512];
+					if (ok) snprintf(line, sizeof line, "Ceiling %s: vmaf mean %.3f min %.3f  (%.1fs)", what.c_str(), frame_stats(sc[0]).mean, frame_stats(sc[0]).min, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+					else snprintf(line, sizeof line, "Ceiling %s could not be scored; its runs have no score against it", what.c_str());
+					ui::log(line);
+					if (ok) for (size_t m : missing) if (const std::string file = file_of(keys[m]); !file.empty()) ceiling_store(file, keys[m], sc[m]);
+				}
 			}
-			it = ceilings.emplace(key, ok ? std::make_shared<const std::vector<double>>(std::move(sc)) : nullptr).first;
+			it = ceilings.emplace(keys[0], ok ? std::make_shared<const Ceilings>(std::move(sc)) : nullptr).first;
 		}
-		if (it->second && it->second->size() == r.scores.size()) { r.ceiling = it->second; r.ceiling_new = true; }
+		if (!it->second || (*it->second)[0].size() != r.scores.size()) return;
+		if (!r.ceiling) { r.ceiling = std::shared_ptr<const std::vector<double>>(it->second, &(*it->second)[0]); r.ceiling_new = true; }
+		if (r.detail.extra.size() == all_models.size() - 1)
+			for (size_t m = 1; m < all_models.size(); m++)
+				if (ModelScores& e = r.detail.extra[m - 1]; e.ceiling.empty() && (*it->second)[m].size() == e.scores.size()) { e.ceiling = (*it->second)[m]; r.ceiling_new = true; }
 	};
 	// Distributed: the runs of a round (an input's runs made so far, then each next layer of its lazy groups) that are not done yet are cut into jobs (one input,
 	// encoder entry, scenario, bitrate, key frame interval, size and GPU model each) for the workers that connect to --host. What they send back is stored as result
