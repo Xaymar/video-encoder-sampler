@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
@@ -624,25 +625,63 @@ void reply(uint8_t type, uint32_t id, const std::string& body) {
 // ---- a wave in this process (the encoder process) ----
 unsigned process_vendor = 0; // the GPU this process serves; 0 for the process of the CPU encoders
 int process_gpu = 0;
+std::string decode_gpu_spec, scaling_gpu_spec; // --decode-gpu, --scaling-gpu: "" or "auto", "own", a Vulkan index or a name
 
-// The Vulkan device this process converts frames on: its GPU's, when a test picture comes back right from it; else the first other one that gets it right (discrete GPUs
-// first). Some drivers convert to nothing but zeros without an error: the Vega iGPU of an AMD laptop gave all-green videos. Found once per process.
+// The Vulkan device a --decode-gpu or --scaling-gpu value names, -1 for "auto" (or nothing that matches; then `why` says so). "own": this process's GPU.
+int vulkan_device_of_spec(const std::string& spec, std::string& why) {
+	if (spec.empty() || spec == "auto") return -1;
+	if (spec == "own") return process_vendor ? vulkan_device_of_gpu(process_vendor, process_gpu) : -1;
+	std::string e;
+	const auto all = Vk::devices(e);
+	if (std::all_of(spec.begin(), spec.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+		const int d = atoi(spec.c_str());
+		if (d < (int)all.size()) return d;
+	}
+	auto lower = [](std::string s) { for (auto& c : s) c = (char)std::tolower((unsigned char)c); return s; };
+	for (auto& d : all) if (lower(d.name).find(lower(spec)) != std::string::npos) return d.index;
+	why = "there is no Vulkan device '" + spec + "'";
+	return -1;
+}
+
+// The GPU this process decodes on: the one --decode-gpu names, else the fastest one that hardware decoding can be pointed at (it does not have to be the GPU that
+// encodes: the frames come back to memory either way). Hardware decoding still checks its first frames against software and decodes in software where it cannot.
+void pick_decode_gpu() {
+	std::string why;
+	int want = vulkan_device_of_spec(decode_gpu_spec, why);
+	if (!why.empty()) fprintf(stderr, "decode gpu: %s, decoding on the fastest GPU instead\n", why.c_str());
+	std::vector<int> order;
+	if (want >= 0) order.push_back(want);
+	for (auto& d : vulkan_devices_fastest_first()) order.push_back(d.index);
+	for (int index : order) {
+		unsigned vendor = 0;
+		int n = 0;
+		if (!gpu_of_vulkan_device(index, vendor, n)) continue;
+		set_hw_decode_gpu(vendor, n);
+		fprintf(stderr, "decoding on %s\n", gpu_description(vendor, n).c_str());
+		return;
+	}
+	if (process_vendor) set_hw_decode_gpu(process_vendor, process_gpu); // no Vulkan to tell the GPUs apart: as before, on this process's GPU
+}
+
+// The Vulkan device this process converts frames on: the one --scaling-gpu names, else the fastest one, when a test picture comes back right from it; else the next one that
+// gets it right. Some drivers convert to nothing but zeros without an error: the Vega iGPU of an AMD laptop gave all-green videos. Found once per process.
 std::string scaling_device() {
 	static std::once_flag once;
 	static std::string name;
 	std::call_once(once, [] {
 		std::string why;
-		auto all = Vk::devices(why);
-		const int own = vulkan_device_of_gpu(process_vendor, process_gpu);
+		const int want = vulkan_device_of_spec(scaling_gpu_spec, why);
+		if (!why.empty()) fprintf(stderr, "scaling gpu: %s, scaling on the fastest GPU instead\n", why.c_str());
+		const auto fastest = vulkan_devices_fastest_first();
 		std::vector<const VkDeviceInfo*> order;
-		for (auto& d : all) if (d.index == own) order.push_back(&d);
-		for (int discrete = 1; discrete >= 0; discrete--) for (auto& d : all) if (d.index != own && d.discrete == (discrete == 1)) order.push_back(&d);
+		for (auto& d : fastest) if (d.index == want) order.push_back(&d);
+		for (auto& d : fastest) if (d.index != want) order.push_back(&d);
 		for (const VkDeviceInfo* d : order) {
 			ScaleOptions test;
 			test.device = d->name;
 			std::string wrong;
 			if (converter_works(test, wrong)) {
-				if (d->index != own) fprintf(stderr, "frames of this GPU are converted on %s instead%s\n", d->name.c_str(), own < 0 ? " (it has no Vulkan device of its own)" : "");
+				fprintf(stderr, "scaling on %s%s\n", d->name.c_str(), want >= 0 && d->index != want ? " (the scaling gpu asked for does not convert right)" : "");
 				name = d->name;
 				return;
 			}
@@ -687,7 +726,8 @@ void run_wave_here(uint32_t id, const std::string& body) {
 	if (!source_info(input, si)) si = planned;
 	const int source_range = si.fmt.rgb ? 1 : (si.color.range ? si.color.range : 1);
 	for (auto& pl : plans) pl.rescale = pl.enc.w != si.width || pl.enc.h != si.height || pl.enc.pix != si.fmt || (pl.range && pl.range != source_range);
-	if (so.device.empty() && process_vendor) so.device = scaling_device(); // scaling on this GPU too, where it gives the right pictures
+	// Scaling on the fastest GPU that gives the right pictures, or the one this machine's --scaling-gpu names (which beats the sweep's "scaling": {"gpu"}).
+	if (so.device.empty() || !scaling_gpu_spec.empty()) so.device = scaling_device();
 	std::vector<WaveRun*> ptrs;
 	std::vector<int> handles;
 	for (uint32_t i = 0; i < n; i++) {
@@ -901,10 +941,12 @@ int encoder_process_main(int argc, char** argv) {
 		if (a == "--priority" && v == "low") set_low_priority();
 		else if (a == "--hw-decode") set_hw_decode(v);
 		else if (a == "--decode-threads") set_decode_threads(atoi(v.c_str()));
+		else if (a == "--decode-gpu") decode_gpu_spec = v;
+		else if (a == "--scaling-gpu") scaling_gpu_spec = v;
 	}
-	process_vendor = encoder_vendor(encoder); // a GPU's process decodes, scales and scores on that GPU
+	process_vendor = encoder_vendor(encoder); // the GPU that encodes; decoding, scaling and scoring go to the fastest GPU unless told otherwise
 	process_gpu = gpu;
-	if (process_vendor) set_hw_decode_gpu(process_vendor, gpu);
+	pick_decode_gpu();
 	// The messages travel on stdin and stdout; whatever a library prints goes to stderr, where it cannot get in their way.
 #ifdef _WIN32
 	// Copies of their own: the C runtime's stdout owns the original handle and closes it below, and the next handle Windows makes (the copy of stderr) can get the

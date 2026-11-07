@@ -17,9 +17,9 @@ struct GpuVmafFrame {
 
 class GpuVmaf {
 public:
-	// The Vulkan device to score on (an index into Vk::devices()), -1 (and `why`) if there is none. `spec` is vmaf.gpu: "" or "auto" for the GPU that
-	// encodes (GPU `encoder_gpu` of vendor `encoder_vendor`, see gpu.h; vendor 0 for a CPU encoder) where it can score, else the first discrete GPU;
-	// a number for that Vulkan device; anything else for the first device whose name contains it (any case).
+	// The Vulkan device to score on (an index into Vk::devices()), -1 (and `why`) if there is none. `spec` is vmaf.gpu: "" or "auto" for the fastest
+	// GPU that can score (vulkan_devices_fastest_first(); "own" for the GPU that encodes (GPU `encoder_gpu` of vendor
+	// `encoder_vendor`, see gpu.h), else the fastest; a number for that Vulkan device; anything else for the first device whose name contains it (any case).
 	static int pick_device(const std::string& spec, unsigned encoder_vendor, int encoder_gpu, std::string& why);
 	// Whether the GPU scorer can score these frames with these model files on Vulkan device `device`; `why` says what is in the way.
 	// Several models are scored in one pass: what they compute alike (motion, CAMBI, the ADM wavelets, the SpEED planes) is computed once.
