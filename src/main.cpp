@@ -51,7 +51,6 @@
 
 namespace fs = std::filesystem;
 
-static constexpr double BEST_FRAME_SHARE = 0.95;
 
 // Running under a CBR target is the encoder's own loss, so only overshoot is penalized.
 // Default slope: the 3000 -> 6000 kbps sweep gains roughly 2.5 VMAF over +100%, i.e. ~0.025 per percent.
@@ -141,12 +140,25 @@ struct Run {
 	const std::string *gpu_json = &NULL_JSON, *caps_json = &NULL_JSON; // its PCI ids, and what its encoder reports about itself (see encoder_caps_json); shared by all runs on the GPU
 	double penalty = 0;     // VMAF points deducted for exceeding the target bitrate
 	double best_share = 0;  // share of frames where this run is at least as good as every other run of its group
+	double rwm = 0;         // rank-weighted mean of the scores (see rank_weighted_mean), less the penalty: what runs are ranked by
 	bool has_distorted = false; // its distorted score (the encode against the frames its encoder got; see run_wave) is known
-	struct { double mean = 0, min = 0, p5 = 0; } distorted; // of the first model, before the penalty
+	struct { double mean = 0, min = 0, p5 = 0, rwm = 0; } distorted; // of the first model, before the penalty
 };
 
-// Mean, lowest and 5th percentile of per-frame values.
-struct FrameStats { double mean = 0, min = 0, p5 = 0; };
+// The rank-weighted mean of per-frame values sorted from worst to best: every frame counts, the worse ones more. The frame at rank i of n
+// (0 = worst) weighs 2 * (n - i - 0.5) / n, so the worst weighs about 2, the median 1 and the best about 0, and the weights add up to n.
+// It is the mean of all percentiles weighted by how bad they are, so no single percentile (such as the jump between reference and B-frames)
+// decides the score. The website computes it the same way (rwm() in src/lib.php).
+static double rank_weighted_mean(const std::vector<double>& sorted) {
+	const size_t n = sorted.size();
+	if (!n) return 0;
+	double sum = 0;
+	for (size_t i = 0; i < n; i++) sum += sorted[i] * 2.0 * ((double)(n - i) - 0.5) / (double)n;
+	return sum / (double)n;
+}
+
+// Mean, lowest, 5th percentile and rank-weighted mean of per-frame values.
+struct FrameStats { double mean = 0, min = 0, p5 = 0, rwm = 0; };
 static FrameStats frame_stats(std::vector<double> v) {
 	FrameStats st;
 	if (v.empty()) return st;
@@ -154,6 +166,7 @@ static FrameStats frame_stats(std::vector<double> v) {
 	st.mean = std::accumulate(v.begin(), v.end(), 0.0) / v.size();
 	st.min = v.front();
 	st.p5 = v[(size_t)(v.size() * 0.05)];
+	st.rwm = rank_weighted_mean(v);
 	return st;
 }
 
@@ -501,7 +514,7 @@ Paths
                             <dir>/<input>/ (fragmented .mp4) and the result file <dir>/<input>.json;
                             "off" writes nothing
         --no-videos         write the result files but not the encoded streams
-        --all-videos        keep every encoded stream. By default only the winner (the run that is best in the most frames after the overshoot penalty, as in the ranking) of each input,
+        --all-videos        keep every encoded stream. By default only the winner (the highest rank-weighted mean after the overshoot penalty, as in the ranking) of each input,
                             encoder, bitrate, key frame interval and size keeps its stream; the others are deleted when the group is complete, and the kept
                             one is uploaded then (a stream an earlier sweep sent that is beaten now is removed from the site)
         --upload <url>      after the sweep, upload the results (and videos) to this VES website, e.g. https://ves.example.com ("off" disables it)
@@ -1470,14 +1483,13 @@ int main(int argc, char** argv) {
 			return;
 		}
 		r.penalty = over_penalty_points(r.kbps, (double)r.bitrate);
-		std::vector<double> sc = r.scores;
-		std::sort(sc.begin(), sc.end());
-		const double mean = std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size();
-		char rel[96] = "";
+		const FrameStats fs_ = frame_stats(r.scores);
+		r.rwm = fs_.rwm - r.penalty;
+		char rel[128] = "";
 		if (!r.detail.distorted.empty()) {
 			const FrameStats st = frame_stats(r.detail.distorted);
-			r.has_distorted = true; r.distorted.mean = st.mean; r.distorted.min = st.min; r.distorted.p5 = st.p5;
-			snprintf(rel, sizeof rel, ", distorted mean %.3f p5 %.3f", st.mean, st.p5);
+			r.has_distorted = true; r.distorted.mean = st.mean; r.distorted.min = st.min; r.distorted.p5 = st.p5; r.distorted.rwm = st.rwm;
+			snprintf(rel, sizeof rel, ", distorted rwm %.3f mean %.3f p5 %.3f", st.rwm, st.mean, st.p5);
 		}
 		if (!t.result_file.empty() && (!r.cached || r.imported)) store_result(t, t.result_file, cached_of(r), run_details(t));
 		r.detail = VmafDetail{}; // in the result file now; nothing else reads it, and a sweep holds many runs
@@ -1493,31 +1505,20 @@ int main(int argc, char** argv) {
 		}
 		// Only the stream of the group's winner stays, decided when the group is complete (see `finish`).
 		if (cfg.best_videos) group_ok[r.group].push_back(&t);
-		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf mean %.3f min %.3f p5 %.3f%s%s%s%s  [wave %.1fs: encoder busy %.1f, starved %.1f; decoder backed up %.1f; scorer starved %.1f]", r.tag.c_str(), r.label.c_str(), r.kbps,
-		         mean, sc.front(), sc[(size_t)(sc.size() * 0.05)], rel, r.cached ? " (cached)" : "",
+		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf rwm %.3f mean %.3f min %.3f p5 %.3f%s%s%s%s  [wave %.1fs: encoder busy %.1f, starved %.1f; decoder backed up %.1f; scorer starved %.1f]", r.tag.c_str(), r.label.c_str(), r.kbps,
+		         fs_.rwm, fs_.mean, fs_.min, fs_.p5, rel, r.cached ? " (cached)" : "",
 		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.enc_busy_s, r.enc_starved_s, r.decode_blocked_s, r.score_starved_s);
 		ui::log(line);
 	};
 	// The group is complete: the stream of its winner stays, the others go (see below).
 	auto complete_group = [&](const std::string& group) {
-		// The winner is ranked as in the summary: the run that is at least as good as all the others (after the overshoot penalty)
-		// in the most frames; ties go to the higher mean. Only runs that still have a stream can keep it.
+		// The winner is ranked as in the summary and on the website: the highest rank-weighted mean after the overshoot penalty (Run::rwm).
+		// Only runs that still have a stream can keep it.
 		auto& runs_ok = group_ok[group];
-		const size_t frames = runs_ok.empty() ? 0 : runs_ok.front()->r.scores.size();
-		std::vector<double> top(frames, 0.0);
-		for (Task* x : runs_ok) if (x->r.scores.size() == frames) for (size_t f = 0; f < frames; f++) top[f] = std::max(top[f], x->r.scores[f] - x->r.penalty);
 		Task* kept = nullptr;
-		double kept_share = -1, kept_mean = 0;
 		for (Task* x : runs_ok) {
 			if (x->r.video.empty() || !fs::exists(fs::path(cfg.output_dir) / x->r.video)) continue;
-			size_t best = 0;
-			double sum = 0;
-			for (size_t f = 0; f < x->r.scores.size(); f++) {
-				sum += x->r.scores[f];
-				best += x->r.scores.size() == frames && x->r.scores[f] - x->r.penalty >= top[f] - 1e-6;
-			}
-			const double share = frames ? (double)best / frames : 0, mean = sum / std::max<size_t>(1, x->r.scores.size()) - x->r.penalty;
-			if (share > kept_share || (share == kept_share && mean > kept_mean)) { kept = x; kept_share = share; kept_mean = mean; }
+			if (!kept || x->r.rwm > kept->r.rwm) kept = x;
 		}
 		for (Task* x : runs_ok) {
 			if (x == kept || x->r.video.empty()) continue;
@@ -2015,8 +2016,12 @@ int main(int argc, char** argv) {
 		size_t e = g;
 		while (e < runs.size() && key(runs[e]) == key(runs[g])) e++;
 		size_t frames = runs[g].scores.size();
-		// Count the frames on which a run is at least as good as all others (after the overshoot penalty).
+		// Ranked by the rank-weighted mean after the overshoot penalty, like the website. Also shown: the share of frames on which a run is at
+		// least as good as all others (after the penalty).
 		for (size_t i = g; i < e; i++) {
+			std::vector<double> sc = runs[i].scores;
+			std::sort(sc.begin(), sc.end());
+			runs[i].rwm = rank_weighted_mean(sc) - runs[i].penalty;
 			size_t best = 0;
 			for (size_t f = 0; f < frames; f++) {
 				double top = 0;
@@ -2025,19 +2030,14 @@ int main(int argc, char** argv) {
 			}
 			runs[i].best_share = (double)best / frames;
 		}
-		std::sort(runs.begin() + g, runs.begin() + e, [](const Run& a, const Run& b) { return a.best_share > b.best_share; });
-		printf("\n== %s, %lld kbps, kf %.1f: best in >= %.0f%% of frames ==\n", runs[g].input.c_str(), (long long)runs[g].bitrate, runs[g].kf, BEST_FRAME_SHARE * 100);
-		bool any = false;
-		for (size_t i = g; i < e; i++) {
-			bool win = runs[i].best_share >= BEST_FRAME_SHARE;
-			any |= win;
-			printf("%s %5.1f%%  %s  (%.0f kbps, penalty %.2f%s%s)\n", win ? "*" : " ", runs[i].best_share * 100, runs[i].label.c_str(), runs[i].kbps, runs[i].penalty,
+		std::stable_sort(runs.begin() + g, runs.begin() + e, [](const Run& a, const Run& b) { return a.rwm > b.rwm; });
+		printf("\n== %s, %lld kbps, kf %.1f: rank-weighted mean (after the penalty), share of frames where best ==\n", runs[g].input.c_str(), (long long)runs[g].bitrate, runs[g].kf);
+		for (size_t i = g; i < e; i++)
+			printf("%s %8.3f %5.1f%%  %s  (%.0f kbps, penalty %.2f%s%s)\n", i == g ? "*" : " ", runs[i].rwm, runs[i].best_share * 100, runs[i].label.c_str(), runs[i].kbps, runs[i].penalty,
 			       runs[i].gpu.empty() ? "" : ", ", runs[i].gpu.c_str());
-		}
-		if (!any) printf("  no configuration reaches %.0f%%; the top entry is the closest\n", BEST_FRAME_SHARE * 100);
 
 		std::ostringstream o;
-		o << "{\"bitrate_kbps\":" << runs[g].bitrate << ",\"keyframe_interval_s\":" << runs[g].kf << ",\"frames\":" << frames << ",\"best_frame_share_required\":" << BEST_FRAME_SHARE << ",\"runs\":[";
+		o << "{\"bitrate_kbps\":" << runs[g].bitrate << ",\"keyframe_interval_s\":" << runs[g].kf << ",\"frames\":" << frames << ",\"ranked_by\":\"rank_weighted_mean\",\"runs\":[";
 		for (size_t i = g; i < e; i++) {
 			const Run& r = runs[i];
 			std::vector<double> sc = r.scores;
@@ -2046,9 +2046,9 @@ int main(int argc, char** argv) {
 			bool first = true;
 			for (auto& [k, v] : *r.options) { o << (first ? "" : ",") << jq(k) << ":" << jq(v); first = false; }
 			o << "},\"width\":" << r.shape.w << ",\"height\":" << r.shape.h << ",\"fps\":" << (r.shape.fps.num ? r.shape.fps.value() : 0.0)
-			  << ",\"kbps\":" << r.kbps << ",\"over_target_penalty\":" << r.penalty << ",\"best_frame_share\":" << r.best_share << ",\"winner\":" << (r.best_share >= BEST_FRAME_SHARE ? "true" : "false")
-			  << ",\"vmaf\":{\"mean\":" << std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size() << ",\"min\":" << sc.front() << ",\"p5\":" << sc[(size_t)(sc.size() * 0.05)] << "}"
-			  << ",\"distorted\":" << [&] { if (!r.has_distorted) return std::string("null"); std::ostringstream c; c << "{\"mean\":" << r.distorted.mean << ",\"min\":" << r.distorted.min << ",\"p5\":" << r.distorted.p5 << "}"; return c.str(); }()
+			  << ",\"kbps\":" << r.kbps << ",\"over_target_penalty\":" << r.penalty << ",\"best_frame_share\":" << r.best_share << ",\"rank_weighted_mean\":" << r.rwm << ",\"winner\":" << (i == g ? "true" : "false")
+			  << ",\"vmaf\":{\"mean\":" << std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size() << ",\"min\":" << sc.front() << ",\"p5\":" << sc[(size_t)(sc.size() * 0.05)] << ",\"rwm\":" << rank_weighted_mean(sc) << "}"
+			  << ",\"distorted\":" << [&] { if (!r.has_distorted) return std::string("null"); std::ostringstream c; c << "{\"mean\":" << r.distorted.mean << ",\"min\":" << r.distorted.min << ",\"p5\":" << r.distorted.p5 << ",\"rwm\":" << r.distorted.rwm << "}"; return c.str(); }()
 			  << ",\"gpu\":" << (r.gpu.empty() ? "null" : jq(r.gpu)) << ",\"gpu_info\":" << *r.gpu_json << ",\"encoder_caps\":" << *r.caps_json << ",\"cached\":" << (r.cached ? "true" : "false")
 			  << ",\"video\":" << (r.video.empty() ? "null" : jq(r.video)) << ",\"video_sha256\":" << (r.video_sha256.empty() ? "null" : jq(r.video_sha256)) << ",\"identical_runs\":[" << [&] { std::string l; for (auto& x : r.identical) l += (l.empty() ? "" : ",") + jq(x); return l; }() << "],\"result\":" << (r.result.empty() ? "null" : jq(r.result)) << "}";
 		}
