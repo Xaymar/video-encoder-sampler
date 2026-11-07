@@ -13,11 +13,6 @@ static std::string lower(std::string s) {
 	return s;
 }
 
-// The first usable discrete device, -1 if there is none.
-static int first_discrete(const std::vector<VkDeviceInfo>& all) {
-	for (auto& d : all) if (d.discrete && d.usable) return d.index;
-	return -1;
-}
 
 // The Vulkan device that is the n-th GPU of `vendor` as gpu.h lists them (what gpu=n means to that vendor's encoder): the one with the same LUID where the
 // driver says, else the n-th device of that vendor in Vulkan's order if it is the same model, else the first device of that model. -1 if none matches.
@@ -49,6 +44,31 @@ std::string vulkan_device_name(int index) {
 	return {};
 }
 
+std::vector<VkDeviceInfo> vulkan_devices_fastest_first() {
+	std::string why;
+	auto all = Vk::devices(why);
+	std::stable_sort(all.begin(), all.end(), [](const VkDeviceInfo& a, const VkDeviceInfo& b) {
+		if (a.discrete != b.discrete) return a.discrete;
+		return a.local_memory > b.local_memory;
+	});
+	return all;
+}
+
+bool gpu_of_vulkan_device(int index, unsigned& vendor, int& n) {
+	for (unsigned v : {VENDOR_NVIDIA, VENDOR_AMD, VENDOR_INTEL}) {
+		const size_t count = list_gpus(v).size();
+		for (size_t i = 0; i < count; i++)
+			if (vulkan_device_of_gpu(v, (int)i) == index) { vendor = v; n = (int)i; return true; }
+	}
+	return false;
+}
+
+// The fastest device the scorer can use, -1 if there is none.
+static int fastest_usable() {
+	for (auto& d : vulkan_devices_fastest_first()) if (d.usable) return d.index;
+	return -1;
+}
+
 int GpuVmaf::pick_device(const std::string& spec, unsigned encoder_vendor, int encoder_gpu, std::string& why) {
 	const auto all = Vk::devices(why);
 	if (all.empty()) { if (why.empty()) why = "there is no Vulkan device"; return -1; }
@@ -58,14 +78,17 @@ int GpuVmaf::pick_device(const std::string& spec, unsigned encoder_vendor, int e
 		return s;
 	};
 	if (spec.empty() || spec == "auto") {
-		// The GPU that encodes, so the encoded frames and the scoring stay on one GPU; then the first discrete one.
-		if (encoder_vendor) {
-			const int d = device_of_encoder_gpu(all, encoder_vendor, encoder_gpu);
-			if (d >= 0 && all[d].usable) return d;
-		}
-		const int d = first_discrete(all);
-		if (d < 0) why = "no discrete Vulkan GPU with 64 bit integer and float support (Vulkan devices: " + list() + "; vmaf.gpu picks one)";
+		// The fastest GPU, whichever GPU encodes: scoring does not need the encoder's GPU, and an integrated one is far too slow for it.
+		const int d = fastest_usable();
+		if (d < 0) why = "no Vulkan GPU with 64 bit integer and float support (Vulkan devices: " + list() + "; vmaf.gpu picks one)";
 		return d;
+	}
+	if (spec == "own") { // the GPU that encodes, as before
+		const int d = encoder_vendor ? device_of_encoder_gpu(all, encoder_vendor, encoder_gpu) : -1;
+		if (d >= 0 && all[d].usable) return d;
+		const int f = fastest_usable();
+		if (f < 0) why = "no Vulkan GPU with 64 bit integer and float support (Vulkan devices: " + list() + ")";
+		return f;
 	}
 	if (std::all_of(spec.begin(), spec.end(), [](char c) { return c >= '0' && c <= '9'; })) {
 		const int d = atoi(spec.c_str());

@@ -1,6 +1,7 @@
 #include "vk_compute.h"
 
 #ifndef VES_NO_VULKAN
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -118,6 +119,10 @@ bool instance_up(std::string& why) {
 			d.vendor_id = p2.properties.vendorID;
 			d.device_id = p2.properties.deviceID;
 			if (vkGetPhysicalDeviceProperties2 && idp.deviceLUIDValid) { memcpy(&d.luid, idp.deviceLUID, sizeof d.luid); d.luid_valid = true; }
+			VkPhysicalDeviceMemoryProperties mp;
+			vkGetPhysicalDeviceMemoryProperties(in.phys[i], &mp);
+			for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
+				if (mp.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) d.local_memory = std::max<uint64_t>(d.local_memory, mp.memoryHeaps[h].size);
 			in.info.push_back(d);
 		}
 		in.ok = true;

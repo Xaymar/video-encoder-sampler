@@ -14,11 +14,17 @@ struct VkDeviceInfo {
 	uint32_t vendor_id = 0, device_id = 0;
 	uint64_t luid = 0;             // the adapter LUID (Windows), the same number as GpuInfo::luid
 	bool luid_valid = false;
+	uint64_t local_memory = 0;     // bytes in its largest device-local heap (an integrated GPU's is carved out of system memory)
 };
 
 // The Vulkan device that is the n-th GPU of a vendor as gpu.h lists them (matched by LUID where the driver says), -1 if none; and a device's name.
 int vulkan_device_of_gpu(unsigned vendor, int n);
 std::string vulkan_device_name(int index);
+// The Vulkan devices from fastest to slowest, as far as one can tell without measuring: discrete GPUs first, then by device-local memory, then in the
+// loader's order. Decoding, scaling and scoring run on the first one that works unless a setting names another (they do not need the encoder's GPU).
+std::vector<VkDeviceInfo> vulkan_devices_fastest_first();
+// The GPU behind Vulkan device `index` as gpu.h numbers it (vendor and the n-th adapter of that vendor), for decoding on it. False if it is none of them.
+bool gpu_of_vulkan_device(int index, unsigned& vendor, int& n);
 
 #ifndef VES_NO_VULKAN
 #define VK_NO_PROTOTYPES

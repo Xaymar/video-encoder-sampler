@@ -98,6 +98,9 @@ struct Config {
 	bool plain = false; // no live display, just lines
 	std::string hw_decode = "auto"; // "" software only, "auto", or a device type or decoder name: see set_hw_decode()
 	int decode_threads = 0;  // 0: as many as the cores allow within a memory budget
+	// Where the encoder processes decode and scale (vmaf.gpu says where they score): "" or "auto" the fastest GPU, "own" the GPU that encodes, a Vulkan index or a
+	// name. This machine's choice, so not part of a run's key; scaling_gpu beats the sweep's "scaling": {"gpu"} in the processes.
+	std::string decode_gpu, scaling_gpu;
 	std::string priority = "low"; // "low": idle CPU and lowest disk priority, see priority.h; "normal" leaves the system's default
 	bool low_memory = false; // score a wave before encoding the next, and fewer VMAF threads
 	bool in_process = false; // the encoders run inside this process instead of one process per GPU and CPU encoder (encoder_process.h)
@@ -423,6 +426,8 @@ static void load_config_json(const Json& root, Config& cfg) {
 	if (auto* v = root.find("output")) cfg.output_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "output" : "") : v->text();
 	if (auto* v = setting("hw_decode")) cfg.hw_decode = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "auto" : "") : v->text();
 	if (auto* v = setting("decode_threads")) cfg.decode_threads = atoi(v->text().c_str());
+	if (auto* v = setting("decode_gpu")) cfg.decode_gpu = v->text();
+	if (auto* v = setting("scaling_gpu")) cfg.scaling_gpu = v->text();
 	if (auto* v = setting("priority")) cfg.priority = v->text();
 	if (auto* v = setting("low_memory")) cfg.low_memory = v->text() == "1" || v->text() == "true";
 	if (auto* v = setting("encoder_processes")) cfg.in_process = v->text() == "0" || v->text() == "false";
@@ -522,6 +527,10 @@ Paths
         --no-upload-videos  upload the results but not the encoded videos
         --hw-decode <auto|off|name>  decode the sources on the GPU when their first frames match a software decode exactly (default: auto);
                             a name is a device type (cuda, d3d11va, d3d12va, dxva2, qsv, amf, vaapi, vulkan) or a hardware decoder (hevc_cuvid, h264_qsv, ...)
+        --decode-gpu <auto|own|n|name>  the GPU the sources are decoded on (default: auto, the fastest GPU: discrete first, then the most VRAM); own: the GPU
+                            that encodes the run; n: Vulkan device n; name: the first device whose name contains it (--vmaf-gpu list shows them)
+        --scaling-gpu <auto|own|n|name>  the GPU frames are scaled and converted on, the same way (default: auto). Beats "scaling": {"gpu"} of the
+                            config; unlike that one it is this machine's choice and does not change which runs count as done
         --priority <low|normal>  low (default): idle CPU priority and the lowest disk priority, so ves never gets in the way of other programs; normal: the system default
         --decode-threads <n> threads per decoder (default: all cores; 4 with --low-memory)
         --low-memory        score each wave before the next is encoded and use fewer VMAF threads: slower, takes much less memory
@@ -537,7 +546,7 @@ Scoring
         --vmaf-threads <n>
         --vmaf-device <cpu|gpu|auto>  where VMAF is computed (default: cpu). gpu: on the GPU with Vulkan compute (8 and 10 bit input; v0 and v1 models; scores within 1e-9 of libvmaf's);
                             auto: the GPU where it can be used (8 or 10 bit YUV, a model file, a Vulkan GPU), else the CPU. These scores are kept apart from libvmaf's in the cache
-        --vmaf-gpu <auto|n|name>  the Vulkan device that scores (default: auto, the GPU that encodes the run, else the first discrete GPU); n: Vulkan device n;
+        --vmaf-gpu <auto|n|name>  the Vulkan device that scores (default: auto, the fastest GPU: discrete first, then the most VRAM); own: the GPU that encodes the run; n: Vulkan device n;
                             name: the first device whose name contains it. --vmaf-gpu list shows the Vulkan devices
         --over-penalty <p>  VMAF points deducted per percent for a run just over the target bitrate (default: 0.025); it grows exponentially, like the website's
 
@@ -666,6 +675,8 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--min-workers") cfg.min_workers = std::max(1, atoi(value().c_str()));
 		else if (a == "--decode-threads") cfg.decode_threads = atoi(value().c_str());
 		else if (a == "--hw-decode") cfg.hw_decode = value();
+		else if (a == "--decode-gpu") cfg.decode_gpu = value();
+		else if (a == "--scaling-gpu") cfg.scaling_gpu = value();
 		else if (a == "--priority") cfg.priority = value();
 		else if (a == "-c" || a == "--cache") cache = value();
 		else if (a == "--vmaf-model") model = value();
@@ -877,7 +888,7 @@ static SourceInfo source_from_json(const std::string& text) {
 static int run_worker(int argc, char** argv) {
 	// Settings of the runs from the worker config, as the flags they stand for; a flag on the command line is passed on as it is and wins.
 	static const std::pair<const char*, const char*> run_settings[] = {
-		{"vmaf_gpu", "--vmaf-gpu"}, {"vmaf_device", "--vmaf-device"}, {"hw_decode", "--hw-decode"}, {"decode_threads", "--decode-threads"}, {"priority", "--priority"}};
+		{"vmaf_gpu", "--vmaf-gpu"}, {"vmaf_device", "--vmaf-device"}, {"hw_decode", "--hw-decode"}, {"decode_gpu", "--decode-gpu"}, {"scaling_gpu", "--scaling-gpu"}, {"decode_threads", "--decode-threads"}, {"priority", "--priority"}};
 	std::vector<std::pair<std::string, std::string>> from_file; // flag, value
 	int only_gpu = -1, default_parallel = 0;
 	std::string target, dir, token = getenv("VES_TOKEN") ? getenv("VES_TOKEN") : "";
@@ -915,6 +926,13 @@ static int run_worker(int argc, char** argv) {
 					else if (name == "gpu") from_file.push_back({"--vmaf-gpu", x.text()});
 					else if (name == "threads") from_file.push_back({"--vmaf-threads", x.text()});
 					else throw std::runtime_error(x.where() + "a worker's \"vmaf\" takes device, gpu and threads (the models come from the host)");
+				}
+			}
+			if (auto* v = root.find("scaling")) { // "scaling": { "gpu": ... }; the scalers come from the host
+				if (v->type != Json::Obj) throw std::runtime_error(v->where() + "\"scaling\" must be an object ({ \"gpu\": ... })");
+				for (auto& [name, x] : v->o) {
+					if (name == "gpu") from_file.push_back({"--scaling-gpu", x.text()});
+					else throw std::runtime_error(x.where() + "a worker's \"scaling\" takes gpu (the scalers come from the host)");
 				}
 			}
 			if (auto* v = root.find("parallel"); v && !default_parallel) default_parallel = std::max(1, atoi(v->text().c_str()));
@@ -1002,6 +1020,8 @@ int main(int argc, char** argv) {
 	{ // the processes decode on their GPUs as asked; this one only reads what the inputs are, which needs no GPU
 		std::vector<std::string> args{"--hw-decode", cfg.hw_decode.empty() ? "off" : cfg.hw_decode, "--decode-threads", std::to_string(cfg.decode_threads > 0 ? cfg.decode_threads : cfg.low_memory ? 4 : 0)};
 		if (cfg.priority == "low") { args.push_back("--priority"); args.push_back("low"); }
+		if (!cfg.decode_gpu.empty()) { args.push_back("--decode-gpu"); args.push_back(cfg.decode_gpu); }
+		if (!cfg.scaling_gpu.empty()) { args.push_back("--scaling-gpu"); args.push_back(cfg.scaling_gpu); }
 		set_encoder_process_args(args);
 	}
 	set_hw_decode(cfg.in_process ? cfg.hw_decode : "");

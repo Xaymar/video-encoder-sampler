@@ -16,8 +16,8 @@ struct VmafOptions {
 	std::vector<std::string> extra_models = {"path=models/vmaf_v1.0.16_3d0h.json", "path=models/vmaf_v1.0.16_5d0h.json", "path=models/vmaf_v1.0.16_3d0h_2160.json"};
 	int threads = 0; // 0: all cores, shared between the scorers that run at the same time
 	std::string device = "cpu"; // "cpu": libvmaf; "gpu": Vulkan compute (8 bit input, an error where it cannot be used); "auto": the GPU where it can be used, else the CPU
-	std::string gpu;            // which Vulkan device scores (GpuVmaf::pick_device): "" or "auto" for the GPU that encodes, else the first discrete one; a Vulkan index; a name
-	unsigned encoder_vendor = 0; // set per run: the vendor (gpu.h) and GPU index of the encoder, for gpu "auto"; 0 for a CPU encoder
+	std::string gpu;            // which Vulkan device scores (GpuVmaf::pick_device): "" or "auto" for the fastest GPU, "own" for the GPU that encodes; a Vulkan index; a name
+	unsigned encoder_vendor = 0; // set per run: the vendor (gpu.h) and GPU index of the encoder, for gpu "own"; 0 for a CPU encoder
 	int encoder_gpu = 0;
 };
 
