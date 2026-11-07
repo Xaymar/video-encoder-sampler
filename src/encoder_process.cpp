@@ -109,8 +109,32 @@ void put(Writer& w, const Plan& p) { put(w, p.enc); put(w, p.score_fmt); w.num((
 void get(Reader& r, Plan& p) { get(r, p.enc); get(r, p.score_fmt); p.convert_rate = r.num<uint8_t>() != 0; p.rescale = r.num<uint8_t>() != 0; p.range = r.num<int>(); get(r, p.color); get(r, p.options); }
 void put(Writer& w, const ScaleOptions& s) { w.str(s.upscaler).str(s.downscaler).str(s.device); }
 void get(Reader& r, ScaleOptions& s) { s.upscaler = r.str(); s.downscaler = r.str(); s.device = r.str(); }
-void put(Writer& w, const VmafOptions& v) { w.str(v.model).num(v.threads).str(v.device).str(v.gpu).num(v.encoder_vendor).num(v.encoder_gpu); }
-void get(Reader& r, VmafOptions& v) { v.model = r.str(); v.threads = r.num<int>(); v.device = r.str(); v.gpu = r.str(); v.encoder_vendor = r.num<unsigned>(); v.encoder_gpu = r.num<int>(); }
+void put(Writer& w, const VmafOptions& v) {
+	w.str(v.model).num(v.threads).str(v.device).str(v.gpu).num(v.encoder_vendor).num(v.encoder_gpu).num((uint32_t)v.extra_models.size());
+	for (auto& m : v.extra_models) w.str(m);
+}
+void get(Reader& r, VmafOptions& v) {
+	v.model = r.str(); v.threads = r.num<int>(); v.device = r.str(); v.gpu = r.str(); v.encoder_vendor = r.num<unsigned>(); v.encoder_gpu = r.num<int>();
+	v.extra_models.clear();
+	const uint32_t n = r.num<uint32_t>();
+	for (uint32_t i = 0; i < n && r.ok; i++) v.extra_models.push_back(r.str());
+}
+template <class T> void get_list(Reader& r, std::vector<T>& v) {
+	v.clear();
+	const uint32_t n = r.num<uint32_t>();
+	for (uint32_t i = 0; i < n && r.ok; i++) v.push_back(r.num<T>());
+}
+void put(Writer& w, const VmafDetail& d) {
+	put_list(w, d.chroma_u); put_list(w, d.chroma_v);
+	w.num((uint32_t)d.extra.size());
+	for (auto& e : d.extra) { put_list(w, e.scores); put_list(w, e.chroma_u); put_list(w, e.chroma_v); }
+}
+void get(Reader& r, VmafDetail& d) {
+	get_list(r, d.chroma_u); get_list(r, d.chroma_v);
+	d.extra.clear();
+	const uint32_t n = r.num<uint32_t>();
+	for (uint32_t i = 0; i < n && r.ok; i++) { ModelScores e; get_list(r, e.scores); get_list(r, e.chroma_u); get_list(r, e.chroma_v); d.extra.push_back(std::move(e)); }
+}
 
 // ---- the process ----
 // A child with its stdin, stdout and stderr on pipes. Only those three handles are passed on: a handle of another child's pipe that a child kept open would hide
@@ -700,6 +724,7 @@ void run_wave_here(uint32_t id, const std::string& body) {
 		w.num((uint8_t)ej.ok).num(ej.kbps).num(ej.output.count).num(ej.output.bytes).num(ej.output.hash);
 		w.num((int64_t)ej.rp->busy_ms).num((int64_t)ej.rp->starved_ms).num((uint8_t)run.score_ok).num((int64_t)run.score_rp->starved_ms);
 		put_list(w, run.scores);
+		put(w, run.detail);
 	}
 	reply('w', id, w.s);
 }
@@ -801,6 +826,7 @@ bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vect
 			const uint32_t count = r.num<uint32_t>();
 			run->scores.clear();
 			for (uint32_t i = 0; i < count && r.ok; i++) run->scores.push_back(r.num<double>());
+			get(r, run->detail);
 			if (!ej.ok || !run->score_ok) ej.error = why(!ej.ok ? "the encoder failed and said nothing" : "scoring failed and said nothing");
 			if (ej.rp) { ej.rp->busy_ms = busy; ej.rp->starved_ms = starved; ej.rp->failed = !ej.ok; ej.rp->finish(); }
 			if (run->score_rp) { run->score_rp->starved_ms = score_starved; run->score_rp->failed = !run->score_ok; run->score_rp->finish(); }

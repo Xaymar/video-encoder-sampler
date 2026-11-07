@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <sstream>
 
 #include "download.h"
@@ -65,29 +66,47 @@ std::string key_run(long long bitrate_kbps, double kf, const Shape& shape) {
 	return buf;
 }
 
+// The key's text for a model: an absolute path (the user's own folders) is reduced to the file name, since the key goes into the result files; the
+// content hash (model_id()) is what identifies a model file. Relative paths are kept as they are, which keeps the keys of earlier results valid.
+static std::string model_key_text(const std::string& model) {
+	if (model.rfind("path=", 0) == 0 && fs::path(model.substr(5)).is_absolute()) return "path=" + fs::path(model.substr(5)).filename().string();
+	return model;
+}
+
+std::string model_id(const std::string& model) {
+	if (model.rfind("path=", 0) != 0) return "";
+	static std::mutex m;
+	static std::map<std::string, std::string> model_hash; // the model file does not change during a run
+	std::lock_guard lock(m);
+	auto it = model_hash.find(model);
+	if (it == model_hash.end()) {
+		std::ifstream f(model.substr(5), std::ios::binary);
+		std::stringstream ss; ss << f.rdbuf();
+		it = model_hash.emplace(model, hex64(fnv1a(ss.str()))).first;
+	}
+	return it->second;
+}
+
 std::string key_settings(const ScaleOptions& scale, const VmafOptions& vmaf) {
 	std::ostringstream k;
 	k << "scaling=" << scale.upscaler << '/' << scale.downscaler << ' ' << scale.device << ' ' << scaler_library_version() << '\n';
 	k << "decoder=" << decoder_library_version() << '\n';
 	// the scorer: library version, model, and the model file's contents when it is a path
-	// The key goes into the result files, so an absolute model path (the user's own folders) is reduced to the file name; the model's content
-	// hash below is what identifies it. Relative paths are kept as they are, which keeps the keys of earlier results valid.
-	std::string model_text = vmaf.model;
-	if (model_text.rfind("path=", 0) == 0 && fs::path(model_text.substr(5)).is_absolute()) model_text = "path=" + fs::path(model_text.substr(5)).filename().string();
-	k << "vmaf=" << vmaf_library_version() << ' ' << model_text;
-	if (vmaf.model.rfind("path=", 0) == 0) {
-		static std::map<std::string, std::string> model_hash; // the model file does not change during a run
-		auto it = model_hash.find(vmaf.model);
-		if (it == model_hash.end()) {
-			std::ifstream f(vmaf.model.substr(5), std::ios::binary);
-			std::stringstream ss; ss << f.rdbuf();
-			it = model_hash.emplace(vmaf.model, hex64(fnv1a(ss.str()))).first;
-		}
-		k << ' ' << it->second;
-	}
+	k << "vmaf=" << vmaf_library_version() << ' ' << model_key_text(vmaf.model);
+	if (const std::string id = model_id(vmaf.model); !id.empty()) k << ' ' << id;
 	// The GPU scorer's scores differ from libvmaf's in the fourth decimal; "cpu" adds nothing, which keeps the keys of earlier results valid.
 	if (vmaf.device != "cpu") k << " scorer=" << vmaf.device << "-1";
 	k << '\n';
+	// the models scored besides it (only when there are any, which keeps the keys of earlier results valid)
+	const std::vector<std::string> all = vmaf_models(vmaf);
+	if (all.size() > 1) {
+		k << "vmaf_extra=";
+		for (size_t i = 1; i < all.size(); i++) {
+			k << (i > 1 ? ";" : "") << model_key_text(all[i]);
+			if (const std::string id = model_id(all[i]); !id.empty()) k << ' ' << id;
+		}
+		k << '\n';
+	}
 	return k.str();
 }
 
@@ -140,16 +159,26 @@ bool result_load(const std::string& file, const std::string& key, CachedRun& out
 		out.input = in && in->type == Json::Str ? in->text() : std::string();
 		auto* ref = j.find("reference_sha256");
 		out.reference_sha256 = ref && ref->type == Json::Str ? ref->text() : std::string();
-		out.scores.clear();
-		for (auto& s : scores->a) out.scores.push_back(atof(s.text().c_str()));
-		out.ceiling.clear();
-		if (auto* c = vmaf ? vmaf->find("ceiling") : nullptr; c && c->type == Json::Arr) for (auto& s : c->a) out.ceiling.push_back(atof(s.text().c_str()));
+		auto list = [](const Json* a, std::vector<double>& v) { v.clear(); if (a && a->type == Json::Arr) for (auto& s : a->a) v.push_back(atof(s.text().c_str())); };
+		list(scores, out.scores);
+		list(vmaf ? vmaf->find("ceiling") : nullptr, out.ceiling);
 		if (out.ceiling.size() != out.scores.size()) out.ceiling.clear();
+		out.detail = VmafDetail{};
+		if (vmaf) {
+			list(vmaf->find("chroma_u"), out.detail.chroma_u);
+			list(vmaf->find("chroma_v"), out.detail.chroma_v);
+			if (const Json* ex = vmaf->find("extra_models"); ex && ex->type == Json::Arr)
+				for (auto& e : ex->a) {
+					ModelScores m;
+					list(e.find("scores"), m.scores); list(e.find("chroma_u"), m.chroma_u); list(e.find("chroma_v"), m.chroma_v);
+					out.detail.extra.push_back(std::move(m));
+				}
+		}
 		return !out.scores.empty();
 	} catch (const std::exception&) { return false; }
 }
 
-void result_store(const std::string& file, const std::string& key, const CachedRun& run, const std::string& details, const std::string& model) {
+void result_store(const std::string& file, const std::string& key, const CachedRun& run, const std::string& details, const VmafOptions& vo) {
 	std::error_code ec;
 	fs::create_directories(fs::path(file).parent_path(), ec);
 	fs::path tmp = file;
@@ -160,12 +189,29 @@ void result_store(const std::string& file, const std::string& key, const CachedR
 		snprintf(b, sizeof b, "%.17g", run.kbps);
 		f << "{\"key\":\"" << json_escape(key) << "\",\"kbps\":" << b;
 		if (!details.empty()) f << "," << details;
-		f << ",\"vmaf\":{\"model\":\"" << json_escape(vmaf_model_display_name(model)) << "\",\"model_generation\":\"" << json_escape(vmaf_model_generation(model)) << "\",\"scores\":[";
-		for (size_t i = 0; i < run.scores.size(); i++) { snprintf(b, sizeof b, "%.17g", run.scores[i]); f << (i ? "," : "") << b; }
-		f << "]";
-		if (!run.ceiling.empty() && run.ceiling.size() == run.scores.size()) { // what the frames could score at all at this size, frame rate and format
-			f << ",\"ceiling\":[";
-			for (size_t i = 0; i < run.ceiling.size(); i++) { snprintf(b, sizeof b, "%.17g", run.ceiling[i]); f << (i ? "," : "") << b; }
+		auto list = [&](const char* name, const std::vector<double>& v, const char* fmt) {
+			f << ",\"" << name << "\":[";
+			for (size_t i = 0; i < v.size(); i++) { snprintf(b, sizeof b, fmt, v[i]); f << (i ? "," : "") << b; }
+			f << "]";
+		};
+		auto model = [&](const std::string& spec, const std::vector<double>& scores, const std::vector<double>& u, const std::vector<double>& v) {
+			f << "\"model\":\"" << json_escape(vmaf_model_display_name(spec)) << "\",\"model_id\":\"" << json_escape(model_id(spec)) << "\",\"model_generation\":\""
+			  << json_escape(vmaf_model_generation(spec)) << "\"";
+			list("scores", scores, "%.17g");
+			if (!u.empty()) { list("chroma_u", u, "%.9g"); list("chroma_v", v, "%.9g"); }
+		};
+		f << ",\"vmaf\":{";
+		model(vo.model, run.scores, run.detail.chroma_u, run.detail.chroma_v);
+		if (!run.ceiling.empty() && run.ceiling.size() == run.scores.size()) list("ceiling", run.ceiling, "%.17g"); // what the frames could score at all at this size, frame rate and format (the first model)
+		const std::vector<std::string> all = vmaf_models(vo);
+		if (all.size() > 1 && run.detail.extra.size() == all.size() - 1) {
+			f << ",\"extra_models\":[";
+			for (size_t i = 1; i < all.size(); i++) {
+				const ModelScores& e = run.detail.extra[i - 1];
+				f << (i > 1 ? "," : "") << "{";
+				model(all[i], e.scores, e.chroma_u, e.chroma_v);
+				f << "}";
+			}
 			f << "]";
 		}
 		f << "}}\n";
@@ -176,7 +222,9 @@ void result_store(const std::string& file, const std::string& key, const CachedR
 
 std::string ceiling_key(const std::string& input, const std::string& feed_key, const Fmt& score_fmt, const ScaleOptions& scale, const VmafOptions& vmaf) {
 	std::ostringstream k;
-	k << key_input(input) << "ceiling-1 feed=" << feed_key << " score=" << score_fmt.chroma << '/' << score_fmt.depth << '\n' << key_settings(scale, vmaf);
+	VmafOptions first = vmaf; // the ceiling is scored with the first model only
+	first.extra_models.clear();
+	k << key_input(input) << "ceiling-1 feed=" << feed_key << " score=" << score_fmt.chroma << '/' << score_fmt.depth << '\n' << key_settings(scale, first);
 	return k.str();
 }
 

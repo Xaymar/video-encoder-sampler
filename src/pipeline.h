@@ -111,6 +111,7 @@ struct WaveRun {
 	Codec codec = Codec::None;
 	RunProgress* score_rp = nullptr;
 	std::vector<double> scores;
+	VmafDetail detail; // the extra models' scores, the chroma values
 	bool score_ok = false;
 	std::string label, pool; // for the rows of the live display
 };

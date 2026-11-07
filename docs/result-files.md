@@ -30,6 +30,9 @@ This describes version 0.2.0. Fields are only added, so a reader should ignore o
 | `reference_sha256` | string | SHA-256 (hex) of the input file the run was scored against. A website only accepts scores against reference videos it knows. |
 | `vmaf.scores` | array of numbers | The VMAF score of every frame, in display order. |
 | `vmaf.model` | string | The VMAF model the scores are from, as its file name without `.json` (`vmaf_v1.0.16_1d5h_2160`, `vmaf_4k_v0.6.1neg`). Added after 0.2.0 shipped; older files do not have it, and their `key` has the model on its `vmaf=` line. |
+| `vmaf.model_id` | string | The model file's id: a hash of its content (16 hex digits), the one on the key's `vmaf=` line; empty for a model built into libvmaf. Newer files only. |
+| `vmaf.chroma_u`, `vmaf.chroma_v` | array of numbers | Only for a model with SpEED chroma (VMAF v1): its U and V values of every frame (lower is better, 0 for no loss). Newer files only. |
+| `vmaf.extra_models` | array of objects | The other models scored in the same pass, when ves was given several (`vmaf.model` as a list): each has `model`, `model_id`, `model_generation`, `scores` and, for v1, `chroma_u` and `chroma_v`, as above. The key then has a `vmaf_extra=` line naming them. Newer files only. |
 | `vmaf.model_generation` | string | `v0` or `v1`, empty if it is not known. The two generations score on different scales, so a site keeps them apart. Older files do not have it; they are v0 unless the `vmaf=` line names a v1 model. |
 
 ### Software encoders
@@ -64,6 +67,7 @@ bitrate=<kbps> kf=<seconds> shape=<w>x<h>@<fps numerator>/<denominator>
 scaling=<up scaler>/<down scaler>  <libplacebo version>
 decoder=<ffmpeg version>
 vmaf=<libvmaf version> <model> <model hash> [scorer=<device>-1]
+vmaf_extra=<model> <model hash>;<model> <model hash>;...   only when more models were scored with it
 ```
 
 `scorer=` is only there when the GPU scorer produced the scores (`scorer=gpu-1`). The scores of the CPU and GPU scorers agree to about a billionth of a point (before November 2026 the GPU scorer scored v0 models about 4e-4 points low).

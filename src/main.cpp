@@ -120,6 +120,7 @@ struct Run {
 	std::vector<double> scores; // per frame, display order
 	std::shared_ptr<const std::vector<double>> ceiling; // per frame: what its feed scores with no encoder (shared by the runs of the feed); null if unknown
 	bool ceiling_new = false; // the ceiling was not in its result file yet
+	VmafDetail detail;          // the extra models' scores and the chroma values
 	bool cached = false;    // taken from the result cache instead of being run
 	bool uploaded = false;  // handed to the uploader when the worker sent it
 	bool imported = false;  // its result came from a worker: written again with this sweep's details (the input's name and URL are the host's, not the worker's copy)
@@ -334,6 +335,21 @@ static std::vector<Options> expand(const std::string& encoder, const std::vector
 	return combos;
 }
 
+// "a,b,c": the first model ranks, the others are scored with it.
+static void set_models(VmafOptions& vo, const std::string& list) {
+	std::vector<std::string> ms;
+	for (size_t p = 0;;) {
+		const size_t c = list.find(',', p);
+		std::string m = list.substr(p, c == std::string::npos ? std::string::npos : c - p);
+		if (!m.empty()) ms.push_back(m);
+		if (c == std::string::npos) break;
+		p = c + 1;
+	}
+	if (ms.empty()) throw std::runtime_error("no VMAF model given");
+	vo.model = ms[0];
+	vo.extra_models.assign(ms.begin() + 1, ms.end());
+}
+
 static void add_inputs(Config& cfg, const std::string& path) {
 	if (is_url(path)) { cfg.inputs.push_back(path); return; } // fetched when the first run that needs it comes up, see local_path() in main()
 	if (!fs::exists(path)) throw std::runtime_error("input '" + path + "' does not exist");
@@ -410,7 +426,14 @@ static void load_config(const std::string& path, Config& cfg) {
 	}
 	if (auto* v = root.find("over_penalty")) over_penalty = atof(v->text().c_str()); // where older files have it; it belongs in "vmaf" now
 	if (auto* v = root.find("vmaf")) {
-		if (auto* m = v->find("model")) cfg.vo.model = m->text();
+		if (auto* m = v->find("model")) { // one model, or a list: the first one ranks, the others are scored with it
+			if (m->type == Json::Arr) {
+				if (m->a.empty()) throw std::runtime_error("vmaf.model is an empty list");
+				cfg.vo.model = m->a[0].text();
+				cfg.vo.extra_models.clear();
+				for (size_t i = 1; i < m->a.size(); i++) cfg.vo.extra_models.push_back(m->a[i].text());
+			} else { cfg.vo.model = m->text(); cfg.vo.extra_models.clear(); }
+		}
 		if (auto* t = v->find("threads")) cfg.vo.threads = atoi(t->text().c_str());
 		if (auto* d = v->find("device")) {
 			cfg.vo.device = d->text();
@@ -498,7 +521,8 @@ Paths
   -c,   --cache <dir>       finished runs are kept here and not repeated (default: cache); "off" disables it
 
 Scoring
-        --vmaf-model <spec> libvmaf model (default: path=models/vmaf_v1.0.16_1d5h_2160.json; models/ has the others)
+        --vmaf-model <spec>[,<spec>...]  VMAF models, scored in one pass; the first one ranks, the others' scores go into the result files
+                            (default: the four VMAF v1 models in models/, vmaf_v1.0.16_1d5h_2160 first)
         --vmaf-threads <n>
         --vmaf-device <cpu|gpu|auto>  where VMAF is computed (default: cpu). gpu: on the GPU with Vulkan compute (8 and 10 bit input; v0 and v1 models; scores within 1e-9 of libvmaf's);
                             auto: the GPU where it can be used (8 or 10 bit YUV, a model file, a Vulkan GPU), else the CPU. These scores are kept apart from libvmaf's in the cache
@@ -564,7 +588,7 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 		size_t eq = a.find('=');
 		if (eq == std::string::npos) { fprintf(stderr, "bad option '%s', expected key=value\n", argv[i]); return false; }
 		std::string k = a.substr(0, eq), v = a.substr(eq + 1);
-		if (k == "vmaf.model") cfg.vo.model = v;
+		if (k == "vmaf.model") set_models(cfg.vo, v);
 		else if (k == "vmaf.threads") cfg.vo.threads = atoi(v.c_str());
 		else if (k == "vmaf.device") cfg.vo.device = v;
 		else if (k == "vmaf.gpu") cfg.vo.gpu = v;
@@ -693,21 +717,24 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	if (upload_key) cfg.upload.key = *upload_key;
 	cfg.upload.videos = cfg.upload.videos && upload_videos;
 	if (cache) cfg.cache_dir = *cache == "off" ? "" : *cache;
-	if (model) cfg.vo.model = *model;
+	if (model) set_models(cfg.vo, *model);
 	if (only_set) { cfg.only_runs_set = true; cfg.only_runs = only_lines; }
 	if (short_names) cfg.short_names = true;
 	if (threads) cfg.vo.threads = *threads;
 	if (penalty) over_penalty = *penalty;
 	// A relative model is looked for where the program is as well (a worker's jobs run wherever the worker was started), and in the folder above it, where a build sits.
-	if (cfg.vo.model.rfind("path=", 0) == 0) {
-		const fs::path rel = cfg.vo.model.substr(5);
+	auto locate = [](std::string& model) {
+		if (model.rfind("path=", 0) != 0) return;
+		const fs::path rel = model.substr(5);
 		std::error_code ec;
 		if (rel.is_relative() && !fs::exists(rel, ec)) {
 			const fs::path exe = fs::path(executable_path()).parent_path();
 			for (const fs::path& base : {exe, exe.parent_path()})
-				if (fs::exists(base / rel, ec)) { cfg.vo.model = "path=" + (base / rel).string(); break; }
+				if (fs::exists(base / rel, ec)) { model = "path=" + (base / rel).string(); break; }
 		}
-	}
+	};
+	locate(cfg.vo.model);
+	for (auto& m : cfg.vo.extra_models) locate(m);
 }
 
 static Codec codec_of(const std::string& encoder, const std::string& codec) {
@@ -766,7 +793,9 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 	if (shape.upscale) o << ",\"upscale\":true";
 	o << "}],\"scaling\":{\"upscaler\":" << jq(cfg.scale.upscaler) << ",\"downscaler\":" << jq(cfg.scale.downscaler);
 	if (!cfg.scale.device.empty()) o << ",\"gpu\":" << jq(cfg.scale.device);
-	o << "},\"vmaf\":{\"model\":" << jq(cfg.vo.model) << ",\"device\":" << jq(cfg.vo.device) << ",\"ceiling\":" << (cfg.ceiling ? "true" : "false") << "},\"encoders\":[{\"encoder\":" << jq(job.encoder) << ",\"codec\":" << jq(job.codec);
+	o << "},\"vmaf\":{\"model\":[";
+	for (size_t i = 0, n = vmaf_models(cfg.vo).size(); i < n; i++) o << (i ? "," : "") << jq(vmaf_models(cfg.vo)[i]);
+	o << "],\"device\":" << jq(cfg.vo.device) << ",\"ceiling\":" << (cfg.ceiling ? "true" : "false") << "},\"encoders\":[{\"encoder\":" << jq(job.encoder) << ",\"codec\":" << jq(job.codec);
 	o << ",\"prune\":false,\"options\":{";
 	bool first = true;
 	if (is_gpu_encoder(job.encoder)) { o << "\"gpu\":[\"@GPU@\"]"; first = false; } // the host puts the worker's GPU index in
@@ -939,8 +968,12 @@ int main(int argc, char** argv) {
 	if (cfg.low_memory && cfg.vo.threads <= 0) cfg.vo.threads = 2;
 	{ // a model libvmaf cannot use would fail every run
 		std::string why;
-		if (!vmaf_check_model(cfg.vo.model, why)) { fprintf(stderr, "error: %s\n", why.c_str()); return 1; }
-		set_min_score_depth(vmaf_model_min_depth(cfg.vo.model));
+		int depth = 8;
+		for (auto& m : vmaf_models(cfg.vo)) {
+			if (!vmaf_check_model(m, why)) { fprintf(stderr, "error: %s\n", why.c_str()); return 1; }
+			depth = std::max(depth, vmaf_model_min_depth(m));
+		}
+		set_min_score_depth(depth);
 	}
 	if (cfg.priority != "low" && cfg.priority != "normal") { fprintf(stderr, "error: priority must be low or normal\n"); return 1; }
 	if (cfg.priority == "low" && !set_low_priority()) fprintf(stderr, "warning: could not lower the process priority\n");
@@ -1356,14 +1389,14 @@ int main(int argc, char** argv) {
 		return it->second.count(name) != 0;
 	};
 	auto cached_of = [](const Run& r) {
-		CachedRun c{r.kbps, r.scores};
+		CachedRun c{r.kbps, r.scores, r.detail};
 		if (r.ceiling) c.ceiling = *r.ceiling;
 		return c;
 	};
 	// Gives a finished run its ceiling (see ceiling_wave): from memory, the cache folder, or scored now, once for each feed. Set further down.
 	std::function<void(Task&)> attach_ceiling = [](Task&) {};
 	auto store_result = [&](const Task& t, const std::string& file, const CachedRun& run, const std::string& details) {
-		result_store(file, t.key(), run, details, cfg.vo.model);
+		result_store(file, t.key(), run, details, cfg.vo);
 		auto [dir, name] = split_file(file);
 		if (auto it = result_dirs.find(dir); it != result_dirs.end()) it->second.insert(name);
 	};
@@ -1630,7 +1663,7 @@ int main(int argc, char** argv) {
 			Task& t = *it->second;
 			CachedRun hit;
 			if (!result_load(file, t.key(), hit)) return;
-			t.r.kbps = hit.kbps; t.r.scores = std::move(hit.scores);
+			t.r.kbps = hit.kbps; t.r.scores = std::move(hit.scores); t.r.detail = std::move(hit.detail);
 			if (!hit.ceiling.empty()) t.r.ceiling = std::make_shared<const std::vector<double>>(std::move(hit.ceiling));
 			store_result(t, file, cached_of(t.r), run_details(t));
 			t.r.imported = false; // already rewritten
@@ -1660,7 +1693,7 @@ int main(int argc, char** argv) {
 		if (!t.result_file.empty() && result_listed(t.result_file)) {
 			CachedRun hit;
 			if (result_load(t.result_file, t.key(), hit)) {
-				r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.video_sha256 = hit.video_sha256; r.cached = t.ok = true;
+				r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.detail = std::move(hit.detail); r.video_sha256 = hit.video_sha256; r.cached = t.ok = true;
 				if (!hit.ceiling.empty()) r.ceiling = std::make_shared<const std::vector<double>>(std::move(hit.ceiling));
 				if (!hit.reference_sha256.empty()) reference_hashes.emplace(r.input, hit.reference_sha256); // known: the file is not needed to say it
 				if (!r.shape.w && hit.width > 0 && hit.height > 0 && hit.fps > 0) { // the geometry the run was encoded at, for the summary: from its result file
@@ -1930,6 +1963,7 @@ int main(int argc, char** argv) {
 				if (wr[i].enc.ok && wr[i].score_ok) {
 					r.kbps = wr[i].enc.kbps;
 					r.scores = std::move(wr[i].scores);
+					r.detail = std::move(wr[i].detail);
 					t.ok = true;
 				}
 				if (!t.ok) r.reason = wr[i].enc.error;

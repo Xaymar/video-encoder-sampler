@@ -386,7 +386,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 			VmafOptions run_vo = group_vo; // scoring follows the run's encoder to its GPU (vmaf.gpu "auto")
 			run_vo.encoder_vendor = encoder_vendor(run.enc.encoder);
 			if (auto it = run.enc.plan->options.find("gpu"); it != run.enc.plan->options.end()) run_vo.encoder_gpu = atoi(it->second.c_str());
-			run.score_ok = vmaf_score(ref, feed, run.codec, next_packet, {}, run.enc.plan->enc, run.enc.plan->color, shown, g.fmt, run_vo, so, run.scores, run.score_rp);
+			run.score_ok = vmaf_score(ref, feed, run.codec, next_packet, {}, run.enc.plan->enc, run.enc.plan->color, shown, g.fmt, run_vo, so, run.scores, run.score_rp, &run.detail);
 			if (run.score_ok && (long long)run.scores.size() != fr.frames) { fprintf(stderr, "%zu scores for %lld frames\n", run.scores.size(), fr.frames); run.score_ok = false; }
 			if (run.score_rp) { run.score_rp->failed = !run.score_ok; run.score_rp->finish(); }
 			rq.cancel(); // done with the original frames: do not hold the reference decode back
@@ -423,6 +423,7 @@ bool ceiling_wave(const std::string& input, const SourceInfo& si, const Plan& pl
 	};
 	const ShownFeed shown = [&fr](size_t k, uint32_t& v) { return fr.shown.get(k, v); };
 	VmafOptions o = vo;
+	o.extra_models.clear(); // the ceiling is the first model's
 	if (o.threads <= 0) o.threads = std::max(2, (int)std::thread::hardware_concurrency());
 	bool ok = vmaf_score_frames(ref, next_ref, next_dis, pl.enc, pl.color, shown, pl.score_fmt, o, so, scores, rp);
 	fq.cancel(); rq.cancel();
