@@ -29,8 +29,9 @@ extern "C" {
 namespace {
 
 // Loads `model` ("path=<file>" or "version=<built-in>") into `out`.
-int load_model(const std::string& model, VmafModel** out) {
-	VmafModelConfig mc{"vmaf", 0};
+// `name` is what libvmaf files the scores under: models scored in one context need names of their own, or every one gets the first one's scores.
+int load_model(const std::string& model, VmafModel** out, const char* name = "vmaf") {
+	VmafModelConfig mc{name, 0};
 	const bool from_path = model.rfind("path=", 0) == 0;
 	const std::string spec = model.substr(model.find('=') == std::string::npos ? 0 : model.find('=') + 1);
 	return from_path ? vmaf_model_load_from_path(out, &mc, spec.c_str()) : vmaf_model_load(out, &mc, spec.c_str());
@@ -54,7 +55,49 @@ std::vector<std::string> model_features(const std::string& model) {
 	return known[model] = names;
 }
 
+// libvmaf's names of a model's SpEED chroma U and V features ("speed_chroma_u" and the options that are not the default, as
+// feature_name.c builds them: sorted by option name, by alias, doubles as %g); empty if the model has no SpEED.
+std::pair<std::string, std::string> speed_feature_names(const std::string& model) {
+	if (model.rfind("path=", 0) != 0) return {};
+	try {
+		std::ifstream f(model.substr(5), std::ios::binary);
+		std::stringstream ss; ss << f.rdbuf();
+		const Json j = Json::parse(ss.str());
+		const Json* md = j.find("model_dict");
+		const Json* fn = md ? md->find("feature_names") : nullptr;
+		const Json* fo = md ? md->find("feature_opts_dicts") : nullptr;
+		if (!fn) return {};
+		for (size_t i = 0; i < fn->a.size(); i++) {
+			if (fn->a[i].text().rfind("Speed_chroma", 0) != 0) continue;
+			struct Opt { const char* name; const char* alias; double def; const char* sdef; bool integer; };
+			static const Opt opts[] = { // alphabetical by name
+				{"speed_kernelscale", "ks", 1.0, nullptr, false}, {"speed_max_val", "mxv", 1000.0, nullptr, false}, {"speed_nn_floor", "nnf", 0.0, nullptr, false},
+				{"speed_prescale", "ps", 1.0, nullptr, false}, {"speed_prescale_method", "psm", 0, "nearest", false}, {"speed_sigma_nn", "snn", 0.29, nullptr, false},
+				{"speed_weight_var_mode", "wvm", 0, nullptr, true}};
+			std::string suffix;
+			const Json* o = fo && i < fo->a.size() ? &fo->a[i] : nullptr;
+			for (const Opt& op : opts) {
+				const Json* v = o ? o->find(op.name) : nullptr;
+				if (!v) continue;
+				char b[64];
+				if (op.sdef) { if (v->text() == op.sdef) continue; snprintf(b, sizeof b, "%s", v->text().c_str()); }
+				else if (op.integer) { const int x = atoi(v->text().c_str()); if (x == (int)op.def) continue; snprintf(b, sizeof b, "%d", x); }
+				else { const double x = atof(v->text().c_str()); if (x == op.def) continue; snprintf(b, sizeof b, "%g", x); }
+				suffix += std::string("_") + op.alias + "_" + b;
+			}
+			return {"speed_chroma_u" + suffix, "speed_chroma_v" + suffix};
+		}
+	} catch (const std::exception&) {}
+	return {};
+}
+
 } // namespace
+
+std::vector<std::string> vmaf_models(const VmafOptions& o) {
+	std::vector<std::string> all{o.model};
+	for (auto& m : o.extra_models) if (std::find(all.begin(), all.end(), m) == all.end()) all.push_back(m);
+	return all;
+}
 
 bool vmaf_check_model(const std::string& model, std::string& why) {
 	VmafContext* ctx = nullptr;
@@ -112,13 +155,15 @@ CambiEncode cambi_encode(const Shape& enc, int w, int h, int depth) {
 struct Scorer {
 	virtual ~Scorer() = default;
 	virtual bool add(const Picture& ref, const Picture& dis) = 0;
-	virtual bool finish(std::vector<double>& scores) = 0;
+	// Per model: the scores and, for a model with SpEED chroma, its U and V values (else empty).
+	virtual bool finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<double>>& u, std::vector<std::vector<double>>& v) = 0;
 };
 
 // With libvmaf, in-process, on the CPU.
 class CpuScorer : public Scorer {
 	VmafContext* ctx = nullptr;
-	VmafModel* model = nullptr;
+	std::vector<VmafModel*> models;
+	std::vector<std::pair<std::string, std::string>> speed_names;
 	unsigned count = 0;
 
 	static bool to_picture(const Picture& p, VmafPicture& pic) {
@@ -135,7 +180,7 @@ class CpuScorer : public Scorer {
 public:
 	~CpuScorer() override {
 		if (ctx) vmaf_close(ctx);
-		if (model) vmaf_model_destroy(model);
+		for (auto* m : models) vmaf_model_destroy(m);
 	}
 
 	// `w` x `h` at `depth` bits is what is scored; `enc` is what was encoded (see cambi_encode()).
@@ -144,16 +189,23 @@ public:
 		cfg.log_level = VMAF_LOG_LEVEL_WARNING;
 		cfg.n_threads = o.threads;
 		if (vmaf_init(&ctx, cfg) < 0) { fprintf(stderr, "vmaf: init failed\n"); return false; }
-		if (load_model(o.model, &model) < 0) { fprintf(stderr, "vmaf: cannot load model '%s'\n", o.model.c_str()); return false; }
-		VmafFeatureDictionary* cambi = nullptr;
 		const CambiEncode ce = cambi_encode(enc, w, h, depth);
-		if (ce.w != w || ce.h != h) {
-			vmaf_feature_dictionary_set(&cambi, "enc_width", std::to_string(ce.w).c_str());
-			vmaf_feature_dictionary_set(&cambi, "enc_height", std::to_string(ce.h).c_str());
+		// Every model's features go into the one context; libvmaf computes a feature with the same options once.
+		for (const std::string& spec : vmaf_models(o)) {
+			VmafModel* model = nullptr;
+			const std::string name = "vmaf_" + std::to_string(models.size());
+			if (load_model(spec, &model, name.c_str()) < 0) { fprintf(stderr, "vmaf: cannot load model '%s'\n", spec.c_str()); return false; }
+			models.push_back(model);
+			speed_names.push_back(speed_feature_names(spec));
+			VmafFeatureDictionary* cambi = nullptr;
+			if (ce.w != w || ce.h != h) {
+				vmaf_feature_dictionary_set(&cambi, "enc_width", std::to_string(ce.w).c_str());
+				vmaf_feature_dictionary_set(&cambi, "enc_height", std::to_string(ce.h).c_str());
+			}
+			if (ce.depth != depth) vmaf_feature_dictionary_set(&cambi, "enc_bitdepth", std::to_string(ce.depth).c_str());
+			if (cambi && vmaf_model_feature_overload(model, "cambi", cambi) < 0) { fprintf(stderr, "vmaf: cannot pass the encoded size to CAMBI\n"); return false; }
+			if (vmaf_use_features_from_model(ctx, model) < 0) { fprintf(stderr, "vmaf: features of model '%s' unavailable\n", spec.c_str()); return false; }
 		}
-		if (ce.depth != depth) vmaf_feature_dictionary_set(&cambi, "enc_bitdepth", std::to_string(ce.depth).c_str());
-		if (cambi && vmaf_model_feature_overload(model, "cambi", cambi) < 0) { fprintf(stderr, "vmaf: cannot pass the encoded size to CAMBI\n"); return false; }
-		if (vmaf_use_features_from_model(ctx, model) < 0) { fprintf(stderr, "vmaf: model features unavailable\n"); return false; }
 		return true;
 	}
 
@@ -166,17 +218,32 @@ public:
 		return true;
 	}
 
-	bool finish(std::vector<double>& scores) override {
+	bool finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<double>>& u, std::vector<std::vector<double>>& v) override {
 		if (vmaf_read_pictures(ctx, nullptr, nullptr, 0) < 0) { fprintf(stderr, "vmaf: flushing failed\n"); return false; }
-		scores.assign(count, 0);
-		for (unsigned i = 0; i < count; i++) {
-			if (vmaf_score_at_index(ctx, model, &scores[i], i) < 0) { fprintf(stderr, "vmaf: no score for frame %u\n", i); return false; }
+		const size_t n = models.size();
+		scores.assign(n, std::vector<double>(count, 0));
+		u.assign(n, {}); v.assign(n, {});
+		for (size_t k = 0; k < n; k++) {
+			for (unsigned i = 0; i < count; i++) {
+				if (vmaf_score_at_index(ctx, models[k], &scores[k][i], i) < 0) { fprintf(stderr, "vmaf: no score for frame %u\n", i); return false; }
+			}
+			if (speed_names[k].first.empty()) continue;
+			std::vector<double> uu(count), vv(count);
+			bool got = true;
+			for (unsigned i = 0; got && i < count; i++)
+				got = vmaf_feature_score_at_index(ctx, speed_names[k].first.c_str(), &uu[i], i) >= 0 && vmaf_feature_score_at_index(ctx, speed_names[k].second.c_str(), &vv[i], i) >= 0;
+			if (got) { u[k] = std::move(uu); v[k] = std::move(vv); }
+			else {
+				static std::atomic<bool> told{false};
+				if (!told.exchange(true)) fprintf(stderr, "vmaf: the chroma values (%s) are not where they were expected; results go without them\n", speed_names[k].first.c_str());
+			}
 		}
 		return true;
 	}
 };
 
-// On the GPU (Vulkan compute, vk_vmaf.cpp): 8 and 10 bit planar YUV; the chroma planes are only read by models with a chroma feature.
+// On the GPU (Vulkan compute, vk_vmaf.cpp): 8 and 10 bit planar YUV; the chroma planes are only read by models with a chroma feature. All
+// models in one pass.
 class GpuScorer : public Scorer {
 	std::unique_ptr<GpuVmaf> gpu;
 	int w, h;
@@ -192,13 +259,23 @@ public:
 		const size_t ds[3] = {(size_t)dis.stride[0], (size_t)dis.stride[1], (size_t)dis.stride[2]};
 		return gpu->add(rd, rs, dd, ds);
 	}
-	bool finish(std::vector<double>& scores) override { return gpu->finish(scores); }
+	bool finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<double>>& u, std::vector<std::vector<double>>& v) override {
+		std::vector<std::vector<std::map<std::string, double>>> fe;
+		if (!gpu->finish(scores, &fe)) return false;
+		u.assign(scores.size(), {}); v.assign(scores.size(), {});
+		for (size_t k = 0; k < fe.size(); k++) {
+			if (fe[k].empty() || !fe[k][0].count("Speed_chroma_feature_speed_chroma_u_score")) continue;
+			for (auto& f : fe[k]) { u[k].push_back(f.at("Speed_chroma_feature_speed_chroma_u_score")); v[k].push_back(f.at("Speed_chroma_feature_speed_chroma_v_score")); }
+		}
+		return true;
+	}
 };
 
 } // namespace
 
 bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const PacketFeed& next_packet, const std::vector<uint8_t>& extradata, const Shape& enc,
-                const Color& decoded_color, const ShownFeed& shown, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp) {
+                const Color& decoded_color, const ShownFeed& shown, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp,
+                VmafDetail* detail) {
 	auto decoder = make_decoder();
 	if (!decoder->open(codec, extradata)) return false;
 	long long m = 0;
@@ -214,29 +291,32 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 			if (!decoder->send(packet.data(), packet.size())) { fprintf(stderr, "vmaf: the encoded stream does not decode (packet of %zu bytes, after %lld frames)\n", packet.size(), m); return -1; }
 		}
 	};
-	return vmaf_score_frames(ref, next_ref, next_dis, enc, decoded_color, shown, score_fmt, opt, scale, scores, rp);
+	return vmaf_score_frames(ref, next_ref, next_dis, enc, decoded_color, shown, score_fmt, opt, scale, scores, rp, detail);
 }
 
 bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const FrameFeed& next_dis, const Shape& enc, const Color& decoded_color, const ShownFeed& shown,
-                       Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp) {
+                       Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp, VmafDetail* detail) {
 	if (rp) rp->begin(2, std::max<long long>(1, ref.frames));
 
 	const bool convert_dis = enc.w != ref.width || enc.h != ref.height || enc.pix != score_fmt || (decoded_color.range ? decoded_color.range : 1) != ref.score_range; // scale back, change format, change range back
 
 	// "gpu" needs the GPU scorer; "auto" falls back to libvmaf when it cannot be used.
 	std::unique_ptr<Scorer> scorer;
+	const std::vector<std::string> models = vmaf_models(opt);
 	bool ok = true;
 	if (opt.device != "cpu") {
 		std::string why;
 		std::unique_ptr<GpuVmaf> gpu;
 		if ((score_fmt.depth != 8 && score_fmt.depth != 10) || !score_fmt.planar || score_fmt.rgb) why = "only 8 and 10 bit YUV is supported";
-		else if (opt.model.rfind("path=", 0) != 0) why = "the model is not a file";
+		else if (std::any_of(models.begin(), models.end(), [](const std::string& m) { return m.rfind("path=", 0) != 0; })) why = "a model is not a file";
 		else if (const int device = GpuVmaf::pick_device(opt.gpu, opt.encoder_vendor, opt.encoder_gpu, why); device >= 0) {
 			GpuVmafFrame f;
 			f.w = ref.width; f.h = ref.height; f.depth = score_fmt.depth; f.chroma = score_fmt.chroma;
 			const CambiEncode ce = cambi_encode(enc, ref.width, ref.height, score_fmt.depth);
 			f.enc_w = ce.w; f.enc_h = ce.h; f.enc_depth = ce.depth;
-			gpu = GpuVmaf::create(opt.model.substr(5), device, f, why);
+			std::vector<std::string> paths;
+			for (auto& m : models) paths.push_back(m.substr(5));
+			gpu = GpuVmaf::create(paths, device, f, why);
 			if (gpu) { // say once for each device which one scores
 				static std::mutex m;
 				static std::set<int> told;
@@ -304,6 +384,13 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 	uint32_t extra;
 	if (ok && (shown((size_t)k, extra) || next_ref(r) == 1)) { fprintf(stderr, "encoded stream does not cover the reference frames\n"); ok = false; }
 	if (!ok) return false;
-	if (!scorer->finish(scores)) { fprintf(stderr, "vmaf: the scorer could not finish\n"); return false; }
+	std::vector<std::vector<double>> all, cu, cv;
+	if (!scorer->finish(all, cu, cv) || all.empty()) { fprintf(stderr, "vmaf: the scorer could not finish\n"); return false; }
+	scores = std::move(all[0]);
+	if (detail) {
+		detail->chroma_u = std::move(cu[0]); detail->chroma_v = std::move(cv[0]);
+		detail->extra.clear();
+		for (size_t k = 1; k < all.size(); k++) detail->extra.push_back(ModelScores{std::move(all[k]), std::move(cu[k]), std::move(cv[k])});
+	}
 	return true;
 }

@@ -281,7 +281,7 @@ struct Uploader::Impl {
 				if (up.status == 200 || up.status == 201) {
 					run = text_of(up.json, "uuid");
 					(flag_of(up.json, "new") ? scores_new : scores_known)++;
-					done = flag_of(up.json, "ceiling_added") ? "ceiling added to the stored score" : "score stored";
+					done = flag_of(up.json, "ceiling_added") ? "stored score topped up (ceiling or more models)" : "score stored";
 				} else { log(who + "the score was refused (" + Site::why(up) + ")"); problems++; return; }
 			} else if (score && text_of(*score, "status") == "exists") {
 				if (!item.late) scores_known++;

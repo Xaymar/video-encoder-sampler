@@ -386,7 +386,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 			VmafOptions run_vo = group_vo; // scoring follows the run's encoder to its GPU (vmaf.gpu "auto")
 			run_vo.encoder_vendor = encoder_vendor(run.enc.encoder);
 			if (auto it = run.enc.plan->options.find("gpu"); it != run.enc.plan->options.end()) run_vo.encoder_gpu = atoi(it->second.c_str());
-			run.score_ok = vmaf_score(ref, feed, run.codec, next_packet, {}, run.enc.plan->enc, run.enc.plan->color, shown, g.fmt, run_vo, so, run.scores, run.score_rp);
+			run.score_ok = vmaf_score(ref, feed, run.codec, next_packet, {}, run.enc.plan->enc, run.enc.plan->color, shown, g.fmt, run_vo, so, run.scores, run.score_rp, &run.detail);
 			if (run.score_ok && (long long)run.scores.size() != fr.frames) { fprintf(stderr, "%zu scores for %lld frames\n", run.scores.size(), fr.frames); run.score_ok = false; }
 			if (run.score_rp) { run.score_rp->failed = !run.score_ok; run.score_rp->finish(); }
 			rq.cancel(); // done with the original frames: do not hold the reference decode back
@@ -401,7 +401,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 	return fr.ok;
 }
 
-bool ceiling_wave(const std::string& input, const SourceInfo& si, const Plan& pl, const ScaleOptions& so, const VmafOptions& vo, std::vector<double>& scores, RunProgress* rp) {
+bool ceiling_wave(const std::string& input, const SourceInfo& si, const Plan& pl, const ScaleOptions& so, const VmafOptions& vo, std::vector<double>& scores, RunProgress* rp, std::vector<std::vector<double>>* extra) {
 	// The frames the encoders of this feed get, scored as if an encoder had passed them through untouched: what is lost here is lost before any encoder.
 	Broadcast feed(1), ref_bc(1);
 	FeedResult fr;
@@ -423,8 +423,16 @@ bool ceiling_wave(const std::string& input, const SourceInfo& si, const Plan& pl
 	};
 	const ShownFeed shown = [&fr](size_t k, uint32_t& v) { return fr.shown.get(k, v); };
 	VmafOptions o = vo;
+	if (!extra) o.extra_models.clear();
 	if (o.threads <= 0) o.threads = std::max(2, (int)std::thread::hardware_concurrency());
-	bool ok = vmaf_score_frames(ref, next_ref, next_dis, pl.enc, pl.color, shown, pl.score_fmt, o, so, scores, rp);
+	VmafDetail detail;
+	bool ok = vmaf_score_frames(ref, next_ref, next_dis, pl.enc, pl.color, shown, pl.score_fmt, o, so, scores, rp, extra ? &detail : nullptr);
+	if (extra) {
+		extra->clear();
+		for (auto& e : detail.extra) extra->push_back(std::move(e.scores));
+		if (ok && extra->size() != o.extra_models.size()) ok = false;
+		for (auto& e : *extra) if (e.size() != scores.size()) ok = false;
+	}
 	fq.cancel(); rq.cancel();
 	producer.join();
 	reference.join();

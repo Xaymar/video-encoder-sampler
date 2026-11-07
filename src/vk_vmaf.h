@@ -21,16 +21,17 @@ public:
 	// encodes (GPU `encoder_gpu` of vendor `encoder_vendor`, see gpu.h; vendor 0 for a CPU encoder) where it can score, else the first discrete GPU;
 	// a number for that Vulkan device; anything else for the first device whose name contains it (any case).
 	static int pick_device(const std::string& spec, unsigned encoder_vendor, int encoder_gpu, std::string& why);
-	// Whether the GPU scorer can score these frames with this model file on Vulkan device `device`; `why` says what is in the way.
-	static bool supported(const std::string& model_path, int device, const GpuVmafFrame& f, std::string& why);
+	// Whether the GPU scorer can score these frames with these model files on Vulkan device `device`; `why` says what is in the way.
+	// Several models are scored in one pass: what they compute alike (motion, CAMBI, the ADM wavelets, the SpEED planes) is computed once.
+	static bool supported(const std::vector<std::string>& model_paths, int device, const GpuVmafFrame& f, std::string& why);
 	// A scorer for one run; nullptr (and `why`) if it cannot be had (no suitable GPU, not enough video memory, an unsupported model).
-	static std::unique_ptr<GpuVmaf> create(const std::string& model_path, int device, const GpuVmafFrame& f, std::string& why);
+	static std::unique_ptr<GpuVmaf> create(const std::vector<std::string>& model_paths, int device, const GpuVmafFrame& f, std::string& why);
 	~GpuVmaf();
 	// The next pair of original and decoded frames: planes Y, U, V (samples of 1 byte, or 2 bytes above 8 bit; rows `stride` bytes apart). The chroma
 	// planes are only read when the model has a chroma feature.
 	bool add(const uint8_t* const ref[3], const size_t ref_stride[3], const uint8_t* const dis[3], const size_t dis_stride[3]);
-	// The VMAF score of every pair added; and, if asked for, every frame's features as libvmaf names them (for comparisons with libvmaf).
-	bool finish(std::vector<double>& scores, std::vector<std::map<std::string, double>>* features = nullptr);
+	// For each model (in the order given), the VMAF score of every pair added; and, if asked for, every frame's features as libvmaf names them.
+	bool finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<std::map<std::string, double>>>* features = nullptr);
 
 private:
 	GpuVmaf();

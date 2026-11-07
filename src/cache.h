@@ -12,6 +12,7 @@
 struct CachedRun {
 	double kbps = 0;
 	std::vector<double> scores;
+	VmafDetail detail; // the extra models' scores and the chroma values, where the file has them
 	std::vector<double> ceiling; // per frame: the score the run's feed reaches with no encoder (see ceiling_wave); empty if unknown
 	int width = 0, height = 0; // of the encoded video; 0 in files from before it was recorded
 	double fps = 0;
@@ -37,11 +38,13 @@ std::string key_hash(const std::string& key);
 
 bool result_load(const std::string& file, const std::string& key, CachedRun& out);
 // `details` are JSON members ("\"encoder\":\"x264\",...") that go into the file besides the key, the bitrate and the scores.
-// `model` is the VMAF model spec (VmafOptions::model): the file names it and its generation next to the scores.
-void result_store(const std::string& file, const std::string& key, const CachedRun& run, const std::string& details, const std::string& model);
+// `vo` names the VMAF models: the file names each, with its id and generation, next to its scores.
+void result_store(const std::string& file, const std::string& key, const CachedRun& run, const std::string& details, const VmafOptions& vo);
+// A model file's id: a hash of its content (16 hex digits), as the key's vmaf= line has it; "" for a built-in model.
+std::string model_id(const std::string& model);
 
 // The ceiling of a feed (see ceiling_wave in pipeline.h), kept in <cache>/ceilings/<hash>.json: the input, what the feed key says about the frames the
-// encoders get, the format both sides are scored in, and the scaler and scorer settings.
+// encoders get, the format both sides are scored in, and the scaler and scorer settings. One per model: the key names vmaf.model only.
 std::string ceiling_key(const std::string& input, const std::string& feed_key, const Fmt& score_fmt, const ScaleOptions& scale, const VmafOptions& vmaf);
 bool ceiling_load(const std::string& file, const std::string& key, std::vector<double>& scores);
 void ceiling_store(const std::string& file, const std::string& key, const std::vector<double>& scores);
