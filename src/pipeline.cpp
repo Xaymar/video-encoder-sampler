@@ -98,7 +98,9 @@ Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::str
 	// Both sides are scored in the source's chroma layout at the higher of the two bit depths, and at least at the model's (10 bit for VMAF v1).
 	// 4:2:2 sources are scored as 4:4:4, which holds all of their chroma.
 	pl.score_fmt = planar_fmt(sf.chroma == 422 ? 444 : sf.chroma, std::max({sf.depth, depth, min_score_depth}));
-	if (!valid(enc.pix) || !valid(pl.score_fmt)) return ignore("unsupported chroma " + std::to_string(chroma) + " / bit depth " + std::to_string(depth));
+	// The distorted score (the encode against the frames its encoder got) is scored in the encode's own chroma layout, at least at the model's depth.
+	pl.dist_fmt = planar_fmt(chroma == 422 ? 444 : chroma, std::max(depth, min_score_depth));
+	if (!valid(enc.pix) || !valid(pl.score_fmt) || !valid(pl.dist_fmt)) return ignore("unsupported chroma " + std::to_string(chroma) + " / bit depth " + std::to_string(depth));
 	pl.convert_rate = want.fps.num != 0 && !same_rate;
 	pl.rescale = enc.w != src.width || enc.h != src.height || enc.pix != src.fmt || (pl.range && pl.range != source_range); // scale, convert and/or change the range
 	pl.options = std::move(o);
@@ -322,16 +324,65 @@ void feed_reference(const std::string& input, Fmt fmt, const ScaleOptions& so, B
 	bc.close();
 }
 
+// The frames an encoder got, as the reference of its distorted score: taken from a feed of their own (the same decode, drop and scale as the encoders'),
+// converted to the scoring format the way the decoded encode is, at the encode's size. has() tells whether one more frame comes, for the scorer's
+// "shown" map, which is one to one here: encoded frame k is on screen at feed frame k.
+class ConvertedFeed {
+	FrameQueue& q;
+	const Plan& pl;
+	const ScaleOptions& so;
+	std::unique_ptr<Converter> conv = make_converter();
+	std::deque<Picture> ready;
+	bool opened = false, ended = false, failed = false;
+
+	bool fetch() { // one more frame into `ready`; false at the end or on an error
+		while (ready.empty() && !ended) {
+			Picture p;
+			if (!q.pop(p)) {
+				ended = true;
+				if (opened && (!conv->push(nullptr) || !drain())) failed = true;
+				break;
+			}
+			if (p.layout.planes == 0 && p.fmt.planar) p.layout = layout_of(av_planar_format(p.fmt.chroma, p.fmt.depth)); // the scaler's frames say only their format
+			p.color = pl.color; // what the decoded encode is taken to be as well
+			if (p.fmt == pl.dist_fmt) { ready.push_back(std::move(p)); break; }
+			p.duration = 1;
+			if (!opened && !(opened = conv->open(p, pl.enc.fps.inverse(), pl.enc.w, pl.enc.h, pl.dist_fmt, so))) { failed = ended = true; break; }
+			if (!conv->push(&p) || !drain()) { failed = ended = true; break; }
+		}
+		return !ready.empty();
+	}
+	bool drain() {
+		Picture o;
+		int got;
+		while ((got = conv->pop(o)) == 1) ready.push_back(std::move(o));
+		return got >= 0;
+	}
+
+public:
+	ConvertedFeed(FrameQueue& q, const Plan& pl, const ScaleOptions& so) : q(q), pl(pl), so(so) {}
+	bool has() { return fetch(); }
+	int next(Picture& out) {
+		if (!fetch()) return failed ? -1 : 0;
+		out = std::move(ready.front());
+		ready.pop_front();
+		return 1;
+	}
+	bool ok() const { return !failed; }
+};
+
 } // namespace
 
 bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRun*>& runs, const ScaleOptions& so, const VmafOptions& vo, RunProgress* feed_rp, FeedResult& fr) {
 	const size_t n = runs.size();
-	Broadcast bc(n);
-	std::vector<std::unique_ptr<PacketQueue>> packets;
+	Broadcast bc(n), dist_bc(n); // the frames for the encoders, and the same frames again (a decode of their own) for the distorted scores
+	std::vector<std::unique_ptr<PacketQueue>> packets, dist_packets;
 	for (size_t i = 0; i < n; i++) {
 		packets.push_back(std::make_unique<PacketQueue>());
+		dist_packets.push_back(std::make_unique<PacketQueue>());
 		PacketQueue* pq = packets.back().get();
-		runs[i]->enc.tee = [pq](const uint8_t* d, size_t size) { return pq->push(d, size); };
+		PacketQueue* dq = dist_packets.back().get();
+		runs[i]->enc.tee = [pq, dq](const uint8_t* d, size_t size) { const bool a = pq->push(d, size), b = dq->push(d, size); return a || b; };
 		if (runs[i]->enc.rp) { // frames the encoder gets: fewer than the source's when the frame rate is lowered
 			const Plan& pl = *runs[i]->enc.plan;
 			runs[i]->enc.rp->begin(1, pl.convert_rate ? std::max<long long>(1, std::llround(si.duration * pl.enc.fps.value())) : std::max<long long>(1, si.frame_count));
@@ -340,10 +391,15 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 
 	// Encoding: one decode feeds every encoder.
 	std::thread producer([&] { produce(input, si, *runs[0]->enc.plan, so, bc, fr, feed_rp); });
+	// The distorted feed has a decode of its own: the encoders hold frames back (look-ahead, reordering), so the frames one of them got cannot wait
+	// in a short queue until its packets for them come out without stopping the decode that feeds them all.
+	FeedResult dist_fr;
+	std::thread dist_producer([&] { produce(input, si, *runs[0]->enc.plan, so, dist_bc, dist_fr, nullptr); });
 	std::vector<std::thread> threads;
 	for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {
 		consume(runs[i]->enc, si, bc.at(i));
-		packets[i]->close(); // the scorer has all there is
+		packets[i]->close(); // the scorers have all there is
+		dist_packets[i]->close();
 	});
 
 	// Scoring runs at the same time, following the encoders' output as it is written. Runs that compare in the same format share one decode of
@@ -393,50 +449,49 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 			pq.cancel(); // and with the packets: do not hold the encoder back
 		});
 	}
+	// The distorted score: each encode against the frames its encoder got, at their size and frame rate, with every model.
+	for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {
+		WaveRun& run = *runs[i];
+		const Plan& pl = *run.enc.plan;
+		FrameQueue& fq = dist_bc.at(i);
+		PacketQueue& pq = *dist_packets[i];
+		ConvertedFeed cf(fq, pl, so);
+		RefInfo dref;
+		dref.width = pl.enc.w; dref.height = pl.enc.h; dref.framerate = pl.enc.fps; dref.color = pl.color;
+		dref.frames = pl.convert_rate ? std::max<long long>(1, std::llround(si.duration * pl.enc.fps.value())) : si.frame_count;
+		dref.score_range = pl.color.range ? pl.color.range : 1;
+		const FrameFeed next_ref = [&cf](Picture& out) { return cf.next(out); };
+		const PacketFeed next_packet = [&pq](std::vector<uint8_t>& out) { return pq.pop(out); };
+		const ShownFeed shown = [&cf](size_t k, uint32_t& v) { v = (uint32_t)k; return cf.has(); };
+		VmafOptions run_vo = vo;
+		if (run_vo.threads <= 0) run_vo.threads = std::max(2, (int)std::thread::hardware_concurrency() / (int)runs.size());
+		run_vo.encoder_vendor = encoder_vendor(run.enc.encoder);
+		if (auto it = pl.options.find("gpu"); it != pl.options.end()) run_vo.encoder_gpu = atoi(it->second.c_str());
+		std::vector<double> scores;
+		VmafDetail detail;
+		bool ok = vmaf_score(dref, next_ref, run.codec, next_packet, {}, pl.enc, pl.color, shown, pl.dist_fmt, run_vo, so, scores, nullptr, &detail) && cf.ok();
+		if (!ok) fprintf(stderr, "the distorted score (the encode against the frames its encoder got) failed\n");
+		run.dist_ok = ok;
+		if (ok) {
+			run.detail_distorted = std::move(scores);
+			for (auto& e : detail.extra) run.extra_distorted.push_back(std::move(e.scores));
+		}
+		fq.cancel();
+		pq.cancel();
+	});
 
 	producer.join();
+	dist_producer.join();
 	for (auto& t : threads) t.join();
 	for (auto& g : groups) ui::detach(g->handle);
-	for (auto* r : runs) r->enc.ok = r->enc.ok && fr.ok;
-	return fr.ok;
-}
-
-bool ceiling_wave(const std::string& input, const SourceInfo& si, const Plan& pl, const ScaleOptions& so, const VmafOptions& vo, std::vector<double>& scores, RunProgress* rp, std::vector<std::vector<double>>* extra) {
-	// The frames the encoders of this feed get, scored as if an encoder had passed them through untouched: what is lost here is lost before any encoder.
-	Broadcast feed(1), ref_bc(1);
-	FeedResult fr;
-	RunProgress feed_rp, ref_rp;
-	feed_rp.begin(3, 1);
-	ref_rp.begin(3, std::max<long long>(1, si.frame_count));
-	std::thread producer([&] { produce(input, si, pl, so, feed, fr, &feed_rp); });
-	std::thread reference([&] { feed_reference(input, pl.score_fmt, so, ref_bc, ref_rp); });
-	RefInfo ref;
-	ref.width = si.width; ref.height = si.height; ref.framerate = si.framerate; ref.color = si.color; ref.frames = si.frame_count;
-	ref.score_range = si.fmt.rgb ? 1 : (si.color.range ? si.color.range : 1);
-	FrameQueue& fq = feed.at(0);
-	FrameQueue& rq = ref_bc.at(0);
-	const FrameFeed next_ref = [&rq](Picture& out) { return rq.pop(out) ? 1 : 0; };
-	const FrameFeed next_dis = [&fq, rp](Picture& out) {
-		if (!fq.pop(out, rp)) return 0;
-		if (out.layout.planes == 0 && out.fmt.planar) out.layout = layout_of(av_planar_format(out.fmt.chroma, out.fmt.depth)); // the scaler's frames say only their format; scaling back reads the layout
-		return 1;
-	};
-	const ShownFeed shown = [&fr](size_t k, uint32_t& v) { return fr.shown.get(k, v); };
-	VmafOptions o = vo;
-	if (!extra) o.extra_models.clear();
-	if (o.threads <= 0) o.threads = std::max(2, (int)std::thread::hardware_concurrency());
-	VmafDetail detail;
-	bool ok = vmaf_score_frames(ref, next_ref, next_dis, pl.enc, pl.color, shown, pl.score_fmt, o, so, scores, rp, extra ? &detail : nullptr);
-	if (extra) {
-		extra->clear();
-		for (auto& e : detail.extra) extra->push_back(std::move(e.scores));
-		if (ok && extra->size() != o.extra_models.size()) ok = false;
-		for (auto& e : *extra) if (e.size() != scores.size()) ok = false;
+	for (auto* r : runs) {
+		r->enc.ok = r->enc.ok && fr.ok;
+		// Both scores or none: a run without its distorted score counts as not scored.
+		if (r->score_ok && (!r->dist_ok || r->extra_distorted.size() != r->detail.extra.size())) r->score_ok = false;
+		if (r->score_ok) {
+			r->detail.distorted = std::move(r->detail_distorted);
+			for (size_t m = 0; m < r->detail.extra.size(); m++) r->detail.extra[m].distorted = std::move(r->extra_distorted[m]);
+		}
 	}
-	fq.cancel(); rq.cancel();
-	producer.join();
-	reference.join();
-	if (ok && (!fr.ok || (long long)scores.size() != fr.frames)) { fprintf(stderr, "ceiling: %zu scores for %lld frames\n", scores.size(), fr.frames); ok = false; }
-	if (rp) { rp->failed = !ok; rp->finish(); }
-	return ok;
+	return fr.ok;
 }

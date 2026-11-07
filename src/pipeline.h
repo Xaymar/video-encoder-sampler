@@ -50,6 +50,7 @@ struct Plan {
 	std::string reason;
 	Shape enc;            // resolution, frame rate and pixel format the frames are encoded at
 	Fmt score_fmt;        // both sides are scored in this format
+	Fmt dist_fmt;         // and for the distorted score (the encode against the frames its encoder got) in this one
 	bool convert_rate = false, rescale = false;
 	int range = 0;        // the range the encoder gets: 0 the source's, 1 limited, 2 full (the "range" option)
 	Color color;          // the colour of the frames the encoder gets: what the stream is tagged with
@@ -111,18 +112,15 @@ struct WaveRun {
 	Codec codec = Codec::None;
 	RunProgress* score_rp = nullptr;
 	std::vector<double> scores;
-	VmafDetail detail; // the extra models' scores, the chroma values
-	bool score_ok = false;
+	VmafDetail detail; // the extra models' scores, the chroma values, the distorted scores
+	bool score_ok = false; // both scores: against the original, and against the frames the encoder got (detail.distorted)
+	bool dist_ok = false;  // run_wave's own: the distorted scores, before they go into `detail`
+	std::vector<double> detail_distorted;
+	std::vector<std::vector<double>> extra_distorted;
 	std::string label, pool; // for the rows of the live display
 };
 
-// Encodes all runs (which must share a feed key) from one decode of `input`, and scores each against the original at the same time.
+// Encodes all runs (which must share a feed key) from one decode of `input`, and scores each against the original at the same time, and against the
+// frames its encoder got (the distorted score: at the encode's size and frame rate, from a second decode of the same feed).
 // Runs that compare in the same format share one decode of the original.
 bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRun*>& runs, const ScaleOptions& so, const VmafOptions& vo, RunProgress* feed_rp, FeedResult& fr);
-
-// The ceiling of a feed: the original against the frames every run of this plan's feed key is given (scaled, frame rate dropped, converted), scaled back
-// and scored like a run's, with no encoder in between. A run's score can only come close to it; how far it stays below is what its encoder lost.
-// One score per original frame.
-bool ceiling_wave(const std::string& input, const SourceInfo& si, const Plan& pl, const ScaleOptions& so, const VmafOptions& vo, std::vector<double>& scores, RunProgress* rp = nullptr,
-	std::vector<std::vector<double>>* extra = nullptr); // extra: the scores of vo.extra_models, in order
-
