@@ -625,6 +625,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	std::optional<std::string> output, cache, model, upload_url, upload_key;
 	std::optional<int> threads;
 	std::optional<double> penalty;
+	std::optional<std::string> vmaf_device, vmaf_gpu;
 	bool videos = true, all_videos = false, upload_videos = true, quick = false, upscale = false;
 	std::set<std::string> only_lines; // --only-runs
 	bool short_names = false;
@@ -668,13 +669,13 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "-c" || a == "--cache") cache = value();
 		else if (a == "--vmaf-model") model = value();
 		else if (a == "--vmaf-threads") threads = atoi(value().c_str());
-		else if (a == "--vmaf-device") {
-			cfg.vo.device = value();
-			if (cfg.vo.device != "cpu" && cfg.vo.device != "gpu" && cfg.vo.device != "auto") throw std::runtime_error("--vmaf-device must be cpu, gpu or auto");
+		else if (a == "--vmaf-device") { // kept until the config is read: the flag wins over its vmaf.device (a worker's job config carries the host's)
+			vmaf_device = value();
+			if (*vmaf_device != "cpu" && *vmaf_device != "gpu" && *vmaf_device != "auto") throw std::runtime_error("--vmaf-device must be cpu, gpu or auto");
 		}
 		else if (a == "--vmaf-gpu") {
-			cfg.vo.gpu = value();
-			if (cfg.vo.gpu == "list") { list_vulkan_devices(); quit = true; return; }
+			vmaf_gpu = value();
+			if (*vmaf_gpu == "list") { list_vulkan_devices(); quit = true; return; }
 		}
 		else if (a == "--over-penalty") penalty = atof(value().c_str());
 		else if (a == "-enc" || a == "--encoder") { job.encoder = value(); quick = true; }
@@ -727,6 +728,8 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	if (only_set) { cfg.only_runs_set = true; cfg.only_runs = only_lines; }
 	if (short_names) cfg.short_names = true;
 	if (threads) cfg.vo.threads = *threads;
+	if (vmaf_device) cfg.vo.device = *vmaf_device;
+	if (vmaf_gpu) cfg.vo.gpu = *vmaf_gpu;
 	if (penalty) over_penalty = *penalty;
 	// A relative model is looked for where the program is as well (a worker's jobs run wherever the worker was started), and in the folder above it, where a build sits.
 	auto locate = [](std::string& model) {
@@ -866,7 +869,8 @@ static SourceInfo source_from_json(const std::string& text) {
 
 // `ves --worker <host:port or config file>`: runs the jobs a host sends, until it is stopped. The config file says where the host is and what the worker offers:
 //   { "host": "10.0.0.1:5599", "token": "...", "dir": "ves-worker",
-//     "resources": { "cpu": { "parallel": 4 }, "nvenc": [ { "gpu": 0, "parallel": 10 } ], "amf": { "gpu": 0, "parallel": 2 } } }
+//     "resources": { "cpu": { "parallel": 4 }, "nvenc": [ { "gpu": 0, "parallel": 10 } ], "amf": { "gpu": 0, "parallel": 2 } },
+//     "vmaf": { "device": "gpu", "gpu": "0" } }
 // A resource that is left out is detected and gets the default (1 encode on the CPU, 2 on a GPU); "parallel": 0 does not offer it. Every other flag is passed on to the `ves`
 // that runs a job, so --priority, --hw-decode, --vmaf-device and so on work as they do for a sweep started by hand.
 static int run_worker(int argc, char** argv) {
@@ -903,6 +907,15 @@ static int run_worker(int argc, char** argv) {
 			if (auto* v = root.find("dir"); v && !dir_given) { dir = v->text(); dir_given = true; }
 			if (auto* v = root.find("gpu"); v && only_gpu < 0) only_gpu = atoi(v->text().c_str());
 			for (auto& [key, flag] : run_settings) if (auto* v = root.find(key)) from_file.push_back({flag, v->text()});
+			if (auto* v = root.find("vmaf")) { // "vmaf": { "device": ..., "gpu": ... }, as in a sweep config
+				if (v->type != Json::Obj) throw std::runtime_error(v->where() + "\"vmaf\" must be an object ({ \"device\": ..., \"gpu\": ... })");
+				for (auto& [name, x] : v->o) {
+					if (name == "device") from_file.push_back({"--vmaf-device", x.text()});
+					else if (name == "gpu") from_file.push_back({"--vmaf-gpu", x.text()});
+					else if (name == "threads") from_file.push_back({"--vmaf-threads", x.text()});
+					else throw std::runtime_error(x.where() + "a worker's \"vmaf\" takes device, gpu and threads (the models come from the host)");
+				}
+			}
 			if (auto* v = root.find("parallel"); v && !default_parallel) default_parallel = std::max(1, atoi(v->text().c_str()));
 			if (auto* rs = root.find("resources")) {
 				for (auto& [name, v] : rs->o) {
