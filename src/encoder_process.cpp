@@ -125,15 +125,15 @@ template <class T> void get_list(Reader& r, std::vector<T>& v) {
 	for (uint32_t i = 0; i < n && r.ok; i++) v.push_back(r.num<T>());
 }
 void put(Writer& w, const VmafDetail& d) {
-	put_list(w, d.chroma_u); put_list(w, d.chroma_v);
+	put_list(w, d.chroma_u); put_list(w, d.chroma_v); put_list(w, d.distorted);
 	w.num((uint32_t)d.extra.size());
-	for (auto& e : d.extra) { put_list(w, e.scores); put_list(w, e.chroma_u); put_list(w, e.chroma_v); }
+	for (auto& e : d.extra) { put_list(w, e.scores); put_list(w, e.chroma_u); put_list(w, e.chroma_v); put_list(w, e.distorted); }
 }
 void get(Reader& r, VmafDetail& d) {
-	get_list(r, d.chroma_u); get_list(r, d.chroma_v);
+	get_list(r, d.chroma_u); get_list(r, d.chroma_v); get_list(r, d.distorted);
 	d.extra.clear();
 	const uint32_t n = r.num<uint32_t>();
-	for (uint32_t i = 0; i < n && r.ok; i++) { ModelScores e; get_list(r, e.scores); get_list(r, e.chroma_u); get_list(r, e.chroma_v); d.extra.push_back(std::move(e)); }
+	for (uint32_t i = 0; i < n && r.ok; i++) { ModelScores e; get_list(r, e.scores); get_list(r, e.chroma_u); get_list(r, e.chroma_v); get_list(r, e.distorted); d.extra.push_back(std::move(e)); }
 }
 
 // ---- the process ----

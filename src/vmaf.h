@@ -28,10 +28,11 @@ std::vector<std::string> vmaf_models(const VmafOptions& o);
 // U and V values (lower is better; empty for a model without it).
 struct ModelScores {
 	std::vector<double> scores, chroma_u, chroma_v;
-	std::vector<double> ceiling; // this model's ceiling of the run's feed (see ceiling_wave), per frame; empty if unknown
+	std::vector<double> distorted; // this model's score of the encode against the frames its encoder got (see run_wave), one per encoded frame
 };
 struct VmafDetail {
 	std::vector<double> chroma_u, chroma_v; // of `model`
+	std::vector<double> distorted;          // of `model`: the encode against the frames its encoder got, at their size and frame rate; one per encoded frame
 	std::vector<ModelScores> extra;          // of `extra_models`, in order
 };
 
@@ -67,7 +68,6 @@ using PacketFeed = std::function<bool(std::vector<uint8_t>&)>; // the next encod
 bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const PacketFeed& next_packet, const std::vector<uint8_t>& extradata, const Shape& enc,
                 const Color& decoded_color, const ShownFeed& shown, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp = nullptr,
                 VmafDetail* detail = nullptr);
-// The same, for frames that are already decoded (at `enc`, in coding = display order): vmaf_score() decodes the packets into this. The ceiling of a shape
-// (see pipeline.h) is scored this way, with the frames the encoders would get.
+// The same, for frames that are already decoded (at `enc`, in coding = display order): vmaf_score() decodes the packets into this.
 bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const FrameFeed& next_dis, const Shape& enc, const Color& decoded_color, const ShownFeed& shown,
                        Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp = nullptr, VmafDetail* detail = nullptr);

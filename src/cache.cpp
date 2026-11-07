@@ -1,5 +1,7 @@
 #include "cache.h"
 
+#include <algorithm>
+
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -97,6 +99,8 @@ std::string key_settings(const ScaleOptions& scale, const VmafOptions& vmaf) {
 	// The GPU scorer's scores differ from libvmaf's in the fourth decimal; "cpu" adds nothing, which keeps the keys of earlier results valid.
 	if (vmaf.device != "cpu") k << " scorer=" << vmaf.device << "-1";
 	k << '\n';
+	// Results from before the distorted score (the encode against the frames its encoder got) lack it: this line makes them run once more.
+	k << "distorted=1\n";
 	// the models scored besides it (only when there are any, which keeps the keys of earlier results valid)
 	const std::vector<std::string> all = vmaf_models(vmaf);
 	if (all.size() > 1) {
@@ -161,20 +165,20 @@ bool result_load(const std::string& file, const std::string& key, CachedRun& out
 		out.reference_sha256 = ref && ref->type == Json::Str ? ref->text() : std::string();
 		auto list = [](const Json* a, std::vector<double>& v) { v.clear(); if (a && a->type == Json::Arr) for (auto& s : a->a) v.push_back(atof(s.text().c_str())); };
 		list(scores, out.scores);
-		list(vmaf ? vmaf->find("ceiling") : nullptr, out.ceiling);
-		if (out.ceiling.size() != out.scores.size()) out.ceiling.clear();
 		out.detail = VmafDetail{};
 		if (vmaf) {
+			list(vmaf->find("distorted"), out.detail.distorted);
 			list(vmaf->find("chroma_u"), out.detail.chroma_u);
 			list(vmaf->find("chroma_v"), out.detail.chroma_v);
 			if (const Json* ex = vmaf->find("extra_models"); ex && ex->type == Json::Arr)
 				for (auto& e : ex->a) {
 					ModelScores m;
-					list(e.find("scores"), m.scores); list(e.find("chroma_u"), m.chroma_u); list(e.find("chroma_v"), m.chroma_v); list(e.find("ceiling"), m.ceiling);
-					if (m.ceiling.size() != m.scores.size()) m.ceiling.clear();
+					list(e.find("scores"), m.scores); list(e.find("chroma_u"), m.chroma_u); list(e.find("chroma_v"), m.chroma_v); list(e.find("distorted"), m.distorted);
 					out.detail.extra.push_back(std::move(m));
 				}
 		}
+		// A key that asks for the distorted score (see key_settings) is only met by a file that has it: a result an older worker sent under this key does not.
+		if (key.find("\ndistorted=1\n") != std::string::npos && (out.detail.distorted.empty() || std::any_of(out.detail.extra.begin(), out.detail.extra.end(), [](const ModelScores& m) { return m.distorted.empty(); }))) return false;
 		return !out.scores.empty();
 	} catch (const std::exception&) { return false; }
 }
@@ -203,7 +207,7 @@ void result_store(const std::string& file, const std::string& key, const CachedR
 		};
 		f << ",\"vmaf\":{";
 		model(vo.model, run.scores, run.detail.chroma_u, run.detail.chroma_v);
-		if (!run.ceiling.empty() && run.ceiling.size() == run.scores.size()) list("ceiling", run.ceiling, "%.17g"); // what the frames could score at all at this size, frame rate and format
+		if (!run.detail.distorted.empty()) list("distorted", run.detail.distorted, "%.17g"); // against the frames the encoder got, at their size and frame rate
 		const std::vector<std::string> all = vmaf_models(vo);
 		if (all.size() > 1 && run.detail.extra.size() == all.size() - 1) {
 			f << ",\"extra_models\":[";
@@ -211,7 +215,7 @@ void result_store(const std::string& file, const std::string& key, const CachedR
 				const ModelScores& e = run.detail.extra[i - 1];
 				f << (i > 1 ? "," : "") << "{";
 				model(all[i], e.scores, e.chroma_u, e.chroma_v);
-				if (!e.ceiling.empty() && e.ceiling.size() == e.scores.size()) list("ceiling", e.ceiling, "%.17g");
+				if (!e.distorted.empty()) list("distorted", e.distorted, "%.17g");
 				f << "}";
 			}
 			f << "]";
@@ -222,41 +226,3 @@ void result_store(const std::string& file, const std::string& key, const CachedR
 	fs::rename(tmp, file, ec); // atomic, so an interrupted run never leaves a half-written file
 }
 
-std::string ceiling_key(const std::string& input, const std::string& feed_key, const Fmt& score_fmt, const ScaleOptions& scale, const VmafOptions& vmaf) {
-	std::ostringstream k;
-	VmafOptions first = vmaf; // one model's ceiling: each model's is kept on its own, so adding or dropping a model keeps the others
-	first.extra_models.clear();
-	k << key_input(input) << "ceiling-1 feed=" << feed_key << " score=" << score_fmt.chroma << '/' << score_fmt.depth << '\n' << key_settings(scale, first);
-	return k.str();
-}
-
-bool ceiling_load(const std::string& file, const std::string& key, std::vector<double>& scores) {
-	std::ifstream f(file);
-	if (!f) return false;
-	try {
-		std::stringstream ss; ss << f.rdbuf();
-		Json j = Json::parse(ss.str());
-		auto* k = j.find("key");
-		auto* s = j.find("scores");
-		if (!k || !s || k->text() != key || s->type != Json::Arr) return false;
-		scores.clear();
-		for (auto& v : s->a) scores.push_back(atof(v.text().c_str()));
-		return !scores.empty();
-	} catch (const std::exception&) { return false; }
-}
-
-void ceiling_store(const std::string& file, const std::string& key, const std::vector<double>& scores) {
-	std::error_code ec;
-	fs::create_directories(fs::path(file).parent_path(), ec);
-	fs::path tmp = file;
-	tmp += ".tmp";
-	{
-		std::ofstream f(tmp, std::ios::binary);
-		char b[32];
-		f << "{\"key\":\"" << json_escape(key) << "\",\"scores\":[";
-		for (size_t i = 0; i < scores.size(); i++) { snprintf(b, sizeof b, "%.17g", scores[i]); f << (i ? "," : "") << b; }
-		f << "]}\n";
-		if (!f) { fs::remove(tmp, ec); return; }
-	}
-	fs::rename(tmp, file, ec);
-}

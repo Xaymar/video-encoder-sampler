@@ -101,7 +101,6 @@ struct Config {
 	int decode_threads = 0;  // 0: as many as the cores allow within a memory budget
 	std::string priority = "low"; // "low": idle CPU and lowest disk priority, see priority.h; "normal" leaves the system's default
 	bool low_memory = false; // score a wave before encoding the next, and fewer VMAF threads
-	bool ceiling = true;     // score each feed once with no encoder in between, so every run also has its score against what its size, frame rate and format allow
 	bool in_process = false; // the encoders run inside this process instead of one process per GPU and CPU encoder (encoder_process.h)
 	int host_port = 0;       // distributed: listen on this port and hand the runs that are not done to the workers that connect (remote.h); 0: run everything here
 	std::string token;       // what a worker must present to the host
@@ -118,8 +117,6 @@ struct Run {
 	Shape shape;
 	double kbps = 0;        // actual
 	std::vector<double> scores; // per frame, display order
-	std::shared_ptr<const std::vector<double>> ceiling; // per frame: what its feed scores with no encoder (shared by the runs of the feed); null if unknown
-	bool ceiling_new = false; // the ceiling was not in its result file yet
 	VmafDetail detail;          // the extra models' scores and the chroma values
 	bool cached = false;    // taken from the result cache instead of being run
 	bool uploaded = false;  // handed to the uploader when the worker sent it
@@ -144,6 +141,8 @@ struct Run {
 	const std::string *gpu_json = &NULL_JSON, *caps_json = &NULL_JSON; // its PCI ids, and what its encoder reports about itself (see encoder_caps_json); shared by all runs on the GPU
 	double penalty = 0;     // VMAF points deducted for exceeding the target bitrate
 	double best_share = 0;  // share of frames where this run is at least as good as every other run of its group
+	bool has_distorted = false; // its distorted score (the encode against the frames its encoder got; see run_wave) is known
+	struct { double mean = 0, min = 0, p5 = 0; } distorted; // of the first model, before the penalty
 };
 
 // Mean, lowest and 5th percentile of per-frame values.
@@ -156,13 +155,6 @@ static FrameStats frame_stats(std::vector<double> v) {
 	st.min = v.front();
 	st.p5 = v[(size_t)(v.size() * 0.05)];
 	return st;
-}
-// A run against its ceiling, frame by frame: score minus ceiling (0: all its size, frame rate and format allow; below: what its encoder lost).
-static std::vector<double> vs_ceiling(const Run& r) {
-	std::vector<double> d;
-	if (!r.ceiling || r.ceiling->size() != r.scores.size()) return d;
-	for (size_t f = 0; f < r.scores.size(); f++) d.push_back(r.scores[f] - (*r.ceiling)[f]);
-	return d;
 }
 
 // What the GPU's encoder says it cannot do, against what a run asks of it: the reason the run cannot work there, or empty. Such a run is ignored, not failed.
@@ -447,7 +439,7 @@ static void load_config_json(const Json& root, Config& cfg) {
 		}
 		if (auto* g = v->find("gpu")) cfg.vo.gpu = g->text();
 		if (auto* p = v->find("over_penalty")) over_penalty = atof(p->text().c_str());
-		if (auto* c = v->find("ceiling")) cfg.ceiling = !(c->text() == "0" || c->text() == "false");
+		if (v->find("ceiling")) fprintf(stderr, "vmaf.ceiling is no longer used: every run is scored against the frames its encoder got as well (the distorted score)\n");
 	}
 	auto off = [](const Json* v) { return v && (v->text() == "0" || v->text() == "false"); };
 	const bool default_prune = !off(setting("prune"));
@@ -534,8 +526,6 @@ Scoring
                             auto: the GPU where it can be used (8 or 10 bit YUV, a model file, a Vulkan GPU), else the CPU. These scores are kept apart from libvmaf's in the cache
         --vmaf-gpu <auto|n|name>  the Vulkan device that scores (default: auto, the GPU that encodes the run, else the first discrete GPU); n: Vulkan device n;
                             name: the first device whose name contains it. --vmaf-gpu list shows the Vulkan devices
-        --no-ceiling        do not score the ceiling of each size, frame rate and format (the original against its own scaled and converted frames, no encoder).
-                            With it (the default), every run also has its score relative to that ceiling: 0 is all that size could reach
         --over-penalty <p>  VMAF points deducted per percent for a run just over the target bitrate (default: 0.025); it grows exponentially, like the website's
 
 Distributed (see docs/distributed.md)
@@ -598,7 +588,6 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 		else if (k == "vmaf.threads") cfg.vo.threads = atoi(v.c_str());
 		else if (k == "vmaf.device") cfg.vo.device = v;
 		else if (k == "vmaf.gpu") cfg.vo.gpu = v;
-		else if (k == "vmaf.ceiling") cfg.ceiling = !(v == "off" || v == "0" || v == "false");
 		else if (k == "over.penalty") over_penalty = atof(v.c_str());
 		else if (k == "cache") cfg.cache_dir = v == "off" ? "" : v;
 		else if (k == "output") cfg.output_dir = v;
@@ -655,7 +644,6 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--plain") cfg.plain = true;
 		else if (a == "--low-memory") cfg.low_memory = true;
 		else if (a == "--in-process") cfg.in_process = true;
-		else if (a == "--no-ceiling") cfg.ceiling = false;
 		else if (a == "--host") cfg.host_port = atoi(value().c_str());
 		else if (a == "--progress") ui::set_progress_stdout(true);
 		else if (a == "--trust-downloads") set_trust_downloads(true);
@@ -804,7 +792,7 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 	if (!cfg.scale.device.empty()) o << ",\"gpu\":" << jq(cfg.scale.device);
 	o << "},\"vmaf\":{\"model\":[";
 	for (size_t i = 0, n = vmaf_models(cfg.vo).size(); i < n; i++) o << (i ? "," : "") << jq(vmaf_models(cfg.vo)[i]);
-	o << "],\"device\":" << jq(cfg.vo.device) << ",\"ceiling\":" << (cfg.ceiling ? "true" : "false") << "},\"encoders\":[{\"encoder\":" << jq(job.encoder) << ",\"codec\":" << jq(job.codec);
+	o << "],\"device\":" << jq(cfg.vo.device) << "},\"encoders\":[{\"encoder\":" << jq(job.encoder) << ",\"codec\":" << jq(job.codec);
 	o << ",\"prune\":false,\"options\":{";
 	bool first = true;
 	if (is_gpu_encoder(job.encoder)) { o << "\"gpu\":[\"@GPU@\"]"; first = false; } // the host puts the worker's GPU index in
@@ -1408,13 +1396,7 @@ int main(int argc, char** argv) {
 		}
 		return it->second.count(name) != 0;
 	};
-	auto cached_of = [](const Run& r) {
-		CachedRun c{r.kbps, r.scores, r.detail};
-		if (r.ceiling) c.ceiling = *r.ceiling;
-		return c;
-	};
-	// Gives a finished run its ceiling (see ceiling_wave): from memory, the cache folder, or scored now, once for each feed. Set further down.
-	std::function<void(Task&)> attach_ceiling = [](Task&) {};
+	auto cached_of = [](const Run& r) { return CachedRun{r.kbps, r.scores, r.detail}; };
 	auto store_result = [&](const Task& t, const std::string& file, const CachedRun& run, const std::string& details) {
 		result_store(file, t.key(), run, details, cfg.vo);
 		auto [dir, name] = split_file(file);
@@ -1488,13 +1470,16 @@ int main(int argc, char** argv) {
 			return;
 		}
 		r.penalty = over_penalty_points(r.kbps, (double)r.bitrate);
-		attach_ceiling(t);
 		std::vector<double> sc = r.scores;
 		std::sort(sc.begin(), sc.end());
 		const double mean = std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size();
 		char rel[96] = "";
-		if (const auto d = vs_ceiling(r); !d.empty()) { const FrameStats st = frame_stats(d); snprintf(rel, sizeof rel, ", vs ceiling mean %.3f p5 %.3f", st.mean, st.p5); }
-		if (!t.result_file.empty() && (!r.cached || r.imported || r.ceiling_new)) store_result(t, t.result_file, cached_of(r), run_details(t));
+		if (!r.detail.distorted.empty()) {
+			const FrameStats st = frame_stats(r.detail.distorted);
+			r.has_distorted = true; r.distorted.mean = st.mean; r.distorted.min = st.min; r.distorted.p5 = st.p5;
+			snprintf(rel, sizeof rel, ", distorted mean %.3f p5 %.3f", st.mean, st.p5);
+		}
+		if (!t.result_file.empty() && (!r.cached || r.imported)) store_result(t, t.result_file, cached_of(r), run_details(t));
 		r.detail = VmafDetail{}; // in the result file now; nothing else reads it, and a sweep holds many runs
 		if (uploader && r.result.empty()) ui::log("Upload " + r.label + ": not sent, the run has no result file in the output folder");
 		else if (uploader && !r.uploaded && !r.video_sha256.empty() && !sent_streams.insert(r.group + "|" + r.video_sha256).second)
@@ -1582,61 +1567,6 @@ int main(int argc, char** argv) {
 		if (!t.r.shape.w) { t.r.shape.w = t.plan.enc.w; t.r.shape.h = t.plan.enc.h; }
 		if (!t.r.shape.fps.num) t.r.shape.fps = t.plan.enc.fps;
 	};
-	// One ceiling per model, index 0 the first (vmaf_models order); each model's is cached on its own (see ceiling_key), so a model added later
-	// scores only its own. By the first model's ceiling_key; null: could not be scored (not tried again).
-	using Ceilings = std::vector<std::vector<double>>;
-	std::map<std::string, std::shared_ptr<const Ceilings>> ceilings;
-	const std::vector<std::string> all_models = vmaf_models(cfg.vo);
-	auto model_opts = [&](const std::string& m) { VmafOptions o = cfg.vo; o.model = m; o.extra_models.clear(); return o; };
-	attach_ceiling = [&](Task& t) {
-		Run& r = t.r;
-		if (!cfg.ceiling || !t.ok) return;
-		const bool have_extra = r.detail.extra.size() == all_models.size() - 1 && std::all_of(r.detail.extra.begin(), r.detail.extra.end(), [](const ModelScores& m) { return !m.ceiling.empty(); });
-		if (r.ceiling && have_extra) return;
-		Plan pl = t.plan;
-		if (!pl.enc.w) { // a run taken from its result file: planned now, from the shape it asked for (the file's frame rate is rounded)
-			const SourceInfo* src = source_of(r.input);
-			if (!src) return;
-			pl = make_plan(*src, t.job->encoder, t.job->codec, *t.opts, t.sc && t.shape_i < t.sc->shapes.size() ? t.sc->shapes[t.shape_i] : r.shape);
-			if (pl.ignored) return;
-		}
-		std::vector<std::string> keys;
-		for (auto& m : all_models) keys.push_back(ceiling_key(r.input, pl.feed_key(), pl.score_fmt, cfg.scale, model_opts(m)));
-		auto it = ceilings.find(keys[0]);
-		if (it == ceilings.end()) {
-			auto file_of = [&](const std::string& key) { return cfg.cache_dir.empty() ? std::string() : (fs::path(cfg.cache_dir) / "ceilings" / (key_hash(key) + ".json")).string(); };
-			Ceilings sc(all_models.size());
-			std::vector<size_t> missing;
-			for (size_t m = 0; m < all_models.size(); m++) { const std::string file = file_of(keys[m]); if (file.empty() || !ceiling_load(file, keys[m], sc[m])) missing.push_back(m); }
-			bool ok = true;
-			if (!missing.empty()) {
-				ok = false;
-				if (const SourceInfo* src = source_of(r.input)) {
-					const std::string what = file_name(r.input) + " at " + std::to_string(pl.enc.w) + "x" + std::to_string(pl.enc.h) + " " + pl.feed_key().substr(pl.feed_key().find(' ') + 1);
-					VmafOptions o = model_opts(all_models[missing[0]]); // only the models whose ceiling is not cached yet
-					for (size_t k = 1; k < missing.size(); k++) o.extra_models.push_back(all_models[missing[k]]);
-					RunProgress rp;
-					const int h = ui::attach(&rp, "ceiling " + what, "decode");
-					const auto t0 = std::chrono::steady_clock::now();
-					std::vector<std::vector<double>> extra;
-					ok = ceiling_wave(local_path(r.input), *src, pl, cfg.scale, o, sc[missing[0]], &rp, &extra);
-					ui::detach(h);
-					for (size_t k = 1; ok && k < missing.size(); k++) sc[missing[k]] = std::move(extra[k - 1]);
-					char line[512];
-					if (ok) snprintf(line, sizeof line, "Ceiling %s: vmaf mean %.3f min %.3f  (%.1fs)", what.c_str(), frame_stats(sc[0]).mean, frame_stats(sc[0]).min, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-					else snprintf(line, sizeof line, "Ceiling %s could not be scored; its runs have no score against it", what.c_str());
-					ui::log(line);
-					if (ok) for (size_t m : missing) if (const std::string file = file_of(keys[m]); !file.empty()) ceiling_store(file, keys[m], sc[m]);
-				}
-			}
-			it = ceilings.emplace(keys[0], ok ? std::make_shared<const Ceilings>(std::move(sc)) : nullptr).first;
-		}
-		if (!it->second || (*it->second)[0].size() != r.scores.size()) return;
-		if (!r.ceiling) { r.ceiling = std::shared_ptr<const std::vector<double>>(it->second, &(*it->second)[0]); r.ceiling_new = true; }
-		if (r.detail.extra.size() == all_models.size() - 1)
-			for (size_t m = 1; m < all_models.size(); m++)
-				if (ModelScores& e = r.detail.extra[m - 1]; e.ceiling.empty() && (*it->second)[m].size() == e.scores.size()) { e.ceiling = (*it->second)[m]; r.ceiling_new = true; }
-	};
 	// Distributed: the runs of a round (an input's runs made so far, then each next layer of its lazy groups) that are not done yet are cut into jobs (one input,
 	// encoder entry, scenario, bitrate, key frame interval, size and GPU model each) for the workers that connect to --host. What they send back is stored as result
 	// files with this run's keys, so settle() finds those runs finished and their scores decide the next layer. Whatever the workers could not do (runs that cannot
@@ -1709,9 +1639,8 @@ int main(int argc, char** argv) {
 			if (it == by_file.end()) { ui::log("remote: a worker's result " + file + " belongs to no run of this sweep; it is not used or uploaded"); return; }
 			Task& t = *it->second;
 			CachedRun hit;
-			if (!result_load(file, t.key(), hit)) { ui::log("remote: the worker's result for " + t.r.label + " cannot be read back (" + file + "); it is not uploaded now"); return; }
+			if (!result_load(file, t.key(), hit)) { ui::log("remote: the worker's result for " + t.r.label + " cannot be used (" + file + "): unreadable, or without the distorted score (a worker older than this host?); it is not used"); return; }
 			t.r.kbps = hit.kbps; t.r.scores = std::move(hit.scores); t.r.detail = std::move(hit.detail);
-			if (!hit.ceiling.empty()) t.r.ceiling = std::make_shared<const std::vector<double>>(std::move(hit.ceiling));
 			store_result(t, file, cached_of(t.r), run_details(t));
 			t.r.imported = false; // already rewritten
 			if (uploader && !t.r.result.empty()) {
@@ -1741,7 +1670,6 @@ int main(int argc, char** argv) {
 			CachedRun hit;
 			if (result_load(t.result_file, t.key(), hit)) {
 				r.kbps = hit.kbps; r.scores = std::move(hit.scores); r.detail = std::move(hit.detail); r.video_sha256 = hit.video_sha256; r.cached = t.ok = true;
-				if (!hit.ceiling.empty()) r.ceiling = std::make_shared<const std::vector<double>>(std::move(hit.ceiling));
 				if (!hit.reference_sha256.empty()) reference_hashes.emplace(r.input, hit.reference_sha256); // known: the file is not needed to say it
 				if (!r.shape.w && hit.width > 0 && hit.height > 0 && hit.fps > 0) { // the geometry the run was encoded at, for the summary: from its result file
 					r.shape.w = hit.width; r.shape.h = hit.height;
@@ -2120,8 +2048,7 @@ int main(int argc, char** argv) {
 			o << "},\"width\":" << r.shape.w << ",\"height\":" << r.shape.h << ",\"fps\":" << (r.shape.fps.num ? r.shape.fps.value() : 0.0)
 			  << ",\"kbps\":" << r.kbps << ",\"over_target_penalty\":" << r.penalty << ",\"best_frame_share\":" << r.best_share << ",\"winner\":" << (r.best_share >= BEST_FRAME_SHARE ? "true" : "false")
 			  << ",\"vmaf\":{\"mean\":" << std::accumulate(sc.begin(), sc.end(), 0.0) / sc.size() << ",\"min\":" << sc.front() << ",\"p5\":" << sc[(size_t)(sc.size() * 0.05)] << "}"
-			  << ",\"ceiling\":" << [&] { if (!r.ceiling) return std::string("null"); const FrameStats st = frame_stats(*r.ceiling); std::ostringstream c; c << "{\"mean\":" << st.mean << ",\"min\":" << st.min << ",\"p5\":" << st.p5 << "}"; return c.str(); }()
-			  << ",\"vs_ceiling\":" << [&] { const auto d = vs_ceiling(r); if (d.empty()) return std::string("null"); const FrameStats st = frame_stats(d); std::ostringstream c; c << "{\"mean\":" << st.mean << ",\"min\":" << st.min << ",\"p5\":" << st.p5 << "}"; return c.str(); }()
+			  << ",\"distorted\":" << [&] { if (!r.has_distorted) return std::string("null"); std::ostringstream c; c << "{\"mean\":" << r.distorted.mean << ",\"min\":" << r.distorted.min << ",\"p5\":" << r.distorted.p5 << "}"; return c.str(); }()
 			  << ",\"gpu\":" << (r.gpu.empty() ? "null" : jq(r.gpu)) << ",\"gpu_info\":" << *r.gpu_json << ",\"encoder_caps\":" << *r.caps_json << ",\"cached\":" << (r.cached ? "true" : "false")
 			  << ",\"video\":" << (r.video.empty() ? "null" : jq(r.video)) << ",\"video_sha256\":" << (r.video_sha256.empty() ? "null" : jq(r.video_sha256)) << ",\"identical_runs\":[" << [&] { std::string l; for (auto& x : r.identical) l += (l.empty() ? "" : ",") + jq(x); return l; }() << "],\"result\":" << (r.result.empty() ? "null" : jq(r.result)) << "}";
 		}

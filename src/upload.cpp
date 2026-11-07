@@ -281,7 +281,7 @@ struct Uploader::Impl {
 			if (!reference_hash.empty()) body += ",\"reference_sha256\":\"" + reference_hash + "\""; // the site wants it for the score as well
 			if (with_video) body += ",\"video_sha256\":\"" + video_hash + "\",\"video_size\":" + std::to_string(video_size);
 			const Json* vm = result.find("vmaf");
-			if (const Json* c = vm ? vm->find("ceiling") : nullptr; c && c->type == Json::Arr && !c->a.empty()) body += ",\"ceiling\":true"; // a run stored without it can get it now
+			if (const Json* c = vm ? vm->find("distorted") : nullptr; c && c->type == Json::Arr && !c->a.empty()) body += ",\"distorted\":true"; // a run stored without it can get it now
 			body += "}";
 			const Reply check = site->request(true, "/api/v1/check", "application/json", body.data(), body.size(), 120);
 			if (check.status != 200) { log(who + "check failed (" + Site::why(check) + ")"); problems++; return; }
@@ -309,7 +309,7 @@ struct Uploader::Impl {
 					run = text_of(up.json, "uuid");
 					const std::string note = text_of(up.json, "note"); // newer sites say what they did with it
 					if (flag_of(up.json, "new")) { scores_new++; done = "score stored (new)"; }
-					else if (flag_of(up.json, "ceiling_added")) { scores_topped++; done = "stored score topped up (ceiling or more models)"; }
+					else if (flag_of(up.json, "topped_up") || flag_of(up.json, "ceiling_added")) { scores_topped++; done = "stored score topped up (distorted score or more models)"; }
 					else { scores_known++; done = "score sent, but the site kept what it had"; }
 					if (!note.empty()) done += ": " + note;
 				} else { log(who + "the score was refused (" + Site::why(up) + ")"); problems++; return; }
