@@ -1,5 +1,6 @@
 #pragma once
 // Minimal JSON reader for config files; also takes comments (// and /* */) and trailing commas. Numbers keep their source text so "6000" and "2.0" survive round trips.
+#include <algorithm>
 #include <cctype>
 #include <stdexcept>
 #include <string>
@@ -11,6 +12,10 @@ struct Json {
 	std::string s; // Str: the text, Num: source text, Bool: "1" or "0"
 	std::vector<Json> a;
 	std::vector<std::pair<std::string, Json>> o;
+	size_t line = 0; // where the value starts in the parsed text, from 1; 0 for a value that was not parsed
+
+	// "line 12: " for error messages about this value, or "" when it was not parsed.
+	std::string where() const { return line ? "line " + std::to_string(line) + ": " : std::string(); }
 
 	const Json* find(const std::string& k) const {
 		for (auto& [key, v] : o) if (key == k) return &v;
@@ -18,20 +23,37 @@ struct Json {
 	}
 	// Scalars as the string an encoder option would take.
 	std::string text() const {
-		if (type == Arr || type == Obj || type == Null) throw std::runtime_error("expected a string, number or boolean");
+		if (type == Arr || type == Obj || type == Null)
+			throw std::runtime_error(where() + "expected a string, number or boolean, not " + (type == Arr ? "a list" : type == Obj ? "an object" : "null"));
 		return s;
 	}
 
 	static Json parse(const std::string& src) {
-		size_t i = 0;
-		Json j = value(src, i);
-		ws(src, i);
-		if (i != src.size()) fail(i, "trailing data");
-		return j;
+		std::vector<size_t> nl; // offsets of the line breaks, to turn offsets into lines
+		for (size_t k = src.find('\n'); k != std::string::npos; k = src.find('\n', k + 1)) nl.push_back(k);
+		auto line_of = [&](size_t at) { return (size_t)(std::upper_bound(nl.begin(), nl.end(), at) - nl.begin()) + 1; };
+		try {
+			size_t i = 0;
+			Json j = value(src, i);
+			ws(src, i);
+			if (i != src.size()) fail(i, "trailing data");
+			number_lines(j, line_of);
+			return j;
+		} catch (const ParseError& e) {
+			const size_t l = line_of(e.at), col = e.at - (l > 1 ? nl[l - 2] + 1 : 0) + 1;
+			throw std::runtime_error("line " + std::to_string(l) + ", column " + std::to_string(col) + ": " + e.what);
+		}
 	}
 
 private:
-	[[noreturn]] static void fail(size_t at, const char* what) { throw std::runtime_error(std::string("JSON error at offset ") + std::to_string(at) + ": " + what); }
+	struct ParseError { size_t at; const char* what; };
+	[[noreturn]] static void fail(size_t at, const char* what) { throw ParseError{at, what}; }
+	// value() leaves the offset in `line`; this turns it into the line.
+	template <class F> static void number_lines(Json& j, const F& line_of) {
+		j.line = line_of(j.line);
+		for (auto& x : j.a) number_lines(x, line_of);
+		for (auto& [k, x] : j.o) number_lines(x, line_of);
+	}
 	// Whitespace, and the comments JSONC allows between tokens: // to the end of the line and /* ... */.
 	static void ws(const std::string& s, size_t& i) {
 		for (;;) {
@@ -78,6 +100,7 @@ private:
 		ws(s, i);
 		if (i >= s.size()) fail(i, "unexpected end");
 		Json j;
+		j.line = i;
 		char c = s[i];
 		if (c == '{' || c == '[') {
 			bool obj = c == '{';

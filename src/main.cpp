@@ -275,13 +275,13 @@ static void parse_conds(const Json& j, std::vector<Cond>& out, const std::string
 		Cond c;
 		c.key = name;
 		if (spec.type == Json::Arr) for (auto& x : spec.a) c.any_of.push_back(x.text());
-		else if (spec.type == Json::Bool) { if (spec.text() != "1" && spec.text() != "true") throw std::runtime_error("option '" + option + "': a condition on '" + name + "' says false; leave it out"); }
+		else if (spec.type == Json::Bool) { if (spec.text() != "1" && spec.text() != "true") throw std::runtime_error(spec.where() + "option '" + option + "': a condition on '" + name + "' says false; leave it out"); }
 		else {
 			const std::string t = spec.text();
 			size_t n = 0;
 			for (const char* op : {">=", "<=", "==", "!=", ">", "<"}) if (t.compare(0, strlen(op), op) == 0) { c.op = op; n = strlen(op); break; }
 			if (!c.op.empty()) {
-				if (!Cond::number(t.substr(n), c.num)) throw std::runtime_error("option '" + option + "': '" + t + "' is not a comparison with a number");
+				if (!Cond::number(t.substr(n), c.num)) throw std::runtime_error(spec.where() + "option '" + option + "': '" + t + "' is not a comparison with a number");
 			} else c.any_of.push_back(t);
 		}
 		out.push_back(c);
@@ -363,14 +363,20 @@ static void add_inputs(Config& cfg, const std::string& path) {
 	cfg.inputs.insert(cfg.inputs.end(), found.begin(), found.end());
 }
 
+static void load_config_json(const Json& root, Config& cfg);
+// Errors name the file, and the line where the JSON says where (Json::where()).
 static void load_config(const std::string& path, Config& cfg) {
 	std::ifstream f(path);
 	if (!f) throw std::runtime_error("cannot read '" + path + "'");
 	std::stringstream ss; ss << f.rdbuf();
-	Json root = Json::parse(ss.str());
+	try { load_config_json(Json::parse(ss.str()), cfg); }
+	catch (const std::runtime_error& e) { throw std::runtime_error(path + ": " + e.what()); }
+}
+
+static void load_config_json(const Json& root, Config& cfg) {
 
 	auto list = [&](const char* k, auto fn) {
-		if (auto* v = root.find(k)) { if (v->type != Json::Arr) throw std::runtime_error(std::string("'") + k + "' must be an array"); for (auto& e : v->a) fn(e); }
+		if (auto* v = root.find(k)) { if (v->type != Json::Arr) throw std::runtime_error(v->where() + "'" + k + "' must be an array"); for (auto& e : v->a) fn(e); }
 	};
 	list("inputs", [&](const Json& e) { add_inputs(cfg, e.text()); });
 	// Either a "scenarios" list, or the top level itself is the one and only scenario.
@@ -383,7 +389,7 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* n = o.find("name")) sc.name = n->text();
 		std::vector<std::string> res, fps;
 		auto strs = [&](const char* k, auto fn) {
-			if (auto* v = o.find(k)) { if (v->type != Json::Arr) throw std::runtime_error(std::string("'") + k + "' must be an array"); for (auto& e : v->a) fn(e.text()); }
+			if (auto* v = o.find(k)) { if (v->type != Json::Arr) throw std::runtime_error(v->where() + "'" + k + "' must be an array"); for (auto& e : v->a) fn(e.text()); }
 		};
 		strs("bitrates", [&](const std::string& t) { sc.bitrates.push_back(atoll(t.c_str())); });
 		if (o.find("kfintervals")) { sc.kfs.clear(); strs("kfintervals", [&](const std::string& t) { sc.kfs.push_back(atof(t.c_str())); }); }
@@ -394,7 +400,7 @@ static void load_config(const std::string& path, Config& cfg) {
 		strs("bitdepth", [&](const std::string& t) { sc.bitdepth.push_back(t); });
 		strs("range", [&](const std::string& t) { sc.range.push_back(t); });
 		if (auto* u = o.find("upscale"); u && (u->text() == "1" || u->text() == "true")) for (auto& sh : sc.shapes) sh.upscale = true;
-		if (sc.bitrates.empty()) throw std::runtime_error("a scenario needs bitrates");
+		if (sc.bitrates.empty()) throw std::runtime_error(o.where() + "a scenario needs bitrates");
 		cfg.scenarios.push_back(std::move(sc));
 	};
 	if (auto* v = root.find("scenarios")) { for (auto& e : v->a) scenario(e); } else scenario(root);
@@ -428,7 +434,7 @@ static void load_config(const std::string& path, Config& cfg) {
 	if (auto* v = root.find("vmaf")) {
 		if (auto* m = v->find("model")) { // one model, or a list: the first one ranks, the others are scored with it
 			if (m->type == Json::Arr) {
-				if (m->a.empty()) throw std::runtime_error("vmaf.model is an empty list");
+				if (m->a.empty()) throw std::runtime_error(m->where() + "vmaf.model is an empty list");
 				cfg.vo.model = m->a[0].text();
 				cfg.vo.extra_models.clear();
 				for (size_t i = 1; i < m->a.size(); i++) cfg.vo.extra_models.push_back(m->a[i].text());
@@ -437,7 +443,7 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* t = v->find("threads")) cfg.vo.threads = atoi(t->text().c_str());
 		if (auto* d = v->find("device")) {
 			cfg.vo.device = d->text();
-			if (cfg.vo.device != "cpu" && cfg.vo.device != "gpu" && cfg.vo.device != "auto") throw std::runtime_error("vmaf.device must be cpu, gpu or auto");
+			if (cfg.vo.device != "cpu" && cfg.vo.device != "gpu" && cfg.vo.device != "auto") throw std::runtime_error(d->where() + "vmaf.device must be cpu, gpu or auto");
 		}
 		if (auto* g = v->find("gpu")) cfg.vo.gpu = g->text();
 		if (auto* p = v->find("over_penalty")) over_penalty = atof(p->text().c_str());
@@ -452,9 +458,9 @@ static void load_config(const std::string& path, Config& cfg) {
 		if (auto* f = e.find("fixed")) for (auto& x : f->a) j.fixed.insert(x.text());
 		for (auto& [k, v] : e.o)
 			if (k != "enabled" && k != "encoder" && k != "codec" && k != "pool" && k != "parallel" && k != "scenarios" && k != "options" && k != "fixed" && k != "prune")
-				fprintf(stderr, "warning: encoder entry key '%s' is not known and is ignored\n", k.c_str());
+				fprintf(stderr, "warning: %sencoder entry key '%s' is not known and is ignored\n", v.where().c_str(), k.c_str());
 		auto* name = e.find("encoder");
-		if (!name) throw std::runtime_error("encoder entry without 'encoder'");
+		if (!name) throw std::runtime_error(e.where() + "encoder entry without 'encoder'");
 		j.encoder = name->text();
 		if (auto* c = e.find("codec")) j.codec = c->text();
 		if (auto* p = e.find("pool")) j.pool = p->text();
@@ -464,9 +470,9 @@ static void load_config(const std::string& path, Config& cfg) {
 			Axis ax{k, {}, {}, {}};
 			const Json* list = &v;
 			if (v.type == Json::Obj) { // { "values": [...], "requires": "other" or ["a", "b"], "unless": "other" or [...] }
-				for (auto& [rk, rv] : v.o) if (rk != "values" && rk != "requires" && rk != "unless") throw std::runtime_error("option '" + k + "' has an unknown key '" + rk + "' (it takes values, requires and unless)");
+				for (auto& [rk, rv] : v.o) if (rk != "values" && rk != "requires" && rk != "unless") throw std::runtime_error(rv.where() + "option '" + k + "' has an unknown key '" + rk + "' (it takes values, requires and unless)");
 				list = v.find("values");
-				if (!list) throw std::runtime_error("option '" + k + "' needs 'values'");
+				if (!list) throw std::runtime_error(v.where() + "option '" + k + "' needs 'values'");
 				for (auto* rule : {&ax.requires_all, &ax.unless_any}) {
 					const Json* conds = v.find(rule == &ax.requires_all ? "requires" : "unless");
 					if (conds) parse_conds(*conds, *rule, k);
@@ -886,6 +892,7 @@ static int run_worker(int argc, char** argv) {
 	}
 	std::vector<WorkerResource> resources;
 	if (target.find(':') == std::string::npos || fs::exists(target)) { // a config file
+		const std::string config_file = target; // target becomes the host it names
 		try {
 			std::ifstream f(target);
 			if (!f) throw std::runtime_error("cannot read '" + target + "'");
@@ -910,7 +917,7 @@ static int run_worker(int argc, char** argv) {
 					if (v.type == Json::Arr) for (auto& r : v.a) one(r); else one(v);
 				}
 			}
-		} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
+		} catch (const std::exception& e) { fprintf(stderr, "error: %s: %s\n", config_file.c_str(), e.what()); return 1; }
 	}
 	if (dir.empty()) dir = "ves-worker";
 	for (auto& [flag, v] : from_file) if (std::find(pass.begin(), pass.end(), flag) == pass.end()) { pass.push_back(flag); pass.push_back(v); }
