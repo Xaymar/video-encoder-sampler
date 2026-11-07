@@ -99,7 +99,7 @@
 		// one, each run's result file is kept next to its stream there, and a run whose result file exists is not repeated). "" / false (or
 		// `--cache off`) turns it off.
 		"cache": "cache",
-		// true / "best": keep only the stream of the winner (best in the most frames, after the overshoot penalty) of each input, encoder, bitrate, key frame interval and size (uploaded once the
+		// true / "best": keep only the stream of the winner (highest rank-weighted mean, after the overshoot penalty) of each input, encoder, bitrate, key frame interval and size (uploaded once the
 		// group is complete; a stream an earlier sweep sent that is beaten now is removed from the site). "all": keep every stream. false: result files only.
 		"videos": "best",
 		// Decode the sources on the GPU when that gives exactly the same frames as software (checked on the first 120 frames):
