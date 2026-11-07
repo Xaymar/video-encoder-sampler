@@ -119,13 +119,21 @@ public:
 	}
 
 	static std::string why(const Reply& r) {
-		if (r.status == 0) return r.error;
+		if (r.status == 0) return r.error.empty() ? std::string("no answer") : r.error;
 		const std::string e = text_of(r.json, "error");
-		return "HTTP " + std::to_string(r.status) + (e.empty() ? "" : ": " + e);
+		return "HTTP " + std::to_string(r.status) + (e.empty() ? (r.body.empty() ? "" : ", body: " + snippet(r.body)) : ": " + e);
+	}
+
+	// The start of a reply body, on one line, for messages about answers that are not what was expected.
+	static std::string snippet(const std::string& body) {
+		std::string s;
+		for (char c : body.substr(0, 300)) s += (c == '\n' || c == '\r' || c == '\t') ? ' ' : c;
+		return body.size() > 300 ? s + "..." : s;
 	}
 
 	// Sends a file in chunks; returns the final reply (status 200 or 201 with "done"), or a reply that says what went wrong.
-	Reply upload_file(const std::string& kind, const std::string& file, const std::string& extra_query, uint64_t chunk, RunProgress* rp, long long base) const {
+	Reply upload_file(const std::string& kind, const std::string& file, const std::string& extra_query, uint64_t chunk, RunProgress* rp, long long base,
+	                  const std::function<void(const std::string&)>& log = nullptr) const {
 		Reply last;
 		std::error_code ec;
 		const uint64_t total = fs::file_size(file, ec);
@@ -147,11 +155,13 @@ public:
 			if (last.status == 409) { // the server holds another amount: continue where it says
 				const uint64_t held = (uint64_t)strtoull(text_of(last.json, "size").c_str(), nullptr, 10);
 				if (held == offset || held > total || ++failures > 3) return last;
+				if (log) log(kind + " chunk at " + std::to_string(offset) + ": the server holds " + std::to_string(held) + " bytes, continuing there");
 				offset = held;
 				continue;
 			}
 			if (last.status == 0 || last.status >= 500) { // a network error or a server hiccup: try the same chunk again
 				if (++failures > 3) return last;
+				if (log) log(kind + " chunk at " + std::to_string(offset) + " failed (" + why(last) + "), trying again (" + std::to_string(failures) + "/3)");
 				continue;
 			}
 			if (last.status != 200 && last.status != 201) return last;
@@ -191,59 +201,73 @@ struct Uploader::Impl {
 	std::thread worker;
 	bool closing = false;
 	std::atomic<bool> disabled{false};                 // the key was refused, the site is out of reach or the account may not upload: the rest is skipped
-	bool announced = false;
-	int scores_new = 0, scores_known = 0, videos_sent = 0, videos_removed = 0, problems = 0, skipped = 0;
+	std::string disabled_why;
+	int scores_new = 0, scores_known = 0, scores_topped = 0, videos_sent = 0, videos_removed = 0, problems = 0, skipped = 0;
 	std::atomic<int> added{0}, handled{0}; // for the count in the live display
 
 	// What /me said, once it has been asked.
 	bool ready = false, may_scores = false, may_videos = false;
 	uint64_t chunk = 0;
 	std::unique_ptr<Site> site;
-	std::map<std::string, int> declined; // what the site said no to, and how often: said once when it first happens, counted at the end
+	std::map<std::string, int> declined; // what the site said no to, and how often, for the summary at the end
 
-	void decline(const std::string& what, const std::string& reason) {
-		if (declined[what + ": " + reason]++ == 0) log("Upload: not sent, " + what + ": " + reason + " (said once, counted at the end)");
+	void decline(const std::string& who, const std::string& what, const std::string& reason) {
+		declined[what + ": " + (reason.empty() ? "(the site gave no reason)" : reason)]++;
+		log(who + what + " not sent: " + (reason.empty() ? "the site gave no reason" : reason));
+	}
+
+	bool give_up(const std::string& why) {
+		log("Upload: " + why + "; nothing will be uploaded in this sweep");
+		disabled_why = why;
+		return false;
 	}
 
 	// Asks the site who we are, once. False when nothing can be uploaded.
 	bool connect() {
 		if (ready) return true;
-		if (options.key.empty()) { log("Upload: no API key (settings.upload.key, --upload-key or the VES_API_KEY environment variable)"); return false; }
-		if (options.url.rfind("https://", 0) != 0 && !(options.url.rfind("http://", 0) == 0 && is_local_host(options.url))) {
-			log("Upload: the address must be https:// (the key is sent with every request)");
-			return false;
-		}
+		log("Upload: connecting to " + options.url + " ...");
+		if (options.key.empty()) return give_up("no API key (upload.key in the config, --upload-key or the VES_API_KEY environment variable)");
+		if (options.url.rfind("https://", 0) != 0 && !(options.url.rfind("http://", 0) == 0 && is_local_host(options.url)))
+			return give_up("the address must be https:// (the key is sent with every request)");
 		static const bool curl_ready = curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK;
-		if (!curl_ready) { log("Upload: cannot start libcurl"); return false; }
+		if (!curl_ready) return give_up("cannot start libcurl");
 		site = std::make_unique<Site>(options);
 		const Reply me = site->request(false, "/api/v1/me", nullptr, nullptr, 0, 60);
-		if (me.status == 401) { log("Upload: the site refused the API key (it was replaced or mistyped)"); return false; }
-		if (me.status != 200) { log("Upload: cannot reach the site (" + Site::why(me) + ")"); return false; }
+		if (me.status == 401) return give_up("the site refused the API key (it was replaced or mistyped)");
+		if (me.status != 200) return give_up("cannot reach the site (" + Site::why(me) + ")");
 		const Json* can = me.json.find("can");
-		may_scores = can && flag_of(*can, "upload_scores");
-		may_videos = can && flag_of(*can, "upload_videos");
+		if (!can) return give_up("the site's answer to /api/v1/me is not what this version expects (" + Site::snippet(me.body) + ")");
+		may_scores = flag_of(*can, "upload_scores");
+		may_videos = flag_of(*can, "upload_videos");
 		chunk = std::max<uint64_t>(64 << 10, (uint64_t)strtoull(text_of(me.json, "chunk_bytes").c_str(), nullptr, 10));
-		if (!may_scores && !(may_videos && options.videos)) { log("Upload: this account may not upload anything"); return false; }
-		log("Upload: sending results to " + options.url + (may_videos && options.videos ? " (with videos)" : ""));
+		const std::string user = text_of(me.json, "nickname");
+		log("Upload: signed in" + (user.empty() ? std::string() : " as " + user) + "; this account may upload scores: " + (may_scores ? "yes" : "no") +
+		    ", videos: " + (may_videos ? "yes" : "no") + (options.videos ? "" : " (videos are off in the config)"));
+		if (!may_scores && !(may_videos && options.videos)) return give_up("this account may not upload anything");
+		log("Upload: sending results to " + options.url + (may_videos && options.videos ? " (with videos)" : "") + " as the runs finish");
 		return ready = true;
 	}
 
 	void process(const UploadItem& item) {
 		const std::string who = "Upload " + item.label + ": ";
 		try {
-			const Json result = Json::parse(read_text(item.result_file));
+			const std::string text = read_text(item.result_file);
+			if (text.empty()) throw std::runtime_error("cannot read the result file " + item.result_file);
+			const Json result = Json::parse(text);
 			const Json* k = result.find("key");
-			if (!k || k->type != Json::Str) throw std::runtime_error("the result file has no key");
+			if (!k || k->type != Json::Str) throw std::runtime_error("the result file has no key (" + item.result_file + ")");
 			std::string video_hash = text_of(result, "video_sha256"), reference_hash = text_of(result, "reference_sha256");
 			if (item.drop_video) { // a stream this tool does not keep any more: if the site has it, it goes
-				if (!options.videos || video_hash.empty()) return;
+				if (!options.videos) { log(who + "superseded video left alone (videos are off)"); return; }
+				if (video_hash.empty()) { log(who + "superseded video left alone (the result has no video_sha256)"); return; }
 				const std::string b = "{\"key_sha256\":\"" + sha256_bytes(k->s) + "\",\"video_sha256\":\"" + video_hash + "\"}";
 				const Reply check = site->request(true, "/api/v1/check", "application/json", b.data(), b.size(), 120);
-				const Json* v = check.status == 200 ? check.json.find("video") : nullptr;
+				if (check.status != 200) { log(who + "check for a superseded video failed (" + Site::why(check) + ")"); problems++; return; }
+				const Json* v = check.json.find("video");
 				const std::string run = v && text_of(*v, "status") == "exists" ? text_of(*v, "run") : std::string();
-				if (run.empty()) return;
+				if (run.empty()) { log(who + "superseded video is not on the site, nothing to remove"); return; }
 				const Reply del = site->request(false, "/api/v1/run/" + run + "/video", nullptr, nullptr, 0, 120, nullptr, "DELETE");
-				if (del.status == 200) { videos_removed++; if (!ui::live()) log(who + "video removed from the site, a better one was found"); }
+				if (del.status == 200) { videos_removed++; log(who + "video removed from the site, a better one was found"); }
 				else { log(who + "its video could not be removed from the site (" + Site::why(del) + ")"); problems++; }
 				return;
 			}
@@ -251,6 +275,7 @@ struct Uploader::Impl {
 			std::error_code ec;
 			const bool with_video = options.videos && may_videos && !item.video_file.empty() && !video_hash.empty() && fs::exists(item.video_file, ec);
 			if (with_video) video_size = fs::file_size(item.video_file, ec);
+			if (reference_hash.empty()) log(who + "the result file has no reference_sha256 (its input could not be hashed); the site will not take a new score without it");
 
 			std::string body = "{\"key_sha256\":\"" + sha256_bytes(k->s) + "\"";
 			if (!reference_hash.empty()) body += ",\"reference_sha256\":\"" + reference_hash + "\""; // the site wants it for the score as well
@@ -262,10 +287,11 @@ struct Uploader::Impl {
 			if (check.status != 200) { log(who + "check failed (" + Site::why(check) + ")"); problems++; return; }
 			const Json* score = check.json.find("score");
 			const Json* video = check.json.find("video");
+			if (!score) { log(who + "the site's answer to the check is not what this version expects (" + Site::snippet(check.body) + ")"); problems++; return; }
 			std::string run = video ? text_of(*video, "run") : std::string();
 			std::string done;
 
-			const bool send_score = score && flag_of(*score, "can_upload") && may_scores;
+			const bool send_score = flag_of(*score, "can_upload") && may_scores;
 			const bool send_video = with_video && video && flag_of(*video, "can_upload") && (send_score || !run.empty());
 			const long long score_bytes = send_score ? (long long)fs::file_size(item.result_file, ec) : 0;
 			RunProgress rp; // shown in the live display while the files go out
@@ -275,39 +301,49 @@ struct Uploader::Impl {
 				handle = ui::attach(&rp, item.label, "server");
 			}
 			struct Detach { RunProgress& rp; int handle; ~Detach() { if (handle) { rp.finish(); ui::detach(handle); } } } detach{rp, handle};
+			auto chunk_log = [&](const std::string& line) { log(who + line); };
 
 			if (send_score) {
-				const Reply up = site->upload_file("score", item.result_file, "", chunk, &rp, 0);
+				const Reply up = site->upload_file("score", item.result_file, "", chunk, &rp, 0, chunk_log);
 				if (up.status == 200 || up.status == 201) {
 					run = text_of(up.json, "uuid");
-					(flag_of(up.json, "new") ? scores_new : scores_known)++;
-					done = flag_of(up.json, "ceiling_added") ? "stored score topped up (ceiling or more models)" : "score stored";
+					const std::string note = text_of(up.json, "note"); // newer sites say what they did with it
+					if (flag_of(up.json, "new")) { scores_new++; done = "score stored (new)"; }
+					else if (flag_of(up.json, "ceiling_added")) { scores_topped++; done = "stored score topped up (ceiling or more models)"; }
+					else { scores_known++; done = "score sent, but the site kept what it had"; }
+					if (!note.empty()) done += ": " + note;
 				} else { log(who + "the score was refused (" + Site::why(up) + ")"); problems++; return; }
-			} else if (score && text_of(*score, "status") == "exists") {
+			} else if (text_of(*score, "status") == "exists") {
 				if (!item.late) scores_known++;
-				done = "score already there";
-			} else if (score && !send_score) decline("score", may_scores ? text_of(*score, "reason") : "this account may not upload scores");
+				const std::string reason = text_of(*score, "reason");
+				done = "score already on the site" + (reason.empty() ? std::string() : " (" + reason + ")");
+			} else if (!may_scores) decline(who, "score", "this account may not upload scores");
+			else decline(who, "score", text_of(*score, "reason"));
 
-			if (video && with_video) {
-				const std::string status = text_of(*video, "status");
-				if (flag_of(*video, "can_upload") && !run.empty()) {
-					const Reply up = site->upload_file("video", item.video_file, "&run=" + run + "&name=" + escape(fs::path(item.video_file).filename().string()), chunk, &rp, score_bytes);
+			if (with_video) {
+				const std::string status = video ? text_of(*video, "status") : std::string();
+				if (send_video) {
+					const Reply up = site->upload_file("video", item.video_file, "&run=" + run + "&name=" + escape(fs::path(item.video_file).filename().string()), chunk, &rp, score_bytes, chunk_log);
 					if (up.status == 200 || up.status == 201) { videos_sent++; done += ", video stored"; }
 					else { log(who + "the video was refused (" + Site::why(up) + ")"); problems++; }
 				} else if (status == "exists") done += ", video already there";
+				else if (video && flag_of(*video, "can_upload")) done += ", no video: the score is not on the site";
 				else {
-					const std::string reason = text_of(*video, "reason");
-					if (!reason.empty()) { done += ", no video: " + reason; decline("video", reason); }
+					const std::string reason = video ? text_of(*video, "reason") : std::string("the site said nothing about the video");
+					done += ", no video";
+					decline(who, "video", reason);
 				}
-			}
-			if (!done.empty() && !ui::live()) log(who + done); // the live display shows what is going out; plain output says what happened to each
+			} else if (options.videos && may_videos && !item.video_file.empty()) done += video_hash.empty() ? ", no video: the result has no video_sha256" : ", no video: " + item.video_file + " is gone";
+			if (!done.empty()) log(who + done);
 		} catch (const std::exception& e) {
-			log(who + e.what());
+			log(who + "failed: " + e.what());
 			problems++;
 		}
 	}
 
 	void run() {
+		// Signs in right away, so a wrong key or an unreachable site shows when the sweep starts, not when its first run is through.
+		if (!connect()) disabled = true;
 		for (;;) {
 			UploadItem item;
 			{
@@ -317,8 +353,7 @@ struct Uploader::Impl {
 				item = std::move(queue.front());
 				queue.pop_front();
 			}
-			if (disabled) skipped++;
-			else if (!connect()) { disabled = true; skipped++; }
+			if (disabled) { if (skipped++ == 0) log("Upload " + item.label + ": skipped, and so is every later one (" + disabled_why + ")"); }
 			else process(item);
 			ui::uploads(++handled, added);
 		}
@@ -346,8 +381,13 @@ void Uploader::finish() {
 	if (waiting && !impl->disabled) impl->log("Upload: " + std::to_string(waiting) + " still to send");
 	impl->cv.notify_all();
 	impl->worker.join();
-	if (!impl->ready) return; // said why in connect(), or nothing was ever queued
-	impl->log("Upload finished: " + std::to_string(impl->scores_new) + " new scores, " + std::to_string(impl->scores_known) + " already known, " + std::to_string(impl->videos_sent) + " videos" + (impl->videos_removed ? ", " + std::to_string(impl->videos_removed) + " superseded videos removed" : "") +
+	if (!impl->ready) {
+		impl->log("Upload finished: nothing sent (" + (impl->disabled_why.empty() ? std::string("not signed in") : impl->disabled_why) + "), " + std::to_string(impl->skipped) + " results skipped");
+		return;
+	}
+	if (impl->added == 0) { impl->log("Upload finished: no results were handed to the uploader (no run of this sweep finished with a result)"); return; }
+	impl->log("Upload finished: " + std::to_string(impl->added) + " handed over, " + std::to_string(impl->scores_new) + " new scores, " + std::to_string(impl->scores_topped) + " topped up, " +
+	          std::to_string(impl->scores_known) + " already known, " + std::to_string(impl->videos_sent) + " videos" + (impl->videos_removed ? ", " + std::to_string(impl->videos_removed) + " superseded videos removed" : "") +
 	          (impl->problems ? ", " + std::to_string(impl->problems) + " problems (they are tried again next time)" : ""));
 	for (auto& [what, n] : impl->declined) impl->log("Upload: " + std::to_string(n) + " not sent, " + what);
 }

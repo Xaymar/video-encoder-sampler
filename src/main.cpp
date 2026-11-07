@@ -1466,7 +1466,9 @@ int main(int argc, char** argv) {
 	// Results go out as the runs are scored, from a thread of their own. Runs whose streams are identical to one already sent are one result (see below).
 	std::unique_ptr<Uploader> uploader;
 	std::set<std::string> sent_streams;
-	if (!cfg.upload.url.empty() && !cfg.output_dir.empty()) {
+	if (cfg.upload.url.empty()) ui::log("Upload: off (no \"upload\": {\"url\": ...} in the config and no --upload)");
+	else if (cfg.output_dir.empty()) ui::log("Upload: off, there is no output folder (\"output\" in the config or --output); results are only kept in the cache");
+	else {
 		UploadOptions up = cfg.upload;
 		if (up.key.empty()) if (const char* k = getenv("VES_API_KEY")) up.key = k;
 		uploader = std::make_unique<Uploader>(up, [](const std::string& line) { ui::log(line); });
@@ -1494,7 +1496,10 @@ int main(int argc, char** argv) {
 		if (const auto d = vs_ceiling(r); !d.empty()) { const FrameStats st = frame_stats(d); snprintf(rel, sizeof rel, ", vs ceiling mean %.3f p5 %.3f", st.mean, st.p5); }
 		if (!t.result_file.empty() && (!r.cached || r.imported || r.ceiling_new)) store_result(t, t.result_file, cached_of(r), run_details(t));
 		r.detail = VmafDetail{}; // in the result file now; nothing else reads it, and a sweep holds many runs
-		if (uploader && !r.result.empty() && !r.uploaded && (r.video_sha256.empty() || sent_streams.insert(r.group + "|" + r.video_sha256).second)) {
+		if (uploader && r.result.empty()) ui::log("Upload " + r.label + ": not sent, the run has no result file in the output folder");
+		else if (uploader && !r.uploaded && !r.video_sha256.empty() && !sent_streams.insert(r.group + "|" + r.video_sha256).second)
+			ui::log("Upload " + r.label + ": not sent, its stream is identical to one of its group that was sent already");
+		else if (uploader && !r.uploaded) {
 			UploadItem it;
 			it.result_file = (fs::path(cfg.output_dir) / r.result).string();
 			it.label = r.label;
@@ -1701,10 +1706,10 @@ int main(int argc, char** argv) {
 		const size_t stored = remote->run_jobs(jobs, [&](size_t n, const std::string& file) {
 			ui::overall((int)(already + n), total);
 			auto it = by_file.find(file);
-			if (it == by_file.end()) return;
+			if (it == by_file.end()) { ui::log("remote: a worker's result " + file + " belongs to no run of this sweep; it is not used or uploaded"); return; }
 			Task& t = *it->second;
 			CachedRun hit;
-			if (!result_load(file, t.key(), hit)) return;
+			if (!result_load(file, t.key(), hit)) { ui::log("remote: the worker's result for " + t.r.label + " cannot be read back (" + file + "); it is not uploaded now"); return; }
 			t.r.kbps = hit.kbps; t.r.scores = std::move(hit.scores); t.r.detail = std::move(hit.detail);
 			if (!hit.ceiling.empty()) t.r.ceiling = std::make_shared<const std::vector<double>>(std::move(hit.ceiling));
 			store_result(t, file, cached_of(t.r), run_details(t));

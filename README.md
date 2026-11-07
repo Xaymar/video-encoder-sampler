@@ -33,7 +33,7 @@ ves --help
 
 ### Uploading results
 
-Make an API key on the website (*Account → API key*), then set `"upload": {"url": "https://...", "key": "ves_..."}` in the config (or `--upload <url>` and the `VES_API_KEY` environment variable). Each run is uploaded right after it is scored, with its video where the site allows it; runs the site already has are skipped, and a failed upload never fails the sweep.
+Make an API key on the website (*Account → API key*), then set `"upload": {"url": "https://...", "key": "ves_..."}` in the config (or `--upload <url>` and the `VES_API_KEY` environment variable). Each run is uploaded right after it is scored, with its video where the site allows it; runs the site already has are skipped, and a failed upload never fails the sweep. The sweep says at its start whether uploading is on and whether the site took the key, and prints one `Upload <run>: ...` line per result with what the site did with it (or why it was not sent).
 
 ## Building
 
