@@ -16,12 +16,17 @@ public:
 	bool send_msg(uint8_t type, const std::string& payload); // false once the connection is lost
 	bool recv_msg(uint8_t& type, std::string& payload);      // false once the connection is lost or the message is implausibly large
 	void close();
+	void shutdown();                                         // ends the connection for every thread that waits in send_msg or recv_msg, which then return false
+	// A send_msg or recv_msg that makes no progress for `ms` fails (and the connection is lost); timed_out() says whether that is why the connection was lost.
+	void set_timeout(int ms);
+	bool timed_out() const { return timeout_hit; }
 	std::string peer;                                        // "address:port" of the other side
 
 private:
 	bool send_all(const void* data, size_t size);
 	bool recv_all(void* data, size_t size);
 	intptr_t fd;
+	bool timeout_hit = false;
 };
 
 // A connection to host:port; nullptr (and `err`) if there is none.
