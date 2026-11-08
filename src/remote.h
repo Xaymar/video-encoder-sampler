@@ -63,6 +63,10 @@ std::string executable_path();
 // Ends this process at once, after flushing stdout and stderr: nothing is wound down, not even the loaded DLLs (for `ves --probe-amf`, see probe_amf).
 [[noreturn]] void exit_now(int code);
 
+// A crash ends this process at once, with the code of the exception (Windows): no error report is made first and no dialog waits for anyone. Windows Error Reporting
+// otherwise keeps a crashed process alive, its threads stopped, while it writes its report, and the process that waits for it sees neither an answer nor an end.
+void end_crashes_at_once();
+
 // The option line of a run's key without the GPU index: what tells the runs of one job apart on the host and on the worker that runs them.
 std::string run_options_of(const std::string& key);
 

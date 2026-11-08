@@ -50,7 +50,18 @@ std::vector<std::string> process_args;
 // ends are the same program on the same machine.
 //   to the encoder process:   'W' a wave (input, source, scaling and VMAF options, the runs)   'S' supports (codec, chroma, depth)   'K' capabilities (codec)
 //   from it:                  'P' the wave's progress rows (as ui::snapshot_json)   'w' the wave's results   's' supports (1/0)   'k' capabilities (JSON)
+//                             'H' (id 0, empty) every kBeatMs, whatever else it does: it is still there
 constexpr size_t HEADER = 9;
+
+// A process that is asked something and says nothing at all for kSilentMs has stopped (a crash that something holds on to, or a hang of the whole process); one whose
+// wave moves no frame anywhere for kStallMs has hung in a driver or library; one that does not answer a question in kQuestionMs will not. Each is ended, and its runs
+// fail as in a crash (and are run again on their own).
+#ifndef VES_WATCHDOG_TEST
+constexpr int64_t kBeatMs = 2000, kSilentMs = 30000, kStallMs = 300000, kQuestionMs = 120000;
+#else
+constexpr int64_t kBeatMs = 200, kSilentMs = 2000, kStallMs = 3000, kQuestionMs = 2000; // the test of the watchdog
+#endif
+int64_t clock_ms() { return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 struct Writer {
 	std::string s;
@@ -350,6 +361,7 @@ struct Waiter {
 	virtual ~Waiter() = default;
 	virtual void on_message(uint8_t type, Reader& r) = 0;
 	virtual void on_death() = 0;
+	virtual std::string stuck(int64_t now) const = 0; // why it waits in vain, or nothing
 	virtual bool counts() const { return false; } // runs that fail when the process dies
 	virtual size_t count() const { return 0; }    // how many
 };
@@ -365,6 +377,9 @@ struct Device {
 	std::map<uint32_t, Waiter*> waiters;
 	uint32_t next_id = 1;
 	std::thread reader, errors;
+	std::atomic<int64_t> last_heard{0};
+	bool given_up = false; // by the watchdog: ended, its runs failed; the threads end when the process is gone
+	std::string given_up_why;
 	// The last lines the process printed, numbered, so that a wave can tell which came while it ran: they are why its runs failed.
 	std::mutex lines_m;
 	std::deque<std::string> lines;
@@ -398,6 +413,7 @@ struct Device {
 		}
 		if (!proc.start(executable_path(), args)) return false;
 		alive = true;
+		last_heard = clock_ms();
 		ui::log_plain("Encoder process for " + name + " started (pid " + std::to_string(proc.pid) + ")");
 		reader = std::thread([this] { read_loop(); });
 		errors = std::thread([this] { error_loop(); });
@@ -413,6 +429,8 @@ struct Device {
 			memcpy(&id, head.data() + 5, 4);
 			body.resize(size);
 			if (size && !proc.read(body.data(), size)) break;
+			last_heard = clock_ms();
+			if (head[4] == 'H') continue;
 			std::lock_guard lock(m);
 			auto it = waiters.find(id);
 			if (it == waiters.end()) continue; // for an encoder that was closed already
@@ -463,18 +481,34 @@ struct Device {
 		line_count++;
 	}
 
+	// Ends the process because it waits in vain (the watchdog's call, with the lock held): what waits for it fails now, not when the process is gone, which
+	// a process stuck in a driver may never be.
+	void give_up(const std::string& why) {
+		size_t runs = 0;
+		for (auto& [id, w] : waiters) { if (w->counts()) runs += w->count(); w->on_death(); }
+		alive = false;
+		stopping = true; // the end that follows is this one, not a crash of its own
+		given_up = true;
+		given_up_why = why;
+		std::string what = "The encoder process for " + name + " (pid " + std::to_string(proc.pid) + ") " + why + ": ended";
+		if (runs) what += "; the " + std::to_string(runs) + (runs == 1 ? " run" : " runs") + " in it failed";
+		ui::log(what + "; the next run starts a new one");
+		proc.kill();
+	}
+
 	void stop() {
 		{
 			std::lock_guard lock(m);
 			stopping = true;
 		}
 		proc.close_input(); // the process ends when its input does
+		bool done;
 		{
 			std::unique_lock lock(m);
 			if (!ended_cv.wait_for(lock, std::chrono::seconds(5), [&] { return ended; })) proc.kill();
+			done = ended_cv.wait_for(lock, std::chrono::seconds(5), [&] { return ended; });
 		}
-		if (reader.joinable()) reader.join();
-		if (errors.joinable()) errors.join();
+		if (done) reap(); else abandon();
 	}
 
 	// A process that ended is cleaned up before it is replaced.
@@ -482,10 +516,45 @@ struct Device {
 		if (reader.joinable()) reader.join();
 		if (errors.joinable()) errors.join();
 	}
+	// One that does not end even when killed (stuck in a driver) is left to itself: its threads go on without anyone waiting for them, and so must this object.
+	void abandon();
 };
+
+std::mutex abandoned_m;
+std::vector<std::shared_ptr<Device>>* abandoned = new std::vector<std::shared_ptr<Device>>; // never freed: their threads may still use them
+void Device::abandon() {
+	if (reader.joinable()) reader.detach();
+	if (errors.joinable()) errors.detach();
+}
 
 std::mutex devices_m;
 std::map<std::string, std::shared_ptr<Device>> devices;
+
+// Looks at every process once a second: one that is waited for and stuck is given up on (see kSilentMs).
+void start_watchdog() {
+	static std::once_flag once;
+	std::call_once(once, [] {
+		std::thread([] {
+			for (;;) {
+				std::this_thread::sleep_for(std::chrono::seconds(1));
+				std::vector<std::shared_ptr<Device>> all;
+				{
+					std::lock_guard lock(devices_m);
+					for (auto& [key, d] : devices) if (d) all.push_back(d);
+				}
+				const int64_t now = clock_ms();
+				for (auto& d : all) {
+					std::lock_guard lock(d->m);
+					if (!d->alive || d->stopping || d->waiters.empty()) continue;
+					std::string why;
+					if (now - d->last_heard > kSilentMs) why = "said nothing for " + std::to_string(kSilentMs / 1000) + " s (hung, or crashed and held)";
+					for (auto it = d->waiters.begin(); why.empty() && it != d->waiters.end(); ++it) why = it->second->stuck(now);
+					if (!why.empty()) d->give_up(why);
+				}
+			}
+		}).detach();
+	});
+}
 
 // The process of a GPU (or CPU encoder), started when it is not running.
 std::shared_ptr<Device> device_for(const std::string& encoder, int gpu) {
@@ -493,15 +562,23 @@ std::shared_ptr<Device> device_for(const std::string& encoder, int gpu) {
 	const std::string key = on_gpu ? encoder + ":" + std::to_string(gpu) : "cpu"; // the CPU encoders share one process, and with it one decode of the input
 	std::lock_guard lock(devices_m);
 	auto& d = devices[key];
+	bool finished = true;
 	if (d) {
 		std::lock_guard dl(d->m);
 		if (d->alive) return d;
+		finished = d->ended;
 	}
-	if (d) d->reap();
+	if (d && finished) d->reap();
+	else if (d) { // given up on and not gone yet: its threads keep it
+		d->abandon();
+		std::lock_guard al(abandoned_m);
+		abandoned->push_back(d);
+	}
 	auto fresh = std::make_shared<Device>();
 	fresh->encoder = on_gpu ? encoder : "cpu";
 	fresh->gpu = on_gpu ? gpu : 0;
 	fresh->name = on_gpu ? encoder + " GPU " + std::to_string(gpu) : "CPU encoders";
+	start_watchdog();
 	if (!fresh->start()) {
 		ui::log("cannot start the encoder process for " + fresh->name);
 		d = nullptr;
@@ -519,11 +596,23 @@ struct WaveWait : Waiter {
 	bool done = false, dead = false;
 	std::string result;
 	size_t runs = 0;
+	long long moved = -1;              // frames done in all of its rows, and runs finished
+	int64_t last_move = clock_ms();
 	void on_message(uint8_t type, Reader& r) override {
-		if (type == 'P') { ui::set_remote(key, "", ui::parse_progress(r.rest())); return; }
+		if (type == 'P') {
+			const auto rows = ui::parse_progress(r.rest());
+			long long sum = 0;
+			for (auto& p : rows) sum += p.done + (p.finished ? 1 : 0);
+			if (sum != moved) { moved = sum; last_move = clock_ms(); }
+			ui::set_remote(key, "", rows);
+			return;
+		}
 		if (type == 'w') { result = r.rest(); done = true; cv.notify_all(); }
 	}
 	void on_death() override { dead = true; cv.notify_all(); }
+	std::string stuck(int64_t now) const override {
+		return !done && now - last_move > kStallMs ? "moved no frame for " + std::to_string(kStallMs / 1000) + " s (hung)" : std::string();
+	}
 	bool counts() const override { return true; }
 	size_t count() const override { return runs; }
 };
@@ -542,8 +631,12 @@ struct Question : Waiter {
 	std::condition_variable cv;
 	bool answered = false, dead = false;
 	std::string answer;
+	int64_t asked = clock_ms();
 	void on_message(uint8_t, Reader& r) override { answer = r.rest(); answered = true; cv.notify_all(); }
 	void on_death() override { dead = true; cv.notify_all(); }
+	std::string stuck(int64_t now) const override {
+		return !answered && now - asked > kQuestionMs ? "did not answer a question about the encoder in " + std::to_string(kQuestionMs / 1000) + " s (hung)" : std::string();
+	}
 };
 
 // Asks the process of a GPU; a process that dies on the question gets a second chance in a new process. False: no answer.
@@ -801,7 +894,12 @@ bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vect
 			return s.empty() ? fallback : s;
 		};
 		auto fail_all = [&](bool crashed) {
-			const std::string error = why(!dev ? "its encoder process did not start" : crashed ? "its encoder process ended" : "its encoder process sent a garbled answer");
+			std::string error = why(!dev ? "its encoder process did not start" : crashed ? "its encoder process ended" : "its encoder process sent a garbled answer");
+			if (dev && crashed) { // the watchdog's reason first, then what the process said last
+				const std::string said = dev->lines_since(first_line);
+				std::lock_guard lock(dev->m);
+				if (dev->given_up) error = "its encoder process " + dev->given_up_why + " and was ended" + (said.empty() ? "" : ": " + said);
+			}
 			for (WaveRun* run : part) {
 				run->enc.ok = false;
 				run->enc.crashed = crashed;
@@ -946,7 +1044,6 @@ int encoder_process_main(int argc, char** argv) {
 	}
 	process_vendor = encoder_vendor(encoder); // the GPU that encodes; decoding, scaling and scoring go to the fastest GPU unless told otherwise
 	process_gpu = gpu;
-	pick_decode_gpu();
 	// The messages travel on stdin and stdout; whatever a library prints goes to stderr, where it cannot get in their way.
 #ifdef _WIN32
 	// Copies of their own: the C runtime's stdout owns the original handle and closes it below, and the next handle Windows makes (the copy of stderr) can get the
@@ -963,6 +1060,8 @@ int encoder_process_main(int argc, char** argv) {
 	if (null >= 0) { dup2(null, 0); ::close(null); }
 #endif
 	setvbuf(stderr, nullptr, _IONBF, 0);
+	std::thread([] { for (;;) { reply('H', 0, std::string()); std::this_thread::sleep_for(std::chrono::milliseconds(kBeatMs)); } }).detach(); // still here
+	pick_decode_gpu();
 	if (encoder == "amf") amf_dedicate_process(gpu);
 
 	std::string head(HEADER, '\0'), body;

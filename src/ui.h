@@ -53,6 +53,7 @@ void detach(int handle);
 
 void log(const std::string& line);             // a permanent line
 void log_plain(const std::string& line);       // only in plain mode: detail the live area already shows
+bool open_log(const std::string& path, const std::string& first_line, std::string& err); // --log: every line of log() and log_plain() also goes to this file (appended to), with the date and time
 void overall(int done, int total);             // runs finished out of all of them
 void uploads(int sent, int queued);            // uploads handled out of all queued so far
 long long peak_memory_mb();                    // largest working set of this process so far

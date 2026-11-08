@@ -96,6 +96,7 @@ struct Config {
 	bool best_videos = true; // keep only the stream of the best run so far of each group
 	UploadOptions upload; // where the results go after a sweep; no address: nowhere
 	bool plain = false; // no live display, just lines
+	std::string log_file; // --log: the lines also go to this file, with the date and time
 	std::string hw_decode = "auto"; // "" software only, "auto", or a device type or decoder name: see set_hw_decode()
 	int decode_threads = 0;  // 0: as many as the cores allow within a memory budget
 	// Where the encoder processes decode and scale (vmaf.gpu says where they score): "" or "auto" the fastest GPU, "own" the GPU that encodes, a Vulkan index or a
@@ -422,6 +423,7 @@ static void load_config_json(const Json& root, Config& cfg) {
 		if (auto* g = root.find("settings")) if (auto* v = g->find(k)) return v;
 		return root.find(k);
 	};
+	if (auto* v = setting("log")) cfg.log_file = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "ves.log" : "") : v->text();
 	if (auto* v = setting("cache")) cfg.cache_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "cache" : "") : v->text();
 	if (auto* v = root.find("output")) cfg.output_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "output" : "") : v->text();
 	if (auto* v = setting("hw_decode")) cfg.hw_decode = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "auto" : "") : v->text();
@@ -535,6 +537,8 @@ Paths
         --decode-threads <n> threads per decoder (default: all cores; 4 with --low-memory)
         --low-memory        score each wave before the next is encoded and use fewer VMAF threads: slower, takes much less memory
         --plain             plain lines instead of the live display (also used when stdout is not a terminal)
+        --log <file>        every line also goes to this file, with the date and time (appended to; "log" in the config's settings; a worker takes it
+                            too, and "log" in its config)
         --in-process        run everything inside ves itself. By default every GPU gets a process of its own that decodes, encodes and scores its runs
                             on that GPU (the CPU encoders share one), so a driver or library that crashes fails only the runs that were in that process, and
                             the sweep goes on ("encoder_processes": false in the config)
@@ -633,7 +637,7 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	std::string config_path = default_config();
 	std::vector<std::string> inputs, bitrates, res, fps, kfs;
-	std::optional<std::string> output, cache, model, upload_url, upload_key;
+	std::optional<std::string> output, cache, log_path, model, upload_url, upload_key;
 	std::optional<int> threads;
 	std::optional<double> penalty;
 	std::optional<std::string> vmaf_device, vmaf_gpu;
@@ -664,6 +668,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--upload-key") upload_key = value();
 		else if (a == "--no-upload-videos") upload_videos = false;
 		else if (a == "--plain") cfg.plain = true;
+		else if (a == "--log") log_path = value();
 		else if (a == "--low-memory") cfg.low_memory = true;
 		else if (a == "--in-process") cfg.in_process = true;
 		else if (a == "--host") cfg.host_port = atoi(value().c_str());
@@ -736,6 +741,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	if (upload_key) cfg.upload.key = *upload_key;
 	cfg.upload.videos = cfg.upload.videos && upload_videos;
 	if (cache) cfg.cache_dir = *cache == "off" ? "" : *cache;
+	if (log_path) cfg.log_file = *log_path == "off" ? "" : *log_path;
 	if (model) set_models(cfg.vo, *model);
 	if (only_set) { cfg.only_runs_set = true; cfg.only_runs = only_lines; }
 	if (short_names) cfg.short_names = true;
@@ -891,7 +897,7 @@ static int run_worker(int argc, char** argv) {
 		{"vmaf_gpu", "--vmaf-gpu"}, {"vmaf_device", "--vmaf-device"}, {"hw_decode", "--hw-decode"}, {"decode_gpu", "--decode-gpu"}, {"scaling_gpu", "--scaling-gpu"}, {"decode_threads", "--decode-threads"}, {"priority", "--priority"}};
 	std::vector<std::pair<std::string, std::string>> from_file; // flag, value
 	int only_gpu = -1, default_parallel = 0;
-	std::string target, dir, token = getenv("VES_TOKEN") ? getenv("VES_TOKEN") : "";
+	std::string target, dir, log_path, token = getenv("VES_TOKEN") ? getenv("VES_TOKEN") : "";
 	bool dir_given = false, token_given = false;
 	std::vector<std::string> pass;
 	for (int i = 1; i < argc; i++) {
@@ -903,6 +909,7 @@ static int run_worker(int argc, char** argv) {
 			else if (a == "--worker-gpu") only_gpu = atoi(value().c_str());
 			else if (a == "--worker-jobs") default_parallel = std::max(1, atoi(value().c_str()));
 			else if (a == "--token") { token = value(); token_given = true; }
+			else if (a == "--log") log_path = value(); // the worker's own: the lines of its jobs are in it, and a job writing to it too would write them twice
 			else pass.push_back(a);
 		} catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); return 1; }
 	}
@@ -917,6 +924,7 @@ static int run_worker(int argc, char** argv) {
 			if (auto* v = root.find("host")) target = v->text(); else throw std::runtime_error("the worker config needs a \"host\" (host:port)");
 			if (auto* v = root.find("token"); v && !token_given) token = v->text();
 			if (auto* v = root.find("dir"); v && !dir_given) { dir = v->text(); dir_given = true; }
+			if (auto* v = root.find("log"); v && log_path.empty()) log_path = v->text();
 			if (auto* v = root.find("gpu"); v && only_gpu < 0) only_gpu = atoi(v->text().c_str());
 			for (auto& [key, flag] : run_settings) if (auto* v = root.find(key)) from_file.push_back({flag, v->text()});
 			if (auto* v = root.find("vmaf")) { // "vmaf": { "device": ..., "gpu": ... }, as in a sweep config
@@ -955,6 +963,10 @@ static int run_worker(int argc, char** argv) {
 	for (auto& [flag, v] : from_file) if (std::find(pass.begin(), pass.end(), flag) == pass.end()) { pass.push_back(flag); pass.push_back(v); }
 	const size_t colon = target.rfind(':');
 	if (colon == std::string::npos) { fprintf(stderr, "error: --worker takes host:port or a config file\n"); return 1; }
+	if (!log_path.empty() && log_path != "off") {
+		std::string why;
+		if (!ui::open_log(log_path, std::string("ves ") + VERSION + " worker started", why)) { fprintf(stderr, "error: %s\n", why.c_str()); return 1; }
+	}
 	// The worker has the same display as a sweep: its log lines above, and the rows of the jobs it runs. --plain turns it off.
 	ui::start(std::find(pass.begin(), pass.end(), "--plain") != pass.end());
 	return remote_worker(target.substr(0, colon), atoi(target.c_str() + colon + 1), token, dir, only_gpu, default_parallel, resources, pass, [](const std::string& line) { ui::log(line); });
@@ -962,6 +974,7 @@ static int run_worker(int argc, char** argv) {
 
 int main(int argc, char** argv) {
 	ui::end_on_interrupt();
+	end_crashes_at_once();
 #if defined(_WIN32) && defined(_DEBUG)
 	// A failed assertion of the debug runtime goes to stderr and aborts, instead of opening a dialog that offers to start a debugger.
 	_set_error_mode(_OUT_TO_STDERR);
@@ -1026,6 +1039,10 @@ int main(int argc, char** argv) {
 	}
 	set_hw_decode(cfg.in_process ? cfg.hw_decode : "");
 	set_decode_threads(cfg.decode_threads > 0 ? cfg.decode_threads : cfg.low_memory ? 4 : 0);
+	if (!cfg.log_file.empty()) {
+		std::string why;
+		if (!ui::open_log(cfg.log_file, std::string("ves ") + VERSION + " started", why)) { fprintf(stderr, "error: %s\n", why.c_str()); return 1; }
+	}
 	ui::start(cfg.plain);
 	struct UiGuard { ~UiGuard() { ui::stop(); } } ui_guard; // the live display is cleared on every way out
 	struct EncoderProcesses { ~EncoderProcesses() { stop_encoder_processes(); } } encoder_processes; // ended before the live display is, so that what they say still shows

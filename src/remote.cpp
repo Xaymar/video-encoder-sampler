@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
@@ -44,6 +45,7 @@ constexpr int kVersion = 4;
 // the connection: the host gives that worker's jobs to the others, the worker stops them and connects again.
 constexpr int kPingEvery = 10;      // seconds
 constexpr int kSilenceMs = 60000;
+constexpr int kJobSilenceMs = 120000; // a job's `ves` that prints nothing for this long is ended
 constexpr size_t kChunk = 1 << 20;
 constexpr int kTries = 3;
 
@@ -284,7 +286,9 @@ struct RemoteHost::Impl {
 		std::atomic<bool> dead{false};
 		auto send = [&](uint8_t t, const std::string& p) {
 			std::lock_guard lock(send_m);
-			return conn->send_msg(t, p);
+			if (conn->send_msg(t, p)) return true;
+			conn->shutdown(); // half a message would garble the rest: the worker connects again and its jobs go back to the queue
+			return false;
 		};
 		std::vector<std::thread> senders; // input transfers
 		std::mutex ping_m;
@@ -546,6 +550,39 @@ void exit_now(int code) {
 	std::_Exit(code);
 }
 
+#ifdef _WIN32
+namespace {
+LONG WINAPI end_on_exception(EXCEPTION_POINTERS* e) {
+	const DWORD code = e && e->ExceptionRecord ? e->ExceptionRecord->ExceptionCode : 1;
+	char b[96];
+	const int n = snprintf(b, sizeof b, "crashed: exception 0x%08lx\n", (unsigned long)code);
+	DWORD put;
+	WriteFile(GetStdHandle(STD_ERROR_HANDLE), b, (DWORD)n, &put, nullptr); // nothing that takes a lock: the crash may have happened while it was held
+	TerminateProcess(GetCurrentProcess(), (UINT)code);
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+void end_on_abort(int) {
+	static const char msg[] = "crashed: abort\n";
+	DWORD put;
+	WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, sizeof msg - 1, &put, nullptr);
+	TerminateProcess(GetCurrentProcess(), 3);
+}
+void end_on_bad_parameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned, uintptr_t) { end_on_abort(0); }
+} // namespace
+#endif
+
+void end_crashes_at_once() {
+#ifdef _WIN32
+	// No "has stopped working" box, no box for a missing drive or DLL; inherited by the processes this one starts.
+	SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+	SetUnhandledExceptionFilter(end_on_exception);
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+	signal(SIGABRT, end_on_abort);
+	_set_invalid_parameter_handler(end_on_bad_parameter);
+	_set_purecall_handler([] { end_on_abort(0); });
+#endif
+}
+
 namespace {
 
 std::string self_exe() {
@@ -560,12 +597,29 @@ std::string self_exe() {
 }
 
 // Runs a program and hands every line it prints (output and errors together) to `on_line`; returns its exit code, or -1 if it could not be started.
-// `cancel` set ends the program early (the host is gone: nobody wants its results).
-int run_process(const std::string& exe, const std::vector<std::string>& args, const std::function<void(const std::string&)>& on_line, const std::atomic<bool>& cancel) {
+// `cancel` set ends the program early (the host is gone: nobody wants its results). `silence_ms` > 0 ends it, and sets `silenced`, when it prints nothing for that long:
+// it has hung, or it crashed and something holds it.
+int run_process(const std::string& exe, const std::vector<std::string>& args, const std::function<void(const std::string&)>& on_line, const std::atomic<bool>& cancel,
+                int silence_ms = 0, bool* silenced = nullptr) {
 	std::atomic<bool> finished{false};
-	auto watch = [&](auto kill_it) { return std::thread([&, kill_it] { while (!finished) { if (cancel) { kill_it(); return; } std::this_thread::sleep_for(std::chrono::milliseconds(100)); } }); };
+	auto now_ms = [] { return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+	std::atomic<long long> last_heard{now_ms()};
+	auto watch = [&](auto kill_it) {
+		return std::thread([&, kill_it] {
+			while (!finished) {
+				const bool quiet = silence_ms > 0 && now_ms() - last_heard > silence_ms;
+				if (cancel || quiet) {
+					if (quiet && silenced) *silenced = true;
+					kill_it();
+					return;
+				}
+				std::this_thread::sleep_for(std::chrono::milliseconds(100));
+			}
+		});
+	};
 	std::string pending;
 	auto feed = [&](const char* data, size_t n) {
+		last_heard = now_ms();
 		pending.append(data, n);
 		for (size_t at; (at = pending.find('\n')) != std::string::npos;) {
 			std::string line = pending.substr(0, at);
@@ -907,7 +961,11 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 		std::mutex send_m;
 		auto send = [&](uint8_t t, const std::string& p) {
 			std::lock_guard lock(send_m);
-			return conn->send_msg(t, p);
+			if (conn->send_msg(t, p)) return true;
+			// A message that did not go out whole leaves the host waiting for it (a job's end, say) on a connection that still looks alive: it is ended, the host gives
+			// the jobs to others, and this worker connects again.
+			conn->shutdown();
+			return false;
 		};
 		std::mutex inbox_m;
 		std::atomic<bool> lost{false}; // the host is gone: running jobs are ended
@@ -1017,6 +1075,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 				};
 				// Once a second the job's `ves` prints the numbers of its runs; they go to the host and to this worker's own display. Its other lines are kept for a failure.
 				std::deque<std::string> tail;
+				bool silenced = false;
 				const int code = run_process(exe, args, [&](const std::string& text) {
 					if (!text.empty() && text[0] == (char)29) {
 						send(M_SOURCE, id_bytes(id) + text.substr(1));
@@ -1031,10 +1090,16 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 						tail.push_back(text);
 						if (tail.size() > 12) tail.pop_front();
 					}
-				}, lost);
+				}, lost, kJobSilenceMs, &silenced); // the job prints its numbers four times a second: one that says nothing has hung
+				if (silenced) {
+					const std::string why = "said nothing for " + std::to_string(kJobSilenceMs / 1000) + " s (hung, or crashed and held): ended";
+					log("job " + jname + " " + why);
+					send(M_LOG, id_bytes(id) + "this job " + why);
+					log_text += "this job " + why + "\n";
+				}
 				for (auto& l : tail) log_text += l + "\n";
-				ok = code == 0;
-				if (!ok) log("job " + jname + " failed with code " + std::to_string(code)); // what it said came as it said it
+				ok = code == 0 && !silenced;
+				if (!ok && !silenced) log("job " + jname + " failed with code " + std::to_string(code)); // what it said came as it said it
 				send_results(); // what the last progress line did not see
 			}
 			fs::remove_all(dir, ec2);
