@@ -12,6 +12,7 @@ using sock_t = SOCKET;
 static const sock_t kBad = INVALID_SOCKET;
 static void sock_close(sock_t s) { closesocket(s); }
 static int last_error() { return WSAGetLastError(); }
+static bool is_timeout(int e) { return e == WSAETIMEDOUT || e == WSAEWOULDBLOCK; }
 #else
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -21,10 +22,12 @@ static int last_error() { return WSAGetLastError(); }
 #include <sys/socket.h>
 #include <unistd.h>
 #include <cerrno>
+#include <fcntl.h>
 using sock_t = int;
 static const sock_t kBad = -1;
 static void sock_close(sock_t s) { ::close(s); }
 static int last_error() { return errno; }
+static bool is_timeout(int e) { return e == EAGAIN || e == EWOULDBLOCK; }
 #endif
 
 namespace net {
@@ -55,6 +58,41 @@ std::string peer_name(const sockaddr_storage& ss) {
 	return std::string(host) + ":" + std::to_string(port);
 }
 
+// Programs this one starts (a worker runs `ves` for each job) must not get a copy of a socket: a copy keeps the connection open after this process is gone, so the other
+// side never learns that it is.
+sock_t new_socket(int family, int type, int protocol) {
+#ifdef _WIN32
+	return WSASocketW(family, type, protocol, nullptr, 0, WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
+#else
+	return ::socket(family, type | SOCK_CLOEXEC, protocol);
+#endif
+}
+
+void no_inherit(sock_t s) {
+#ifdef _WIN32
+	SetHandleInformation((HANDLE)s, HANDLE_FLAG_INHERIT, 0);
+#else
+	fcntl(s, F_SETFD, FD_CLOEXEC);
+#endif
+}
+
+// A peer that vanishes without closing the connection (power off, cable out) is noticed by the system after about 25 s of silence, not hours.
+void keep_alive(sock_t s) {
+	int one = 1;
+#ifdef _WIN32
+	struct { ULONG onoff, time_ms, interval_ms; } keep{1, 10000, 5000};
+	DWORD returned = 0;
+	WSAIoctl(s, 0x98000004 /* SIO_KEEPALIVE_VALS */, &keep, sizeof keep, nullptr, 0, &returned, nullptr, nullptr);
+#else
+	setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
+	int idle = 10, interval = 5, count = 3;
+	setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
+	setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof interval);
+	setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof count);
+#endif
+	setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof one);
+}
+
 } // namespace
 
 Conn::~Conn() { close(); }
@@ -63,11 +101,38 @@ void Conn::close() {
 	if (fd != (intptr_t)kBad) { sock_close((sock_t)fd); fd = (intptr_t)kBad; }
 }
 
+void Conn::shutdown() {
+#ifdef _WIN32
+	if (fd != (intptr_t)kBad) ::shutdown((sock_t)fd, SD_BOTH);
+#else
+	if (fd != (intptr_t)kBad) ::shutdown((sock_t)fd, SHUT_RDWR);
+#endif
+}
+
+void Conn::set_timeout(int ms) {
+#ifdef _WIN32
+	const DWORD t = (DWORD)ms;
+	setsockopt((sock_t)fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&t, sizeof t);
+	setsockopt((sock_t)fd, SOL_SOCKET, SO_SNDTIMEO, (const char*)&t, sizeof t);
+#else
+	timeval t{ms / 1000, (ms % 1000) * 1000};
+	setsockopt((sock_t)fd, SOL_SOCKET, SO_RCVTIMEO, &t, sizeof t);
+	setsockopt((sock_t)fd, SOL_SOCKET, SO_SNDTIMEO, &t, sizeof t);
+#endif
+}
+
 bool Conn::send_all(const void* data, size_t size) {
 	const char* p = (const char*)data;
 	while (size) {
+#ifdef _WIN32
 		const int n = (int)::send((sock_t)fd, p, (int)std::min<size_t>(size, 1 << 20), 0);
-		if (n <= 0) return false;
+#else
+		const int n = (int)::send((sock_t)fd, p, std::min<size_t>(size, 1 << 20), MSG_NOSIGNAL); // a lost connection is an error here, not the end of the process
+#endif
+		if (n <= 0) {
+			if (n < 0 && is_timeout(last_error())) timeout_hit = true;
+			return false;
+		}
 		p += n;
 		size -= (size_t)n;
 	}
@@ -78,7 +143,10 @@ bool Conn::recv_all(void* data, size_t size) {
 	char* p = (char*)data;
 	while (size) {
 		const int n = (int)::recv((sock_t)fd, p, (int)std::min<size_t>(size, 1 << 20), 0);
-		if (n <= 0) return false;
+		if (n <= 0) {
+			if (n < 0 && is_timeout(last_error())) timeout_hit = true;
+			return false;
+		}
 		p += n;
 		size -= (size_t)n;
 	}
@@ -115,7 +183,7 @@ std::unique_ptr<Conn> connect_to(const std::string& host, int port, std::string&
 	sock_t s = kBad;
 	std::string peer;
 	for (addrinfo* a = res; a; a = a->ai_next) {
-		s = ::socket(a->ai_family, a->ai_socktype, a->ai_protocol);
+		s = new_socket(a->ai_family, a->ai_socktype, a->ai_protocol);
 		if (s == kBad) continue;
 		if (::connect(s, a->ai_addr, (int)a->ai_addrlen) == 0) {
 			sockaddr_storage ss{};
@@ -128,20 +196,7 @@ std::unique_ptr<Conn> connect_to(const std::string& host, int port, std::string&
 	}
 	freeaddrinfo(res);
 	if (s == kBad) { err = "cannot connect to " + host + ":" + std::to_string(port) + " (error " + std::to_string(last_error()) + ")"; return nullptr; }
-	int one = 1;
-	setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof one);
-	// A host that vanishes without closing the connection (power off, cable out) is noticed after about 25 s of silence, not hours.
-#ifdef _WIN32
-	struct { ULONG onoff, time_ms, interval_ms; } keep{1, 10000, 5000};
-	DWORD returned = 0;
-	WSAIoctl(s, 0x98000004 /* SIO_KEEPALIVE_VALS */, &keep, sizeof keep, nullptr, 0, &returned, nullptr, nullptr);
-#else
-	setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one);
-	int idle = 10, interval = 5, count = 3;
-	setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof idle);
-	setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof interval);
-	setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof count);
-#endif
+	keep_alive(s);
 	auto c = std::make_unique<Conn>((intptr_t)s);
 	c->peer = peer;
 	return c;
@@ -156,13 +211,13 @@ void Listener::close() {
 
 bool Listener::open(int port, std::string& err) {
 	startup();
-	sock_t s = ::socket(AF_INET6, SOCK_STREAM, 0); // dual stack where the system has it
+	sock_t s = new_socket(AF_INET6, SOCK_STREAM, 0); // dual stack where the system has it
 	bool v6 = s != kBad;
 	if (v6) {
 		int off = 0;
 		setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, (const char*)&off, sizeof off);
 	} else {
-		s = ::socket(AF_INET, SOCK_STREAM, 0);
+		s = new_socket(AF_INET, SOCK_STREAM, 0);
 		if (s == kBad) { err = "cannot create a socket"; return false; }
 	}
 	int one = 1;
@@ -203,8 +258,8 @@ std::unique_ptr<Conn> Listener::accept(int timeout_ms) {
 	socklen_t len = sizeof ss;
 	sock_t c = ::accept((sock_t)fd, (sockaddr*)&ss, &len);
 	if (c == kBad) return nullptr;
-	int one = 1;
-	setsockopt(c, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof one);
+	no_inherit(c);
+	keep_alive(c);
 	auto conn = std::make_unique<Conn>((intptr_t)c);
 	conn->peer = peer_name(ss);
 	return conn;

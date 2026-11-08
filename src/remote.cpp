@@ -20,6 +20,8 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <signal.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -36,8 +38,12 @@ namespace fs = std::filesystem;
 
 namespace {
 
-enum : uint8_t { M_HELLO = 1, M_JOB = 2, M_NEED = 3, M_FILE_DATA = 4, M_FILE_END = 5, M_RESULT = 6, M_DONE = 7, M_PROGRESS = 8, M_SOURCE = 9, M_LOG = 10 };
-constexpr int kVersion = 3;
+enum : uint8_t { M_HELLO = 1, M_JOB = 2, M_NEED = 3, M_FILE_DATA = 4, M_FILE_END = 5, M_RESULT = 6, M_DONE = 7, M_PROGRESS = 8, M_SOURCE = 9, M_LOG = 10, M_PING = 11 };
+constexpr int kVersion = 4;
+// Both sides say something at least every kPingEvery; one that has heard nothing for kSilence takes the other as gone (crashed, hung, or the machine is off) and ends
+// the connection: the host gives that worker's jobs to the others, the worker stops them and connects again.
+constexpr int kPingEvery = 10;      // seconds
+constexpr int kSilenceMs = 60000;
 constexpr size_t kChunk = 1 << 20;
 constexpr int kTries = 3;
 
@@ -236,6 +242,7 @@ struct RemoteHost::Impl {
 		std::string payload;
 		auto worker = std::make_shared<Worker>();
 		std::string who = conn->peer;
+		conn->set_timeout(kSilenceMs); // also for a connection that never says hello
 		try {
 			if (!conn->recv_msg(type, payload) || type != M_HELLO) return;
 			Json hello = Json::parse(payload);
@@ -280,6 +287,13 @@ struct RemoteHost::Impl {
 			return conn->send_msg(t, p);
 		};
 		std::vector<std::thread> senders; // input transfers
+		std::mutex ping_m;
+		std::condition_variable ping_cv;
+		std::thread pinger([&] { // lets the worker know the host is still there while nothing else is said
+			std::unique_lock lock(ping_m);
+			while (!ping_cv.wait_for(lock, std::chrono::seconds(kPingEvery), [&] { return dead.load(); }))
+				if (!send(M_PING, std::string())) break;
+		});
 
 		std::thread dispatcher([&] {
 			for (;;) {
@@ -308,7 +322,8 @@ struct RemoteHost::Impl {
 					log("job " + job.name + " -> " + who + (job.model.empty() ? "" : " on " + job.model));
 					if (!send(M_JOB, msg)) throw std::runtime_error("connection lost");
 				} catch (const std::exception&) {
-					dead = true; // the reader notices the lost connection and gives the jobs back
+					dead = true;
+					conn->shutdown(); // the reader notices the lost connection and gives the jobs back
 					return;
 				}
 			}
@@ -420,8 +435,15 @@ struct RemoteHost::Impl {
 		}
 
 		// The connection is gone: what this worker was running goes back to the queue.
-		dead = true;
+		log("worker " + who + (conn->timed_out() ? " said nothing for " + std::to_string(kSilenceMs / 1000) + " s (crashed or hung?): dropped" : " disconnected"));
+		{
+			std::lock_guard lock(ping_m); // the pinger waits under it: it cannot miss this
+			dead = true;
+		}
+		ping_cv.notify_all();
+		conn->shutdown(); // a thread that sends to it (an input, a job) returns now, not when the system gives up on the connection
 		cv.notify_all();
+		pinger.join();
 		dispatcher.join();
 		for (auto& t : senders) t.join();
 		std::lock_guard lock(m);
@@ -571,17 +593,40 @@ int run_process(const std::string& exe, const std::vector<std::string>& args, co
 	HANDLE rd = nullptr, wr = nullptr;
 	if (!CreatePipe(&rd, &wr, &sa, 1 << 16)) return -1;
 	SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
-	STARTUPINFOW si{};
-	si.cb = sizeof si;
-	si.dwFlags = STARTF_USESTDHANDLES;
-	si.hStdOutput = si.hStdError = wr;
-	si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+	// The program gets its output pipe and an empty input, and nothing else of this process: a handle it kept (the worker's connection to the host) would outlive
+	// this process.
+	HANDLE nul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, nullptr);
+	HANDLE inherit[2] = {wr, nul};
+	SIZE_T attr_size = 0;
+	InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+	std::vector<char> attr_buf(attr_size);
+	auto attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)attr_buf.data();
+	const bool attrs_made = nul != INVALID_HANDLE_VALUE && InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size);
+	BOOL ok = attrs_made && UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit, sizeof inherit, nullptr, nullptr);
+	STARTUPINFOEXW si{};
+	si.StartupInfo.cb = sizeof si;
+	si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+	si.StartupInfo.hStdOutput = si.StartupInfo.hStdError = wr;
+	si.StartupInfo.hStdInput = nul;
+	si.lpAttributeList = attrs;
 	PROCESS_INFORMATION pi{};
 	std::vector<wchar_t> mutable_cmd(cmd.begin(), cmd.end());
 	mutable_cmd.push_back(0);
-	const BOOL ok = CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi);
+	// Suspended until it is in the job that ends it with this process, however this one ends: a worker that crashes leaves no job running.
+	ok = ok && CreateProcessW(nullptr, mutable_cmd.data(), nullptr, nullptr, TRUE, EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED, nullptr, nullptr, &si.StartupInfo, &pi);
+	if (attrs_made) DeleteProcThreadAttributeList(attrs);
 	CloseHandle(wr);
+	if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
 	if (!ok) { CloseHandle(rd); return -1; }
+	static HANDLE kill_with_us = [] {
+		HANDLE j = CreateJobObjectW(nullptr, nullptr);
+		JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+		li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+		if (j) SetInformationJobObject(j, JobObjectExtendedLimitInformation, &li, sizeof li);
+		return j;
+	}();
+	if (kill_with_us) AssignProcessToJobObject(kill_with_us, pi.hProcess);
+	ResumeThread(pi.hThread);
 	std::thread killer = watch([&] { TerminateProcess(pi.hProcess, 1); });
 	char buf[4096];
 	DWORD got;
@@ -599,9 +644,13 @@ int run_process(const std::string& exe, const std::vector<std::string>& args, co
 #else
 	int fds[2];
 	if (pipe(fds) != 0) return -1;
+	const pid_t parent = getpid();
 	const pid_t pid = fork();
 	if (pid < 0) { close(fds[0]); close(fds[1]); return -1; }
 	if (pid == 0) {
+		// Ends with the thread that started it, which waits for it: a worker that crashes leaves no job running.
+		prctl(PR_SET_PDEATHSIG, SIGKILL);
+		if (getppid() != parent) _exit(127);
 		close(fds[0]);
 		dup2(fds[1], 1);
 		dup2(fds[1], 2);
@@ -837,6 +886,7 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 			continue;
 		}
 		std::shared_ptr<net::Conn> conn = std::move(conn_u);
+		conn->set_timeout(kSilenceMs);
 		if (!conn->send_msg(M_HELLO, "{\"version\":" + std::to_string(kVersion) + ",\"token\":" + jq(token) + ",\"name\":" + jq(name) + ",\"cpu\":" + std::to_string(cpu_parallel) + ",\"gpus\":" + inventory + "}"))
 			continue;
 		uint8_t type;
@@ -863,6 +913,13 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 		std::atomic<bool> lost{false}; // the host is gone: running jobs are ended
 		std::map<size_t, std::shared_ptr<Inbox>> inboxes;
 		std::vector<std::thread> jobs;
+		std::mutex ping_m;
+		std::condition_variable ping_cv;
+		std::thread pinger([&] { // lets the host know this worker is still there while its jobs say nothing
+			std::unique_lock lock(ping_m);
+			while (!ping_cv.wait_for(lock, std::chrono::seconds(kPingEvery), [&] { return lost.load(); }))
+				if (!send(M_PING, std::string())) break;
+		});
 
 		auto run_job = [&](std::string job_payload, std::shared_ptr<Inbox> inbox) {
 			Json job = Json::parse(job_payload);
@@ -1007,14 +1064,21 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 				if (inbox) inbox->push(type, payload);
 			}
 		}
-		lost = true;
+		const bool silent = conn->timed_out();
+		{
+			std::lock_guard lock(ping_m);
+			lost = true;
+		}
+		ping_cv.notify_all();
+		conn->shutdown();
 		{
 			std::lock_guard lock(inbox_m);
 			for (auto& [id, inbox] : inboxes) inbox->close();
 		}
+		pinger.join();
 		for (auto& t : jobs) t.join();
 		show_title(false);
-		log("lost the connection, jobs stopped; trying again in 5 s");
+		log(std::string(silent ? "the host said nothing for " + std::to_string(kSilenceMs / 1000) + " s" : "lost the connection") + ", jobs stopped; trying again in 5 s");
 		std::this_thread::sleep_for(std::chrono::seconds(5));
 	}
 }

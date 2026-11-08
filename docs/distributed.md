@@ -90,6 +90,11 @@ The host and the worker draw the rows from them with the same code. A job's `ves
 
 TCP, each message is a type byte, a 32-bit big-endian length and a payload. `HELLO` (version, token, name, slots, GPUs) in both directions; `JOB` (id, name, config, input) from the host;
 `NEED` / `FILE_DATA` / `FILE_END` to fetch an input; `RESULT` (file name and contents) `PROGRESS` (rows) and `DONE` (ok, tail of the log) from the worker. Everything after `JOB` carries the job id, so a worker's jobs share one connection.
+`PING` (empty) goes both ways every 10 seconds. A side that hears nothing for 60 seconds ends the connection: the host gives that worker's jobs to the others (a job goes out three times
+at most), and the worker stops its jobs and connects again. That is how a worker whose machine crashed (a bluescreen closes no connection) is noticed. Host and workers must run the
+same protocol version; an older worker is refused.
+
+A job's `ves` is ended with the worker, however the worker ends, and gets no copy of the worker's connection, which would keep the connection open after the worker is gone.
 
 ## Not done yet
 
