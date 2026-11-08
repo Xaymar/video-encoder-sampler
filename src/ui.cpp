@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <ctime>
 #include <cstdio>
 #include <csignal>
 #include <deque>
@@ -57,6 +59,83 @@ int saved_stderr = -1, pipe_read = -1;
 #ifdef _WIN32
 unsigned saved_code_page = 0;
 #endif
+
+// Everything for stdout goes through one writer thread, so that a console that does not take output (on Windows a click into it starts a selection, which holds
+// every write until it ends) holds only that thread, not the sweep: frames are skipped meanwhile and log lines wait.
+std::mutex out_m;
+std::condition_variable out_cv;
+std::string out_q;
+bool out_busy = false, out_quit = false, out_running = false;
+std::thread out_thread;
+void emit(const std::string& text) {
+	{
+		std::lock_guard lock(out_m);
+		if (out_running) { out_q += text; out_cv.notify_all(); return; }
+	}
+	fwrite(text.data(), 1, text.size(), stdout); // no writer (an encoder process, or before start()): as it comes
+	fflush(stdout);
+}
+bool output_behind() {
+	std::lock_guard lock(out_m);
+	return out_busy || !out_q.empty();
+}
+void out_loop() {
+	std::unique_lock lock(out_m);
+	for (;;) {
+		out_cv.wait(lock, [] { return out_quit || !out_q.empty(); });
+		if (out_q.empty()) return;
+		std::string text;
+		text.swap(out_q);
+		out_busy = true;
+		lock.unlock();
+		fwrite(text.data(), 1, text.size(), stdout);
+		fflush(stdout);
+		lock.lock();
+		out_busy = false;
+	}
+}
+void start_output() {
+	std::lock_guard lock(out_m);
+	if (out_running) return;
+	out_running = true;
+	out_quit = false;
+	out_thread = std::thread(out_loop);
+}
+void stop_output() { // writes what is left first
+	{
+		std::lock_guard lock(out_m);
+		if (!out_running) return;
+		out_quit = true;
+	}
+	out_cv.notify_all();
+	out_thread.join();
+	std::lock_guard lock(out_m);
+	out_running = false;
+}
+
+// --log: every permanent line, with the date and time, in a file of its own.
+std::mutex log_m;
+FILE* log_file = nullptr;
+void to_log_file(const std::string& line) {
+	std::lock_guard lock(log_m);
+	if (!log_file) return;
+	const auto now = std::chrono::system_clock::now();
+	const time_t t = std::chrono::system_clock::to_time_t(now);
+	const int ms = (int)(std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000);
+	tm local{};
+#ifdef _WIN32
+	localtime_s(&local, &t);
+#else
+	localtime_r(&t, &local);
+#endif
+	char stamp[40];
+	const size_t n = strftime(stamp, sizeof stamp, "%Y-%m-%d %H:%M:%S", &local);
+	snprintf(stamp + n, sizeof stamp - n, ".%03d ", ms);
+	fputs(stamp, log_file);
+	fputs(line.c_str(), log_file);
+	fputc('\n', log_file);
+	fflush(log_file);
+}
 
 std::string span(double sec) {
 	char b[32];
@@ -173,6 +252,7 @@ Row make_row(const Entry& e) { return row_of(progress_of(e), ""); }
 // The live area: a frame with the overall progress in its top border and one row per run in flight. It takes the width of the terminal: the
 // task column and the bar share what the fixed columns leave, and columns drop out when the terminal is too narrow for them.
 void render() {
+	if (output_behind()) return; // the last frame is not out yet: the lines wait for the next one
 	const int term_w = console_width(), term_h = console_height();
 	static int last_w = 0;
 	std::string out;
@@ -262,8 +342,7 @@ void render() {
 	}
 	out += rule("\xE2\x94\x94", "\xE2\x94\xB4", "\xE2\x94\x98") + "\x1b[K\n";
 	live_lines = lines + 1;
-	fwrite(out.data(), 1, out.size(), stdout);
-	fflush(stdout);
+	emit(out);
 }
 
 // Without a console to draw on: one line per run in flight now and then.
@@ -271,20 +350,24 @@ void plain_status() {
 	static int64_t last = now_ms();
 	if (now_ms() - last < 15000) return;
 	last = now_ms();
+	std::string out;
+	char b[1024];
 	for (auto& [h, e] : entries) {
 		const long long total = e.p->total, done = e.p->done;
 		if (e.p->stage == 0 || total <= 0 || e.p->end_ms) continue; // not started, or already finished
-		if (e.p->stage == 4 || e.p->stage == 5) { printf("  %s: %lld%% (%.1f/%.1f MB)  %s\n", e.p->stage == 4 ? "uploading" : "downloading", done * 100 / total, done / 1048576.0, total / 1048576.0, e.label.c_str()); continue; }
+		if (e.p->stage == 4 || e.p->stage == 5) { snprintf(b, sizeof b, "  %s: %lld%% (%.1f/%.1f MB)  %s\n", e.p->stage == 4 ? "uploading" : "downloading", done * 100 / total, done / 1048576.0, total / 1048576.0, e.label.c_str()); out += b; continue; }
 		static const char* waits[] = {"", " [starved: waiting for frames]", " [backed up: waiting for room downstream]"};
 		const int ws = e.p->state;
-		printf("  %s %s: %lld%% (%lld/%lld frames)%s  %s\n", e.p->stage == 1 ? "encoding" : e.p->stage == 3 ? "decoding" : "scoring", e.pool.c_str(), done * 100 / total, done, total, waits[ws >= 0 && ws < 3 ? ws : 0], e.label.c_str());
+		snprintf(b, sizeof b, "  %s %s: %lld%% (%lld/%lld frames)%s  %s\n", e.p->stage == 1 ? "encoding" : e.p->stage == 3 ? "decoding" : "scoring", e.pool.c_str(), done * 100 / total, done, total, waits[ws >= 0 && ws < 3 ? ws : 0], e.label.c_str());
+		out += b;
 	}
 	for (auto& [key, group] : remote_rows)
 		for (auto& p : group.second) {
 			const Row r = row_of(p, group.first);
-			printf("  %s: %.0f%% %s %s\n", r.status.c_str(), r.fraction * 100, r.speed.c_str(), r.task.c_str());
+			snprintf(b, sizeof b, "  %s: %.0f%% %s %s\n", r.status.c_str(), r.fraction * 100, r.speed.c_str(), r.task.c_str());
+			out += b;
 		}
-	fflush(stdout);
+	if (!out.empty()) emit(out);
 }
 
 std::string json_string(const std::string& s) {
@@ -314,9 +397,7 @@ std::string snapshot() {
 }
 
 void write_snapshot() {
-	const std::string line = std::string(1, (char)30) + snapshot() + "\n";
-	fwrite(line.data(), 1, line.size(), stdout);
-	fflush(stdout);
+	emit(std::string(1, (char)30) + snapshot() + "\n");
 }
 
 void render_loop() {
@@ -372,6 +453,7 @@ void start(bool plain) {
 	std::lock_guard lock(m);
 	t0 = Clock::now();
 	running = true;
+	start_output();
 #ifdef _WIN32
 	HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
 	DWORD mode = 0;
@@ -399,10 +481,14 @@ void stop() {
 	renderer.join();
 	std::lock_guard lock(m);
 	if (is_live) {
-		if (live_lines) { std::string up = "\x1b[" + std::to_string(live_lines) + "A\r\x1b[J"; fwrite(up.data(), 1, up.size(), stdout); live_lines = 0; }
-		for (auto& l : pending) printf("%s\n", l.c_str());
+		std::string out;
+		if (live_lines) { out = "\x1b[" + std::to_string(live_lines) + "A\r\x1b[J"; live_lines = 0; }
+		for (auto& l : pending) out += l + "\n";
 		pending.clear();
-		fflush(stdout);
+		emit(out);
+		m.unlock();
+		stop_output(); // what is left is written before stderr goes back and the live display ends
+		m.lock();
 		if (saved_stderr >= 0) {
 			_dup2(saved_stderr, 2); // closes the pipe's write end, which ends the reader
 			_close(saved_stderr);
@@ -416,6 +502,9 @@ void stop() {
 		if (saved_code_page) SetConsoleOutputCP(saved_code_page);
 #endif
 	}
+	m.unlock();
+	stop_output();
+	m.lock();
 }
 
 bool live() { return is_live; }
@@ -443,9 +532,7 @@ void end_on_interrupt() {
 void emit_record(char kind, const std::string& payload) {
 	std::lock_guard lock(m);
 	if (!progress_stdout) return;
-	const std::string line = std::string(1, kind) + payload + "\n";
-	fwrite(line.data(), 1, line.size(), stdout);
-	fflush(stdout);
+	emit(std::string(1, kind) + payload + "\n");
 }
 
 std::string snapshot_json() {
@@ -497,14 +584,28 @@ void detach(int handle) {
 }
 
 void log(const std::string& line) {
+	to_log_file(line);
 	std::lock_guard lock(m);
 	if (is_live) pending.push_back(line);
-	else { printf("%s\n", line.c_str()); fflush(stdout); }
+	else emit(line + "\n");
 }
 
 void log_plain(const std::string& line) {
+	to_log_file(line);
 	std::lock_guard lock(m);
-	if (!is_live) { printf("%s\n", line.c_str()); fflush(stdout); }
+	if (!is_live) emit(line + "\n");
+}
+
+bool open_log(const std::string& path, const std::string& first_line, std::string& err) {
+	FILE* f = fopen(path.c_str(), "ab"); // appended to: a restart keeps what came before
+	if (!f) { err = "cannot open the log file '" + path + "'"; return false; }
+	{
+		std::lock_guard lock(log_m);
+		if (log_file) fclose(log_file);
+		log_file = f;
+	}
+	to_log_file(first_line);
+	return true;
 }
 
 long long peak_memory_mb() {
