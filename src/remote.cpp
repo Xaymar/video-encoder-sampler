@@ -12,6 +12,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <thread>
@@ -45,6 +46,12 @@ constexpr int kVersion = 4;
 // the connection: the host gives that worker's jobs to the others, the worker stops them and connects again.
 constexpr int kPingEvery = 10;      // seconds
 constexpr int kSilenceMs = 60000;
+#ifndef VES_REMOTE_TEST
+constexpr int kJobLost = 300;         // seconds without a word of a job before the host takes it as lost
+constexpr int kUnplaceable = 300;     // seconds that jobs wait, with nothing running, for a worker that can take them before the host runs them itself
+#else
+constexpr int kJobLost = 25, kUnplaceable = 15;
+#endif
 constexpr int kJobSilenceMs = 120000; // a job's `ves` that prints nothing for this long is ended
 constexpr size_t kChunk = 1 << 20;
 constexpr int kTries = 3;
@@ -280,7 +287,10 @@ struct RemoteHost::Impl {
 		for (auto& g : worker->gpus) gpus_text += "; " + g.encoder + " " + std::to_string(g.index) + " x" + std::to_string(g.parallel) + ": " + g.description;
 		log("worker " + who + " connected, resources: " + gpus_text);
 
-		struct Active { size_t stored = 0; };
+		struct Active {
+			size_t stored = 0;
+			std::chrono::steady_clock::time_point seen = std::chrono::steady_clock::now(); // the last word of it (a job's `ves` prints its numbers four times a second)
+		};
 		std::map<size_t, Active> active; // jobs this worker has now, guarded by m
 		std::mutex send_m;
 		std::atomic<bool> dead{false};
@@ -295,8 +305,26 @@ struct RemoteHost::Impl {
 		std::condition_variable ping_cv;
 		std::thread pinger([&] { // lets the worker know the host is still there while nothing else is said
 			std::unique_lock lock(ping_m);
-			while (!ping_cv.wait_for(lock, std::chrono::seconds(kPingEvery), [&] { return dead.load(); }))
+			while (!ping_cv.wait_for(lock, std::chrono::seconds(kPingEvery), [&] { return dead.load(); })) {
 				if (!send(M_PING, std::string())) break;
+				// A job the worker says nothing of for kJobLost while the connection lives is lost: the worker has ended it without the end reaching this side, or it
+				// is stuck where the worker's own watchdog does not look. It goes back to the queue (a late end of it is ignored, results that came are kept).
+				std::lock_guard jl(m);
+				const auto now = std::chrono::steady_clock::now();
+				for (auto it = active.begin(); it != active.end();) {
+					if (now - it->second.seen < std::chrono::seconds(kJobLost)) { ++it; continue; }
+					const size_t id = it->first;
+					it = active.erase(it);
+					if (auto d = worker->device.find(id); d != worker->device.end()) { worker->load[d->second.first] -= d->second.second; worker->device.erase(d); }
+					if (probe_state[(*jobs)[id].input] == 1) probe_state[(*jobs)[id].input] = 0;
+					ui::set_remote(worker->name + "#" + std::to_string(id), "", {});
+					const RemoteJobSpec& job = (*jobs)[id];
+					const std::string heard = "job " + job.name + " on " + who + ": nothing heard of it for " + std::to_string(kJobLost) + " s";
+					if (tries[id] < kTries) { queue.push_front(id); log(heard + "; it goes back to the queue"); }
+					else { left--; log(heard + "; given up after " + std::to_string(kTries) + " tries"); }
+					cv.notify_all();
+				}
+			}
 		});
 
 		std::thread dispatcher([&] {
@@ -350,6 +378,8 @@ struct RemoteHost::Impl {
 						const size_t n = (size_t)f.gcount();
 						if (n && !send(M_FILE_DATA, id_bytes(id) + chunk.substr(0, n))) return;
 						rp.done += (long long)n;
+						std::lock_guard lock(m); // the jobs that wait for this input are not lost while it travels
+						for (auto& [other, a] : active) if ((*jobs)[other].input == (*jobs)[id].input) a.seen = std::chrono::steady_clock::now();
 					}
 					send(M_FILE_END, id_bytes(id));
 				});
@@ -404,10 +434,18 @@ struct RemoteHost::Impl {
 				cv.notify_all(); // the input is known: the jobs of it that waited for that can go out, to every worker
 			} else if (type == M_LOG) { // a line a job printed, as it comes
 				if (payload.size() < 5) continue;
+				{
+					std::lock_guard lock(m);
+					if (auto a = active.find(id_of(payload)); a != active.end()) a->second.seen = std::chrono::steady_clock::now();
+				}
 				log("[" + worker->name + "] " + payload.substr(4));
 			} else if (type == M_PROGRESS) {
 				if (payload.size() < 5) continue;
 				const size_t id = id_of(payload);
+				{
+					std::lock_guard lock(m);
+					if (auto a = active.find(id); a != active.end()) a->second.seen = std::chrono::steady_clock::now();
+				}
 				ui::set_remote(worker->name + "#" + std::to_string(id), "[" + worker->name + "] ", ui::parse_progress(payload.substr(4)));
 			} else if (type == M_DONE) {
 				bool ok = false;
@@ -529,9 +567,45 @@ size_t RemoteHost::run_jobs(const std::vector<RemoteJobSpec>& jobs, const std::f
 	impl->log("remote: " + std::to_string(jobs.size()) + " jobs");
 	impl->cv.notify_all();
 	std::unique_lock lock(impl->m);
+	auto last_note = std::chrono::steady_clock::now();
+	std::optional<std::chrono::steady_clock::time_point> stuck_since;
 	while (impl->left > 0) {
-		if (impl->cv.wait_for(lock, std::chrono::seconds(60)) == std::cv_status::timeout && impl->left > 0)
-			impl->log("remote: " + std::to_string(impl->left) + " jobs left, " + std::to_string(impl->workers.size()) + " workers connected");
+		impl->cv.wait_for(lock, std::chrono::seconds(10));
+		if (impl->left == 0) break;
+		const auto now = std::chrono::steady_clock::now();
+		// Jobs that wait for a resource no connected worker has (a GPU model, or a codec of it, that is gone: the worker came back without it, or with another
+		// answer from its driver) would wait for good. When nothing runs anywhere and the workers that are connected can take none of what waits, those jobs are
+		// handed back after kUnplaceable, and the host runs them itself as it does with every run the workers could not do.
+		bool running = false, placeable = false;
+		for (auto& w : impl->workers) running = running || !w->device.empty();
+		for (size_t id : impl->queue) {
+			for (auto& w : impl->workers) {
+				std::string device;
+				int limit = 0, gpu = -1;
+				if (Impl::place(*w, jobs[id], device, limit, gpu)) { placeable = true; break; }
+			}
+			if (placeable) break;
+		}
+		if (running || placeable || impl->workers.empty() || impl->queue.empty()) stuck_since.reset();
+		else if (!stuck_since) stuck_since = now;
+		else if (now - *stuck_since >= std::chrono::seconds(kUnplaceable)) {
+			std::map<std::string, size_t> wanted;
+			for (size_t id : impl->queue) wanted[jobs[id].model.empty() ? std::string("cpu") : jobs[id].encoder + "/" + jobs[id].codec + " on " + jobs[id].model]++;
+			std::string text;
+			for (auto& [what, n] : wanted) text += " " + std::to_string(n) + " x " + what + ";";
+			impl->log("remote: no connected worker can take the " + std::to_string(impl->queue.size()) + " jobs left for " + std::to_string(kUnplaceable) + " s; they are run here:" + text);
+			impl->left -= std::min(impl->left, impl->queue.size());
+			impl->queue.clear();
+			stuck_since.reset();
+			continue;
+		}
+		if (now - last_note >= std::chrono::seconds(60)) {
+			last_note = now;
+			size_t active = 0;
+			for (auto& w : impl->workers) active += w->device.size();
+			impl->log("remote: " + std::to_string(impl->left) + " jobs left (" + std::to_string(active) + " running, " + std::to_string(impl->queue.size()) + " waiting), " +
+			          std::to_string(impl->workers.size()) + " workers connected" + (stuck_since ? "; none of them can take what waits" : ""));
+		}
 	}
 	impl->jobs = nullptr;
 	impl->queue.clear();
