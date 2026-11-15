@@ -125,7 +125,7 @@ public:
 	template <class Pred> void wait_for(std::unique_lock<std::mutex>& lock, Pred pred, RunProgress* rp, int state, std::atomic<int64_t> RunProgress::*counter) {
 		if (pred()) return;
 		const auto t = std::chrono::steady_clock::now();
-		if (rp) rp->state = state;
+		if (rp) rp->wait(state);
 		cv.wait(lock, pred);
 		if (rp) {
 			rp->state = 0;
@@ -204,7 +204,7 @@ public:
 		std::unique_lock lock(m);
 		if (q.empty() && !closed && !cancelled) {
 			const auto t = std::chrono::steady_clock::now();
-			if (rp) rp->state = 1;
+			if (rp) rp->wait(1);
 			waiting = true;
 			changed.notify();
 			cv.wait(lock, [&] { return !q.empty() || closed || cancelled; });
@@ -329,7 +329,7 @@ public:
 		auto there = [&] { return rd.at < base + (long long)q.size() || closed; };
 		if (!there()) {
 			const auto t = std::chrono::steady_clock::now();
-			if (rp) rp->state = 1;
+			if (rp) rp->wait(1);
 			cv.wait(lock, there);
 			if (rp) {
 				rp->state = 0;
@@ -384,7 +384,7 @@ void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& h
 	for (;;) {
 		if (held()) {
 			const auto t = std::chrono::steady_clock::now();
-			if (rp) rp->state = 2;
+			if (rp) rp->wait(2);
 			changed.wait_until([&] { return !held() || !raw.read(); });
 			if (rp) {
 				rp->state = 0;
@@ -427,7 +427,7 @@ void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Pl
 		while (ok && (got = scaler->pop(scaled)) == 1) hand_on(scaled);
 		ok = ok && got >= 0;
 	};
-	while (ok && raw.next(reader, frame) == 1) {
+	while (ok && raw.next(reader, frame, rp) == 1) {
 		const int64_t slot = src.slot(fr.frames, e.fps);
 		const bool keep = !pl.convert_rate || fr.frames == 0 || slot != last_slot; // no target rate: every frame stays
 		last_slot = slot;
@@ -469,11 +469,15 @@ void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, F
 	};
 	for (;;) {
 		if (out.behind(true) >= (long long)DECODE_AHEAD) {
+			const auto t = std::chrono::steady_clock::now();
+			rp.wait(2);
 			waiting = true;
 			changed.notify();
 			changed.wait_until([&] { return out.behind(true) < (long long)DECODE_AHEAD || !out.read(); });
 			waiting = false;
 			changed.notify();
+			rp.state = 0;
+			rp.blocked_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
 		}
 		if (!out.read() || raw.next(reader, t) != 1) break; // the end, or every scorer of this format has ended
 		rp.step();
