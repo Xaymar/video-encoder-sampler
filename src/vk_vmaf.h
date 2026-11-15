@@ -32,6 +32,8 @@ public:
 	bool add(const uint8_t* const ref[3], const size_t ref_stride[3], const uint8_t* const dis[3], const size_t dis_stride[3]);
 	// For each model (in the order given), the VMAF score of every pair added; and, if asked for, every frame's features as libvmaf names them.
 	bool finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<std::map<std::string, double>>>* features = nullptr);
+	// Seconds spent so far copying frames in, waiting for the GPU (submit to done, including other scorers' work queued ahead), and summing the results.
+	void timing(double& copy, double& gpu, double& results) const;
 
 private:
 	GpuVmaf();

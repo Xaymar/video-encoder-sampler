@@ -5,6 +5,8 @@
 #include <cstring>
 
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -157,6 +159,19 @@ struct Scorer {
 	virtual bool add(const Picture& ref, const Picture& dis) = 0;
 	// Per model: the scores and, for a model with SpEED chroma, its U and V values (else empty).
 	virtual bool finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<double>>& u, std::vector<std::vector<double>>& v) = 0;
+	virtual bool timing(double& copy, double& gpu, double& results) const { copy = gpu = results = 0; return false; } // the GPU scorer's parts of add()
+};
+
+// Where a scoring pass spends its time, in seconds, for VES_SCORE_TIMING=1: one line per pass when it ends. Per thread: a pass runs on one.
+struct ScoreClock {
+	double decode = 0, packets = 0, reference = 0, convert = 0, score = 0;
+	std::chrono::steady_clock::time_point began;
+};
+thread_local ScoreClock score_clock;
+struct Timed { // adds the time from here to the end of the scope to `to`
+	double& to;
+	std::chrono::steady_clock::time_point from = std::chrono::steady_clock::now();
+	~Timed() { to += std::chrono::duration<double>(std::chrono::steady_clock::now() - from).count(); }
 };
 
 // With libvmaf, in-process, on the CPU.
@@ -259,6 +274,7 @@ public:
 		const size_t ds[3] = {(size_t)dis.stride[0], (size_t)dis.stride[1], (size_t)dis.stride[2]};
 		return gpu->add(rd, rs, dd, ds);
 	}
+	bool timing(double& copy, double& g, double& results) const override { gpu->timing(copy, g, results); return true; }
 	bool finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<double>>& u, std::vector<std::vector<double>>& v) override {
 		std::vector<std::vector<std::map<std::string, double>>> fe;
 		if (!gpu->finish(scores, &fe)) return false;
@@ -276,19 +292,26 @@ public:
 bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, const PacketFeed& next_packet, const std::vector<uint8_t>& extradata, const Shape& enc,
                 const Color& decoded_color, const ShownFeed& shown, Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp,
                 VmafDetail* detail) {
+	score_clock = ScoreClock();
+	score_clock.began = std::chrono::steady_clock::now();
 	auto decoder = make_decoder();
 	if (!decoder->open(codec, extradata)) return false;
 	long long m = 0;
 	bool flushed = false;
 	const FrameFeed next_dis = [&](Picture& d) -> int {
 		for (;;) {
-			const int got = decoder->receive(d);
+			int got;
+			{ Timed t{score_clock.decode}; got = decoder->receive(d); }
 			if (got < 0) { fprintf(stderr, "vmaf: decoding the encoded stream failed after %lld frames\n", m); return -1; }
 			if (got == 1) { m++; return 1; }
 			if (flushed) return 0;
 			std::vector<uint8_t> packet;
-			if (!next_packet(packet)) { decoder->flush(); flushed = true; continue; }
-			if (!decoder->send(packet.data(), packet.size())) { fprintf(stderr, "vmaf: the encoded stream does not decode (packet of %zu bytes, after %lld frames)\n", packet.size(), m); return -1; }
+			bool more;
+			{ Timed t{score_clock.packets}; more = next_packet(packet); }
+			if (!more) { decoder->flush(); flushed = true; continue; }
+			bool sent;
+			{ Timed t{score_clock.decode}; sent = decoder->send(packet.data(), packet.size()); }
+			if (!sent) { fprintf(stderr, "vmaf: the encoded stream does not decode (packet of %zu bytes, after %lld frames)\n", packet.size(), m); return -1; }
 		}
 	};
 	return vmaf_score_frames(ref, next_ref, next_dis, enc, decoded_color, shown, score_fmt, opt, scale, scores, rp, detail);
@@ -349,13 +372,14 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 		uint32_t on_screen;
 		bool first = true;
 		while (ok && shown((size_t)k, on_screen) && on_screen == mi) {
-			int rr = next_ref(r);
+			int rr;
+			{ Timed t{score_clock.reference}; rr = next_ref(r); }
 			if (rr < 0) { fprintf(stderr, "vmaf: the original frames stopped coming (frame %lld)\n", k); ok = false; break; }
 			if (rr == 0) break;
 			if (!first) { repeats.back()++; k++; if (rp) rp->step(); continue; }
 			first = false;
 			repeats.push_back(1);
-			ok = scorer->add(r, pic);
+			{ Timed t{score_clock.score}; ok = scorer->add(r, pic); }
 			if (!ok) fprintf(stderr, "vmaf: the scorer refused frame %lld (original %dx%d %d-bit %d%s, encoded %dx%d %d-bit %d%s)\n", k, r.width, r.height, r.fmt.depth, r.fmt.chroma, r.fmt.planar ? "" : " packed", pic.width, pic.height, pic.fmt.depth, pic.fmt.chroma, pic.fmt.planar ? "" : " packed");
 			k++;
 			if (rp) rp->step();
@@ -381,7 +405,9 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 			d.pts = m;
 			d.duration = 1; // libplacebo needs it to know when the last frame ends; the packets carry none
 			if (m == 0 && !up->open(d, enc.fps.inverse(), ref.width, ref.height, score_fmt, scale, ref.score_range)) { fprintf(stderr, "vmaf: cannot scale the encoded frames back to %dx%d\n", ref.width, ref.height); ok = false; break; }
-			if (!up->push(&d)) { fprintf(stderr, "scaling the decoded frame back failed\n"); ok = false; break; }
+			bool pushed;
+			{ Timed t{score_clock.convert}; pushed = up->push(&d); }
+			if (!pushed) { fprintf(stderr, "scaling the decoded frame back failed\n"); ok = false; break; }
 			collect_converted();
 		}
 		m++;
@@ -393,6 +419,19 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 	if (!ok) return false;
 	std::vector<std::vector<double>> all, cu, cv;
 	if (!scorer->finish(all, cu, cv) || all.empty()) { fprintf(stderr, "vmaf: the scorer could not finish\n"); return false; }
+	if (const char* e = getenv("VES_SCORE_TIMING"); e && atoi(e) > 0 && k > 0) {
+		const ScoreClock& c = score_clock;
+		double copy, gpu, results;
+		const bool split = scorer->timing(copy, gpu, results);
+		const double all_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - c.began).count(), per = 1000.0 / (double)m;
+		char b[512];
+		if (split) snprintf(b, sizeof b, " (copy in %.2f, GPU %.2f, results %.2f)", copy * per, gpu * per, results * per);
+		else b[0] = 0;
+		std::string sc = b;
+		fprintf(stderr, "vmaf timing, %s %dx%d %d-bit %d, %lld frames, %.1f fps: ms per frame: decode %.2f, waiting for packets %.2f, reference %.2f, convert %.2f, score %.2f%s, rest %.2f\n",
+		        rp ? "true score" : "distorted score", ref.width, ref.height, score_fmt.depth, score_fmt.chroma, m, m / all_s, c.decode * per, c.packets * per, c.reference * per, c.convert * per, c.score * per, sc.c_str(),
+		        (all_s - c.decode - c.packets - c.reference - c.convert - c.score) * per);
+	}
 	// One value per original frame: a frame the encode dropped repeats the score of the frame on screen.
 	auto expand = [&](std::vector<double>& v) {
 		if (v.empty() || v.size() != repeats.size() || (long long)repeats.size() == k) return;

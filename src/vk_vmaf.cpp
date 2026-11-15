@@ -1,4 +1,5 @@
 #define _USE_MATH_DEFINES
+#include <chrono>
 #include "vk_vmaf.h"
 
 #include <algorithm>
@@ -579,7 +580,10 @@ public:
 	}
 
 	// Scores one frame pair, for every model. `index` 0 has no motion.
+	double t_copy = 0, t_gpu = 0, t_results = 0; // seconds, see GpuVmaf::timing()
 	std::vector<Features> process(const uint8_t* const ref[3], const size_t ref_stride[3], const uint8_t* const dis[3], const size_t dis_stride[3], size_t index) {
+		using clock = std::chrono::steady_clock;
+		const auto t0 = clock::now();
 		auto put = [&](void* dst, const uint8_t* src, size_t stride, int w, int h) {
 			const size_t row = (size_t)w * bps;
 			if (stride == row) memcpy(dst, src, row * h);
@@ -596,6 +600,7 @@ public:
 			put(sraw[2].map, dis[1], dis_stride[1], cw, ch);
 			put(sraw[3].map, dis[2], dis_stride[2], cw, ch);
 		}
+		const auto t1 = clock::now();
 		vk.begin();
 		bool with_motion[2] = {false, false};
 		for (int k = 0; k < 2; k++) {
@@ -683,6 +688,13 @@ public:
 			}
 		}
 		vk.submit_wait();
+		const auto t2 = clock::now();
+		struct Results { // counted when process() returns
+			double& to; clock::time_point from;
+			~Results() { to += std::chrono::duration<double>(clock::now() - from).count(); }
+		} results{t_results, t2};
+		t_copy += std::chrono::duration<double>(t1 - t0).count();
+		t_gpu += std::chrono::duration<double>(t2 - t1).count();
 
 		// the sums, once for each shared part
 		double sad_raw[2] = {0, 0};
@@ -1305,6 +1317,10 @@ bool GpuVmaf::add(const uint8_t* const ref[3], const size_t ref_stride[3], const
 	return true;
 }
 
+void GpuVmaf::timing(double& copy, double& gpu, double& results) const {
+	copy = impl->gpu ? impl->gpu->t_copy : 0; gpu = impl->gpu ? impl->gpu->t_gpu : 0; results = impl->gpu ? impl->gpu->t_results : 0;
+}
+
 bool GpuVmaf::finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<std::map<std::string, double>>>* features) {
 	const size_t n = impl->feats.size(), nm = impl->models.size();
 	scores.assign(nm, std::vector<double>(n, 0.0));
@@ -1376,5 +1392,6 @@ bool GpuVmaf::supported(const std::vector<std::string>&, int, const GpuVmafFrame
 std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::vector<std::string>&, int, const GpuVmafFrame&, std::string& why) { why = "built without Vulkan"; return nullptr; }
 bool GpuVmaf::add(const uint8_t* const[3], const size_t[3], const uint8_t* const[3], const size_t[3]) { return false; }
 bool GpuVmaf::finish(std::vector<std::vector<double>>&, std::vector<std::vector<std::map<std::string, double>>>*) { return false; }
+void GpuVmaf::timing(double& copy, double& gpu, double& results) const { copy = gpu = results = 0; }
 
 #endif
