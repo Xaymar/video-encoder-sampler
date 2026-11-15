@@ -19,6 +19,9 @@ struct RunProgress {
 	std::atomic<bool> failed{false};      // it ended without doing its job
 	std::atomic<int64_t> busy_ms{0}, starved_ms{0}, blocked_ms{0};
 	std::atomic<int64_t> state_since_ms{0}; // when the wait it is in began (state != 0)
+	// Whether its speed leaves out the time it waited. Not for an encoder: it hands frames on to work of its own (NVENC and AMF on the GPU, x264's
+	// frame threads), which goes on while it waits for the next frame, so only the time since it began says how fast it really is.
+	std::atomic<bool> waits_excluded{true};
 
 	void wait(int s);       // starts waiting (state 1 or 2); state = 0 ends it, and the time goes to starved_ms or blocked_ms
 	void begin(int st, long long tot);
