@@ -503,7 +503,10 @@ static void load_config_json(const Json& root, Config& cfg) {
 	});
 }
 
-static const char* VERSION = "0.2.0";
+#ifndef VES_VERSION
+#define VES_VERSION "unknown"
+#endif
+static const char* VERSION = VES_VERSION; // set by CMake: tag, commits since and hash (git describe), the same as in CI's archive names
 
 // The config file used when none is named: config.jsonc, or config.json if that is what there is.
 static std::string default_config() { return !fs::exists("config.jsonc") && fs::exists("config.json") ? "config.json" : "config.jsonc"; }

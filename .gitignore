@@ -22,3 +22,6 @@ third-party/svt-av1/
 third-party/vmaf/
 third-party/libplacebo/
 third-party/libvpl/
+
+# Version file CI writes for the build (see CMakeLists.txt)
+/.version

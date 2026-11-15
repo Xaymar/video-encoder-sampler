@@ -4,6 +4,23 @@ project(ves LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# The version ves reports (--version, logs, summaries) and CI puts in its archive names: VES_VERSION if given, else a .version file next to
+# this one (CI writes it, so the Flatpak build, which gets a copy of the tree, sees the same), else `git describe` (tag, commits since, hash).
+set(VES_VERSION "" CACHE STRING "Version ves reports; empty = .version file or git describe")
+if(NOT VES_VERSION AND EXISTS "${CMAKE_SOURCE_DIR}/.version")
+	file(STRINGS "${CMAKE_SOURCE_DIR}/.version" VES_VERSION LIMIT_COUNT 1)
+endif()
+if(NOT VES_VERSION)
+	find_package(Git QUIET)
+	if(GIT_FOUND)
+		execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --always --dirty WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" OUTPUT_VARIABLE VES_VERSION OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+	endif()
+endif()
+if(NOT VES_VERSION)
+	set(VES_VERSION "unknown")
+endif()
+message(STATUS "ves version: ${VES_VERSION}")
+
 if(WIN32)
 # Shared FFmpeg dev build (include/, lib/, bin/).
 set(FFMPEG_DIR "${CMAKE_SOURCE_DIR}/third-party/ffmpeg-dev" CACHE PATH "FFmpeg dev build root")
@@ -98,6 +115,7 @@ execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DI
 
 add_executable(ves src/main.cpp src/combos.cpp src/source.cpp src/ff.cpp src/ff_source.cpp src/pl_convert.cpp src/ff_decode.cpp src/formats.cpp src/cache.cpp src/gpu.cpp src/versions.cpp src/ui.cpp src/pipeline.cpp src/mux.cpp src/download.cpp src/hash.cpp src/options.cpp src/upload.cpp src/priority.cpp src/vmaf.cpp src/net.cpp src/remote.cpp src/encoder_process.cpp src/vk_compute.cpp src/vk_vmaf.cpp "${CMAKE_BINARY_DIR}/shaders_spv.cpp" src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_qsv.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
 target_include_directories(ves PRIVATE "${CMAKE_SOURCE_DIR}/src")
+target_compile_definitions(ves PRIVATE "VES_VERSION=\"${VES_VERSION}\"")
 if(WIN32)
 	target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include" "${CMAKE_SOURCE_DIR}/third-party/amf-include" "${CMAKE_SOURCE_DIR}/third-party/libvpl/ucrt64/include" "${X264_DIR}/include" "${X265_DIR}/include" "${SVTAV1_DIR}/include" "${VMAF_DIR}/include" "${PLACEBO_DIR}/include")
 	target_compile_definitions(ves PRIVATE _CRT_SECURE_NO_WARNINGS)
