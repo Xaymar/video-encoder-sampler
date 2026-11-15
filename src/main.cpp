@@ -250,6 +250,13 @@ static std::vector<std::string> split(const std::string& s) {
 	return out;
 }
 
+// The NTSC rates are written as decimals (23.976, 29.97, 59.94) but are n*1000/1001 exactly.
+static const int ntsc_rates[] = {24, 30, 48, 60, 120, 240};
+static Rational rate_of(double v) {
+	for (int k : ntsc_rates) if (std::fabs(v - k * 1000.0 / 1001) < 0.0005 * k) return {k * 1000, 1001};
+	return {(int)std::lround(v * 1000), 1000};
+}
+
 static Rational parse_fps(const std::string& s) { // "30", "29.97" (= 30000/1001) or "30000/1001"
 	int n, d;
 	if (sscanf(s.c_str(), "%d/%d", &n, &d) == 2) {
@@ -258,21 +265,97 @@ static Rational parse_fps(const std::string& s) { // "30", "29.97" (= 30000/1001
 	}
 	const double v = atof(s.c_str());
 	if (!(v > 0)) throw std::runtime_error("bad frame rate '" + s + "'");
-	// The NTSC rates are written as decimals (23.976, 29.97, 59.94) but are n*1000/1001 exactly.
-	for (int k : {24, 30, 48, 60, 120, 240}) if (std::fabs(v - k * 1000.0 / 1001) < 0.0005 * k) return {k * 1000, 1001};
-	return {(int)std::lround(v * 1000), 1000};
+	return rate_of(v);
+}
+
+// One entry of "framerates" (only the frame rate part of the shape is set): an exact rate ("60", "29.97", "30000/1001"), or a rule on the source's rate:
+// "/2" (always half), "/2>50" (half when above 50 fps), "<=60" (divided by the smallest whole number that gets it to 60 or below).
+static Shape parse_rate(const std::string& s) {
+	Shape sh;
+	auto num = [&](const std::string& t) {
+		char* end = nullptr;
+		const double v = strtod(t.c_str(), &end);
+		if (t.empty() || *end || !(v > 0)) throw std::runtime_error("bad frame rate rule '" + s + "', expected /N, /N>X or <=X");
+		return v;
+	};
+	if (s.rfind("<=", 0) == 0) { sh.fps_max = num(s.substr(2)); return sh; }
+	if (s.rfind("/", 0) == 0) {
+		const size_t gt = s.find('>');
+		const double d = num(s.substr(1, gt == std::string::npos ? std::string::npos : gt - 1));
+		if (d != std::floor(d) || d < 2) throw std::runtime_error("bad frame rate rule '" + s + "': the divisor must be a whole number of 2 or more");
+		sh.fps_divide = (int)d;
+		if (gt != std::string::npos) sh.fps_above = num(s.substr(gt + 1));
+		return sh;
+	}
+	sh.fps = parse_fps(s);
+	return sh;
+}
+// The same in a config file, where a rule can also be an object: {"divide": 2, "above": 50} or {"max": 60}.
+static Shape parse_rate(const Json& j) {
+	if (j.type != Json::Obj) return parse_rate(j.text());
+	Shape sh;
+	auto num = [&](const char* k, double& out) {
+		if (auto* v = j.find(k)) { out = atof(v->text().c_str()); if (!(out > 0)) throw std::runtime_error(v->where() + "framerates: '" + k + "' must be above 0"); return true; }
+		return false;
+	};
+	for (auto& [k, v] : j.o) if (k != "divide" && k != "above" && k != "max") throw std::runtime_error(v.where() + "framerates: unknown key '" + k + "' (divide, above, max)");
+	double d = 0;
+	const bool has_divide = num("divide", d), has_max = num("max", sh.fps_max);
+	num("above", sh.fps_above);
+	if (has_divide == has_max) throw std::runtime_error(j.where() + "framerates: a rule needs either \"divide\" (with \"above\" if wanted) or \"max\"");
+	if (has_max && j.find("above")) throw std::runtime_error(j.where() + "framerates: \"above\" goes with \"divide\", not \"max\"");
+	if (has_divide && (d != std::floor(d) || d < 2)) throw std::runtime_error(j.where() + "framerates: \"divide\" must be a whole number of 2 or more");
+	sh.fps_divide = (int)d;
+	return sh;
+}
+
+// How a frame rate entry reads in logs: "60", "/2>50", "<=60".
+static std::string rate_text(const Shape& s) {
+	auto g = [](double v) { char b[32]; snprintf(b, sizeof b, "%g", v); return std::string(b); };
+	if (s.fps_max > 0) return "<=" + g(s.fps_max);
+	if (s.fps_divide) return "/" + std::to_string(s.fps_divide) + (s.fps_above > 0 ? ">" + g(s.fps_above) : std::string());
+	return s.fps.num ? g(s.fps.value()) : std::string();
+}
+
+// A frame rate rule applied to a source: the shape with an exact rate, or with none (the source's own) when the rule leaves the rate as it is.
+// The source's rate is a measurement (119.905 for a 120 fps clip with jittery timestamps), so it is first taken as the whole or NTSC rate within half a
+// percent of it; the result is written as an exact entry with the same rate would be ("60" and a halved 120 fps source are the same run).
+static Shape resolve_rate(Shape s, Rational source) {
+	if (!s.fps_rule()) return s;
+	Rational src = source;
+	const double v = source.value();
+	double best = 0.005;
+	for (int k = 1; k <= 1000; k++) {
+		if (const double e = std::fabs(v / k - 1); e < best) { best = e; src = {k, 1}; }
+		if (const double e = std::fabs(v / (k * 1000.0 / 1001) - 1); e < best) { best = e; src = {k * 1000, 1001}; }
+	}
+	int d = 1;
+	if (s.fps_max > 0) d = std::max(1, (int)std::ceil(src.value() / s.fps_max - 1e-9));
+	else if (s.fps_above <= 0 || src.value() > s.fps_above + 1e-9) d = s.fps_divide;
+	s.fps_divide = 0; s.fps_above = s.fps_max = 0;
+	if (d == 1) { s.fps = {0, 1}; return s; }
+	if (src.den == 1001) { // stays exact: 59.94 / 2 is 30000/1001
+		int64_t n = src.num, den = (int64_t)src.den * d;
+		const int64_t g = std::gcd(n, den);
+		s.fps = {(int)(n / g), (int)(den / g)};
+	} else s.fps = rate_of(src.value() / d);
+	return s;
 }
 
 // Resolutions x frame rates; either list may be empty (= source).
-static std::vector<Shape> make_shapes(const std::vector<std::string>& res, const std::vector<std::string>& fps) {
+static std::vector<Shape> make_shapes(const std::vector<std::string>& res, const std::vector<Shape>& fps) {
 	std::vector<Shape> out;
 	for (size_t i = 0; i < std::max<size_t>(res.size(), 1); i++) for (size_t j = 0; j < std::max<size_t>(fps.size(), 1); j++) {
-		Shape s;
+		Shape s = j < fps.size() ? fps[j] : Shape{};
 		if (i < res.size() && sscanf(res[i].c_str(), "%dx%d", &s.w, &s.h) != 2) throw std::runtime_error("bad resolution '" + res[i] + "', expected WxH");
-		if (j < fps.size()) s.fps = parse_fps(fps[j]);
 		out.push_back(s);
 	}
 	return out;
+}
+static std::vector<Shape> make_shapes(const std::vector<std::string>& res, const std::vector<std::string>& fps) {
+	std::vector<Shape> rates;
+	for (auto& f : fps) rates.push_back(parse_rate(f));
+	return make_shapes(res, rates);
 }
 
 // "requires" and "unless" of an option: a name ("max_b_frames": it is set), a list of names, or an object of name to what it must be:
@@ -396,14 +479,18 @@ static void load_config_json(const Json& root, Config& cfg) {
 		Scenario sc;
 		sc.kfs = default_kfs;
 		if (auto* n = o.find("name")) sc.name = n->text();
-		std::vector<std::string> res, fps;
+		std::vector<std::string> res;
+		std::vector<Shape> fps;
 		auto strs = [&](const char* k, auto fn) {
 			if (auto* v = o.find(k)) { if (v->type != Json::Arr) throw std::runtime_error(v->where() + "'" + k + "' must be an array"); for (auto& e : v->a) fn(e.text()); }
 		};
 		strs("bitrates", [&](const std::string& t) { sc.bitrates.push_back(atoll(t.c_str())); });
 		if (o.find("kfintervals")) { sc.kfs.clear(); strs("kfintervals", [&](const std::string& t) { sc.kfs.push_back(atof(t.c_str())); }); }
 		strs("resolutions", [&](const std::string& t) { res.push_back(t); });
-		strs("framerates", [&](const std::string& t) { fps.push_back(t); });
+		if (auto* v = o.find("framerates")) {
+			if (v->type != Json::Arr) throw std::runtime_error(v->where() + "'framerates' must be an array");
+			for (auto& e : v->a) fps.push_back(parse_rate(e));
+		}
 		sc.shapes = make_shapes(res, fps);
 		strs("chroma", [&](const std::string& t) { sc.chroma.push_back(t); });
 		strs("bitdepth", [&](const std::string& t) { sc.bitdepth.push_back(t); });
@@ -572,6 +659,8 @@ Quick run (replaces the encoders and scenarios of the config file)
   -cd,  --codec <name>      h264 | hevc | av1, for the GPU encoders
   -br,  --bitrate <kbps[,..]>
   -res, --resolution <WxH[,..]>    -fps, --framerate <n[,..]>    --kf <seconds[,..]>
+                            a frame rate can be a rule on the source's: /2 (half), /2>50 (half when above 50), <=60
+                            (divided by the smallest whole number that gets it to 60 or below); quote them in a shell
         --option <key=a,b>  an encoder option, can be given more than once; comma separated values are swept
                             and every combination is tested
         --fixed <key[,..]>  options that are never pruned
@@ -1305,8 +1394,39 @@ int main(int argc, char** argv) {
 	};
 	int total = 0;
 
+	std::map<std::string, SourceInfo> infos;
+	// The file behind an input. A URL is downloaded when it is first needed (its folder is under the cache folder, or the temp folder if there is
+	// none), with the progress in the live display like the runs; an input that cannot be had throws.
+	std::map<std::string, std::string> local_paths;
+	std::set<std::string> source_failed; // inputs that could not be had: said once, not tried again
+	auto local_path = [&](const std::string& input) -> std::string {
+		if (!is_url(input)) return input;
+		if (auto it = local_paths.find(input); it != local_paths.end()) return it->second;
+		const std::string dir = (cfg.cache_dir.empty() ? fs::temp_directory_path() / "ves-downloads" : fs::path(cfg.cache_dir) / "downloads").string();
+		RunProgress rp;
+		rp.begin(5, 0);
+		const int handle = ui::attach(&rp, file_name(input), "input");
+		struct Detach { RunProgress& rp; int h; ~Detach() { rp.finish(); ui::detach(h); } } detach{rp, handle};
+		return local_paths[input] = fetch_url(input, dir, &rp);
+	};
+	// The source files, probed once each. A run that asks for no particular resolution or frame rate gets the source's, which is what its result records.
+	auto source_of = [&](const std::string& input) -> const SourceInfo* {
+		auto it = infos.find(input);
+		if (it != infos.end()) return &it->second;
+		if (source_failed.count(input)) return nullptr;
+		SourceInfo si;
+		try {
+			if (!source_info(local_path(input), si)) { source_failed.insert(input); return nullptr; }
+		} catch (const std::exception& e) { ui::log("Input " + file_name(input) + ": " + e.what()); source_failed.insert(input); return nullptr; }
+		it = infos.emplace(input, si).first;
+		ui::log("Source " + file_name(input) + ": " + std::to_string(si.width) + "x" + std::to_string(si.height) + (cfg.in_process ? " decoded by " + si.decoder : std::string()));
+		ui::emit_record((char)29, source_json(it->second));
+		return &it->second;
+	};
+
 	// The runs of one input. With lazy planning only the first input is made up front and each next one when its turn comes: a big config has over a million runs
 	// at the start, and holding those of every input at once costs gigabytes.
+	std::set<std::string> rates_logged; // input|scenario|size whose frame rate rule was logged
 	auto create_input_tasks = [&](const std::string& input) {
 		const std::string key_head = key_input(input);
 		const std::string folder = cfg.short_names ? key_hash(key_input(input)).substr(0, 8) : sanitize(fs::path(file_name(input)).stem().string());
@@ -1321,9 +1441,28 @@ int main(int argc, char** argv) {
 				const bool lazy_job = is_lazy(job);
 				LazyTable* lt = lazy_job ? &lazy_table_of(job, sc) : nullptr;
 				const std::vector<Variant>* sets = lazy_job ? nullptr : &variants_of(job, sc);
+				// The scenario's sizes for this input: frame rate rules ("/2>50", "<=60") become the rate they give for this source, and entries that end up the
+				// same (a halved 120 fps source and an exact 60) are one run. Rules need the source's rate, so only they make the input be opened here.
+				std::vector<std::pair<size_t, Shape>> shapes_here;
+				const bool rules = std::any_of(sc.shapes.begin(), sc.shapes.end(), [](const Shape& s) { return s.fps_rule(); });
+				const SourceInfo* rule_src = rules ? source_of(input) : nullptr;
+				for (size_t i = 0; i < sc.shapes.size(); i++) {
+					if (sc.shapes[i].fps_rule() && !rule_src) continue; // the input cannot be had: its other runs fail and say so
+					const Shape sh = rule_src ? resolve_rate(sc.shapes[i], rule_src->framerate) : sc.shapes[i];
+					const bool dup = std::any_of(shapes_here.begin(), shapes_here.end(), [&](const auto& p) {
+						return p.second.w == sh.w && p.second.h == sh.h && p.second.fps.num == sh.fps.num && p.second.fps.den == sh.fps.den && p.second.upscale == sh.upscale;
+					});
+					if (!dup) shapes_here.emplace_back(i, sh);
+					if (sc.shapes[i].fps_rule() && rates_logged.insert(input + "|" + std::to_string(&sc - cfg.scenarios.data()) + "|" + std::to_string(i)).second)
+						ui::log("Scenario " + (sc.name.empty() ? std::string("(unnamed)") : sc.name) + ", " + file_name(input) + ": frame rate " + rate_text(sc.shapes[i]) + " of " +
+						        std::to_string(rule_src->framerate.value()).substr(0, 7) + " fps gives " + (sh.fps.num ? std::to_string(sh.fps.value()).substr(0, 7) : std::string("the source's rate")) +
+						        (dup ? " (already planned)" : ""));
+				}
 				for (int64_t br : sc.bitrates) for (double kf : sc.kfs) {
 					const std::string kf_text = std::to_string((double)kf).substr(0, std::to_string((double)kf).find('.') + 2);
-					for (auto& shape : sc.shapes) {
+					for (auto& entry : shapes_here) {
+						const size_t shape_index = entry.first;
+						const Shape& shape = entry.second;
 						std::string head = encoder_label; // the part of the label the options come after
 						if (shape.w) head += " " + std::to_string(shape.w) + "x" + std::to_string(shape.h);
 						if (shape.fps.num) head += " @" + std::to_string(shape.fps.value()).substr(0, 6);
@@ -1331,7 +1470,7 @@ int main(int argc, char** argv) {
 						const std::string group_head = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|";
 						const auto key_parts = std::make_shared<const Task::KeyParts>(Task::KeyParts{key_head, key_run_text + key_tail});
 						// Makes the run of one variant. A lazy group keeps it, to make more runs later.
-						auto make_task = [jobp = &job, scp = &sc, shape_i = (size_t)(&shape - sc.shapes.data()), id, input, br, kf, shape, head, key_parts, kf_text, group_head, folder, folder_path, folder_made, &tasks, &cfg](const Variant& v, LazyGroup* lg, ComboTable::Id combo) {
+						auto make_task = [jobp = &job, scp = &sc, shape_i = shape_index, id, input, br, kf, shape, head, key_parts, kf_text, group_head, folder, folder_path, folder_made, &tasks, &cfg](const Variant& v, LazyGroup* lg, ComboTable::Id combo) {
 							const Job& job = *jobp;
 							Task t;
 							t.job = jobp; t.id = id; t.sc = scp; t.shape_i = shape_i; t.model = v.model;
@@ -1407,7 +1546,7 @@ int main(int argc, char** argv) {
 			put(" kbps, key frames every ");
 			for (size_t k = 0; k < sc.kfs.size(); k++) put("%s%g", k ? "," : "", sc.kfs[k]);
 			put(" s");
-			for (auto& sh : sc.shapes) if (sh.w || sh.fps.num) put(", %dx%d@%g", sh.w, sh.h, sh.fps.num ? sh.fps.value() : 0.0);
+			for (auto& sh : sc.shapes) if (sh.w || sh.fps.num || sh.fps_rule()) put(", %dx%d@%s", sh.w, sh.h, sh.fps.num || sh.fps_rule() ? rate_text(sh).c_str() : "0");
 			for (auto* list : {&sc.chroma, &sc.bitdepth, &sc.range}) if (!list->empty()) {
 				put(", %s ", list == &sc.chroma ? "chroma" : list == &sc.bitdepth ? "bitdepth" : "range");
 				for (size_t k = 0; k < list->size(); k++) put("%s%s", k ? "," : "", (*list)[k].c_str());
@@ -1456,21 +1595,6 @@ int main(int argc, char** argv) {
 	// A run is finished when its result is known, however it came about: print it, count it.
 	std::atomic<int> finished{0};
 	ui::overall(0, total);
-	std::map<std::string, SourceInfo> infos;
-	// The file behind an input. A URL is downloaded when it is first needed (its folder is under the cache folder, or the temp folder if there is
-	// none), with the progress in the live display like the runs; an input that cannot be had throws.
-	std::map<std::string, std::string> local_paths;
-	std::set<std::string> source_failed; // inputs that could not be had: said once, not tried again
-	auto local_path = [&](const std::string& input) -> std::string {
-		if (!is_url(input)) return input;
-		if (auto it = local_paths.find(input); it != local_paths.end()) return it->second;
-		const std::string dir = (cfg.cache_dir.empty() ? fs::temp_directory_path() / "ves-downloads" : fs::path(cfg.cache_dir) / "downloads").string();
-		RunProgress rp;
-		rp.begin(5, 0);
-		const int handle = ui::attach(&rp, file_name(input), "input");
-		struct Detach { RunProgress& rp; int h; ~Detach() { rp.finish(); ui::detach(h); } } detach{rp, handle};
-		return local_paths[input] = fetch_url(input, dir, &rp);
-	};
 	// SHA-256 of an input file, read once per input and only when a result needs it.
 	std::map<std::string, std::string> reference_hashes;
 	auto reference_hash = [&](const std::string& input) -> const std::string& {
@@ -1587,20 +1711,6 @@ int main(int argc, char** argv) {
 		complete_group(t.r.group);
 	};
 
-	// The source files, probed once each. A run that asks for no particular resolution or frame rate gets the source's, which is what its result records.
-	auto source_of = [&](const std::string& input) -> const SourceInfo* {
-		auto it = infos.find(input);
-		if (it != infos.end()) return &it->second;
-		if (source_failed.count(input)) return nullptr;
-		SourceInfo si;
-		try {
-			if (!source_info(local_path(input), si)) { source_failed.insert(input); return nullptr; }
-		} catch (const std::exception& e) { ui::log("Input " + file_name(input) + ": " + e.what()); source_failed.insert(input); return nullptr; }
-		it = infos.emplace(input, si).first;
-		ui::log("Source " + file_name(input) + ": " + std::to_string(si.width) + "x" + std::to_string(si.height) + (cfg.in_process ? " decoded by " + si.decoder : std::string()));
-		ui::emit_record((char)29, source_json(it->second));
-		return &it->second;
-	};
 	auto fit_shape = [](Task& t) {
 		if (!t.r.shape.w) { t.r.shape.w = t.plan.enc.w; t.r.shape.h = t.plan.enc.h; }
 		if (!t.r.shape.fps.num) t.r.shape.fps = t.plan.enc.fps;
