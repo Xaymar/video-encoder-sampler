@@ -412,8 +412,10 @@ void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Pl
 }
 
 // Takes the decoded frames and converts them to `fmt` for scoring (the true score's reference), for every scorer of that format, staying at most
-// DECODE_AHEAD frames ahead of the slowest of them: the decoded frames are what is kept for a scorer that is behind, not the converted ones (which are
-// larger: scored at 10 bit or more). `waiting` is set while it waits for room.
+// DECODE_AHEAD frames ahead of the slowest busy one: the decoded frames are what is kept for a scorer that is behind, not the converted ones (which are
+// larger: scored at 10 bit or more). A scorer that waits for its encoder's packets does not hold it back: the busy scorers may need frames that encoder
+// has not been given yet (an encoder that holds more frames back than the others), and waiting for it would wait forever. `waiting` is set while it
+// waits for room.
 void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, Fmt fmt, const ScaleOptions& so, FrameHistory& out, std::atomic<bool>& waiting, RunProgress& rp) {
 	auto conv = make_converter();
 	Picture t, o;
@@ -424,9 +426,9 @@ void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, F
 		if (got < 0) ok = false;
 	};
 	for (;;) {
-		if (out.behind(false) >= (long long)DECODE_AHEAD) {
+		if (out.behind(true) >= (long long)DECODE_AHEAD) {
 			waiting = true;
-			while (out.behind(false) >= (long long)DECODE_AHEAD && out.read()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			while (out.behind(true) >= (long long)DECODE_AHEAD && out.read()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
 			waiting = false;
 		}
 		if (!out.read() || raw.next(reader, t) != 1) break; // the end, or every scorer of this format has ended
