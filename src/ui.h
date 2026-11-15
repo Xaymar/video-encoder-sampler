@@ -20,10 +20,16 @@ struct RunProgress {
 	std::atomic<int64_t> busy_ms{0}, starved_ms{0}, blocked_ms{0};
 	std::atomic<int64_t> state_since_ms{0}; // when the wait it is in began (state != 0)
 	// Whether its speed leaves out the time it waited. Not for an encoder: it hands frames on to work of its own (NVENC and AMF on the GPU, x264's
-	// frame threads), which goes on while it waits for the next frame, so only the time since it began says how fast it really is.
+	// frame threads), which goes on while it waits for the next frame. An encoder whose packets arrive while it waits (NVENC, AMF, SVT-AV1: they
+	// come on a thread of their own) is working until the last of them: only the rest of the wait is left out. One whose packets come only
+	// from its encode calls (x264, x265) gives no sign of when its threads are done, so its speed is over the whole time.
 	std::atomic<bool> waits_excluded{true};
+	std::atomic<int64_t> alive_ms{0};       // its last sign of work (alive())
+	std::atomic<bool> async_output{false};  // a sign of work came while it waited
 
-	void wait(int s);       // starts waiting (state 1 or 2); state = 0 ends it, and the time goes to starved_ms or blocked_ms
+	void wait(int s);       // starts waiting (state 1 or 2)
+	void end_wait(std::atomic<int64_t> RunProgress::*counter); // ends it: state 0, and the wait (from the last sign of work in it) goes to `counter`
+	void alive();           // work came out (an encoder's packet)
 	void begin(int st, long long tot);
 	void step() { done++; }
 	void finish();

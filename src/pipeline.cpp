@@ -124,13 +124,9 @@ public:
 	// Time spent waiting is added to the stage's counters, and the stage shows what it waits for.
 	template <class Pred> void wait_for(std::unique_lock<std::mutex>& lock, Pred pred, RunProgress* rp, int state, std::atomic<int64_t> RunProgress::*counter) {
 		if (pred()) return;
-		const auto t = std::chrono::steady_clock::now();
 		if (rp) rp->wait(state);
 		cv.wait(lock, pred);
-		if (rp) {
-			rp->state = 0;
-			(rp->*counter) += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
-		}
+		if (rp) rp->end_wait(counter);
 	}
 
 	bool push(Picture&& p, RunProgress* rp = nullptr) { // false once the consumer gave up; rp: the producer, backed up while the queue is full
@@ -266,13 +262,14 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q, Holding* holdi
 	Mp4Writer mp4;
 	bool write_failed = false;
 	if (!codec || !codec->open(p, [&](const uint8_t* d, size_t n, int64_t pts, bool key, int64_t dts) {
+		if (job.rp) job.rp->alive(); // the encoder is working at least until now (see RunProgress::waits_excluded)
 		job.output.add(d, n);
 		if (job.tee) job.tee(d, n);
 		if (!job.file.empty() && !mp4.add(d, n, pts, key, dts)) write_failed = true;
 	})) { q.cancel(); return; }
 	if (!job.file.empty() && !mp4.open(job.file, job.id, pl.enc, job.color, codec->reorder_delay())) { fprintf(stderr, "cannot write %s\n", job.file.c_str()); q.cancel(); return; }
 	bool ok = true;
-	if (job.rp) job.rp->waits_excluded = false; // its work goes on while it waits (see RunProgress)
+	if (job.rp) job.rp->waits_excluded = false; // its work goes on while it waits (see RunProgress::waits_excluded)
 	for (Picture pic; q.pop(pic, job.rp);) {
 		const auto t = std::chrono::steady_clock::now();
 		if (holding) { holding->fed++; changed.notify(); }
