@@ -28,6 +28,9 @@
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#ifdef _WIN32
+extern "C" __declspec(dllimport) unsigned int __stdcall timeBeginPeriod(unsigned int ms); // winmm; not <windows.h>, whose macros clash here
+#endif
 
 #include "cache.h"
 #include "hash.h"
@@ -975,6 +978,11 @@ static int run_worker(int argc, char** argv) {
 int main(int argc, char** argv) {
 	ui::end_on_interrupt();
 	end_crashes_at_once();
+#ifdef _WIN32
+	// Sleeps last whole timer ticks, 15.6 ms by default. AMF, QSV and SVT-AV1 offer no wait for a finished packet, so their backends poll with 1 ms
+	// sleeps, which became 15.6 ms each. One millisecond for this process (Windows 10 2004 and later keep the setting per process).
+	timeBeginPeriod(1);
+#endif
 #if defined(_WIN32) && defined(_DEBUG)
 	// A failed assertion of the debug runtime goes to stderr and aborts, instead of opening a dialog that offers to start a debugger.
 	_set_error_mode(_OUT_TO_STDERR);

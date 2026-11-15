@@ -30,7 +30,7 @@ struct OutputInfo {
 };
 
 // How many converted frames may wait in front of an encoder (or scorer).
-constexpr size_t DECODE_AHEAD = 8;
+constexpr size_t DECODE_AHEAD = 30;
 
 // What is needed to know about an input before decoding any of it.
 struct SourceInfo {

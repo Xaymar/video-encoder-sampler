@@ -154,6 +154,31 @@ public:
 	void cancel() { std::lock_guard lock(m); cancelled = closed = true; q.clear(); cv.notify_all(); }
 };
 
+// Wakes the stages that wait for room in a FrameHistory (the decode, the references' converters) when anything they wait on changes: a reader moved
+// or left, a scorer started or stopped waiting for packets, an encoder took a frame or let one go. One for the process; a wake-up meant for another
+// wave only makes a waiter look again. The waiter checks without holding this lock, so the locks of what it checks never nest inside it.
+class Wakeup {
+	std::mutex m;
+	std::condition_variable cv;
+	uint64_t gen = 0;
+
+public:
+	void notify() {
+		{ std::lock_guard lock(m); gen++; }
+		cv.notify_all();
+	}
+	template <class Pred> void wait_until(Pred done) {
+		for (;;) {
+			uint64_t seen;
+			{ std::lock_guard lock(m); seen = gen; }
+			if (done()) return;
+			std::unique_lock lock(m);
+			cv.wait(lock, [&] { return gen != seen; });
+		}
+	}
+};
+Wakeup changed;
+
 // Encoded packets on their way to a scorer. Bounded by size, but always room for a few packets so that neither side can wait on the other.
 class PacketQueue {
 	static constexpr size_t MAX_BYTES = 64u << 20, MIN_PACKETS = 8;
@@ -181,8 +206,10 @@ public:
 			const auto t = std::chrono::steady_clock::now();
 			if (rp) rp->state = 1;
 			waiting = true;
+			changed.notify();
 			cv.wait(lock, [&] { return !q.empty() || closed || cancelled; });
 			waiting = false;
+			changed.notify();
 			if (rp) {
 				rp->state = 0;
 				rp->starved_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
@@ -214,8 +241,15 @@ public:
 	void close() { for (auto& q : qs) q->close(); }
 };
 
+// How many frames an encoder holds: given to it, no packet out for them yet. x264 and x265 hold their lookahead, their B-frames and one frame per frame
+// thread (often a hundred frames and more); a scorer cannot be given those frames before the encoder lets go of them.
+struct Holding {
+	std::atomic<long long> fed{0}, out{0}; // changed.notify() after each change
+	long long frames() const { return std::max(0LL, fed.load() - out.load()); }
+};
+
 // One encoder taking frames from its queue.
-void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
+void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q, Holding* holding = nullptr) {
 	const Plan& pl = *job.plan;
 	Params p;
 	p.codec = job.codec;
@@ -240,6 +274,7 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
 	bool ok = true;
 	for (Picture pic; q.pop(pic, job.rp);) {
 		const auto t = std::chrono::steady_clock::now();
+		if (holding) { holding->fed++; changed.notify(); }
 		if (ok && !(ok = codec->encode(&pic))) q.cancel(); // frees the producer if it is waiting for room
 		else if (job.rp) job.rp->step();
 		if (job.rp) job.rp->busy_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
@@ -266,6 +301,7 @@ class FrameHistory {
 		bool gone = false;
 		long long limit = 0;         // held(): how far behind it may fall while it is busy
 		std::function<bool()> idle;  // true while the reader waits for something else than this history
+		std::function<long long()> slack; // added to the limit: the frames an encoder holds that this reader waits for
 	};
 	std::vector<Reader> readers;
 
@@ -278,14 +314,14 @@ class FrameHistory {
 public:
 	// A reader, before the first frame comes. `idle`, if given, says when the reader waits for something else (a scorer for the encoder's packets): such a
 	// reader does not hold the decode back, however far behind it is, since its encoder may need more frames before it gives it anything to do. A busy
-	// reader holds it back once it is `limit` frames behind (see held()).
-	size_t add_reader(long long limit, std::function<bool()> idle = {}) {
+	// reader holds it back once it is `limit` frames behind (see held()), and `slack` more: the frames its encoder holds, which it cannot have yet.
+	size_t add_reader(long long limit, std::function<bool()> idle = {}, std::function<long long()> slack = {}) {
 		std::lock_guard lock(m);
-		readers.push_back(Reader{0, false, limit, std::move(idle)});
+		readers.push_back(Reader{0, false, limit, std::move(idle), std::move(slack)});
 		return readers.size() - 1;
 	}
-	void push(Picture p) { std::lock_guard lock(m); q.push_back(std::move(p)); cv.notify_all(); }
-	void close() { std::lock_guard lock(m); closed = true; cv.notify_all(); }
+	void push(Picture p) { { std::lock_guard lock(m); q.push_back(std::move(p)); cv.notify_all(); } changed.notify(); }
+	void close() { { std::lock_guard lock(m); closed = true; cv.notify_all(); } changed.notify(); }
 	// The reader's next frame: 1, or 0 when no more will come. Waits while it is not there yet; rp: the reader, starved meanwhile.
 	int next(size_t r, Picture& out, RunProgress* rp = nullptr) {
 		std::unique_lock lock(m);
@@ -304,9 +340,11 @@ public:
 		out = q[(size_t)(rd.at - base)];
 		rd.at++;
 		trim();
+		lock.unlock();
+		changed.notify();
 		return 1;
 	}
-	void leave(size_t r) { std::lock_guard lock(m); readers[r].gone = true; trim(); }
+	void leave(size_t r) { { std::lock_guard lock(m); readers[r].gone = true; trim(); } changed.notify(); }
 	bool read() { std::lock_guard lock(m); return std::any_of(readers.begin(), readers.end(), [](const Reader& r) { return !r.gone; }); } // by anyone still
 	// How many frames the slowest reader is behind the newest one: of every reader, or of those that are busy (not idle) only.
 	long long behind(bool busy_only) {
@@ -325,15 +363,17 @@ public:
 	bool held() {
 		std::lock_guard lock(m);
 		const long long end = base + (long long)q.size();
-		for (auto& r : readers) if (!r.gone && end - r.at >= r.limit && !(r.idle && r.idle())) return true;
+		for (auto& r : readers) if (!r.gone && end - r.at >= r.limit + (r.slack ? r.slack() : 0) && !(r.idle && r.idle())) return true;
 		return false;
 	}
 };
 
-// How far a scorer that is busy may fall behind the decode before the decode waits for it (and with it the encoders), in frames. The frames it has
-// not looked at yet are kept for it, as they came from the decoder (the true score) or as the encoder got them (the distorted score); a scorer that
-// waits for its encoder's packets never holds the decode back, since the encoder may need more frames before it gives the scorer anything to do.
-constexpr long long SCORE_BEHIND = 48;
+// How far a scorer that is busy may fall behind its encoder's output before the decode waits for it (and with it the encoders), in frames. The frames it
+// has not looked at yet are kept for it, as they came from the decoder (the true score) or as the encoder got them (the distorted score); a scorer that
+// waits for its encoder's packets never holds the decode back, since the encoder may need more frames before it gives the scorer anything to do. The
+// frames the encoder holds (Holding) do not count: measured from the decode, x264's scorer is always that far behind, so the decode stopped whenever it
+// scored, which fed x264 one frame per scored frame and left its threads with nothing to do.
+constexpr long long SCORE_BEHIND = 30;
 
 // Decodes the input once for the whole wave, while nothing that reads the frames holds it back (FrameHistory::held(): the encoders' feed DECODE_AHEAD frames
 // behind, a busy scorer SCORE_BEHIND frames behind).
@@ -345,7 +385,7 @@ void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& h
 		if (held()) {
 			const auto t = std::chrono::steady_clock::now();
 			if (rp) rp->state = 2;
-			while (held() && raw.read()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			changed.wait_until([&] { return !held() || !raw.read(); });
 			if (rp) {
 				rp->state = 0;
 				rp->blocked_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
@@ -430,8 +470,10 @@ void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, F
 	for (;;) {
 		if (out.behind(true) >= (long long)DECODE_AHEAD) {
 			waiting = true;
-			while (out.behind(true) >= (long long)DECODE_AHEAD && out.read()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			changed.notify();
+			changed.wait_until([&] { return out.behind(true) < (long long)DECODE_AHEAD || !out.read(); });
 			waiting = false;
+			changed.notify();
 		}
 		if (!out.read() || raw.next(reader, t) != 1) break; // the end, or every scorer of this format has ended
 		rp.step();
@@ -514,12 +556,15 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 	FrameHistory raw, enc_frames;
 	Broadcast bc(n); // the frames for the encoders
 	std::vector<std::unique_ptr<PacketQueue>> packets, dist_packets;
+	std::vector<std::unique_ptr<Holding>> holding;
 	for (size_t i = 0; i < n; i++) {
 		packets.push_back(std::make_unique<PacketQueue>());
 		dist_packets.push_back(std::make_unique<PacketQueue>());
+		holding.push_back(std::make_unique<Holding>());
 		PacketQueue* pq = packets.back().get();
 		PacketQueue* dq = dist_packets.back().get();
-		runs[i]->enc.tee = [pq, dq](const uint8_t* d, size_t size) { const bool a = pq->push(d, size), b = dq->push(d, size); return a || b; };
+		Holding* hd = holding.back().get();
+		runs[i]->enc.tee = [pq, dq, hd](const uint8_t* d, size_t size) { hd->out++; changed.notify(); const bool a = pq->push(d, size), b = dq->push(d, size); return a || b; };
 		if (runs[i]->enc.rp) { // frames the encoder gets: fewer than the source's when the frame rate is lowered
 			const Plan& pl = *runs[i]->enc.plan;
 			runs[i]->enc.rp->begin(1, pl.convert_rate ? std::max<long long>(1, std::llround(si.duration * pl.enc.fps.value())) : std::max<long long>(1, si.frame_count));
@@ -547,8 +592,18 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 			PacketQueue* pq = packets[i].get();
 			g->readers.push_back(g->frames.add_reader(DECODE_AHEAD, [pq] { return pq->waiting.load(); }));
 		}
-		// The converter holds the decode back like a busy scorer when it waits for one; when its scorers all wait for packets, it does not.
-		g->raw_reader = raw.add_reader(SCORE_BEHIND, [gp = g.get()] { return gp->waiting.load() && !gp->frames.busy(); });
+		// The converter holds the decode back like a busy scorer when it waits for one; when its scorers all wait for packets, it does not. Its slack is
+		// what the members' encoders hold, in decoded frames (more of them than encoded ones when the frame rate is lowered).
+		std::vector<std::pair<Holding*, double>> held_by;
+		for (size_t i : g->members) {
+			const Plan& pl = *runs[i]->enc.plan;
+			held_by.push_back({holding[i].get(), pl.convert_rate && pl.enc.fps.value() > 0 ? std::max(1.0, si.framerate.value() / pl.enc.fps.value()) : 1.0});
+		}
+		g->raw_reader = raw.add_reader(SCORE_BEHIND, [gp = g.get()] { return gp->waiting.load() && !gp->frames.busy(); }, [held_by] {
+			long long most = 0;
+			for (auto& [h, per] : held_by) most = std::max(most, (long long)std::ceil(h->frames() * per));
+			return most;
+		});
 		g->ref_rp.begin(6, std::max<long long>(1, si.frame_count));
 		g->handle = ui::attach(&g->ref_rp, "reference to " + std::to_string(f.depth) + "-bit " + (f.rgb ? std::string("RGB") : f.chroma == 420 ? std::string("4:2:0") : f.chroma == 422 ? std::string("4:2:2") : std::string("4:4:4")), "convert");
 		groups.push_back(std::move(g));
@@ -557,7 +612,8 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 	std::vector<size_t> dist_readers;
 	for (size_t i = 0; i < n; i++) {
 		PacketQueue* dq = dist_packets[i].get();
-		dist_readers.push_back(enc_frames.add_reader(SCORE_BEHIND, [dq] { return dq->waiting.load(); }));
+		Holding* hd = holding[i].get();
+		dist_readers.push_back(enc_frames.add_reader(SCORE_BEHIND, [dq] { return dq->waiting.load(); }, [hd] { return hd->frames(); }));
 	}
 	if (feed_rp) feed_rp->begin(6, std::max<long long>(1, si.frame_count)); // it steps once per decoded frame, kept or dropped
 	// The one decode of the wave has a row of its own; the feed and the references are conversions of what it decoded.
@@ -571,7 +627,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 	std::thread feeder([&] { feed_encoders(*src, raw, feed_reader, *runs[0]->enc.plan, so, bc, enc_frames, fr, feed_ok, feed_rp); });
 	std::vector<std::thread> threads;
 	for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {
-		consume(runs[i]->enc, si, bc.at(i));
+		consume(runs[i]->enc, si, bc.at(i), holding[i].get());
 		packets[i]->close(); // the scorers have all there is
 		dist_packets[i]->close();
 	});
