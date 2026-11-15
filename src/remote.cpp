@@ -41,7 +41,7 @@ namespace fs = std::filesystem;
 namespace {
 
 enum : uint8_t { M_HELLO = 1, M_JOB = 2, M_NEED = 3, M_FILE_DATA = 4, M_FILE_END = 5, M_RESULT = 6, M_DONE = 7, M_PROGRESS = 8, M_SOURCE = 9, M_LOG = 10, M_PING = 11 };
-constexpr int kVersion = 4;
+constexpr int kVersion = 5; // 5: dropped frames take the score of the frame on screen (a worker scoring the old way would store it under the new key)
 // Both sides say something at least every kPingEvery; one that has heard nothing for kSilence takes the other as gone (crashed, hung, or the machine is off) and ends
 // the connection: the host gives that worker's jobs to the others, the worker stops them and connects again.
 constexpr int kPingEvery = 10;      // seconds

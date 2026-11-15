@@ -341,13 +341,20 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 	Picture d, u, r;
 	long long m = 0, mo = 0, k = 0; // decoded frames in, converted frames out, original frame index
 
-	// Hold `shown` (decoded frame number mi, at the original resolution) for every original frame up to the next one.
+	// Decoded frame mi (at the original resolution) is on screen for every original frame up to the next one. It is scored once, against the original
+	// frame it was made from (the first of them); the original frames the encode dropped (a lower frame rate) show that same frame again, so they get its
+	// score instead of one against a picture that moved on. `repeats` counts the original frames of each scored frame.
+	std::vector<uint32_t> repeats;
 	auto show = [&](const Picture& pic, int64_t mi) {
 		uint32_t on_screen;
+		bool first = true;
 		while (ok && shown((size_t)k, on_screen) && on_screen == mi) {
 			int rr = next_ref(r);
 			if (rr < 0) { fprintf(stderr, "vmaf: the original frames stopped coming (frame %lld)\n", k); ok = false; break; }
 			if (rr == 0) break;
+			if (!first) { repeats.back()++; k++; if (rp) rp->step(); continue; }
+			first = false;
+			repeats.push_back(1);
 			ok = scorer->add(r, pic);
 			if (!ok) fprintf(stderr, "vmaf: the scorer refused frame %lld (original %dx%d %d-bit %d%s, encoded %dx%d %d-bit %d%s)\n", k, r.width, r.height, r.fmt.depth, r.fmt.chroma, r.fmt.planar ? "" : " packed", pic.width, pic.height, pic.fmt.depth, pic.fmt.chroma, pic.fmt.planar ? "" : " packed");
 			k++;
@@ -386,6 +393,15 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 	if (!ok) return false;
 	std::vector<std::vector<double>> all, cu, cv;
 	if (!scorer->finish(all, cu, cv) || all.empty()) { fprintf(stderr, "vmaf: the scorer could not finish\n"); return false; }
+	// One value per original frame: a frame the encode dropped repeats the score of the frame on screen.
+	auto expand = [&](std::vector<double>& v) {
+		if (v.empty() || v.size() != repeats.size() || (long long)repeats.size() == k) return;
+		std::vector<double> out;
+		out.reserve((size_t)k);
+		for (size_t i = 0; i < v.size(); i++) out.insert(out.end(), repeats[i], v[i]);
+		v = std::move(out);
+	};
+	for (auto* list : {&all, &cu, &cv}) for (auto& v : *list) expand(v);
 	scores = std::move(all[0]);
 	if (detail) {
 		detail->chroma_u = std::move(cu[0]); detail->chroma_v = std::move(cv[0]);
