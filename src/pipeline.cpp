@@ -1,7 +1,9 @@
 #include "pipeline.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <functional>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
@@ -162,6 +164,8 @@ class PacketQueue {
 	bool closed = false, cancelled = false;
 
 public:
+	std::atomic<bool> waiting{false}; // the scorer waits for the encoder's next packet: it has nothing to do until the encoder gets more frames
+
 	bool push(const uint8_t* d, size_t n) { // false once the scorer gave up
 		std::unique_lock lock(m);
 		cv.wait(lock, [&] { return cancelled || bytes < MAX_BYTES || q.size() < MIN_PACKETS; });
@@ -176,7 +180,9 @@ public:
 		if (q.empty() && !closed && !cancelled) {
 			const auto t = std::chrono::steady_clock::now();
 			if (rp) rp->state = 1;
+			waiting = true;
 			cv.wait(lock, [&] { return !q.empty() || closed || cancelled; });
+			waiting = false;
 			if (rp) {
 				rp->state = 0;
 				rp->starved_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
@@ -207,55 +213,6 @@ public:
 	}
 	void close() { for (auto& q : qs) q->close(); }
 };
-
-// Reads the input, drops frames to the target rate, scales and converts, and hands the result to the encoders.
-// Frame rate conversion drops frames before scaling. Each source frame falls into a slot of the output timeline
-// (its real presentation time times the rate, rounded down) and only the first frame in each slot is kept.
-// `shown[n]` records which encoded frame is on screen at source frame n, for scoring.
-void produce(const std::string& input, const SourceInfo& si, const Plan& pl, const ScaleOptions& so, Broadcast& bc, FeedResult& fr, RunProgress* rp) {
-	auto src = open_source(input);
-	if (!src) { fprintf(stderr, "cannot open %s\n", input.c_str()); fr.shown.finish(); bc.close(); return; }
-	const Shape& enc = pl.enc;
-	if (rp) rp->begin(3, pl.convert_rate ? std::max<long long>(1, std::llround(si.duration * enc.fps.value())) : std::max<long long>(1, si.frame_count));
-	auto scaler = make_converter();
-	Picture frame, scaled;
-	int64_t last_slot = -1;
-	long long kept = 0;
-	bool ok = true;
-	int r = 1;
-	auto queue_scaled = [&] {
-		int got;
-		while (ok && (got = scaler->pop(scaled)) == 1) ok = bc.push(scaled, rp);
-		ok = ok && got >= 0;
-	};
-	while (ok && (r = src->next(frame)) == 1) {
-		const int64_t slot = src->slot(fr.frames, enc.fps);
-		const bool keep = !pl.convert_rate || fr.frames == 0 || slot != last_slot; // no target rate: every frame stays
-		last_slot = slot;
-		fr.frames++;
-		if (rp) rp->step();
-		if (keep) {
-			frame.pts = kept++; // encoded frames are numbered consecutively, whatever the gaps in the source timing
-			frame.duration = 1; // one tick of the 1/enc.fps time base
-			if (!pl.rescale) ok = bc.push(frame, rp);
-			else {
-				if (frame.pts == 0) ok = scaler->open(frame, enc.fps.inverse(), enc.w, enc.h, enc.pix, so, pl.range);
-				ok = ok && scaler->push(&frame);
-				queue_scaled();
-			}
-		}
-		fr.shown.push((uint32_t)(kept - 1));
-	}
-	if (ok && src->frame_count() && src->frame_count() != fr.frames) {
-		fprintf(stderr, "the file lists %lld frames but %lld were decoded\n", src->frame_count(), fr.frames);
-		ok = false;
-	}
-	if (ok && pl.rescale) { ok = scaler->push(nullptr); queue_scaled(); }
-	fr.ok = ok && r >= 0;
-	if (rp) rp->finish();
-	fr.shown.finish();
-	bc.close();
-}
 
 // One encoder taking frames from its queue.
 void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
@@ -296,39 +253,203 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q) {
 	job.kbps = codec->stats.bytes * 8 / si.duration / 1000;
 }
 
-// Decodes the original and converts it to `fmt` for scoring, for every consumer of `bc`.
-void feed_reference(const std::string& input, Fmt fmt, const ScaleOptions& so, Broadcast& bc, RunProgress& rp) {
-	auto src = open_source(input);
-	if (!src) { fprintf(stderr, "cannot open %s\n", input.c_str()); bc.close(); return; }
-	const bool convert = src->fmt != fmt;
-	auto conv = make_converter();
-	Picture t, o;
-	bool ok = true, first = true, conv_failed = false;
-	int r;
-	auto flush_converted = [&] {
-		int got;
-		while (ok && (got = conv->pop(o)) == 1) ok = bc.push(o, &rp);
-		if (ok && got < 0) ok = false, conv_failed = true;
+// Frames that several readers take at their own pace, each through a cursor of its own; a frame is let go of once every reader is past it.
+// The one decode of a wave reaches the encoders, the true scores and the distorted scores through these.
+class FrameHistory {
+	std::mutex m;
+	std::condition_variable cv;
+	std::deque<Picture> q;
+	long long base = 0; // the index of q.front()
+	bool closed = false;
+	struct Reader {
+		long long at = 0;
+		bool gone = false;
+		long long limit = 0;         // held(): how far behind it may fall while it is busy
+		std::function<bool()> idle;  // true while the reader waits for something else than this history
 	};
-	while (ok && (r = src->next(t)) == 1) {
-		rp.step();
-		if (!convert) { ok = bc.push(t, &rp); continue; }
-		t.duration = 1;
-		if (first) { ok = conv->open(t, src->framerate.inverse(), src->width, src->height, fmt, so); first = false; conv_failed = !ok; }
-		if (ok && !conv->push(&t)) ok = false, conv_failed = true;
-		flush_converted();
+	std::vector<Reader> readers;
+
+	void trim() { // with m held
+		long long low = base + (long long)q.size();
+		for (auto& r : readers) if (!r.gone) low = std::min(low, r.at);
+		while (base < low && !q.empty()) { q.pop_front(); base++; }
 	}
-	if (ok && convert) { ok = conv->push(nullptr); flush_converted(); }
-	if (conv_failed) fprintf(stderr, "the original frames could not be converted to %d-bit %d for scoring\n", fmt.depth, fmt.chroma);
-	rp.finish();
+
+public:
+	// A reader, before the first frame comes. `idle`, if given, says when the reader waits for something else (a scorer for the encoder's packets): such a
+	// reader does not hold the decode back, however far behind it is, since its encoder may need more frames before it gives it anything to do. A busy
+	// reader holds it back once it is `limit` frames behind (see held()).
+	size_t add_reader(long long limit, std::function<bool()> idle = {}) {
+		std::lock_guard lock(m);
+		readers.push_back(Reader{0, false, limit, std::move(idle)});
+		return readers.size() - 1;
+	}
+	void push(Picture p) { std::lock_guard lock(m); q.push_back(std::move(p)); cv.notify_all(); }
+	void close() { std::lock_guard lock(m); closed = true; cv.notify_all(); }
+	// The reader's next frame: 1, or 0 when no more will come. Waits while it is not there yet; rp: the reader, starved meanwhile.
+	int next(size_t r, Picture& out, RunProgress* rp = nullptr) {
+		std::unique_lock lock(m);
+		Reader& rd = readers[r];
+		auto there = [&] { return rd.at < base + (long long)q.size() || closed; };
+		if (!there()) {
+			const auto t = std::chrono::steady_clock::now();
+			if (rp) rp->state = 1;
+			cv.wait(lock, there);
+			if (rp) {
+				rp->state = 0;
+				rp->starved_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
+			}
+		}
+		if (rd.at >= base + (long long)q.size()) return 0;
+		out = q[(size_t)(rd.at - base)];
+		rd.at++;
+		trim();
+		return 1;
+	}
+	void leave(size_t r) { std::lock_guard lock(m); readers[r].gone = true; trim(); }
+	bool read() { std::lock_guard lock(m); return std::any_of(readers.begin(), readers.end(), [](const Reader& r) { return !r.gone; }); } // by anyone still
+	// How many frames the slowest reader is behind the newest one: of every reader, or of those that are busy (not idle) only.
+	long long behind(bool busy_only) {
+		std::lock_guard lock(m);
+		const long long end = base + (long long)q.size();
+		long long most = 0;
+		for (auto& r : readers) if (!r.gone && !(busy_only && r.idle && r.idle())) most = std::max(most, end - r.at);
+		return most;
+	}
+	// Whether any reader is busy (not idle), wherever it is.
+	bool busy() {
+		std::lock_guard lock(m);
+		return std::any_of(readers.begin(), readers.end(), [](const Reader& r) { return !r.gone && !(r.idle && r.idle()); });
+	}
+	// Whether a busy reader is as far behind as it may be: then nothing more should be added for now.
+	bool held() {
+		std::lock_guard lock(m);
+		const long long end = base + (long long)q.size();
+		for (auto& r : readers) if (!r.gone && end - r.at >= r.limit && !(r.idle && r.idle())) return true;
+		return false;
+	}
+};
+
+// How far a scorer that is busy may fall behind the decode before the decode waits for it (and with it the encoders), in frames. The frames it has
+// not looked at yet are kept for it, as they came from the decoder (the true score) or as the encoder got them (the distorted score); a scorer that
+// waits for its encoder's packets never holds the decode back, since the encoder may need more frames before it gives the scorer anything to do.
+constexpr long long SCORE_BEHIND = 48;
+
+// Decodes the input once for the whole wave, while nothing that reads the frames holds it back (FrameHistory::held(): the encoders' feed DECODE_AHEAD frames
+// behind, a busy scorer SCORE_BEHIND frames behind).
+void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& held, bool& ok, RunProgress* rp) {
+	Picture frame;
+	long long n = 0;
+	int r;
+	for (;;) {
+		if (held()) {
+			const auto t = std::chrono::steady_clock::now();
+			if (rp) rp->state = 2;
+			while (held() && raw.read()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			if (rp) {
+				rp->state = 0;
+				rp->blocked_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
+			}
+		}
+		if (!raw.read()) { r = -1; break; } // everything that took frames has ended (failed): nothing to decode for
+		if ((r = src.next(frame)) != 1) break;
+		raw.push(std::move(frame));
+		frame = Picture();
+		n++;
+	}
+	ok = r == 0;
+	if (r < 0 && raw.read()) fprintf(stderr, "decoding the input failed after %lld frames\n", n);
+	if (ok && src.frame_count() && src.frame_count() != n) {
+		fprintf(stderr, "the file lists %lld frames but %lld were decoded\n", src.frame_count(), n);
+		ok = false;
+	}
+	raw.close();
+}
+
+// Takes the decoded frames, drops frames to the target rate, scales and converts, and hands the result to the encoders and to the distorted scores (`enc`).
+// Frame rate conversion drops frames before scaling. Each source frame falls into a slot of the output timeline (its real presentation time times the rate,
+// rounded down) and only the first frame in each slot is kept. `shown[n]` records which encoded frame is on screen at source frame n, for scoring.
+void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Plan& pl, const ScaleOptions& so, Broadcast& bc, FrameHistory& enc, FeedResult& fr, bool& ok, RunProgress* rp) {
+	const Shape& e = pl.enc;
+	auto scaler = make_converter();
+	Picture frame, scaled;
+	int64_t last_slot = -1;
+	long long kept = 0;
+	ok = true;
+	auto hand_on = [&](const Picture& p) {
+		enc.push(p);
+		if (!bc.push(p, rp)) ok = false; // every encoder gave up
+	};
+	auto queue_scaled = [&] {
+		int got;
+		while (ok && (got = scaler->pop(scaled)) == 1) hand_on(scaled);
+		ok = ok && got >= 0;
+	};
+	while (ok && raw.next(reader, frame) == 1) {
+		const int64_t slot = src.slot(fr.frames, e.fps);
+		const bool keep = !pl.convert_rate || fr.frames == 0 || slot != last_slot; // no target rate: every frame stays
+		last_slot = slot;
+		fr.frames++;
+		if (rp) rp->step();
+		if (keep) {
+			frame.pts = kept++; // encoded frames are numbered consecutively, whatever the gaps in the source timing
+			frame.duration = 1; // one tick of the 1/enc.fps time base
+			if (!pl.rescale) hand_on(frame);
+			else {
+				if (frame.pts == 0) ok = scaler->open(frame, e.fps.inverse(), e.w, e.h, e.pix, so, pl.range);
+				ok = ok && scaler->push(&frame);
+				queue_scaled();
+			}
+		}
+		fr.shown.push((uint32_t)(kept - 1));
+	}
+	raw.leave(reader);
+	if (ok && pl.rescale && kept) { ok = scaler->push(nullptr); queue_scaled(); }
+	if (rp) rp->finish();
+	fr.shown.finish();
+	enc.close();
 	bc.close();
 }
 
-// The frames an encoder got, as the reference of its distorted score: taken from a feed of their own (the same decode, drop and scale as the encoders'),
-// converted to the scoring format the way the decoded encode is, at the encode's size. has() tells whether one more frame comes, for the scorer's
-// "shown" map, which is one to one here: encoded frame k is on screen at feed frame k.
+// Takes the decoded frames and converts them to `fmt` for scoring (the true score's reference), for every scorer of that format, staying at most
+// DECODE_AHEAD frames ahead of the slowest of them: the decoded frames are what is kept for a scorer that is behind, not the converted ones (which are
+// larger: scored at 10 bit or more). `waiting` is set while it waits for room.
+void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, Fmt fmt, const ScaleOptions& so, FrameHistory& out, std::atomic<bool>& waiting, RunProgress& rp) {
+	auto conv = make_converter();
+	Picture t, o;
+	bool ok = true, first = true;
+	auto flush_converted = [&] {
+		int got;
+		while ((got = conv->pop(o)) == 1) out.push(std::move(o));
+		if (got < 0) ok = false;
+	};
+	for (;;) {
+		if (out.behind(false) >= (long long)DECODE_AHEAD) {
+			waiting = true;
+			while (out.behind(false) >= (long long)DECODE_AHEAD && out.read()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			waiting = false;
+		}
+		if (!out.read() || raw.next(reader, t) != 1) break; // the end, or every scorer of this format has ended
+		rp.step();
+		if (t.fmt == fmt) { out.push(t); continue; }
+		t.duration = 1;
+		if (first) { ok = conv->open(t, si.framerate.inverse(), si.width, si.height, fmt, so); first = false; }
+		if (ok && !conv->push(&t)) ok = false;
+		if (ok) flush_converted();
+		if (!ok) break;
+	}
+	raw.leave(reader);
+	if (ok && !first) { ok = conv->push(nullptr); flush_converted(); }
+	if (!ok) fprintf(stderr, "the original frames could not be converted to %d-bit %d for scoring\n", fmt.depth, fmt.chroma);
+	rp.finish();
+	out.close();
+}
+
+// The frames an encoder got, as the reference of its distorted score, converted to the scoring format the way the decoded encode is, at the encode's
+// size. has() tells whether one more frame comes, for the scorer's "shown" map, which is one to one here: encoded frame k is on screen at feed frame k.
 class ConvertedFeed {
-	FrameQueue& q;
+	FrameHistory& h;
+	size_t reader;
 	const Plan& pl;
 	const ScaleOptions& so;
 	std::unique_ptr<Converter> conv = make_converter();
@@ -338,7 +459,7 @@ class ConvertedFeed {
 	bool fetch() { // one more frame into `ready`; false at the end or on an error
 		while (ready.empty() && !ended) {
 			Picture p;
-			if (!q.pop(p)) {
+			if (h.next(reader, p) != 1) {
 				ended = true;
 				if (opened && (!conv->push(nullptr) || !drain())) failed = true;
 				break;
@@ -360,7 +481,8 @@ class ConvertedFeed {
 	}
 
 public:
-	ConvertedFeed(FrameQueue& q, const Plan& pl, const ScaleOptions& so) : q(q), pl(pl), so(so) {}
+	ConvertedFeed(FrameHistory& h, size_t reader, const Plan& pl, const ScaleOptions& so) : h(h), reader(reader), pl(pl), so(so) {}
+	~ConvertedFeed() { h.leave(reader); }
 	bool has() { return fetch(); }
 	int next(Picture& out) {
 		if (!fetch()) return failed ? -1 : 0;
@@ -375,7 +497,18 @@ public:
 
 bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRun*>& runs, const ScaleOptions& so, const VmafOptions& vo, RunProgress* feed_rp, FeedResult& fr) {
 	const size_t n = runs.size();
-	Broadcast bc(n), dist_bc(n); // the frames for the encoders, and the same frames again (a decode of their own) for the distorted scores
+	auto src = open_source(input);
+	if (!src) {
+		fprintf(stderr, "cannot open %s\n", input.c_str());
+		fr.shown.finish();
+		for (auto* r : runs) { r->enc.ok = false; r->score_ok = false; }
+		return false;
+	}
+	// One decode for everything: the encoders' feed takes the decoded frames, and so do the converters of the true scores' reference (one for each format
+	// the runs score in); the frames the encoders got are kept for the distorted scores. Scorers read where they are, so nothing is decoded twice, and the
+	// decode (and with it the encoders) waits for a scorer that falls far behind.
+	FrameHistory raw, enc_frames;
+	Broadcast bc(n); // the frames for the encoders
 	std::vector<std::unique_ptr<PacketQueue>> packets, dist_packets;
 	for (size_t i = 0; i < n; i++) {
 		packets.push_back(std::make_unique<PacketQueue>());
@@ -389,27 +522,15 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 		}
 	}
 
-	// Encoding: one decode feeds every encoder.
-	std::thread producer([&] { produce(input, si, *runs[0]->enc.plan, so, bc, fr, feed_rp); });
-	// The distorted feed has a decode of its own: the encoders hold frames back (look-ahead, reordering), so the frames one of them got cannot wait
-	// in a short queue until its packets for them come out without stopping the decode that feeds them all.
-	FeedResult dist_fr;
-	std::thread dist_producer([&] { produce(input, si, *runs[0]->enc.plan, so, dist_bc, dist_fr, nullptr); });
-	std::vector<std::thread> threads;
-	for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {
-		consume(runs[i]->enc, si, bc.at(i));
-		packets[i]->close(); // the scorers have all there is
-		dist_packets[i]->close();
-	});
-
-	// Scoring runs at the same time, following the encoders' output as it is written. Runs that compare in the same format share one decode of
-	// the original, which is read as far as the slowest scorer has got.
+	// The scoring formats, and a reference of each, converted from the decoded frames.
 	std::vector<Fmt> formats;
 	for (auto* r : runs) if (std::find(formats.begin(), formats.end(), r->enc.plan->score_fmt) == formats.end()) formats.push_back(r->enc.plan->score_fmt);
 	struct Group {
 		Fmt fmt;
-		std::vector<size_t> members;
-		std::unique_ptr<Broadcast> bc;
+		std::vector<size_t> members, readers;
+		FrameHistory frames;
+		size_t raw_reader = 0;
+		std::atomic<bool> waiting{false}; // the converter waits for its scorers
 		RunProgress ref_rp;
 		int handle = 0;
 	};
@@ -417,26 +538,50 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 	for (const Fmt& f : formats) {
 		auto g = std::make_unique<Group>();
 		g->fmt = f;
-		for (size_t i = 0; i < n; i++) if (runs[i]->enc.plan->score_fmt == f) g->members.push_back(i);
-		g->bc = std::make_unique<Broadcast>(g->members.size());
+		for (size_t i = 0; i < n; i++) if (runs[i]->enc.plan->score_fmt == f) {
+			g->members.push_back(i);
+			PacketQueue* pq = packets[i].get();
+			g->readers.push_back(g->frames.add_reader(DECODE_AHEAD, [pq] { return pq->waiting.load(); }));
+		}
+		// The converter holds the decode back like a busy scorer when it waits for one; when its scorers all wait for packets, it does not.
+		g->raw_reader = raw.add_reader(SCORE_BEHIND, [gp = g.get()] { return gp->waiting.load() && !gp->frames.busy(); });
 		g->ref_rp.begin(3, std::max<long long>(1, si.frame_count));
-		g->handle = ui::attach(&g->ref_rp, "reference decode " + std::to_string(si.width) + "x" + std::to_string(si.height), "decode");
+		g->handle = ui::attach(&g->ref_rp, "reference convert " + std::to_string(si.width) + "x" + std::to_string(si.height), "decode");
 		groups.push_back(std::move(g));
 	}
+	const size_t feed_reader = raw.add_reader(DECODE_AHEAD);
+	std::vector<size_t> dist_readers;
+	for (size_t i = 0; i < n; i++) {
+		PacketQueue* dq = dist_packets[i].get();
+		dist_readers.push_back(enc_frames.add_reader(SCORE_BEHIND, [dq] { return dq->waiting.load(); }));
+	}
+	if (feed_rp) feed_rp->begin(3, runs[0]->enc.plan->convert_rate ? std::max<long long>(1, std::llround(si.duration * runs[0]->enc.plan->enc.fps.value())) : std::max<long long>(1, si.frame_count));
+
+	bool decode_ok = false, feed_ok = false;
+	std::thread decoder([&] { decode_input(*src, raw, [&] { return raw.held() || enc_frames.held(); }, decode_ok, nullptr); });
+	std::thread feeder([&] { feed_encoders(*src, raw, feed_reader, *runs[0]->enc.plan, so, bc, enc_frames, fr, feed_ok, feed_rp); });
+	std::vector<std::thread> threads;
+	for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {
+		consume(runs[i]->enc, si, bc.at(i));
+		packets[i]->close(); // the scorers have all there is
+		dist_packets[i]->close();
+	});
+
+	// Scoring runs at the same time, following the encoders' output as it is written.
 	RefInfo ref;
 	ref.width = si.width; ref.height = si.height; ref.framerate = si.framerate; ref.color = si.color; ref.frames = si.frame_count;
 	ref.score_range = si.fmt.rgb ? 1 : (si.color.range ? si.color.range : 1); // the reference side is converted to YUV without changing the range (RGB: limited)
 	for (auto& gp : groups) {
 		Group& g = *gp;
-		threads.emplace_back([&, gptr = &g] { feed_reference(input, gptr->fmt, so, *gptr->bc, gptr->ref_rp); });
+		threads.emplace_back([&, gptr = &g] { convert_reference(si, raw, gptr->raw_reader, gptr->fmt, so, gptr->frames, gptr->waiting, gptr->ref_rp); });
 		VmafOptions group_vo = vo;
 		if (group_vo.threads <= 0) group_vo.threads = std::max(2, (int)std::thread::hardware_concurrency() / (int)runs.size());
 		for (size_t m = 0; m < g.members.size(); m++) threads.emplace_back([&, gptr = &g, m, group_vo] {
 			Group& g = *gptr;
 			WaveRun& run = *runs[g.members[m]];
-			FrameQueue& rq = g.bc->at(m);
+			const size_t reader = g.readers[m];
 			PacketQueue& pq = *packets[g.members[m]];
-			const FrameFeed feed = [&rq, rp = run.score_rp](Picture& out) { return rq.pop(out, rp) ? 1 : 0; };
+			const FrameFeed feed = [&g, reader, rp = run.score_rp](Picture& out) { return g.frames.next(reader, out, rp); };
 			const PacketFeed next_packet = [&pq, rp = run.score_rp](std::vector<uint8_t>& out) { return pq.pop(out, rp); };
 			const ShownFeed shown = [&fr](size_t k, uint32_t& v) { return fr.shown.get(k, v); };
 			VmafOptions run_vo = group_vo; // scoring follows the run's encoder to its GPU (vmaf.gpu "auto")
@@ -445,45 +590,47 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 			run.score_ok = vmaf_score(ref, feed, run.codec, next_packet, {}, run.enc.plan->enc, run.enc.plan->color, shown, g.fmt, run_vo, so, run.scores, run.score_rp, &run.detail);
 			if (run.score_ok && (long long)run.scores.size() != fr.frames) { fprintf(stderr, "%zu scores for %lld frames\n", run.scores.size(), fr.frames); run.score_ok = false; }
 			if (run.score_rp) { run.score_rp->failed = !run.score_ok; run.score_rp->finish(); }
-			rq.cancel(); // done with the original frames: do not hold the reference decode back
-			pq.cancel(); // and with the packets: do not hold the encoder back
+			g.frames.leave(reader); // done with the original frames: do not hold the decode back
+			pq.cancel();            // and with the packets: do not hold the encoder back
 		});
 	}
 	// The distorted score: each encode against the frames its encoder got, at their size and frame rate, with every model.
 	for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {
 		WaveRun& run = *runs[i];
 		const Plan& pl = *run.enc.plan;
-		FrameQueue& fq = dist_bc.at(i);
 		PacketQueue& pq = *dist_packets[i];
-		ConvertedFeed cf(fq, pl, so);
-		RefInfo dref;
-		dref.width = pl.enc.w; dref.height = pl.enc.h; dref.framerate = pl.enc.fps; dref.color = pl.color;
-		dref.frames = pl.convert_rate ? std::max<long long>(1, std::llround(si.duration * pl.enc.fps.value())) : si.frame_count;
-		dref.score_range = pl.color.range ? pl.color.range : 1;
-		const FrameFeed next_ref = [&cf](Picture& out) { return cf.next(out); };
-		const PacketFeed next_packet = [&pq](std::vector<uint8_t>& out) { return pq.pop(out); };
-		const ShownFeed shown = [&cf](size_t k, uint32_t& v) { v = (uint32_t)k; return cf.has(); };
-		VmafOptions run_vo = vo;
-		if (run_vo.threads <= 0) run_vo.threads = std::max(2, (int)std::thread::hardware_concurrency() / (int)runs.size());
-		run_vo.encoder_vendor = encoder_vendor(run.enc.encoder);
-		if (auto it = pl.options.find("gpu"); it != pl.options.end()) run_vo.encoder_gpu = atoi(it->second.c_str());
-		std::vector<double> scores;
-		VmafDetail detail;
-		bool ok = vmaf_score(dref, next_ref, run.codec, next_packet, {}, pl.enc, pl.color, shown, pl.dist_fmt, run_vo, so, scores, nullptr, &detail) && cf.ok();
+		bool ok;
+		{
+			ConvertedFeed cf(enc_frames, dist_readers[i], pl, so);
+			RefInfo dref;
+			dref.width = pl.enc.w; dref.height = pl.enc.h; dref.framerate = pl.enc.fps; dref.color = pl.color;
+			dref.frames = pl.convert_rate ? std::max<long long>(1, std::llround(si.duration * pl.enc.fps.value())) : si.frame_count;
+			dref.score_range = pl.color.range ? pl.color.range : 1;
+			const FrameFeed next_ref = [&cf](Picture& out) { return cf.next(out); };
+			const PacketFeed next_packet = [&pq](std::vector<uint8_t>& out) { return pq.pop(out); };
+			const ShownFeed shown = [&cf](size_t k, uint32_t& v) { v = (uint32_t)k; return cf.has(); };
+			VmafOptions run_vo = vo;
+			if (run_vo.threads <= 0) run_vo.threads = std::max(2, (int)std::thread::hardware_concurrency() / (int)runs.size());
+			run_vo.encoder_vendor = encoder_vendor(run.enc.encoder);
+			if (auto it = pl.options.find("gpu"); it != pl.options.end()) run_vo.encoder_gpu = atoi(it->second.c_str());
+			std::vector<double> scores;
+			VmafDetail detail;
+			ok = vmaf_score(dref, next_ref, run.codec, next_packet, {}, pl.enc, pl.color, shown, pl.dist_fmt, run_vo, so, scores, nullptr, &detail) && cf.ok();
+			if (ok) {
+				run.detail_distorted = std::move(scores);
+				for (auto& e : detail.extra) run.extra_distorted.push_back(std::move(e.scores));
+			}
+		} // the feed lets go of the encoders' frames here
 		if (!ok) fprintf(stderr, "the distorted score (the encode against the frames its encoder got) failed\n");
 		run.dist_ok = ok;
-		if (ok) {
-			run.detail_distorted = std::move(scores);
-			for (auto& e : detail.extra) run.extra_distorted.push_back(std::move(e.scores));
-		}
-		fq.cancel();
 		pq.cancel();
 	});
 
-	producer.join();
-	dist_producer.join();
+	decoder.join();
+	feeder.join();
 	for (auto& t : threads) t.join();
 	for (auto& g : groups) ui::detach(g->handle);
+	fr.ok = decode_ok && feed_ok;
 	for (auto* r : runs) {
 		r->enc.ok = r->enc.ok && fr.ok;
 		// Both scores or none: a run without its distorted score counts as not scored.
