@@ -241,8 +241,8 @@ ui::Progress progress_of(const Entry& e) {
 	p.done = e.p->done;
 	p.total = e.p->total;
 	// Its own speed, not that of whatever it waited for: the waits it is done with, and the one it is in, do not count.
-	const int64_t waiting = e.p->state != 0 && !end ? std::max<int64_t>(0, now_ms() - e.p->state_since_ms) : 0;
-	const double worked = e.p->waits_excluded ? secs - (e.p->starved_ms + e.p->blocked_ms + waiting) / 1000.0 : secs;
+	const int64_t waiting = e.p->state != 0 && !end ? std::max<int64_t>(0, now_ms() - std::max<int64_t>(e.p->state_since_ms, e.p->alive_ms)) : 0;
+	const double worked = e.p->waits_excluded || e.p->async_output ? secs - (e.p->starved_ms + e.p->blocked_ms + waiting) / 1000.0 : secs;
 	p.rate = p.done / std::max(0.05, worked);
 	p.state = e.p->state;
 	p.finished = end != 0;
@@ -444,12 +444,25 @@ void RunProgress::wait(int s) {
 	state = s;
 }
 
+void RunProgress::end_wait(std::atomic<int64_t> RunProgress::*counter) {
+	const int64_t from = std::max<int64_t>(state_since_ms, alive_ms);
+	state = 0;
+	this->*counter += std::max<int64_t>(0, now_ms() - from);
+}
+
+void RunProgress::alive() {
+	alive_ms = now_ms();
+	if (state != 0) async_output = true;
+}
+
 void RunProgress::begin(int st, long long tot) {
 	end_ms = 0;
 	failed = false;
 	busy_ms = starved_ms = blocked_ms = 0;
 	state = 0;
 	waits_excluded = true;
+	alive_ms = 0;
+	async_output = false;
 	done = 0;
 	total = tot;
 	since_ms = now_ms();
