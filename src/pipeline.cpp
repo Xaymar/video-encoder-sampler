@@ -272,6 +272,7 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q, Holding* holdi
 	})) { q.cancel(); return; }
 	if (!job.file.empty() && !mp4.open(job.file, job.id, pl.enc, job.color, codec->reorder_delay())) { fprintf(stderr, "cannot write %s\n", job.file.c_str()); q.cancel(); return; }
 	bool ok = true;
+	if (job.rp) job.rp->waits_excluded = false; // its work goes on while it waits (see RunProgress)
 	for (Picture pic; q.pop(pic, job.rp);) {
 		const auto t = std::chrono::steady_clock::now();
 		if (holding) { holding->fed++; changed.notify(); }
