@@ -131,16 +131,78 @@ struct Planes { // the memory of an output picture
 	std::vector<uint8_t> mem[3];
 };
 
+// A frame on its way through the GPU: its planes were copied into `up`, and its result is downloaded into `dl`. Several are in flight per converter,
+// so that the GPU converts one frame while the next is copied in and the one before is copied out, and the copies run without the device's lock:
+// the buffers are mapped, so only recording and submitting the work needs it.
+constexpr int IN_FLIGHT = 3;
+struct Slot {
+	pl_buf up[3]{}, dl[3]{};
+	bool pending = false;
+	int64_t pts = 0, duration = 1;
+	Color color;
+	bool rgb = false;
+};
+
 class PlConverter : public Converter {
 	std::shared_ptr<SharedVulkan> dev;
 	pl_vulkan vk = nullptr; // dev's
 	std::string shape; // the renderers of its sizes, format and scalers are the ones it borrows
-	pl_tex in_tex[3]{}, out_tex[3]{};
-	pl_buf dl[3]{}; // where the output planes are downloaded to
+	pl_tex in_tex[3]{}, out_tex[3]{}; // shared by the frames in flight: libplacebo orders the work on them
+	Slot slots[IN_FLIGHT];
+	std::deque<int> order; // the slots in flight, oldest first
+	int next_slot = 0;
+	bool mapped_up = false; // upload through mapped buffers; otherwise libplacebo copies the planes itself, with the lock held
 	const pl_filter_config *up = nullptr, *down = nullptr;
 	int out_w = 0, out_h = 0;
 	Fmt out_fmt;
 	std::deque<Picture> ready;
+
+	// Waits for the oldest frame in flight (if `wait`; otherwise only takes it if it is done) and copies it out. 1: taken, 0: not done yet, -1: failed.
+	int take_oldest(bool wait) {
+		Slot& s = slots[order.front()];
+		std::unique_lock lock(dev->use);
+		for (;;) {
+			if (pl_gpu_is_failed(vk->gpu)) { lost(); return -1; }
+			bool busy = false;
+			for (auto& b : s.dl) busy = busy || pl_buf_poll(vk->gpu, b, 0);
+			if (!busy) break;
+			if (!wait) return 0;
+			lock.unlock();
+			std::this_thread::sleep_for(std::chrono::microseconds(250));
+			lock.lock();
+		}
+		lock.unlock();
+		auto planes = std::make_shared<Planes>();
+		Picture out;
+		out.width = out_w; out.height = out_h;
+		out.fmt = out_fmt;
+		for (int i = 0; i < 3; i++) {
+			const size_t stride = stride_of(i);
+			planes->mem[i].resize(stride * plane_h(out_h, out_fmt.chroma, i));
+			if (s.dl[i]->data) memcpy(planes->mem[i].data(), s.dl[i]->data, planes->mem[i].size()); // done on the GPU: nothing else touches it now
+			else {
+				std::lock_guard again(dev->use);
+				if (!pl_buf_read(vk->gpu, s.dl[i], 0, planes->mem[i].data(), planes->mem[i].size())) { fprintf(stderr, "libplacebo: download failed\n"); lost(); return -1; }
+			}
+			out.data[i] = planes->mem[i].data();
+			out.stride[i] = (int)stride;
+		}
+		{
+			std::lock_guard again(dev->use);
+			if (lost()) return -1; // after a lost device (driver reset) calls can still report success and hand back stale memory
+		}
+		out.pts = s.pts;
+		out.duration = s.duration;
+		out.color = s.color;
+		if (s.rgb) out.color.space = 1;
+		if (target_range) out.color.range = target_range;
+		else if (s.rgb) out.color.range = 1;
+		out.owner = planes;
+		ready.push_back(std::move(out));
+		s.pending = false;
+		order.pop_front();
+		return 1;
+	}
 
 public:
 	~PlConverter() override {
@@ -148,7 +210,7 @@ public:
 			std::lock_guard lock(dev->use);
 			for (auto& t : in_tex) pl_tex_destroy(vk->gpu, &t);
 			for (auto& t : out_tex) pl_tex_destroy(vk->gpu, &t);
-			for (auto& b : dl) pl_buf_destroy(vk->gpu, &b);
+			for (auto& s : slots) for (int i = 0; i < 3; i++) { pl_buf_destroy(vk->gpu, &s.up[i]); pl_buf_destroy(vk->gpu, &s.dl[i]); } // libplacebo frees them once the GPU is done
 		}
 	}
 
@@ -187,19 +249,60 @@ public:
 			struct pl_buf_params bp = {};
 			bp.size = stride_of(i) * tp.h;
 			bp.host_readable = true;
+			bp.host_mapped = bp.size <= vk->gpu->limits.max_mapped_size;
 			bp.memory_type = PL_BUF_MEM_HOST;
-			if (!(dl[i] = pl_buf_create(vk->gpu, &bp))) { fprintf(stderr, "libplacebo: cannot create the download buffers\n"); return false; }
+			for (auto& s : slots) if (!(s.dl[i] = pl_buf_create(vk->gpu, &bp))) { fprintf(stderr, "libplacebo: cannot create the download buffers\n"); return false; }
 		}
+		mapped_up = vk->gpu->limits.buf_transfer && vk->gpu->limits.max_mapped_size > 0;
 		return true;
 	}
 
 	// Rows of output plane i, 64 byte aligned.
 	size_t stride_of(int i) const { return ((size_t)plane_w(out_w, out_fmt.chroma, i) * (out_fmt.depth > 8 ? 2 : 1) + 63) & ~(size_t)63; }
 
+	// Rows of plane pn of p, and its bytes: every row but the last at its stride, the last one only as long as its samples (that is all a source has to have).
+	static int plane_rows(const Picture* p, int pn) { return !p->fmt.rgb && pn > 0 && p->layout.log2_ch ? (p->height + (1 << p->layout.log2_ch) - 1) >> p->layout.log2_ch : p->height; }
+	static size_t plane_bytes(const Picture* p, int pn) {
+		const int w = !p->fmt.rgb && pn > 0 && p->layout.log2_cw ? (p->width + (1 << p->layout.log2_cw) - 1) >> p->layout.log2_cw : p->width;
+		return (size_t)(plane_rows(p, pn) - 1) * (size_t)p->stride[pn] + (size_t)w * (size_t)p->layout.step[pn];
+	}
+
 	bool push(const Picture* p) override {
-		if (!p) return vk && !lost(); // nothing is ever held back
+		if (!vk) return false;
+		if (!p) { // everything in flight comes out
+			while (!order.empty()) if (take_oldest(true) < 0) return false;
+			std::lock_guard lock(dev->use);
+			return !lost();
+		}
 		const Layout& L = p->layout;
-		if (!vk || L.planes == 0) return false;
+		if (L.planes == 0) return false;
+		if (slots[next_slot].pending && take_oldest(true) < 0) return false; // every slot is in flight: the oldest has to come out first
+		Slot& fs = slots[next_slot];
+
+		// The planes go into the slot's mapped upload buffers without the lock (nothing on the GPU reads them: the slot's last frame is done).
+		bool via_buf = mapped_up;
+		size_t need[3] = {};
+		for (int pn = 0; pn < L.planes && pn < 3 && via_buf; pn++) {
+			need[pn] = ((size_t)p->stride[pn] * (size_t)plane_rows(p, pn) + 3) & ~(size_t)3;
+			if (p->stride[pn] <= 0 || L.step[pn] <= 0 || need[pn] > vk->gpu->limits.max_mapped_size || ((size_t)p->stride[pn] % (size_t)L.step[pn]) != 0) via_buf = false;
+		}
+		if (via_buf) {
+			std::unique_lock lock(dev->use);
+			for (int pn = 0; pn < L.planes && pn < 3; pn++) {
+				if (fs.up[pn] && fs.up[pn]->params.size >= need[pn]) continue;
+				pl_buf_destroy(vk->gpu, &fs.up[pn]);
+				struct pl_buf_params bp = {};
+				bp.size = need[pn];
+				bp.host_writable = true;
+				bp.host_mapped = true;
+				bp.memory_type = PL_BUF_MEM_HOST;
+				if (!(fs.up[pn] = pl_buf_create(vk->gpu, &bp)) || !fs.up[pn]->data) { via_buf = false; break; }
+			}
+			for (int pn = 0; via_buf && pn < L.planes && pn < 3; pn++) // the GPU may still read the buffer of a frame that failed halfway
+				while (pl_buf_poll(vk->gpu, fs.up[pn], 0)) { lock.unlock(); std::this_thread::sleep_for(std::chrono::microseconds(250)); lock.lock(); }
+		}
+		if (via_buf) for (int pn = 0; pn < L.planes && pn < 3; pn++) memcpy(fs.up[pn]->data, p->data[pn], plane_bytes(p, pn));
+
 		std::unique_lock lock(dev->use);
 		if (lost()) return false;
 		const pl_color_system sys = color_system(*p);
@@ -240,7 +343,8 @@ public:
 			if (!ok) { fprintf(stderr, "libplacebo: unsupported sample layout\n"); return false; }
 			d.pixel_stride = L.step[pn];
 			d.row_stride = p->stride[pn];
-			d.pixels = p->data[pn];
+			if (via_buf) { d.buf = fs.up[pn]; d.buf_offset = 0; }
+			else d.pixels = p->data[pn];
 			d.swapped = L.big_endian;
 			if (!pl_upload_plane(vk->gpu, &image.planes[image.num_planes], &in_tex[image.num_planes], &d)) { fprintf(stderr, "libplacebo: upload failed\n"); lost(); return false; }
 			image.num_planes++;
@@ -283,40 +387,20 @@ public:
 			struct pl_tex_transfer_params tp = {};
 			tp.tex = out_tex[i];
 			tp.row_pitch = stride_of(i);
-			tp.buf = dl[i];
+			tp.buf = fs.dl[i];
 			if (!pl_tex_download(vk->gpu, &tp)) { fprintf(stderr, "libplacebo: download failed\n"); lost(); return false; }
 		}
-		// The GPU works on it now: wait for the downloads without the lock, so that the other converters can hand in their frames meanwhile.
-		for (;;) {
-			bool busy = false;
-			for (auto& b : dl) busy = busy || pl_buf_poll(vk->gpu, b, 0);
-			if (!busy || pl_gpu_is_failed(vk->gpu)) break;
-			lock.unlock();
-			std::this_thread::sleep_for(std::chrono::microseconds(250));
-			lock.lock();
-		}
-		auto planes = std::make_shared<Planes>();
-		Picture out;
-		out.width = out_w; out.height = out_h;
-		out.fmt = out_fmt;
-		for (int i = 0; i < 3; i++) {
-			const size_t stride = stride_of(i);
-			planes->mem[i].resize(stride * plane_h(out_h, out_fmt.chroma, i));
-			if (!pl_buf_read(vk->gpu, dl[i], 0, planes->mem[i].data(), planes->mem[i].size())) { fprintf(stderr, "libplacebo: download failed\n"); lost(); return false; }
-			out.data[i] = planes->mem[i].data();
-			out.stride[i] = (int)stride;
-		}
-		// After a lost device (driver reset) calls can still report success and hand back stale memory
-		if (lost()) return false;
+		pl_gpu_flush(vk->gpu); // submitted now, not when the next frame comes
 		lock.unlock();
-		out.pts = p->pts;
-		out.duration = p->duration;
-		out.color = p->color;
-		if (p->fmt.rgb) out.color.space = 1;
-		if (target_range) out.color.range = target_range;
-		else if (p->fmt.rgb) out.color.range = 1;
-		out.owner = planes;
-		ready.push_back(std::move(out));
+		fs.pending = true;
+		fs.pts = p->pts;
+		fs.duration = p->duration;
+		fs.color = p->color;
+		fs.rgb = p->fmt.rgb;
+		order.push_back(next_slot);
+		next_slot = (next_slot + 1) % IN_FLIGHT;
+		// Whatever is done by now comes out; the rest when the slots are needed again, or at the end.
+		for (int got; !order.empty() && (got = take_oldest(false)) != 0;) if (got < 0) return false;
 		return true;
 	}
 
