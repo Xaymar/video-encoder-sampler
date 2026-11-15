@@ -154,6 +154,31 @@ public:
 	void cancel() { std::lock_guard lock(m); cancelled = closed = true; q.clear(); cv.notify_all(); }
 };
 
+// Wakes the stages that wait for room in a FrameHistory (the decode, the references' converters) when anything they wait on changes: a reader moved
+// or left, a scorer started or stopped waiting for packets, an encoder took a frame or let one go. One for the process; a wake-up meant for another
+// wave only makes a waiter look again. The waiter checks without holding this lock, so the locks of what it checks never nest inside it.
+class Wakeup {
+	std::mutex m;
+	std::condition_variable cv;
+	uint64_t gen = 0;
+
+public:
+	void notify() {
+		{ std::lock_guard lock(m); gen++; }
+		cv.notify_all();
+	}
+	template <class Pred> void wait_until(Pred done) {
+		for (;;) {
+			uint64_t seen;
+			{ std::lock_guard lock(m); seen = gen; }
+			if (done()) return;
+			std::unique_lock lock(m);
+			cv.wait(lock, [&] { return gen != seen; });
+		}
+	}
+};
+Wakeup changed;
+
 // Encoded packets on their way to a scorer. Bounded by size, but always room for a few packets so that neither side can wait on the other.
 class PacketQueue {
 	static constexpr size_t MAX_BYTES = 64u << 20, MIN_PACKETS = 8;
@@ -181,8 +206,10 @@ public:
 			const auto t = std::chrono::steady_clock::now();
 			if (rp) rp->state = 1;
 			waiting = true;
+			changed.notify();
 			cv.wait(lock, [&] { return !q.empty() || closed || cancelled; });
 			waiting = false;
+			changed.notify();
 			if (rp) {
 				rp->state = 0;
 				rp->starved_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
@@ -217,7 +244,7 @@ public:
 // How many frames an encoder holds: given to it, no packet out for them yet. x264 and x265 hold their lookahead, their B-frames and one frame per frame
 // thread (often a hundred frames and more); a scorer cannot be given those frames before the encoder lets go of them.
 struct Holding {
-	std::atomic<long long> fed{0}, out{0};
+	std::atomic<long long> fed{0}, out{0}; // changed.notify() after each change
 	long long frames() const { return std::max(0LL, fed.load() - out.load()); }
 };
 
@@ -247,7 +274,7 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q, Holding* holdi
 	bool ok = true;
 	for (Picture pic; q.pop(pic, job.rp);) {
 		const auto t = std::chrono::steady_clock::now();
-		if (holding) holding->fed++;
+		if (holding) { holding->fed++; changed.notify(); }
 		if (ok && !(ok = codec->encode(&pic))) q.cancel(); // frees the producer if it is waiting for room
 		else if (job.rp) job.rp->step();
 		if (job.rp) job.rp->busy_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
@@ -293,8 +320,8 @@ public:
 		readers.push_back(Reader{0, false, limit, std::move(idle), std::move(slack)});
 		return readers.size() - 1;
 	}
-	void push(Picture p) { std::lock_guard lock(m); q.push_back(std::move(p)); cv.notify_all(); }
-	void close() { std::lock_guard lock(m); closed = true; cv.notify_all(); }
+	void push(Picture p) { { std::lock_guard lock(m); q.push_back(std::move(p)); cv.notify_all(); } changed.notify(); }
+	void close() { { std::lock_guard lock(m); closed = true; cv.notify_all(); } changed.notify(); }
 	// The reader's next frame: 1, or 0 when no more will come. Waits while it is not there yet; rp: the reader, starved meanwhile.
 	int next(size_t r, Picture& out, RunProgress* rp = nullptr) {
 		std::unique_lock lock(m);
@@ -313,9 +340,11 @@ public:
 		out = q[(size_t)(rd.at - base)];
 		rd.at++;
 		trim();
+		lock.unlock();
+		changed.notify();
 		return 1;
 	}
-	void leave(size_t r) { std::lock_guard lock(m); readers[r].gone = true; trim(); }
+	void leave(size_t r) { { std::lock_guard lock(m); readers[r].gone = true; trim(); } changed.notify(); }
 	bool read() { std::lock_guard lock(m); return std::any_of(readers.begin(), readers.end(), [](const Reader& r) { return !r.gone; }); } // by anyone still
 	// How many frames the slowest reader is behind the newest one: of every reader, or of those that are busy (not idle) only.
 	long long behind(bool busy_only) {
@@ -356,7 +385,7 @@ void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& h
 		if (held()) {
 			const auto t = std::chrono::steady_clock::now();
 			if (rp) rp->state = 2;
-			while (held() && raw.read()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			changed.wait_until([&] { return !held() || !raw.read(); });
 			if (rp) {
 				rp->state = 0;
 				rp->blocked_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
@@ -441,8 +470,10 @@ void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, F
 	for (;;) {
 		if (out.behind(true) >= (long long)DECODE_AHEAD) {
 			waiting = true;
-			while (out.behind(true) >= (long long)DECODE_AHEAD && out.read()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			changed.notify();
+			changed.wait_until([&] { return out.behind(true) < (long long)DECODE_AHEAD || !out.read(); });
 			waiting = false;
+			changed.notify();
 		}
 		if (!out.read() || raw.next(reader, t) != 1) break; // the end, or every scorer of this format has ended
 		rp.step();
@@ -533,7 +564,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 		PacketQueue* pq = packets.back().get();
 		PacketQueue* dq = dist_packets.back().get();
 		Holding* hd = holding.back().get();
-		runs[i]->enc.tee = [pq, dq, hd](const uint8_t* d, size_t size) { hd->out++; const bool a = pq->push(d, size), b = dq->push(d, size); return a || b; };
+		runs[i]->enc.tee = [pq, dq, hd](const uint8_t* d, size_t size) { hd->out++; changed.notify(); const bool a = pq->push(d, size), b = dq->push(d, size); return a || b; };
 		if (runs[i]->enc.rp) { // frames the encoder gets: fewer than the source's when the frame rate is lowered
 			const Plan& pl = *runs[i]->enc.plan;
 			runs[i]->enc.rp->begin(1, pl.convert_rate ? std::max<long long>(1, std::llround(si.duration * pl.enc.fps.value())) : std::max<long long>(1, si.frame_count));

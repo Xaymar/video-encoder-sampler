@@ -29,8 +29,7 @@ struct OutputInfo {
 	}
 };
 
-// How many converted frames may wait in front of an encoder (or scorer). Enough that a stage that waited (the waits poll, and on Windows a short sleep
-// lasts a timer tick) refills a queue its reader is still busy with, rather than handing over one frame per wake-up.
+// How many converted frames may wait in front of an encoder (or scorer).
 constexpr size_t DECODE_AHEAD = 30;
 
 // What is needed to know about an input before decoding any of it.

@@ -979,8 +979,8 @@ int main(int argc, char** argv) {
 	ui::end_on_interrupt();
 	end_crashes_at_once();
 #ifdef _WIN32
-	// Sleeps (the pipeline's waits, AMF's and SVT-AV1's polling) last whole timer ticks, 15.6 ms by default, which held stages that wait on each other back
-	// to about 64 frames a second. One millisecond for this process (Windows 10 2004 and later keep the setting per process).
+	// Sleeps last whole timer ticks, 15.6 ms by default. AMF, QSV and SVT-AV1 offer no wait for a finished packet, so their backends poll with 1 ms
+	// sleeps, which became 15.6 ms each. One millisecond for this process (Windows 10 2004 and later keep the setting per process).
 	timeBeginPeriod(1);
 #endif
 #if defined(_WIN32) && defined(_DEBUG)
