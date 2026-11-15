@@ -18,7 +18,9 @@ struct RunProgress {
 	std::atomic<int> state{0};
 	std::atomic<bool> failed{false};      // it ended without doing its job
 	std::atomic<int64_t> busy_ms{0}, starved_ms{0}, blocked_ms{0};
+	std::atomic<int64_t> state_since_ms{0}; // when the wait it is in began (state != 0)
 
+	void wait(int s);       // starts waiting (state 1 or 2); state = 0 ends it, and the time goes to starved_ms or blocked_ms
 	void begin(int st, long long tot);
 	void step() { done++; }
 	void finish();
@@ -30,7 +32,7 @@ struct Progress {
 	int stage = 0;           // as RunProgress::stage
 	std::string label;
 	long long done = 0, total = 0; // frames (bytes for uploads and downloads)
-	double rate = 0;         // frames per second (bytes per second), over the time since the stage began
+	double rate = 0;         // frames per second (bytes per second), over the time the stage worked: since it began, less the time it waited
 	int state = 0;           // 0 working, 1 starved, 2 backed up
 	bool finished = false, failed = false;
 };

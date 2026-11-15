@@ -240,7 +240,10 @@ ui::Progress progress_of(const Entry& e) {
 	p.label = e.label;
 	p.done = e.p->done;
 	p.total = e.p->total;
-	p.rate = p.done / secs;
+	// Its own speed, not that of whatever it waited for: the waits it is done with, and the one it is in, do not count.
+	const int64_t waiting = e.p->state != 0 && !end ? std::max<int64_t>(0, now_ms() - e.p->state_since_ms) : 0;
+	const double worked = secs - (e.p->starved_ms + e.p->blocked_ms + waiting) / 1000.0;
+	p.rate = p.done / std::max(0.05, worked);
 	p.state = e.p->state;
 	p.finished = end != 0;
 	p.failed = e.p->failed;
@@ -435,6 +438,11 @@ void capture_stderr() {
 } // namespace
 
 void RunProgress::finish() { end_ms = now_ms(); }
+
+void RunProgress::wait(int s) {
+	state_since_ms = now_ms();
+	state = s;
+}
 
 void RunProgress::begin(int st, long long tot) {
 	end_ms = 0;
