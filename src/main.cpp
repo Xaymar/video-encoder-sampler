@@ -1948,8 +1948,8 @@ int main(int argc, char** argv) {
 				}
 			}
 			RunProgress feed_rp;
-			feed_rp.begin(3, 1);
-			const int feed_handle = cfg.in_process ? ui::attach(&feed_rp, "decode+convert " + file_name(input) + " to " + std::to_string(wave[0]->plan.enc.w) + "x" + std::to_string(wave[0]->plan.enc.h), "decode") : -1;
+			feed_rp.begin(6, 1);
+			const int feed_handle = cfg.in_process ? ui::attach(&feed_rp, "for the encoders to " + std::to_string(wave[0]->plan.enc.w) + "x" + std::to_string(wave[0]->plan.enc.h), "convert") : -1;
 			FeedResult fr;
 			const auto t_wave = std::chrono::steady_clock::now();
 			if (cfg.in_process) run_wave(local_path(input), si, ptrs, cfg.scale, cfg.vo, &feed_rp, fr);

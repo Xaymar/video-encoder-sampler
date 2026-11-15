@@ -218,11 +218,11 @@ struct Row {
 };
 
 Row row_of(const ui::Progress& p, const std::string& prefix) {
-	static const char* names[] = {"wait", "encode", "score", "decode", "upload", "download"};
+	static const char* names[] = {"wait", "encode", "score", "decode", "upload", "download", "convert"};
 	static const char* waits[] = {"working", "starved", "backed up"};
 	Row r;
-	const std::string stage = names[p.stage >= 0 && p.stage < 6 ? p.stage : 0];
-	r.task = prefix + (p.label.find(stage) != std::string::npos ? p.label : stage + " " + p.label); // some labels already begin with it (decode+convert ..)
+	const std::string stage = names[p.stage >= 0 && p.stage < 7 ? p.stage : 0];
+	r.task = prefix + (p.label.find(stage) != std::string::npos ? p.label : stage + " " + p.label); // some labels already begin with it
 	r.fraction = p.total > 0 ? (double)p.done / p.total : 0;
 	char b[32];
 	if (p.stage == 4 || p.stage == 5) snprintf(b, sizeof b, "%.1f MB/s", p.rate / 1048576.0);
@@ -358,7 +358,7 @@ void plain_status() {
 		if (e.p->stage == 4 || e.p->stage == 5) { snprintf(b, sizeof b, "  %s: %lld%% (%.1f/%.1f MB)  %s\n", e.p->stage == 4 ? "uploading" : "downloading", done * 100 / total, done / 1048576.0, total / 1048576.0, e.label.c_str()); out += b; continue; }
 		static const char* waits[] = {"", " [starved: waiting for frames]", " [backed up: waiting for room downstream]"};
 		const int ws = e.p->state;
-		snprintf(b, sizeof b, "  %s %s: %lld%% (%lld/%lld frames)%s  %s\n", e.p->stage == 1 ? "encoding" : e.p->stage == 3 ? "decoding" : "scoring", e.pool.c_str(), done * 100 / total, done, total, waits[ws >= 0 && ws < 3 ? ws : 0], e.label.c_str());
+		snprintf(b, sizeof b, "  %s %s: %lld%% (%lld/%lld frames)%s  %s\n", e.p->stage == 1 ? "encoding" : e.p->stage == 3 ? "decoding" : e.p->stage == 6 ? "converting" : "scoring", e.pool.c_str(), done * 100 / total, done, total, waits[ws >= 0 && ws < 3 ? ws : 0], e.label.c_str());
 		out += b;
 	}
 	for (auto& [key, group] : remote_rows)

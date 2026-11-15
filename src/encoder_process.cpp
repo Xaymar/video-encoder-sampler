@@ -839,9 +839,8 @@ void run_wave_here(uint32_t id, const std::string& body) {
 		ptrs.push_back(&run);
 	}
 	RunProgress feed_rp;
-	feed_rp.begin(3, 1);
-	const size_t slash = input.find_last_of("/\\");
-	handles.push_back(ui::attach(&feed_rp, "decode+convert " + input.substr(slash == std::string::npos ? 0 : slash + 1) + " to " + std::to_string(plans[0].enc.w) + "x" + std::to_string(plans[0].enc.h), "decode"));
+	feed_rp.begin(6, 1);
+	handles.push_back(ui::attach(&feed_rp, "for the encoders to " + std::to_string(plans[0].enc.w) + "x" + std::to_string(plans[0].enc.h), "convert"));
 	std::atomic<bool> finished{false};
 	std::thread rows([&] { // the rows of the live display, for the process that started this one
 		while (!finished) {
