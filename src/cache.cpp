@@ -65,7 +65,9 @@ std::string key_encoder(const std::string& encoder, const std::string& codec, co
 std::string key_run(long long bitrate_kbps, double kf, const Shape& shape) {
 	char buf[128];
 	snprintf(buf, sizeof buf, "\nbitrate=%lld kf=%.6g shape=%dx%d@%d/%d\n", bitrate_kbps, kf, shape.w, shape.h, shape.fps.num, shape.fps.den);
-	return buf;
+	// With a frame rate asked for, original frames the encode drops get the score of the frame on screen (see vmaf_score_frames); before, they were scored
+	// against it and came out near 0. This line makes those results run once more. Runs at the source's own rate keep their keys.
+	return shape.fps.num ? std::string(buf) + "dropped=held\n" : std::string(buf);
 }
 
 // The key's text for a model: an absolute path (the user's own folders) is reduced to the file name, since the key goes into the result files; the
