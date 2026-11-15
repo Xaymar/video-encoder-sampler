@@ -1,4 +1,5 @@
 #include "vk_compute.h"
+#include "gpu.h"
 
 #ifndef VES_NO_VULKAN
 #include <algorithm>
@@ -36,6 +37,7 @@ namespace {
 constexpr int kBindings = 16;
 
 void chk(VkResult r, const char* what) {
+	if (r == VK_ERROR_DEVICE_LOST) gpu_lost(std::string("Vulkan device lost while scoring VMAF (") + what + ")");
 	if (r != VK_SUCCESS) throw std::runtime_error(std::string("Vulkan: ") + what + " failed (" + std::to_string((int)r) + ")");
 }
 

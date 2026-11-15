@@ -799,7 +799,7 @@ private:
 	// adm
 	int sw[4], sh[4], bw[4], bh[4];
 	std::vector<AdmUnit> au;
-	Buf acur[4], aden[4], atmp, adiv;
+	Buf acur[4], acopy[4], aden[4], atmp, adiv; // acopy: the bands the units after the first work on, one after another
 	Pipe adwt_v[4], adwt_h[4], aden_p[4];
 	// cambi
 	bool cambi_on = false;
@@ -921,7 +921,10 @@ private:
 			aden[s] = vk.buffer((size_t)bh[s] * 3 * 8 + 16, 2);
 			for (size_t u = 0; u < au.size(); u++) {
 				AdmUnit& a = au[u];
-				a.cur[s] = u == 0 ? acur[s] : vk.buffer(20 * N * 4 + 16, 1);
+				// The units are recorded one after another, each finished (barrier) before the next copies the bands, and only their sums (cm, aimb) are read
+				// afterwards: one copy of the bands serves every unit after the first. A copy of its own for each took 70 MB per unit at 2560x1440.
+				if (u == 1) acopy[s] = vk.buffer(20 * N * 4 + 16, 1);
+				a.cur[s] = u == 0 ? acur[s] : acopy[s];
 				a.cm[s] = vk.buffer((size_t)bh[s] * 3 * 8 + 16, 2);
 				if (a.aim) a.aimb[s] = vk.buffer((size_t)bh[s] * 3 * 8 + 16, 2);
 			}

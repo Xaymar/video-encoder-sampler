@@ -32,3 +32,9 @@ unsigned encoder_vendor(const std::string& encoder);
 // devices take; Windows, -1 elsewhere or when it is not found), and its DRM render node (/dev/dri/renderD128, what vaapi takes; Linux, empty elsewhere).
 int dxgi_adapter_index(unsigned vendor, int index);
 std::string render_node(unsigned vendor, int index);
+
+// A lost GPU (a Vulkan device lost after a driver reset or a GPU fault, a CUDA context with a sticky error) stays lost for everything in this process that
+// holds it: every later frame on it fails as well. The places that notice call gpu_lost(what); the process decides what then happens. An encoder process
+// ends (see encoder_process.cpp), so that its runs are tried again in a new process on devices that work. Without a handler it is said once.
+void gpu_lost(const std::string& what);
+void set_gpu_lost_handler(void (*handler)(const std::string& what));
