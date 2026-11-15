@@ -23,11 +23,25 @@ env:
 jobs:
   linux-x64:
     runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.tag }}
           submodules: recursive
+          fetch-depth: 0 # all history and tags, for git describe
+
+      # The version ves reports and the archives are named after: the tag, or the last tag, commits since and hash (2.0.0-83-g16372fe).
+      # Written to .version so the build (CMake reads it) uses the same string; the Flatpak build gets a copy of the tree without asking git.
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          v=$(git describe --tags --always)
+          echo "$v" > .version
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "ves $v"
 
       - name: Install flatpak-builder
         run: |
@@ -65,12 +79,12 @@ jobs:
       - name: Build com.xaymar.ves
         run: |
           flatpak-builder --user --disable-rofiles-fuse --install-deps-from=flathub --force-clean --repo=repo build-flatpak flatpak/com.xaymar.ves.yml
-          flatpak build-bundle repo ves-linux-x64.flatpak com.xaymar.ves
+          flatpak build-bundle repo ves-${{ steps.version.outputs.version }}-linux-x64.flatpak com.xaymar.ves
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ves-linux-x64
-          path: ves-linux-x64.flatpak
+          name: ves-${{ steps.version.outputs.version }}-linux-x64
+          path: ves-${{ steps.version.outputs.version }}-linux-x64.flatpak
 
   windows-x64:
     runs-on: windows-2022
@@ -79,6 +93,18 @@ jobs:
         with:
           ref: ${{ inputs.tag }}
           submodules: recursive
+          fetch-depth: 0 # all history and tags, for git describe
+
+      # The version ves reports and the archives are named after: the tag, or the last tag, commits since and hash (2.0.0-83-g16372fe).
+      # Written to .version so the build (CMake reads it) uses the same string; the Flatpak build gets a copy of the tree without asking git.
+      - name: Version
+        id: version
+        shell: bash
+        run: |
+          v=$(git describe --tags --always)
+          echo "$v" > .version
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "ves $v"
 
       # The encoder and scaler libraries come from MSYS2's UCRT64 repository, FFmpeg's headers and import libraries from gyan.dev's shared build.
       - uses: msys2/setup-msys2@v2
@@ -123,12 +149,12 @@ jobs:
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang
           cmake --build build
-          cmake --install build --prefix dist/ves-windows-x64
+          cmake --install build --prefix dist/ves-${{ steps.version.outputs.version }}-windows-x64
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ves-windows-x64
-          path: dist/ves-windows-x64
+          name: ves-${{ steps.version.outputs.version }}-windows-x64
+          path: dist/ves-${{ steps.version.outputs.version }}-windows-x64
 
   release:
     # A pushed version tag, or a manual run that names a tag.
@@ -137,18 +163,20 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      VES: ves-${{ needs.linux-x64.outputs.version }}
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: ves-linux-x64
+          name: ${{ env.VES }}-linux-x64
       - uses: actions/download-artifact@v4
         with:
-          name: ves-windows-x64
-          path: ves-windows-x64
-      - run: zip -r ves-windows-x64.zip ves-windows-x64
+          name: ${{ env.VES }}-windows-x64
+          path: ${{ env.VES }}-windows-x64
+      - run: zip -r "$VES-windows-x64.zip" "$VES-windows-x64"
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: |
-            ves-linux-x64.flatpak
-            ves-windows-x64.zip
+            ${{ env.VES }}-linux-x64.flatpak
+            ${{ env.VES }}-windows-x64.zip
