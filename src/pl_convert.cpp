@@ -1,13 +1,19 @@
 // Converter on libplacebo's own API (Vulkan). Reads frames in whatever sample layout the source has (planar, NV12/P010, packed RGB,
 // ...), scales them and converts them to planar YUV.
 #include "convert.h"
+#include "gpu.h"
 
+#include <chrono>
 #include <cmath>
 
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 extern "C" {
@@ -70,15 +76,67 @@ pl_color_transfer color_transfer(int v) {
 	}
 }
 
+// One Vulkan device per GPU for every converter of this process, and its renderers shared as well. A device and a renderer of its own for each converter
+// made a wave of n runs open 2n + 3 devices on the same GPU at once, each taking 1 to 2 s ("creating vulkan device (slow!)"), and 2n + 3 renderers, each
+// holding intermediate frames at full size: together with the scorers they filled 16 GB of video memory until the driver reset the GPU (device lost).
+// Every libplacebo call on the shared device is made with `use` held. libplacebo calls its Vulkan pl_gpu thread safe, but it is not quite: two threads that
+// wait for its commands at the same time can both take the same finished command buffer, and one of them then recycles it while it runs again
+// (vk_poll_commands; a stress test of 12 threads on one device crashed in the driver, the validation layer saying VUID-vkQueueSubmit2-commandBuffer-03875).
+// Nothing waits with the lock held: a converter records and submits its frame, then waits for the download outside of it, so the GPU still works on the
+// frames of many converters at once. A renderer keeps its intermediate frames for the sizes it last worked with, so a converter takes one of its own sizes
+// for each frame; only as many exist as record at the same moment.
+// A device that was lost is not handed out again: the next converter gets a new one.
+struct SharedVulkan {
+	pl_log log = nullptr;
+	pl_vulkan vk = nullptr;
+	std::mutex use;
+	std::map<std::string, std::vector<pl_renderer>> idle; // by input and output size, output format and scalers
+
+	pl_renderer borrow(const std::string& shape) { // with `use` held
+		auto& list = idle[shape];
+		if (list.empty()) return pl_renderer_create(log, vk->gpu);
+		pl_renderer r = list.back();
+		list.pop_back();
+		return r;
+	}
+	void give_back(const std::string& shape, pl_renderer r) { idle[shape].push_back(r); } // with `use` held
+	~SharedVulkan() {
+		for (auto& [shape, list] : idle) for (auto& r : list) pl_renderer_destroy(&r);
+		pl_vulkan_destroy(&vk);
+		pl_log_destroy(&log);
+	}
+};
+
+std::shared_ptr<SharedVulkan> shared_vulkan(const std::string& device) {
+	static std::mutex m;
+	static auto* devices = new std::map<std::string, std::shared_ptr<SharedVulkan>>; // never freed: converters may still be in use when the process ends
+	std::lock_guard lock(m);
+	auto& slot = (*devices)[device];
+	if (slot && pl_gpu_is_failed(slot->vk->gpu)) slot.reset(); // lost: the converters that hold it let go of it as they end
+	if (slot) return slot;
+	auto s = std::make_shared<SharedVulkan>();
+	struct pl_log_params lp = {};
+	lp.log_cb = log_cb;
+	lp.log_level = PL_LOG_WARN;
+	s->log = pl_log_create(PL_API_VER, &lp);
+	struct pl_vulkan_params vp = pl_vulkan_default_params;
+	if (!device.empty()) vp.device_name = device.c_str();
+	s->vk = pl_vulkan_create(s->log, &vp);
+	if (!s->vk) return nullptr;
+	slot = s;
+	return slot;
+}
+
 struct Planes { // the memory of an output picture
 	std::vector<uint8_t> mem[3];
 };
 
 class PlConverter : public Converter {
-	pl_log log = nullptr;
-	pl_vulkan vk = nullptr;
-	pl_renderer rr = nullptr;
+	std::shared_ptr<SharedVulkan> dev;
+	pl_vulkan vk = nullptr; // dev's
+	std::string shape; // the renderers of its sizes, format and scalers are the ones it borrows
 	pl_tex in_tex[3]{}, out_tex[3]{};
+	pl_buf dl[3]{}; // where the output planes are downloaded to
 	const pl_filter_config *up = nullptr, *down = nullptr;
 	int out_w = 0, out_h = 0;
 	Fmt out_fmt;
@@ -87,32 +145,36 @@ class PlConverter : public Converter {
 public:
 	~PlConverter() override {
 		if (vk) {
+			std::lock_guard lock(dev->use);
 			for (auto& t : in_tex) pl_tex_destroy(vk->gpu, &t);
 			for (auto& t : out_tex) pl_tex_destroy(vk->gpu, &t);
+			for (auto& b : dl) pl_buf_destroy(vk->gpu, &b);
 		}
-		pl_renderer_destroy(&rr);
-		pl_vulkan_destroy(&vk);
-		pl_log_destroy(&log);
+	}
+
+	// The device is lost (a driver reset or a GPU fault): this frame and every later one on it cannot be trusted.
+	bool lost() {
+		if (!pl_gpu_is_failed(vk->gpu)) return false;
+		fprintf(stderr, "libplacebo: the GPU failed (device lost), the converted frame cannot be trusted\n");
+		gpu_lost("Vulkan device lost while converting frames");
+		return true;
 	}
 
 	int target_range = 0; // 0: as the input (RGB: limited), 1 limited, 2 full
-	bool open(const Picture&, Rational, int w, int h, Fmt out, const ScaleOptions& opt, int range) override {
+	bool open(const Picture& first, Rational, int w, int h, Fmt out, const ScaleOptions& opt, int range) override {
 		target_range = range;
 		out_w = w; out_h = h; out_fmt = out;
-		struct pl_log_params lp = {};
-		lp.log_cb = log_cb;
-		lp.log_level = PL_LOG_WARN;
-		log = pl_log_create(PL_API_VER, &lp);
-		struct pl_vulkan_params vp = pl_vulkan_default_params;
-		if (!opt.device.empty()) vp.device_name = opt.device.c_str();
-		vk = pl_vulkan_create(log, &vp);
+		dev = shared_vulkan(opt.device);
+		vk = dev ? dev->vk : nullptr;
 		if (!vk) { fprintf(stderr, "libplacebo: no Vulkan GPU%s\n", opt.device.empty() ? "" : (" named '" + opt.device + "'").c_str()); return false; }
-		rr = pl_renderer_create(log, vk->gpu);
+		shape = std::to_string(first.width) + "x" + std::to_string(first.height) + " to " + std::to_string(w) + "x" + std::to_string(h) + " " + std::to_string(out.chroma) + " " +
+		        std::to_string(out.depth) + " " + opt.upscaler + "/" + opt.downscaler;
 		up = pl_find_filter_config(opt.upscaler.c_str(), PL_FILTER_UPSCALING);
 		down = pl_find_filter_config(opt.downscaler.c_str(), PL_FILTER_DOWNSCALING);
-		if (!rr || !up || !down) { fprintf(stderr, "libplacebo: unknown scaler '%s' / '%s'\n", opt.upscaler.c_str(), opt.downscaler.c_str()); return false; }
+		if (!up || !down) { fprintf(stderr, "libplacebo: unknown scaler '%s' / '%s'\n", opt.upscaler.c_str(), opt.downscaler.c_str()); return false; }
 
 		const int bits = out.depth > 8 ? 16 : 8;
+		std::lock_guard lock(dev->use);
 		pl_fmt fmt = pl_find_fmt(vk->gpu, PL_FMT_UNORM, 1, bits, bits, PL_FMT_CAP_RENDERABLE);
 		if (!fmt) { fprintf(stderr, "libplacebo: this GPU cannot render %d-bit planes\n", bits); return false; }
 		for (int i = 0; i < 3; i++) {
@@ -122,14 +184,24 @@ public:
 			tp.renderable = true;
 			tp.host_readable = true;
 			if (!(out_tex[i] = pl_tex_create(vk->gpu, &tp))) { fprintf(stderr, "libplacebo: cannot create the output planes\n"); return false; }
+			struct pl_buf_params bp = {};
+			bp.size = stride_of(i) * tp.h;
+			bp.host_readable = true;
+			bp.memory_type = PL_BUF_MEM_HOST;
+			if (!(dl[i] = pl_buf_create(vk->gpu, &bp))) { fprintf(stderr, "libplacebo: cannot create the download buffers\n"); return false; }
 		}
 		return true;
 	}
 
+	// Rows of output plane i, 64 byte aligned.
+	size_t stride_of(int i) const { return ((size_t)plane_w(out_w, out_fmt.chroma, i) * (out_fmt.depth > 8 ? 2 : 1) + 63) & ~(size_t)63; }
+
 	bool push(const Picture* p) override {
-		if (!p) return !(vk && pl_gpu_is_failed(vk->gpu)); // nothing is ever held back
+		if (!p) return vk && !lost(); // nothing is ever held back
 		const Layout& L = p->layout;
 		if (!vk || L.planes == 0) return false;
+		std::unique_lock lock(dev->use);
+		if (lost()) return false;
 		const pl_color_system sys = color_system(*p);
 
 		// Read the source's own layout: every plane becomes one texture with the components it holds in memory order,
@@ -170,7 +242,7 @@ public:
 			d.row_stride = p->stride[pn];
 			d.pixels = p->data[pn];
 			d.swapped = L.big_endian;
-			if (!pl_upload_plane(vk->gpu, &image.planes[image.num_planes], &in_tex[image.num_planes], &d)) { fprintf(stderr, "libplacebo: upload failed\n"); return false; }
+			if (!pl_upload_plane(vk->gpu, &image.planes[image.num_planes], &in_tex[image.num_planes], &d)) { fprintf(stderr, "libplacebo: upload failed\n"); lost(); return false; }
 			image.num_planes++;
 		}
 		image.repr.sys = sys;
@@ -201,26 +273,42 @@ public:
 		rp.upscaler = up;
 		rp.downscaler = down;
 		if (out_fmt.depth >= p->fmt.depth) rp.dither_params = nullptr; // only reducing the bit depth needs dithering, it would just add noise otherwise
-		if (!pl_render_image(rr, &image, &target, &rp)) { fprintf(stderr, "libplacebo: rendering failed\n"); return false; }
+		pl_renderer rr = dev->borrow(shape);
+		if (!rr) { fprintf(stderr, "libplacebo: cannot create a renderer\n"); lost(); return false; }
+		const bool rendered = pl_render_image(rr, &image, &target, &rp);
+		dev->give_back(shape, rr);
+		if (!rendered) { fprintf(stderr, "libplacebo: rendering failed\n"); lost(); return false; }
 
+		for (int i = 0; i < 3; i++) {
+			struct pl_tex_transfer_params tp = {};
+			tp.tex = out_tex[i];
+			tp.row_pitch = stride_of(i);
+			tp.buf = dl[i];
+			if (!pl_tex_download(vk->gpu, &tp)) { fprintf(stderr, "libplacebo: download failed\n"); lost(); return false; }
+		}
+		// The GPU works on it now: wait for the downloads without the lock, so that the other converters can hand in their frames meanwhile.
+		for (;;) {
+			bool busy = false;
+			for (auto& b : dl) busy = busy || pl_buf_poll(vk->gpu, b, 0);
+			if (!busy || pl_gpu_is_failed(vk->gpu)) break;
+			lock.unlock();
+			std::this_thread::sleep_for(std::chrono::microseconds(250));
+			lock.lock();
+		}
 		auto planes = std::make_shared<Planes>();
 		Picture out;
 		out.width = out_w; out.height = out_h;
 		out.fmt = out_fmt;
 		for (int i = 0; i < 3; i++) {
-			const int pw = plane_w(out_w, out_fmt.chroma, i), ph = plane_h(out_h, out_fmt.chroma, i);
-			const size_t stride = ((size_t)pw * obytes + 63) & ~(size_t)63;
-			planes->mem[i].resize(stride * ph);
-			struct pl_tex_transfer_params tp = {};
-			tp.tex = out_tex[i];
-			tp.row_pitch = stride;
-			tp.ptr = planes->mem[i].data();
-			if (!pl_tex_download(vk->gpu, &tp)) { fprintf(stderr, "libplacebo: download failed\n"); return false; }
+			const size_t stride = stride_of(i);
+			planes->mem[i].resize(stride * plane_h(out_h, out_fmt.chroma, i));
+			if (!pl_buf_read(vk->gpu, dl[i], 0, planes->mem[i].data(), planes->mem[i].size())) { fprintf(stderr, "libplacebo: download failed\n"); lost(); return false; }
 			out.data[i] = planes->mem[i].data();
 			out.stride[i] = (int)stride;
 		}
 		// After a lost device (driver reset) calls can still report success and hand back stale memory
-		if (pl_gpu_is_failed(vk->gpu)) { fprintf(stderr, "libplacebo: the GPU failed (device lost), the converted frame cannot be trusted\n"); return false; }
+		if (lost()) return false;
+		lock.unlock();
 		out.pts = p->pts;
 		out.duration = p->duration;
 		out.color = p->color;

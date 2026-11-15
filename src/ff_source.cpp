@@ -142,7 +142,13 @@ class FfSource : public Source {
 				AVFrame* f = frame;
 				if (hw_fmt != AV_PIX_FMT_NONE && frame->format == hw_fmt) {
 					av_frame_unref(sw_frame);
-					if (av_hwframe_transfer_data(sw_frame, frame, 0) < 0) return AVERROR_EXTERNAL;
+					if (const int t = av_hwframe_transfer_data(sw_frame, frame, 0); t < 0) {
+						// A frame cannot be read back after others could: the GPU's context is broken (CUDA_ERROR_ILLEGAL_ADDRESS after a GPU reset), and so is every
+						// later frame of every decoder that shares it. (The first frame failing only means this decoder does not work here: software decodes instead.)
+						char b[AV_ERROR_MAX_STRING_SIZE];
+						if (hw_used) gpu_lost(std::string("reading a hardware decoded frame back failed: ") + av_make_error_string(b, sizeof b, t));
+						return AVERROR_EXTERNAL;
+					}
 					av_frame_copy_props(sw_frame, frame);
 					av_frame_unref(frame);
 					f = sw_frame;

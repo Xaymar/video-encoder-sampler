@@ -344,7 +344,11 @@ private:
 #endif
 };
 
+// How an encoder process ends when a GPU it uses was lost (see gpu_lost() in gpu.h): everything on that GPU fails from then on, in this process.
+constexpr int kGpuLostExit = 75;
+
 std::string describe_exit(long long code) {
+	if (code == kGpuLostExit) return "ended because a GPU it used was lost (the driver reset it, or it faulted)";
 	char b[64];
 #ifdef _WIN32
 	if (code >= 0x80000000LL) snprintf(b, sizeof b, "crashed (code 0x%08llx)", code);
@@ -1061,6 +1065,12 @@ int encoder_process_main(int argc, char** argv) {
 #endif
 	setvbuf(stderr, nullptr, _IONBF, 0);
 	std::thread([] { for (;;) { reply('H', 0, std::string()); std::this_thread::sleep_for(std::chrono::milliseconds(kBeatMs)); } }).detach(); // still here
+	// A lost GPU stays lost for this process: every later frame on it fails (the CUDA decoder then said CUDA_ERROR_ILLEGAL_ADDRESS for every frame, endlessly).
+	// The process ends instead; its runs count as crashed and are run again, in a new process with new devices.
+	set_gpu_lost_handler([](const std::string& what) {
+		fprintf(stderr, "the GPU was lost (%s): this process ends, its runs are run again in a new one\n", what.c_str());
+		exit_now(kGpuLostExit);
+	});
 	pick_decode_gpu();
 	if (encoder == "amf") amf_dedicate_process(gpu);
 

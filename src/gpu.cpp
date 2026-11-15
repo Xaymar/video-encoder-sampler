@@ -1,4 +1,5 @@
 #include "gpu.h"
+#include <atomic>
 
 #include <cstdio>
 #include <map>
@@ -157,3 +158,15 @@ std::string render_node(unsigned vendor, int index) {
 	return {};
 }
 #endif
+
+namespace {
+std::atomic<void (*)(const std::string&)> lost_handler{nullptr};
+std::atomic<bool> lost_told{false};
+} // namespace
+
+void set_gpu_lost_handler(void (*handler)(const std::string& what)) { lost_handler = handler; }
+
+void gpu_lost(const std::string& what) {
+	if (auto h = lost_handler.load()) { h(what); return; }
+	if (!lost_told.exchange(true)) fprintf(stderr, "the GPU was lost (%s); what still runs on it fails\n", what.c_str());
+}
