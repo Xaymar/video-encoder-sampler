@@ -1,9 +1,10 @@
 #pragma once
 // Decoding, converting, encoding and scoring, arranged so that the expensive software decode of an input is done once for
 // all the encoders that can share it. Runs that need the very same frames (same input, resolution, frame rate, pixel format)
-// are encoded together as a "wave": one thread decodes and converts, every encoder has a thread that takes the frames from a
-// queue of its own, and the decoder stays at most DECODE_AHEAD frames ahead of the slowest encoder. Scoring works the same way:
-// one thread produces the original frames in the scoring format and every scorer takes them from its own queue.
+// are encoded together as a "wave": one thread decodes, one converts for the encoders, every encoder has a thread that takes the frames
+// from a queue of its own, and the decoder stays at most DECODE_AHEAD frames ahead of the slowest encoder. The same decode serves the
+// scoring: the original frames in each scoring format (the true score) and the frames the encoders got (the distorted score) are kept
+// until every scorer has used them, and the decode waits for a scorer that falls far behind (see run_wave).
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -121,6 +122,5 @@ struct WaveRun {
 };
 
 // Encodes all runs (which must share a feed key) from one decode of `input`, and scores each against the original at the same time, and against the
-// frames its encoder got (the distorted score: at the encode's size and frame rate, from a second decode of the same feed).
-// Runs that compare in the same format share one decode of the original.
+// frames its encoder got (the distorted score: at the encode's size and frame rate). The input is decoded once for all of it.
 bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRun*>& runs, const ScaleOptions& so, const VmafOptions& vo, RunProgress* feed_rp, FeedResult& fr);
