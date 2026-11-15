@@ -356,6 +356,7 @@ void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& h
 		raw.push(std::move(frame));
 		frame = Picture();
 		n++;
+		if (rp) rp->step();
 	}
 	ok = r == 0;
 	if (r < 0 && raw.read()) fprintf(stderr, "decoding the input failed after %lld frames\n", n);
@@ -363,6 +364,7 @@ void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& h
 		fprintf(stderr, "the file lists %lld frames but %lld were decoded\n", src.frame_count(), n);
 		ok = false;
 	}
+	if (rp) { rp->failed = !ok && raw.read(); rp->finish(); }
 	raw.close();
 }
 
@@ -547,8 +549,8 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 		}
 		// The converter holds the decode back like a busy scorer when it waits for one; when its scorers all wait for packets, it does not.
 		g->raw_reader = raw.add_reader(SCORE_BEHIND, [gp = g.get()] { return gp->waiting.load() && !gp->frames.busy(); });
-		g->ref_rp.begin(3, std::max<long long>(1, si.frame_count));
-		g->handle = ui::attach(&g->ref_rp, "reference convert " + std::to_string(si.width) + "x" + std::to_string(si.height), "decode");
+		g->ref_rp.begin(6, std::max<long long>(1, si.frame_count));
+		g->handle = ui::attach(&g->ref_rp, "reference to " + std::to_string(f.depth) + "-bit " + (f.rgb ? std::string("RGB") : f.chroma == 420 ? std::string("4:2:0") : f.chroma == 422 ? std::string("4:2:2") : std::string("4:4:4")), "convert");
 		groups.push_back(std::move(g));
 	}
 	const size_t feed_reader = raw.add_reader(DECODE_AHEAD);
@@ -557,10 +559,15 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 		PacketQueue* dq = dist_packets[i].get();
 		dist_readers.push_back(enc_frames.add_reader(SCORE_BEHIND, [dq] { return dq->waiting.load(); }));
 	}
-	if (feed_rp) feed_rp->begin(3, runs[0]->enc.plan->convert_rate ? std::max<long long>(1, std::llround(si.duration * runs[0]->enc.plan->enc.fps.value())) : std::max<long long>(1, si.frame_count));
+	if (feed_rp) feed_rp->begin(6, std::max<long long>(1, si.frame_count)); // it steps once per decoded frame, kept or dropped
+	// The one decode of the wave has a row of its own; the feed and the references are conversions of what it decoded.
+	RunProgress decode_rp;
+	decode_rp.begin(3, std::max<long long>(1, si.frame_count));
+	const size_t slash = input.find_last_of("/\\");
+	const int decode_handle = ui::attach(&decode_rp, input.substr(slash == std::string::npos ? 0 : slash + 1), "decode");
 
 	bool decode_ok = false, feed_ok = false;
-	std::thread decoder([&] { decode_input(*src, raw, [&] { return raw.held() || enc_frames.held(); }, decode_ok, nullptr); });
+	std::thread decoder([&] { decode_input(*src, raw, [&] { return raw.held() || enc_frames.held(); }, decode_ok, &decode_rp); });
 	std::thread feeder([&] { feed_encoders(*src, raw, feed_reader, *runs[0]->enc.plan, so, bc, enc_frames, fr, feed_ok, feed_rp); });
 	std::vector<std::thread> threads;
 	for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {
@@ -632,6 +639,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 	feeder.join();
 	for (auto& t : threads) t.join();
 	for (auto& g : groups) ui::detach(g->handle);
+	ui::detach(decode_handle);
 	fr.ok = decode_ok && feed_ok;
 	for (auto* r : runs) {
 		r->enc.ok = r->enc.ok && fr.ok;
