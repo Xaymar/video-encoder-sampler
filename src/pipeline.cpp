@@ -477,7 +477,7 @@ void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, F
 			rp.state = 0;
 			rp.blocked_ms += std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t).count();
 		}
-		if (!out.read() || raw.next(reader, t) != 1) break; // the end, or every scorer of this format has ended
+		if (!out.read() || raw.next(reader, t, &rp) != 1) break; // the end, or every scorer of this format has ended
 		rp.step();
 		if (t.fmt == fmt) { out.push(t); continue; }
 		t.duration = 1;

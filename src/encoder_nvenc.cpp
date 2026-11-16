@@ -259,6 +259,12 @@ class Nvenc : public Encoder {
 	std::thread rx;
 	void* eos_event = nullptr; // for the end-of-stream picture, which has no slot
 	bool flushing = false, finished = false, stop = false, rx_ok = true;
+	// Some option combinations make NVENC take pictures and never finish one: no event fires, no output comes. Once every slot is submitted the encoder has
+	// more pictures than it may hold back (see `delay`), so a wait for a free slot (or for the end of the stream) that sees no output for this long gives up:
+	// the run fails instead of holding its wave until the device process's watchdog ends it.
+	static constexpr auto NO_OUTPUT = std::chrono::seconds(30);
+	std::atomic<int64_t> outputs{0}; // pictures read, by read_slot()
+	long long submitted = 0;
 	NV_ENC_BUFFER_FORMAT buffer_fmt = NV_ENC_BUFFER_FORMAT_NV12;
 	int chroma = 420, depth = 8;
 	// What open() handed the encoder, for settings().
@@ -547,6 +553,7 @@ public:
 		NVENCSTATUS st = f.nvEncLockBitstream(enc, &lb);
 		if (st) return fail(st, "lock bitstream");
 		stats.packets++; stats.bytes += lb.bitstreamSizeInBytes;
+		outputs++;
 		if (sink) sink((const uint8_t*)lb.bitstreamBufferPtr, lb.bitstreamSizeInBytes, (int64_t)lb.outputTimeStamp,
 			lb.pictureType == NV_ENC_PIC_TYPE_IDR || lb.pictureType == NV_ENC_PIC_TYPE_I, NO_DTS);
 		f.nvEncUnlockBitstream(enc, s->out);
@@ -569,7 +576,7 @@ public:
 			{
 				std::unique_lock lock(m);
 				cv.wait(lock, [&] { return !pending_.empty() || flushing || stop; });
-				if (stop) return;
+				if (stop) { finished = true; rx_ok = false; cv.notify_all(); return; }
 				if (!pending_.empty()) s = pending_.front();
 			}
 			if (!s) { // everything submitted has been read; the end-of-stream picture is what is left
@@ -600,6 +607,27 @@ public:
 		return true;
 	}
 #endif
+
+	// Waits (with m held) until `done`, as long as output keeps coming: after NO_OUTPUT without a single picture read it gives up, stops the receiver and
+	// fails the encoder (false).
+	template <class Pred> bool wait_output(std::unique_lock<std::mutex>& lock, Pred done, const char* what) {
+		auto since = std::chrono::steady_clock::now();
+		int64_t seen = outputs.load();
+		while (!done()) {
+			cv.wait_for(lock, std::chrono::milliseconds(500));
+			const auto now = std::chrono::steady_clock::now();
+			if (const int64_t o = outputs.load(); o != seen) { seen = o; since = now; continue; }
+			if (now - since >= NO_OUTPUT && !done()) {
+				fprintf(stderr, "nvenc: no output for %lld s while waiting for %s (%lld pictures given, %lld finished): the encoder takes frames but gives nothing back with these settings\n",
+					(long long)std::chrono::duration_cast<std::chrono::seconds>(NO_OUTPUT).count(), what, submitted, (long long)seen);
+				stop = true; // the receiver gives up waiting for the event (wait() checks it)
+				rx_ok = false;
+				cv.notify_all();
+				return false;
+			}
+		}
+		return true;
+	}
 
 	int reorder_delay() const override { return b_delay; }
 
@@ -641,6 +669,7 @@ public:
 	bool encode(const Picture* fr) override {
 		NVENCSTATUS st;
 		if (!fr) { // flush
+			{ std::lock_guard lock(m); if (!rx_ok || stop) return false; } // gave up already: nothing more will come
 			NV_ENC_PIC_PARAMS pp{};
 			pp.version = NV_ENC_PIC_PARAMS_VER;
 			pp.encodePicFlags = NV_ENC_PIC_FLAG_EOS;
@@ -652,14 +681,21 @@ public:
 			std::unique_lock lock(m);
 			flushing = true;
 			cv.notify_all();
-			cv.wait(lock, [&] { return finished; });
+			if (!wait_output(lock, [&] { return finished; }, "the end of the stream")) return false;
 			return rx_ok;
 #endif
 		}
 		Slot* s;
 		{
 			std::unique_lock lock(m);
-			cv.wait(lock, [&] { return !free_.empty() || !rx_ok; }); // never empties for good: the slots outnumber what the encoder holds back
+#ifndef _WIN32
+			if (free_.empty()) { // synchronous: only this thread reads outputs, so none will come
+				fprintf(stderr, "nvenc: no output after %lld pictures: the encoder takes frames but gives nothing back with these settings\n", submitted);
+				return false;
+			}
+#endif
+			// never empties for good: the slots outnumber what the encoder holds back
+			if (!wait_output(lock, [&] { return !free_.empty() || !rx_ok; }, "a free picture buffer")) return false;
 			if (!rx_ok) return false;
 			s = free_.back(); free_.pop_back();
 		}
@@ -685,6 +721,7 @@ public:
 			pending_.push_back(s);
 		}
 		cv.notify_all();
+		submitted++;
 		st = f.nvEncEncodePicture(enc, &pp);
 #ifndef _WIN32
 		if (st == NV_ENC_SUCCESS) return drain(1); // each success makes the oldest queued picture's output available
