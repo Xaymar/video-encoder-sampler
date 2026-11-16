@@ -61,6 +61,11 @@ struct Shape {
 	Fmt pix;
 	bool has_pix = false;
 	bool upscale = false; // from the scenario: encoding above the source's resolution, chroma layout or bit depth is allowed
+	// A frame rate that depends on the source's (from the scenario; when set, `fps` is 0): the source's rate divided by `fps_divide` when it is above
+	// `fps_above` (0: always), or by the smallest whole number that brings it to `fps_max` or below. Turned into `fps` per input before runs are made.
+	int fps_divide = 0;
+	double fps_above = 0, fps_max = 0;
+	bool fps_rule() const { return fps_divide > 0 || fps_max > 0; }
 };
 
 enum class Codec { None, H264, HEVC, AV1 };
