@@ -99,8 +99,8 @@ A job's `ves` is ended with the worker, however the worker ends, and gets no cop
 
 ## Best videos
 
-Workers run their jobs with `--no-videos`. With `"videos": "best"` (the default), once every run of an input is done the host picks the winner of each group (the
-highest rank-weighted Distorted Score after the overshoot penalty). A winner the host can run itself (a CPU encoder, or its own GPU) is encoded again on the host;
+Workers run their jobs with `--no-videos`. With `"videos": "best"` (the default), once every run of an input is done the host picks the best runs of each group (by
+rank-weighted Distorted Score after the overshoot penalty; `best_videos`: 5 or 1% of the group, whichever is more). A winner the host can run itself (a CPU encoder, or its own GPU) is encoded again on the host;
 a winner from a worker's GPU goes out as a *video job* to a worker with that GPU model, which encodes it again and sends the stream back (protocol 6). The host
 keeps the stream, and uploads it, only if its SHA-256 matches the stream that was scored; an encoder that does not give the same stream twice gets no video.
 
