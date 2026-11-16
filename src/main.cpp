@@ -527,9 +527,10 @@ Paths
                             <dir>/<input>/ (fragmented .mp4) and the result file <dir>/<input>.json;
                             "off" writes nothing
         --no-videos         write the result files but not the encoded streams
-        --all-videos        keep every encoded stream. By default only the winner (the highest rank-weighted mean after the overshoot penalty, as in the ranking) of each input,
-                            encoder, bitrate, key frame interval and size keeps its stream; the others are deleted when the group is complete, and the kept
-                            one is uploaded then (a stream an earlier sweep sent that is beaten now is removed from the site)
+        --all-videos        keep every encoded stream. By default no stream is kept while the runs go; once all runs of an input are done, the winner of each
+                            input, encoder, bitrate, key frame interval and size (the highest rank-weighted Distorted Score after the overshoot penalty, the
+                            website's default ranking) is encoded again, and its stream is kept and uploaded if it matches the one that was scored (a stream an
+                            earlier sweep sent that is beaten now is removed from the site)
         --upload <url>      after the sweep, upload the results (and videos) to this VES website, e.g. https://ves.example.com ("off" disables it)
         --upload-key <key>  the API key from the website's account page; better in the config ("upload": {"key": ...}) or the VES_API_KEY environment variable
         --no-upload-videos  upload the results but not the encoded videos
@@ -1261,8 +1262,6 @@ int main(int argc, char** argv) {
 		std::unordered_map<ComboTable::Id, uint8_t> status; // per combination made or judged: 1 ran, 2 left out or failed; missing or 0: not run (yet)
 		std::unordered_map<ComboTable::Id, size_t> task;    // combination -> its task
 		size_t layer = 0;                              // the layers made into runs so far
-		bool expanding = true;                         // more runs of it may come: its streams are not judged yet
-		std::set<std::string> groups;                  // the groups (see Run::group) its runs are in
 		std::function<bool(const Variant&, LazyGroup*, ComboTable::Id)> make; // makes the task of a combination: false if it is not wanted
 	};
 	std::map<ShareKey, std::unique_ptr<LazyTable>> lazy_tables; // shared by the scenarios with the same chroma, bit depth and range
@@ -1369,7 +1368,7 @@ int main(int argc, char** argv) {
 							t.r.gpu = v.gpu; t.r.gpu_json = v.gpu_json; t.r.caps_json = v.caps_json;
 							t.pool = v.pool->name;
 							t.group = lg; t.combo = combo;
-							if (lg) { lg->task[combo] = tasks.size(); lg->groups.insert(t.r.group); }
+							if (lg) lg->task[combo] = tasks.size();
 							t.index = tasks.size();
 							v.pool->tasks.push_back(tasks.size());
 							tasks.push_back(std::move(t));
@@ -1517,8 +1516,21 @@ int main(int argc, char** argv) {
 		uploader = std::make_unique<Uploader>(up, [](const std::string& line) { ui::log(line); });
 	}
 	std::map<std::string, std::vector<Task*>> group_ok; // group -> its runs that were scored, for picking the stream to keep
-	std::map<std::string, int> group_left; // group -> runs not finished yet; its kept stream is uploaded when this reaches 0
-	if (cfg.best_videos) for (auto& t : tasks) group_left[t.r.group]++;
+	// Where a run's stream is kept: next to its result, with the same name.
+	auto video_name_of = [](const Run& r) { return r.result.substr(0, r.result.size() - 5) + ".mp4"; };
+	// What picks a group's winner: the score the website ranks by by default, the Distorted Score (the encode against the frames its encoder got), less the
+	// overshoot penalty; the True Score (Run::rwm) when a run of the group has no distorted score.
+	auto winner_score = [](const Run& r, bool distorted) { return distorted ? r.distorted.rwm - r.penalty : r.rwm; };
+	// The stream of a run goes to the site with its result, which went out without it (UploadItem::late).
+	auto upload_video = [&](const Task& t) {
+		if (!uploader || t.r.result.empty() || t.r.video.empty()) return;
+		UploadItem it;
+		it.result_file = (fs::path(cfg.output_dir) / t.r.result).string();
+		it.video_file = (fs::path(cfg.output_dir) / t.r.video).string();
+		it.label = t.r.label;
+		it.late = true;
+		uploader->add(std::move(it));
+	};
 	auto finish_run = [&](Task& t) {
 		Run& r = t.r;
 		ui::overall(++finished, total);
@@ -1558,44 +1570,10 @@ int main(int argc, char** argv) {
 		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.enc_busy_s, r.enc_starved_s, r.decode_blocked_s, r.score_starved_s);
 		ui::log(line);
 	};
-	// The group is complete: the stream of its winner stays, the others go (see below).
-	auto complete_group = [&](const std::string& group) {
-		// The winner is ranked as in the summary and on the website: the highest rank-weighted mean after the overshoot penalty (Run::rwm).
-		// Only runs that still have a stream can keep it.
-		auto& runs_ok = group_ok[group];
-		Task* kept = nullptr;
-		for (Task* x : runs_ok) {
-			if (x->r.video.empty() || !fs::exists(fs::path(cfg.output_dir) / x->r.video)) continue;
-			if (!kept || x->r.rwm > kept->r.rwm) kept = x;
-		}
-		for (Task* x : runs_ok) {
-			if (x == kept || x->r.video.empty()) continue;
-			std::error_code ec;
-			fs::remove(fs::path(cfg.output_dir) / x->r.video, ec);
-			x->r.video.clear();
-			if (uploader && x->r.cached && !x->r.result.empty()) { // an earlier sweep may have sent it to the site as its best
-				UploadItem drop;
-				drop.result_file = (fs::path(cfg.output_dir) / x->r.result).string();
-				drop.label = x->r.label;
-				drop.drop_video = true;
-				uploader->add(std::move(drop));
-			}
-		}
-		if (!kept || !uploader) return;
-		UploadItem it;
-		it.result_file = (fs::path(cfg.output_dir) / kept->r.result).string();
-		it.video_file = (fs::path(cfg.output_dir) / kept->r.video).string();
-		it.label = kept->r.label;
-		it.late = true;
-		uploader->add(std::move(it));
-	};
 	auto finish = [&](Task& t) {
 		t.done = true;
 		if (t.group) t.group->status[t.combo] = t.ok ? 1 : 2;
 		finish_run(t);
-		if (!cfg.best_videos || --group_left[t.r.group] > 0) return;
-		if (t.group && t.group->expanding) return; // more runs of its group may come; they are judged when it is done
-		complete_group(t.r.group);
 	};
 
 	// The source files, probed once each. A run that asks for no particular resolution or frame rate gets the source's, which is what its result records.
@@ -1841,7 +1819,6 @@ int main(int argc, char** argv) {
 			const size_t at = tasks.size();
 			if (!g.make(lazy_variant(*g.lt, *g.job, c, g.model), &g, c)) { g.status[c] = 2; continue; }
 			total = (int)tasks.size();
-			if (cfg.best_videos) group_left[tasks[at].r.group]++;
 			if (!settle(at)) added.push_back(at);
 		}
 		return true;
@@ -1871,11 +1848,11 @@ int main(int argc, char** argv) {
 		create_input_tasks(input_name);
 		total = (int)tasks.size();
 		for (size_t i = first; i < tasks.size(); i++) {
-			if (cfg.best_videos) group_left[tasks[i].r.group]++;
 			if (!settle(i)) uncached[input_name].push_back(i);
 		}
 	}
-	auto run_round = [&](const std::vector<size_t>& todo) {
+	// reencode: the runs are group winners that were scored before; they are encoded again for their streams (see the end of the input below) and not finished again.
+	auto run_round = [&](const std::vector<size_t>& todo, bool reencode) {
 	// Plan the runs of this input: opening the source is where a URL is downloaded. Runs that cannot work are finished right away; the rest is
 	// sorted by the frames it needs, and runs with the same resolution, frame rate and pixel format share one decode.
 	std::map<std::string, std::vector<Task*>> by_feed;
@@ -1883,6 +1860,17 @@ int main(int argc, char** argv) {
 	for (size_t i : todo) {
 		Task& t = tasks[i];
 		Run& r = t.r;
+		if (reencode) {
+			const SourceInfo* src = source_of(r.input);
+			if (!src) continue;
+			t.plan = make_plan(*src, t.job->encoder, t.job->codec, *t.opts, r.shape);
+			if (t.plan.ignored) continue;
+			fit_shape(t);
+			const std::string fk = r.input + "|" + t.plan.feed_key();
+			if (!by_feed.count(fk)) feed_order.push_back(fk);
+			by_feed[fk].push_back(&t);
+			continue;
+		}
 		if (!t.model.empty()) { r.ignored = true; r.expected = true; r.reason = "no worker produced it (on " + t.model + ")"; finish(t); continue; } // not on this machine's GPU: the key says another one
 		const SourceInfo* src = source_of(r.input);
 		if (!src) { finish(t); continue; }
@@ -1923,7 +1911,7 @@ int main(int argc, char** argv) {
 				for (auto it = list.begin(); it != list.end() && room > 0;) {
 					Task& t = **it;
 					std::string why;
-					const int state = prune_state(t, why);
+					const int state = reencode ? 0 : prune_state(t, why);
 					if (state == 1) { t.r.pruned = true; t.r.reason = why; it = list.erase(it); finish(t); }
 					else if (state == 0) { wave.push_back(&t); it = list.erase(it); room--; }
 					else ++it;
@@ -1946,11 +1934,11 @@ int main(int argc, char** argv) {
 				t.r.score_progress = std::make_shared<RunProgress>();
 				ej.encoder = t.job->encoder; ej.codec = t.job->codec; ej.plan = &t.plan;
 				ej.bitrate = t.r.bitrate * 1000; ej.kf = t.r.kf; ej.rp = t.r.progress.get();
-				ej.file = !t.r.video_file.empty() ? t.r.video_file : (spool_dir / ("run" + std::to_string(t.index) + ".mp4")).string();
+				ej.file = !t.r.video_file.empty() && (reencode || !cfg.best_videos) ? t.r.video_file : (spool_dir / ("run" + std::to_string(t.index) + ".mp4")).string();
 				ej.id = t.id; ej.color = t.plan.color;
 				run.codec = t.id; run.score_rp = t.r.score_progress.get();
 				ptrs.push_back(&run);
-				ui::log_plain(t.r.tag + " encoding and scoring  " + t.r.label + "  (" + file_name(input) + ", " + std::to_string(t.r.bitrate) + " kbps, pool " + t.pool + ")");
+				ui::log_plain(t.r.tag + (reencode ? " encoding the best of its group again  " : " encoding and scoring  ") + t.r.label + "  (" + file_name(input) + ", " + std::to_string(t.r.bitrate) + " kbps, pool " + t.pool + ")");
 				run.label = t.r.label;
 				run.pool = t.pool;
 				if (cfg.in_process) { // otherwise the processes show these rows
@@ -1999,8 +1987,24 @@ int main(int argc, char** argv) {
 					alone.push_back(&t);
 					continue;
 				}
+				if (reencode) { // the group's winner, encoded again for its stream: it stays only if it is the stream that was scored
+					const std::string sha = wr[i].enc.ok ? sha256_file(wr[i].enc.file) : std::string();
+					if (!sha.empty() && sha == r.video_sha256) {
+						r.video = video_name_of(r);
+						ui::log("Best of its group  " + r.label + ": stream kept (" + r.video + ")");
+						if (!t.result_file.empty()) store_result(t, t.result_file, cached_of(r), run_details(t)); // the result names its stream now
+						upload_video(t);
+					} else {
+						fs::remove(wr[i].enc.file, ec);
+						ui::log("Best of its group  " + r.label + ": " + (sha.empty() ? "the re-encode failed" + (wr[i].enc.error.empty() ? std::string() : ": " + wr[i].enc.error)
+						                                                                 : std::string("the re-encode differs from the scored stream (the encoder is not deterministic), so there is no video")));
+					}
+					r.video_file.clear();
+					continue;
+				}
 				if (t.ok) r.video_sha256 = sha256_file(wr[i].enc.file);
-					if (r.video_file.empty()) fs::remove(wr[i].enc.file, ec); // a temporary file
+				if (r.video_file.empty() || cfg.best_videos) fs::remove(wr[i].enc.file, ec); // a temporary file; with "best" the winner is encoded again when its input is done
+				if (cfg.best_videos) r.video.clear();
 				finish(t);
 			}
 		}
@@ -2015,7 +2019,7 @@ int main(int argc, char** argv) {
 			for (size_t i : todo) if (!tasks[i].done && !settle(i)) left.push_back(i);
 			todo = std::move(left);
 		}
-		run_round(todo);
+		run_round(todo, false);
 		todo.clear();
 		for (bool progress = true; progress && todo.empty();) {
 			progress = false;
@@ -2023,9 +2027,45 @@ int main(int argc, char** argv) {
 		}
 		if (todo.empty()) break;
 	}
-	for (LazyGroup* g : lazy_of_input[input_name]) { // nothing more to make: the streams of the groups can be judged
-		g->expanding = false;
-		if (cfg.best_videos) for (const std::string& grp : g->groups) if (group_left[grp] == 0) complete_group(grp);
+	// Nothing more to make for this input: its groups are complete. With "videos": "best" no stream was kept while they ran; now each group's winner is
+	// encoded again, and its stream is kept and uploaded if it is the one that was scored (same SHA-256). Streams of other runs left by earlier sweeps go.
+	if (cfg.best_videos) {
+		std::vector<size_t> again;
+		for (auto it = group_ok.begin(); it != group_ok.end();) {
+			auto& runs_ok = it->second;
+			if (runs_ok.empty() || runs_ok.front()->r.input != input_name) { ++it; continue; }
+			bool distorted = true;
+			for (Task* x : runs_ok) distorted &= x->r.has_distorted;
+			Task* best = nullptr;
+			for (Task* x : runs_ok) if (!best || winner_score(x->r, distorted) > winner_score(best->r, distorted)) best = x;
+			for (Task* x : runs_ok) {
+				if (x == best || x->r.video.empty()) continue;
+				std::error_code ec;
+				fs::remove(fs::path(cfg.output_dir) / x->r.video, ec);
+				x->r.video.clear();
+				if (uploader && x->r.cached && !x->r.result.empty()) { // an earlier sweep may have sent it to the site as its best
+					UploadItem drop;
+					drop.result_file = (fs::path(cfg.output_dir) / x->r.result).string();
+					drop.label = x->r.label;
+					drop.drop_video = true;
+					uploader->add(std::move(drop));
+				}
+			}
+			Run& r = best->r;
+			if (!r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) upload_video(*best); // kept by an earlier sweep
+			else if (r.result.empty()) {}
+			else if (r.video_sha256.empty()) ui::log("Best of its group  " + r.label + ": its result has no video_sha256, so a new encode cannot be checked against it; no video");
+			else if (!best->model.empty()) ui::log("Best of its group  " + r.label + ": it ran on a worker's " + best->model + ", which is not here; no video");
+			else {
+				r.video_file = (fs::path(cfg.output_dir) / video_name_of(r)).string();
+				again.push_back(best->index);
+			}
+			it = group_ok.erase(it);
+		}
+		if (!again.empty()) {
+			ui::log("Encoding the best run of " + std::to_string(again.size()) + " group(s) of " + file_name(input_name) + " again for their streams");
+			run_round(again, true);
+		}
 	}
 	}
 	{ std::error_code ec; fs::remove_all(spool_dir, ec); }
