@@ -16,7 +16,7 @@ bool Cond::number(const std::string& v, double& out) {
 }
 
 bool Cond::holds_value(const std::string* have_value) const {
-	if (!have_value) return false;
+	if (!have_value || have_value->empty()) return false; // "" is the option left out
 	double have = 0;
 	if (!op.empty()) {
 		if (!number(*have_value, have)) return false;
@@ -86,15 +86,18 @@ ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes
 	// Which options can be pruned: those with something between their lowest and highest value.
 	for (size_t k = 0; k < axes_.size(); k++) {
 		Ax& a = axes_[k];
-		if (!prune || fixed.count(a.key) || a.key == "gpu" || a.key == "chroma" || a.key == "bitdepth" || a.key == "range" || a.values.size() < 3) continue;
+		// "" (the option left out) is no point of the range: it is always run, like the ends, and never pruned
+		std::vector<int> set;
+		for (int i = 0; i < (int)a.values.size(); i++) if (!a.values[(size_t)i].empty()) set.push_back(i);
+		if (!prune || fixed.count(a.key) || a.key == "gpu" || a.key == "chroma" || a.key == "bitdepth" || a.key == "range" || set.size() < 3) continue;
 		bool numeric = true;
-		for (auto& v : a.values) { double d; numeric &= Cond::number(v, d); }
+		for (int i : set) { double d; numeric &= Cond::number(a.values[(size_t)i], d); }
 		if (numeric) {
 			auto less = [&](int x, int y) { return atof(a.values[(size_t)x].c_str()) < atof(a.values[(size_t)y].c_str()); };
-			int lo = 0, hi = 0;
-			for (int i = 1; i < (int)a.values.size(); i++) { if (less(i, lo)) lo = i; if (less(hi, i)) hi = i; }
+			int lo = set.front(), hi = set.front();
+			for (int i : set) { if (less(i, lo)) lo = i; if (less(hi, i)) hi = i; }
 			a.lo = lo; a.hi = hi;
-		} else { a.lo = 0; a.hi = (int)a.values.size() - 1; } // not numbers (presets): the order of the list
+		} else { a.lo = set.front(); a.hi = set.back(); } // not numbers (presets): the order of the list
 		a.prunable = true;
 		prunable_.push_back((int)k);
 	}
@@ -149,7 +152,7 @@ const std::vector<ComboTable::Id>& ComboTable::layer(size_t want) const {
 		if (!applies(level, current)) { current[level] = UNSET; generate(level + 1, mids, c + (a.radix - 1) * a.weight); return; } // the option stays unset, in one branch
 		for (size_t v = 0; v < a.values.size(); v++) {
 			current[level] = (uint8_t)v;
-			const bool mid = a.prunable && (int)v != a.lo && (int)v != a.hi;
+			const bool mid = a.prunable && (int)v != a.lo && (int)v != a.hi && !a.values[v].empty();
 			generate(level + 1, mids + mid, c + v * a.weight);
 		}
 		current[level] = UNSET;
@@ -171,7 +174,7 @@ void ComboTable::mid_lines(Id c, std::vector<Line>& out) const {
 	for (int p : prunable_) {
 		const Ax& a = axes_[(size_t)p];
 		const uint8_t v = r[(size_t)p];
-		if (v == UNSET || (int)v == a.lo || (int)v == a.hi) continue;
+		if (v == UNSET || (int)v == a.lo || (int)v == a.hi || a.values[v].empty()) continue;
 		r[(size_t)p] = (uint8_t)a.lo;
 		const int64_t lo = find(r);
 		r[(size_t)p] = (uint8_t)a.hi;

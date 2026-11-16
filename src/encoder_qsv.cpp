@@ -310,6 +310,25 @@ public:
 
 	int reorder_delay() const override { return b_delay; }
 
+	// The fields as the runtime settled on them (GetVideoParam), read through the same table the options are set with.
+	std::vector<std::pair<std::string, std::string>> settings() override {
+		if (!open_encoder) return {};
+		const mfxVideoParam keep_par = par;
+		const mfxExtCodingOption2 keep_co2 = co2;
+		const mfxExtCodingOption3 keep_co3 = co3;
+		mfxExtBuffer* got_ext[2] = {&co2.Header, &co3.Header};
+		par.ExtParam = got_ext; par.NumExtParam = 2;
+		std::vector<std::pair<std::string, std::string>> out;
+		if (a.MFXVideoENCODE_GetVideoParam(session, &par) >= 0) {
+			for (auto& [name, f] : fields) {
+				const long long v = f.size == 1 ? *(const uint8_t*)f.p : f.size == 2 ? *(const uint16_t*)f.p : *(const uint32_t*)f.p;
+				out.push_back({name, std::to_string(v)});
+			}
+		}
+		par = keep_par; co2 = keep_co2; co3 = keep_co3;
+		return out;
+	}
+
 	bool encode(const Picture* fr) override {
 		mfxFrameSurface1* s = nullptr;
 		if (fr) { s = acquire(); fill(fr, s); }

@@ -1,6 +1,8 @@
 #pragma once
 // Encoder option names. Every name a user writes is snake_case ("max_b_frames", "enable_ltr"); each backend maps it to the spelling of its own
 // library. A few options are common: same name and meaning for every encoder that can do them.
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <string>
 #include <utility>
@@ -35,6 +37,7 @@ struct OptionInfo {
 	std::string name;   // as a config writes it
 	std::string values; // what it takes ("cbr | vbr", "0..15", "number"); empty when not known
 	std::string about;  // what it does, may be empty
+	std::string current; // what the encoder has when the option is left out (with the preset and tune asked for); empty when not known
 };
 using OptionList = std::vector<OptionInfo>;
 
@@ -57,6 +60,18 @@ OptionList svtav1_options();
 // Returns false with `error` set for a common option the encoder lacks.
 bool resolve_options(const std::string& encoder, const std::string& codec, const Options& options,
                      const std::function<std::string(const std::string&)>& native_name, NativeOptions& out, std::string& error);
+
+// The settings x264 and x265 write into their stream ("options: cabac=1 ref=3 no-sao ..."), found in `data` (their header NAL units), as
+// snake_case names: "no-x" is x=0 and a bare "x" is x=1.
+std::vector<std::pair<std::string, std::string>> settings_from_sei(const uint8_t* data, size_t size);
+
+// What `defaults` (encoder_defaults) says option `key` is when it is left out, as an option value would write it; false when they do not say. For x264, x265 and
+// SVT-AV1 the common options are looked up by the library's name for them (max_b_frames is bframes).
+bool default_of(const std::string& encoder, const std::string& codec, const std::string& key, const std::vector<std::pair<std::string, std::string>>& defaults,
+                std::string& value);
+// Whether `value` of option `key` is what the encoder has anyway (see default_of): numbers by value, true/on as 1 and false/off as 0.
+bool is_default(const std::string& encoder, const std::string& codec, const std::string& key, const std::string& value,
+                const std::vector<std::pair<std::string, std::string>>& defaults);
 
 // `ves --list-options [encoder[/codec]] [gpu]` (argv[1] is --list-options): prints them, returns the exit code.
 int list_options_main(int argc, char** argv);

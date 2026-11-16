@@ -85,6 +85,17 @@ public:
 		return true;
 	}
 
+	std::vector<std::pair<std::string, std::string>> settings() override {
+		x264_nal_t* nal = nullptr;
+		int n = 0;
+		if (!h || x264_encoder_headers(h, &nal, &n) < 0) return {};
+		for (int i = 0; i < n; i++) if (nal[i].i_type == NAL_SEI) {
+			auto s = settings_from_sei(nal[i].p_payload, (size_t)nal[i].i_payload);
+			if (!s.empty()) return s;
+		}
+		return {};
+	}
+
 	bool encode(const Picture* fr) override {
 		x264_picture_t in, out;
 		x264_nal_t* nal;

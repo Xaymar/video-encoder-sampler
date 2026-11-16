@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <map>
 #include <cstdio>
 #include <set>
@@ -265,4 +266,69 @@ void merge_options(OptionList& list, const OptionList& more) {
 		for (auto& l : list) if (l.name == o.name) { have = true; if (l.about.empty()) l.about = o.about; break; }
 		if (!have) list.push_back(o);
 	}
+}
+
+std::vector<std::pair<std::string, std::string>> settings_from_sei(const uint8_t* data, size_t size) {
+	std::vector<std::pair<std::string, std::string>> out;
+	const std::string all((const char*)data, size);
+	size_t at = all.find("options: ");
+	if (at == std::string::npos) return out;
+	at += 9;
+	size_t end = at;
+	while (end < all.size() && (unsigned char)all[end] >= 32 && (unsigned char)all[end] < 127) end++;
+	const std::string text = all.substr(at, end - at);
+	for (size_t i = 0; i < text.size();) {
+		size_t j = text.find(' ', i);
+		if (j == std::string::npos) j = text.size();
+		const std::string tok = text.substr(i, j - i);
+		i = j + 1;
+		if (tok.empty()) continue;
+		const size_t eq = tok.find('=');
+		if (eq != std::string::npos) out.push_back({snake_case(tok.substr(0, eq)), tok.substr(eq + 1)});
+		else if (tok.compare(0, 3, "no-") == 0) out.push_back({snake_case(tok.substr(3)), "0"});
+		else out.push_back({snake_case(tok), "1"});
+	}
+	return out;
+}
+
+namespace {
+
+const std::string* lookup(const std::vector<std::pair<std::string, std::string>>& d, const std::string& key) {
+	for (auto& [k, v] : d) if (k == key) return &v;
+	return nullptr;
+}
+
+bool same_value(const std::string& a, const std::string& b) {
+	auto norm = [](const std::string& s) { return s == "true" || s == "on" ? std::string("1") : s == "false" || s == "off" ? std::string("0") : s; };
+	const std::string x = norm(a), y = norm(b);
+	if (x == y) return true;
+	char *ex = nullptr, *ey = nullptr;
+	const double dx = strtod(x.c_str(), &ex), dy = strtod(y.c_str(), &ey);
+	return !x.empty() && !y.empty() && !*ex && !*ey && dx == dy;
+}
+
+} // namespace
+
+bool default_of(const std::string& enc, const std::string& codec, const std::string& key, const std::vector<std::pair<std::string, std::string>>& d, std::string& value) {
+	if (const std::string* v = lookup(d, key)) { value = *v; return true; }
+	if ((key != "max_b_frames" && key != "lookahead_frames" && key != "max_ref_frames") || enc == "nvenc") return false;
+	// the library's own name for it (the numbers; the named values are spelled differently by the library): what the common option translates to, if it is one option
+	NativeOptions native;
+	std::string error;
+	const char* probe = key == "b_reference_mode" ? "none" : key == "rate_control" ? "cbr" : "1";
+	if (!translate(enc, codec, key, probe, native, error) || native.size() != 1) return false;
+	const std::string* v = lookup(d, snake_case(native[0].first));
+	if (!v) return false;
+	value = *v;
+	return true;
+}
+
+bool is_default(const std::string& enc, const std::string& codec, const std::string& key, const std::string& value, const std::vector<std::pair<std::string, std::string>>& d) {
+	if (const std::string* v = lookup(d, key)) return same_value(value, *v);
+	if (!is_common_option(key) || enc == "nvenc") return false;
+	NativeOptions native;
+	std::string error;
+	if (!translate(enc, codec, key, value, native, error) || native.size() != 1) return false;
+	const std::string* v = lookup(d, snake_case(native[0].first));
+	return v && same_value(native[0].second, *v);
 }

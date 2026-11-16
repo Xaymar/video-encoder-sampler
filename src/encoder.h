@@ -4,6 +4,8 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "picture.h"
 
@@ -36,6 +38,9 @@ public:
 	// How many frames the display order can lag behind the coding order (B-frame depth), valid after open(); only needed from encoders
 	// that report no DTS, so that a muxer can offset the display times.
 	virtual int reorder_delay() const { return 0; }
+	// After open(): the settings the encoder works with, preset and options applied, by the names a config writes options with where the library has
+	// them (`ves --list-options` shows them as the defaults). Empty when the encoder cannot tell.
+	virtual std::vector<std::pair<std::string, std::string>> settings() { return {}; }
 	Stats stats;
 };
 
@@ -57,6 +62,12 @@ std::string nvenc_caps_json(const std::string& codec, int gpu);
 std::string amf_caps_json(const std::string& codec, int gpu = 0); // where the encoder runs (hardware, GPU compute, software) and the SDK's capability values of AMD GPU `gpu`
 // Asked of the GPU's encoder process when encoders run in processes of their own (encoder_process.h), so that this process never loads the vendor's runtime.
 std::string encoder_caps_json(const std::string& encoder, const std::string& codec, int gpu);
+// The settings (Encoder::settings) of an encoder opened on GPU `gpu` with only the options `base` (preset, tune, profile, chroma, bitdepth), at 1920x1080, 30 fps
+// and 6000 kbps: what each option is when a run leaves it out. Empty with `why` set when it cannot be opened. Asked once per question; a GPU encoder is
+// asked in the process of its GPU (see encoder_process.h).
+// What the encoder process answers to that question (in this process): "key=value" lines, or "!" and why.
+std::string encoder_defaults_text(const std::string& encoder, const std::string& codec, int gpu, const std::string& base);
+std::vector<std::pair<std::string, std::string>> encoder_defaults(const std::string& encoder, const std::string& codec, int gpu, const Options& base, std::string* why = nullptr);
 bool amf_supports(const std::string& codec, int chroma, int depth, int gpu = 0);
 bool amf_probe(const std::string& codec, int gpu, std::string& caps); // for `ves --probe-amf`: one encoder opened, its failures said on stderr
 std::string amf_runtime(); // in such a process, which AMF runtime it loaded ("1.4.24 from <path>"); empty before one was loaded

@@ -25,6 +25,8 @@ bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vect
 // an encoder process (isolation is off, or the encoder runs on the CPU); otherwise `answer` is set, false/"null" when the process could not answer.
 bool isolated_supports(const std::string& encoder, const std::string& codec, int chroma, int depth, int gpu, bool& answer);
 bool isolated_caps(const std::string& encoder, const std::string& codec, int gpu, std::string& answer);
+// encoder_defaults() in the process of the GPU: `base` as "key=value" lines; `answer` the settings the same way, or "!" and why it could not open the encoder.
+bool isolated_defaults(const std::string& encoder, const std::string& codec, int gpu, const std::string& base, std::string& answer);
 
 // Ends the processes (at the end of a sweep); they also end by themselves when this process does.
 void stop_encoder_processes();

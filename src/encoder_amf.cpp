@@ -267,6 +267,19 @@ class Amf : public Encoder {
 	}
 
 public:
+	// The value of every property after open(), by option name.
+	std::vector<std::pair<std::string, std::string>> settings() override {
+		std::vector<std::pair<std::string, std::string>> out;
+		if (!enc) return out;
+		for (auto& [name, native] : names_all) {
+			amf::AMFVariant v;
+			if (enc->GetProperty(wide(native).c_str(), &v) != AMF_OK) continue;
+			std::string t = v.type == amf::AMF_VARIANT_BOOL ? (v.ToBool() ? "1" : "0") : text(v);
+			if (!t.empty()) out.push_back({name, t});
+		}
+		return out;
+	}
+
 	// For `ves --list-options`: every property the encoder of the last open() offers that can be written, with the range, names and default it gives for it.
 	OptionList options() const {
 		OptionList out;

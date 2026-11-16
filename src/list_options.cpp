@@ -7,18 +7,23 @@
 #include <vector>
 
 #include "encoder.h"
+#include "encoder_process.h"
 #include "options.h"
 #include "remote.h"
 
-// `ves --list-options [encoder[/codec]] [gpu]`: the options of each encoder and codec, as a config writes them, with what they take.
+// `ves --list-options [encoder[/codec]] [gpu] [key=value ...]`: the options of each encoder and codec, as a config writes them, with what they take, and what each
+// is when left out: the encoder is opened with the key=value options (preset, tune, ...) and asked what it ended up with.
 int list_options_main(int argc, char** argv) {
 	static const std::vector<std::pair<std::string, std::vector<std::string>>> all = {
 		{"nvenc", {"h264", "hevc", "av1"}}, {"amf", {"h264", "hevc", "av1"}}, {"qsv", {"h264", "hevc", "av1"}},
 		{"x264", {"h264"}}, {"x265", {"hevc"}}, {"svtav1", {"av1"}}};
 	std::string want_enc, want_codec;
 	int gpu = 0;
+	Options base;
+	set_isolated_encoders(false); // nothing but this list happens here
 	for (int i = 2; i < argc; i++) {
 		const std::string a = argv[i];
+		if (const size_t eq = a.find('='); eq != std::string::npos) { base[a.substr(0, eq)] = a.substr(eq + 1); continue; }
 		if (!a.empty() && a.find_first_not_of("0123456789") == std::string::npos) { gpu = atoi(a.c_str()); continue; }
 		const size_t slash = a.find('/');
 		want_enc = a.substr(0, slash);
@@ -44,20 +49,41 @@ int list_options_main(int argc, char** argv) {
 			else if (enc == "x265") { own = x265_options(); note = "Every other x265 option works too, by its command line name with _ for - (x265 --fullhelp)."; }
 			else { own = svtav1_options(); note = "Every other SVT-AV1 option works too, by its command line name with _ for - (SvtAv1EncApp --help)."; }
 			merge_options(list, own);
+			std::string why;
+			const auto defaults = encoder_defaults(enc, codec, gpu, base, &why);
+			for (auto& o : list) {
+				default_of(enc, codec, o.name, defaults, o.current);
+				if (o.current.empty() && !defaults.empty() && base.count(o.name)) o.current = base.at(o.name); // asked for: preset, tune
+			}
+			if (enc == "x264" || enc == "x265") // everything else the library says about itself, by its own names (most of them work as options)
+				for (auto& [k, v] : defaults) {
+					bool have = false;
+					std::string scratch;
+					for (auto& o : list) if (o.name == k || (is_common_option(o.name) && default_of(enc, codec, o.name, {{k, v}}, scratch))) { have = true; break; }
+					if (!have) list.push_back({k, "", enc + "'s setting", v});
+				}
+			std::string base_text;
+			for (auto& [k, v] : base) base_text += " " + k + "=" + v;
+			const std::string defaults_note = defaults.empty() ? "No defaults: " + why + "." : "Defaults (left out) with" + (base_text.empty() ? std::string(" no options") : base_text) +
+				", at 1920x1080 8-bit 4:2:0, 30 fps, 6000 kbps" + (is_gpu_encoder(enc) ? ", GPU " + std::to_string(gpu) : std::string()) + ".";
 			{ // the ones every encoder has first, in the same order everywhere; the backend's own after them as it lists them
 				static const std::vector<std::string> first = {"gpu", "preset", "tune", "profile", "tier", "level", "rate_control", "max_b_frames",
 				                                               "lookahead_frames", "max_ref_frames", "b_reference_mode"};
 				auto rank = [&](const OptionInfo& o) { return (size_t)(std::find(first.begin(), first.end(), o.name) - first.begin()); };
 				std::stable_sort(list.begin(), list.end(), [&](const OptionInfo& a, const OptionInfo& b) { return rank(a) < rank(b); });
 			}
-			size_t w = 0, vw = 0;
-			for (auto& o : list) { w = std::max(w, o.name.size()); vw = std::max(vw, std::min<size_t>(o.values.size(), 40)); }
+			size_t w = 0, vw = 0, dw = 0;
+			for (auto& o : list) { w = std::max(w, o.name.size()); vw = std::max(vw, std::min<size_t>(o.values.size(), 40)); dw = std::max(dw, std::min<size_t>(o.current.size(), 12)); }
 			printf("%s/%s\n", enc.c_str(), codec.c_str());
+			if (dw) printf("  %-*s  %-*s  %s\n", (int)w, "option", (int)dw, "default", "values");
 			for (auto& o : list) {
-				std::string line = "  " + o.name + std::string(w - o.name.size() + 2, ' ') + o.values;
+				std::string line = "  " + o.name + std::string(w - o.name.size() + 2, ' ');
+				if (dw) line += (o.current.empty() ? std::string("-") : o.current) + std::string(o.current.size() < dw ? dw - std::max<size_t>(o.current.size(), 1) + 2 : 2, ' ');
+				line += o.values;
 				if (!o.about.empty()) line += std::string(o.values.size() < vw ? vw - o.values.size() + 2 : 2, ' ') + "// " + o.about;
 				printf("%s\n", line.c_str());
 			}
+			printf("  (%s)\n", defaults_note.c_str());
 			if (!note.empty()) printf("  (%s)\n", note.c_str());
 			printf("\n");
 		}

@@ -48,8 +48,8 @@ std::vector<std::string> process_args;
 // ---- messages ----
 // Every message is a header (payload size, type, id) and the payload, the same way in both directions. Numbers are in the byte order of the machine: both
 // ends are the same program on the same machine.
-//   to the encoder process:   'W' a wave (input, source, scaling and VMAF options, the runs)   'S' supports (codec, chroma, depth)   'K' capabilities (codec)
-//   from it:                  'P' the wave's progress rows (as ui::snapshot_json)   'w' the wave's results   's' supports (1/0)   'k' capabilities (JSON)
+//   to the encoder process:   'W' a wave (input, source, scaling and VMAF options, the runs)   'S' supports (codec, chroma, depth)   'K' capabilities (codec)   'D' defaults (codec, options)
+//   from it:                  'P' the wave's progress rows (as ui::snapshot_json)   'w' the wave's results   's' supports (1/0)   'k' capabilities (JSON)   'd' defaults
 //                             'H' (id 0, empty) every kBeatMs, whatever else it does: it is still there
 constexpr size_t HEADER = 9;
 
@@ -1023,6 +1023,15 @@ bool isolated_caps(const std::string& encoder, const std::string& codec, int gpu
 	return true;
 }
 
+bool isolated_defaults(const std::string& encoder, const std::string& codec, int gpu, const std::string& base, std::string& answer) {
+	if (!isolation || !is_gpu_encoder(encoder)) return false;
+	Writer w;
+	w.str(codec);
+	w.str(base);
+	if (!ask(encoder, gpu, 'D', w.s, answer)) answer = "!the encoder process of GPU " + std::to_string(gpu) + " did not answer";
+	return true;
+}
+
 void stop_encoder_processes() {
 	std::map<std::string, std::shared_ptr<Device>> all;
 	{
@@ -1082,7 +1091,7 @@ int encoder_process_main(int argc, char** argv) {
 		body.resize(size);
 		if (size && !channel_read(body.data(), size)) break;
 		const uint8_t type = (uint8_t)head[4];
-		if (type == 'S' || type == 'K') {
+		if (type == 'S' || type == 'K' || type == 'D') {
 			std::thread([encoder, gpu, type, id, body] {
 				Reader r(body);
 				const std::string codec = r.str();
@@ -1090,7 +1099,8 @@ int encoder_process_main(int argc, char** argv) {
 					const int chroma = r.num<int>(), depth = r.num<int>();
 					reply('s', id, encoder_supports(encoder, codec, chroma, depth, gpu) ? "1" : "0");
 				}
-				else reply('k', id, encoder_caps_json(encoder, codec, gpu));
+				else if (type == 'K') reply('k', id, encoder_caps_json(encoder, codec, gpu));
+				else reply('d', id, encoder_defaults_text(encoder, codec, gpu, r.str()));
 			}).detach();
 			continue;
 		}

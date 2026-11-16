@@ -261,6 +261,12 @@ class Nvenc : public Encoder {
 	bool flushing = false, finished = false, stop = false, rx_ok = true;
 	NV_ENC_BUFFER_FORMAT buffer_fmt = NV_ENC_BUFFER_FORMAT_NV12;
 	int chroma = 420, depth = 8;
+	// What open() handed the encoder, for settings().
+	NV_ENC_CONFIG used_cfg{};
+	NV_ENC_INITIALIZE_PARAMS used_ip{};
+	GUID used_codec{};
+	int used_preset = 0;
+	NV_ENC_TUNING_INFO used_tune = NV_ENC_TUNING_INFO_HIGH_QUALITY;
 	Sink sink;
 	int w = 0, h = 0;
 	size_t delay = 0;
@@ -486,6 +492,7 @@ public:
 		ip.enablePTD = 1;
 		ip.enableEncodeAsync = ASYNC;
 		ip.encodeConfig = &cfg;
+		used_cfg = cfg; used_ip = ip; used_ip.encodeConfig = nullptr; used_codec = codec; used_preset = preset; used_tune = tune;
 		if ((st = f.nvEncInitializeEncoder(enc, &ip))) return fail(st, "initialize");
 
 		// Enough buffers to cover the reorder and lookahead delay.
@@ -595,6 +602,41 @@ public:
 #endif
 
 	int reorder_delay() const override { return b_delay; }
+
+	// The options open() reads itself, then the fields, from what it handed the encoder.
+	std::vector<std::pair<std::string, std::string>> settings() override {
+		if (!enc) return {};
+		std::vector<std::pair<std::string, std::string>> out;
+		auto add = [&](const std::string& k, const std::string& v) { out.push_back({k, v}); };
+		NV_ENC_CONFIG cfg = used_cfg;
+		NV_ENC_INITIALIZE_PARAMS ip = used_ip;
+		const NV_ENC_RC_PARAMS& rc = cfg.rcParams;
+		const bool h264 = used_codec == NV_ENC_CODEC_H264_GUID, hevc = used_codec == NV_ENC_CODEC_HEVC_GUID;
+		add("preset", "p" + std::to_string(used_preset));
+		for (auto& [name, t] : tunes()) if (t == used_tune) add("tune", name);
+		std::string profile = "auto";
+		for (auto& [name, guid] : profiles(h264 ? "h264" : hevc ? "hevc" : "av1")) if (*guid == cfg.profileGUID) profile = name;
+		add("profile", profile);
+		add("rate_control", rc.rateControlMode == NV_ENC_PARAMS_RC_CBR ? "cbr" : rc.rateControlMode == NV_ENC_PARAMS_RC_VBR ? "vbr" : std::to_string((int)rc.rateControlMode));
+		add("max_b_frames", std::to_string(cfg.frameIntervalP > 0 ? (int)cfg.frameIntervalP - 1 : 0));
+		add("lookahead_frames", std::to_string(rc.enableLookahead ? (int)rc.lookaheadDepth : 0));
+		add("spatial_aq", !rc.enableAQ ? "0" : rc.aqStrength == 0 ? "auto" : std::to_string((int)rc.aqStrength));
+		add("temporal_aq", std::to_string((int)rc.enableTemporalAQ));
+		if (h264 || hevc) {
+			const int m = h264 ? (int)cfg.encodeCodecConfig.h264Config.useBFramesAsRef : (int)cfg.encodeCodecConfig.hevcConfig.useBFramesAsRef;
+			add("b_reference_mode", m == NV_ENC_BFRAME_REF_MODE_EACH ? "each" : m == NV_ENC_BFRAME_REF_MODE_MIDDLE ? "middle" : m == NV_ENC_BFRAME_REF_MODE_DISABLED ? "none" : std::to_string(m));
+		}
+		add("max_ref_frames", std::to_string(h264 ? (int)cfg.encodeCodecConfig.h264Config.maxNumRefFrames : hevc ? (int)cfg.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB
+		                                           : (int)cfg.encodeCodecConfig.av1Config.maxNumRefFramesInDPB));
+		add("num_ltr_frames", std::to_string(h264 ? (int)cfg.encodeCodecConfig.h264Config.ltrNumFrames : hevc ? (int)cfg.encodeCodecConfig.hevcConfig.ltrNumFrames
+		                                           : (int)cfg.encodeCodecConfig.av1Config.ltrNumFrames));
+		for (auto& [name, f] : fields_for(used_codec, &cfg, &ip)) {
+			// these also switch their limit on: off is not the same as any value
+			const bool off = (name == "min_qp" && !rc.enableMinQP) || (name == "max_qp" && !rc.enableMaxQP) || (name == "initial_rc_qp" && !rc.enableInitialRCQP);
+			add(name, off ? "off" : std::to_string(f.get()));
+		}
+		return out;
+	}
 
 	bool encode(const Picture* fr) override {
 		NVENCSTATUS st;

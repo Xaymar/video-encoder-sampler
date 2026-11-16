@@ -20,7 +20,7 @@ struct Cond {
 	std::string json() const; // as the config writes it: true, a list of values, or a comparison
 };
 
-struct Axis { // one swept option. null is not a value: it would mean "whatever the preset gives", which is not known; leave the option out to run without it
+struct Axis { // one swept option. null is not a value: it would mean "whatever the preset gives", which is not known; leave the option out to run without it, or list "" (that run)
 	std::string key;
 	std::vector<std::string> values;
 	// Options that only matter in some combinations: where the condition does not hold the option is left unset.

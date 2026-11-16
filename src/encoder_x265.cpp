@@ -96,6 +96,17 @@ public:
 		return true;
 	}
 
+	std::vector<std::pair<std::string, std::string>> settings() override {
+		x265_nal* nal = nullptr;
+		uint32_t n = 0;
+		if (!h || api->encoder_headers(h, &nal, &n) < 0) return {};
+		for (uint32_t i = 0; i < n; i++) {
+			auto s = settings_from_sei(nal[i].payload, nal[i].sizeBytes);
+			if (!s.empty()) return s;
+		}
+		return {};
+	}
+
 	bool encode(const Picture* fr) override {
 		x265_nal* nal;
 		uint32_t n = 0;
