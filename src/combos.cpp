@@ -1,6 +1,7 @@
 #include "combos.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -84,9 +85,19 @@ ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes
 	Id weight = 1;
 	for (size_t k = axes_.size(); k-- > 0;) {
 		Ax& a = axes_[k];
-		a.radix = a.values.size() + 1;
+		if (!a.conds.empty()) { // only an option with conditions can be left unset
+			const auto blank = std::find(a.values.begin(), a.values.end(), std::string());
+			a.unset_digit = (int)(blank - a.values.begin());
+		}
+		a.radix = a.values.size() + (a.unset_digit == (int)a.values.size());
 		a.weight = weight;
-		if (weight > (Id)INT64_MAX / a.radix) throw std::runtime_error("the options of encoder '" + encoder + "' have too many combinations to count");
+		if (weight > (Id)INT64_MAX / a.radix) {
+			long double n = 1;
+			for (auto& b : axes_) n *= (long double)b.values.size();
+			char count[32];
+			snprintf(count, sizeof count, "%.2Le", n);
+			throw std::runtime_error("the options of encoder '" + encoder + "' make about " + count + " combinations, more than can be counted (9.2e18): list fewer values");
+		}
 		weight *= a.radix;
 	}
 
@@ -113,17 +124,18 @@ ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes
 }
 
 std::vector<uint8_t> ComboTable::row(Id c) const {
-	std::vector<uint8_t> r(axes_.size());
-	for (size_t k = 0; k < axes_.size(); k++) {
-		const Id d = c / axes_[k].weight % axes_[k].radix;
-		r[k] = d == axes_[k].radix - 1 ? UNSET : (uint8_t)d;
+	std::vector<uint8_t> r(axes_.size(), UNSET); // as layer() sees a row while making it: the options after k not known yet
+	for (size_t k = 0; k < axes_.size(); k++) { // in order: whether "" is listed or not set depends on the options before it
+		const Ax& a = axes_[k];
+		const Id d = c / a.weight % a.radix;
+		r[k] = (int)d != a.unset_digit ? (uint8_t)d : d < a.values.size() && applies(k, r) ? (uint8_t)d : UNSET;
 	}
 	return r;
 }
 
 ComboTable::Id ComboTable::id(const std::vector<uint8_t>& r) const {
 	Id c = 0;
-	for (size_t k = 0; k < axes_.size(); k++) c += (r[k] == UNSET ? axes_[k].radix - 1 : (Id)r[k]) * axes_[k].weight;
+	for (size_t k = 0; k < axes_.size(); k++) c += (r[k] == UNSET ? (Id)axes_[k].unset_digit : (Id)r[k]) * axes_[k].weight; // valid rows only: UNSET has a digit
 	return c;
 }
 
@@ -173,7 +185,7 @@ const std::vector<ComboTable::Id>& ComboTable::layer(size_t want) const {
 		if (mids > want || mids + prunable_after[level] < want) return;
 		if (level == n) { out.push_back(c); return; }
 		const Ax& a = axes_[level];
-		if (!applies(level, current)) { current[level] = UNSET; generate(level + 1, mids, c + (a.radix - 1) * a.weight); return; } // the option stays unset, in one branch
+		if (!applies(level, current)) { current[level] = UNSET; generate(level + 1, mids, c + (Id)a.unset_digit * a.weight); return; } // the option stays unset, in one branch
 		for (size_t v = 0; v < a.values.size(); v++) {
 			current[level] = (uint8_t)v;
 			const bool mid = a.prunable && (int)v != a.lo && (int)v != a.hi && !a.values[v].empty();

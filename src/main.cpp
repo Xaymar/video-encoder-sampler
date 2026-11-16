@@ -1098,7 +1098,7 @@ static int run_worker(int argc, char** argv) {
 	return remote_worker(target.substr(0, colon), atoi(target.c_str() + colon + 1), token, dir, only_gpu, default_parallel, resources, pass, [](const std::string& line) { ui::log(line); });
 }
 
-int main(int argc, char** argv) {
+static int run(int argc, char** argv) {
 	ui::end_on_interrupt();
 	end_crashes_at_once();
 #ifdef _WIN32
@@ -2460,4 +2460,14 @@ int main(int argc, char** argv) {
 		for (auto& [why, n] : ignored_why) printf("  %d: %s\n", n, why.c_str());
 	}
 	return failed ? 2 : 0;
+}
+
+int main(int argc, char** argv) {
+	// An error nothing below caught ends ves with its message, never silently: the live display is gone by the time it gets here (its guard ended it on the way
+	// out), so stderr is the console again.
+	try { return run(argc, argv); }
+	catch (const std::exception& e) { fprintf(stderr, "error: %s\n", e.what()); }
+	catch (...) { fprintf(stderr, "error: an unknown error ended ves\n"); }
+	fflush(stderr);
+	return 1;
 }
