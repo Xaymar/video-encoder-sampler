@@ -30,7 +30,33 @@ bool translate_named_value(const std::string& encoder, const std::string& codec,
 
 using NativeOptions = std::vector<std::pair<std::string, std::string>>;
 
+// One option as `ves --list-options` shows it.
+struct OptionInfo {
+	std::string name;   // as a config writes it
+	std::string values; // what it takes ("cbr | vbr", "0..15", "number"); empty when not known
+	std::string about;  // what it does, may be empty
+};
+using OptionList = std::vector<OptionInfo>;
+
+// The options ves itself handles for an encoder and codec, before the backend sees them: the common options the encoder can do (found by
+// translating a value, so the list follows the code above), and preset, profile, tier and level where the standard names apply.
+OptionList ves_options(const std::string& encoder, const std::string& codec);
+// Adds `more` to `list`, leaving out names `list` already has.
+void merge_options(OptionList& list, const OptionList& more);
+
+// The options each backend reads itself, from the tables it applies them with. AMF's come from the AMD GPU's runtime (the encoder lists its own
+// properties), so they need that GPU: false with `why` set when it cannot be asked.
+OptionList nvenc_options(const std::string& codec);
+OptionList qsv_options(const std::string& codec);
+bool amf_options(const std::string& codec, int gpu, OptionList& out, std::string& why);
+OptionList x264_options();
+OptionList x265_options();
+OptionList svtav1_options();
+
 // The options of an encoder as its library wants them: common ones translated (the backend's own option names), others through `native_name`.
 // Returns false with `error` set for a common option the encoder lacks.
 bool resolve_options(const std::string& encoder, const std::string& codec, const Options& options,
                      const std::function<std::string(const std::string&)>& native_name, NativeOptions& out, std::string& error);
+
+// `ves --list-options [encoder[/codec]] [gpu]` (argv[1] is --list-options): prints them, returns the exit code.
+int list_options_main(int argc, char** argv);

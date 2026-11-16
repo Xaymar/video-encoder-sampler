@@ -91,7 +91,7 @@ class Qsv : public Encoder {
 	int w = 0, h = 0, depth = 8, chroma = 420, pitch = 0, b_delay = 0;
 	bool eof = false;
 
-	struct Field { void* p; int size; };
+	struct Field { void* p; int size; const char* values; const char* native; };
 	std::map<std::string, Field> fields;
 
 	bool fail(mfxStatus r, const char* what) {
@@ -123,21 +123,47 @@ class Qsv : public Encoder {
 		return true;
 	}
 
+	// The options: fields of mfxInfoMFX and mfxExtCodingOption2/3 by their snake_case names, with what they take where the type does not say it
+	// (oneVPL's enums, mfxstructures.h). A value is a number or one of the words of parse().
 	void make_fields() {
-#define M(n) fields[qsv_name(#n)] = {&par.mfx.n, (int)sizeof(par.mfx.n)};
-		M(TargetUsage) M(GopRefDist) M(NumRefFrame) M(IdrInterval) M(NumSlice) M(RateControlMethod) M(MaxKbps) M(InitialDelayInKB)
-		M(BufferSizeInKB) M(CodecProfile) M(CodecLevel) M(LowPower) M(QPI) M(QPP) M(QPB) M(ICQQuality) M(Convergence) M(Accuracy) M(GopOptFlag)
+		static const char* const ON_OFF = "on | off";
+#define F(s, name, n, v) fields[qsv_name(#n)] = {&s.n, (int)sizeof(s.n), v, name "." #n};
+#define M(n, v) F(par.mfx, "mfxInfoMFX", n, v)
+		M(TargetUsage, "best_quality | balanced | best_speed | 1..7") M(GopRefDist, nullptr) M(NumRefFrame, nullptr) M(IdrInterval, nullptr) M(NumSlice, nullptr)
+		M(RateControlMethod, "cbr | vbr | cqp | avbr | la | icq | la_icq | la_hrd | qvbr") M(MaxKbps, nullptr) M(InitialDelayInKB, nullptr)
+		M(BufferSizeInKB, nullptr) M(CodecProfile, nullptr) M(CodecLevel, nullptr) M(LowPower, "on (fixed-function encoder) | off (shader based)") M(QPI, nullptr) M(QPP, nullptr)
+		M(QPB, nullptr) M(ICQQuality, nullptr) M(Convergence, nullptr) M(Accuracy, nullptr) M(GopOptFlag, "0 | 1 closed GOP | 2 strict GOP | 3 both")
 #undef M
-#define M(n) fields[qsv_name(#n)] = {&co2.n, (int)sizeof(co2.n)};
-		M(IntRefType) M(IntRefCycleSize) M(MaxFrameSize) M(MBBRC) M(ExtBRC) M(LookAheadDepth) M(Trellis) M(BRefType) M(AdaptiveI) M(AdaptiveB)
-		M(LookAheadDS) M(MinQPI) M(MaxQPI) M(MinQPP) M(MaxQPP) M(MinQPB) M(MaxQPB) M(DisableDeblockingIdc)
+#define M(n, v) F(co2, "mfxExtCodingOption2", n, v)
+		M(IntRefType, "0 off | 1 vertical | 2 horizontal | 3 by slices") M(IntRefCycleSize, nullptr) M(MaxFrameSize, nullptr) M(MBBRC, ON_OFF) M(ExtBRC, ON_OFF)
+		M(LookAheadDepth, nullptr) M(Trellis, "0 auto | 1 off | sum of 2 I-frames, 4 P-frames, 8 B-frames") M(BRefType, "0 auto | 1 off | 2 pyramid")
+		M(AdaptiveI, ON_OFF) M(AdaptiveB, ON_OFF) M(LookAheadDS, "0 auto | 1 off | 2 2x | 3 4x") M(MinQPI, nullptr) M(MaxQPI, nullptr) M(MinQPP, nullptr)
+		M(MaxQPP, nullptr) M(MinQPB, nullptr) M(MaxQPB, nullptr) M(DisableDeblockingIdc, nullptr)
 #undef M
-#define M(n) fields[qsv_name(#n)] = {&co3.n, (int)sizeof(co3.n)};
-		M(WinBRCMaxAvgKbps) M(WinBRCSize) M(QVBRQuality) M(WeightedPred) M(WeightedBiPred) M(ScenarioInfo) M(ContentInfo) M(PRefType) M(GPB)
-		M(EnableQPOffset) M(LowDelayBRC) M(AdaptiveRef) M(AdaptiveLTR) M(AdaptiveCQM) M(FadeDetection) M(MaxFrameSizeI) M(MaxFrameSizeP)
+#define M(n, v) F(co3, "mfxExtCodingOption3", n, v)
+		M(WinBRCMaxAvgKbps, nullptr) M(WinBRCSize, nullptr) M(QVBRQuality, nullptr) M(WeightedPred, "0 auto | 1 default | 2 explicit")
+		M(WeightedBiPred, "0 auto | 1 default | 2 explicit | 3 implicit")
+		M(ScenarioInfo, "0 unknown | 1 display remoting | 2 video conference | 3 archive | 4 live streaming | 5 camera capture | 6 video surveillance | 7 game streaming | 8 remote gaming")
+		M(ContentInfo, "0 unknown | 1 full screen video | 2 non-video screen | 3 noisy video") M(PRefType, "0 auto | 1 simple | 2 pyramid") M(GPB, ON_OFF)
+		M(EnableQPOffset, ON_OFF) M(LowDelayBRC, ON_OFF) M(AdaptiveRef, ON_OFF) M(AdaptiveLTR, ON_OFF) M(AdaptiveCQM, ON_OFF) M(FadeDetection, ON_OFF)
+		M(MaxFrameSizeI, nullptr) M(MaxFrameSizeP, nullptr)
 #undef M
+#undef F
 	}
 
+public:
+	// For `ves --list-options`.
+	OptionList options() {
+		make_fields();
+		OptionList out;
+		for (auto& [name, f] : fields) {
+			std::string values = f.values ? f.values : f.size == 1 ? "0..255" : f.size == 2 ? "0..65535" : "number";
+			out.push_back({name, values, f.native});
+		}
+		return out;
+	}
+
+private:
 	mfxFrameSurface1* acquire() {
 		for (auto& p : pool) if (!p.s.Data.Locked) return &p.s;
 		const int alignedH = (h + 15) & ~15;
@@ -302,6 +328,8 @@ public:
 } // namespace
 
 std::unique_ptr<Encoder> make_encoder_qsv() { return std::make_unique<Qsv>(); }
+
+OptionList qsv_options(const std::string&) { return Qsv().options(); } // the same fields for every codec
 
 // Whether this machine's Intel GPU can encode the codec in this layout, found by initializing a throwaway encoder once.
 bool qsv_supports(const std::string& codec, int chroma, int depth) {

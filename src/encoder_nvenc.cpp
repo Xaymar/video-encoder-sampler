@@ -12,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "formats.h"
@@ -64,6 +65,114 @@ GUID codec_guid(const std::string& codec, bool& known) {
 	if (codec == "av1") return NV_ENC_CODEC_AV1_GUID;
 	known = false;
 	return GUID{};
+}
+
+const std::vector<std::pair<std::string, NV_ENC_TUNING_INFO>>& tunes() {
+	static const std::vector<std::pair<std::string, NV_ENC_TUNING_INFO>> t = {{"hq", NV_ENC_TUNING_INFO_HIGH_QUALITY}, {"ll", NV_ENC_TUNING_INFO_LOW_LATENCY},
+		{"ull", NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY}, {"lossless", NV_ENC_TUNING_INFO_LOSSLESS}};
+	return t;
+}
+
+// The profiles by their standard names (see options.h).
+const std::map<std::string, const GUID*>& profiles(const std::string& codec) {
+	static const std::map<std::string, const GUID*> h264 = {{"baseline", &NV_ENC_H264_PROFILE_BASELINE_GUID}, {"main", &NV_ENC_H264_PROFILE_MAIN_GUID},
+		{"high", &NV_ENC_H264_PROFILE_HIGH_GUID}, {"constrained_high", &NV_ENC_H264_PROFILE_CONSTRAINED_HIGH_GUID}, {"high10", &NV_ENC_H264_PROFILE_HIGH_10_GUID},
+		{"high422", &NV_ENC_H264_PROFILE_HIGH_422_GUID}, {"high444", &NV_ENC_H264_PROFILE_HIGH_444_GUID}};
+	static const std::map<std::string, const GUID*> hevc = {{"main", &NV_ENC_HEVC_PROFILE_MAIN_GUID}, {"main10", &NV_ENC_HEVC_PROFILE_MAIN10_GUID}, {"rext", &NV_ENC_HEVC_PROFILE_FREXT_GUID}};
+	static const std::map<std::string, const GUID*> av1 = {{"main", &NV_ENC_AV1_PROFILE_MAIN_GUID}};
+	return codec == "h264" ? h264 : codec == "hevc" ? hevc : av1;
+}
+
+// The options that are fields of NVENC's own structures, under the field's name (see the SDK's nvEncodeAPI.h), set to a number (or true/false);
+// enums are their numeric values. Fields of the codec being used only. A QP option sets all three QPs of NV_ENC_QP. `get` reads a field back
+// (what `ves --list-options` finds the range of a field with).
+struct Field {
+	std::function<void(long long)> set;
+	std::function<long long()> get;
+	bool is_enum = false;
+	std::string native; // the SDK's name ("rcParams.vbvBufferSize")
+};
+using Fields = std::map<std::string, Field>;
+
+Fields fields_for(const GUID& codec, NV_ENC_CONFIG* cfg, NV_ENC_INITIALIZE_PARAMS* ip) {
+	Fields fields;
+	NV_ENC_RC_PARAMS* rcp = &cfg->rcParams;
+#define F(name, s, f) fields[name] = {[s](long long v) { s->f = (decltype(s->f))v; }, [s] { return (long long)s->f; }, std::is_enum_v<decltype(s->f)>, std::string(where) + #f};
+	const char* where = "rcParams.";
+#define RC(f) F(snake_case(#f), rcp, f)
+	RC(maxBitRate) RC(vbvBufferSize) RC(vbvInitialDelay) RC(disableIadapt) RC(disableBadapt) RC(zeroReorderDelay) RC(enableNonRefP) RC(strictGOPTarget)
+	RC(targetQuality) RC(targetQualityLSB) RC(lowDelayKeyFrameScale) RC(yDcQPIndexOffset) RC(uDcQPIndexOffset) RC(vDcQPIndexOffset) RC(multiPass)
+	RC(cbQPIndexOffset) RC(crQPIndexOffset) RC(lookaheadLevel)
+#undef RC
+	auto qp = [](NV_ENC_QP& q, long long v) { q.qpInterP = q.qpInterB = q.qpIntra = (uint32_t)v; };
+	fields["const_qp"] = {[=](long long v) { qp(rcp->constQP, v); }, [=] { return (long long)rcp->constQP.qpIntra; }, false, "rcParams.constQP"};
+	fields["min_qp"] = {[=](long long v) { qp(rcp->minQP, v); rcp->enableMinQP = 1; }, [=] { return (long long)rcp->minQP.qpIntra; }, false, "rcParams.minQP"};
+	fields["max_qp"] = {[=](long long v) { qp(rcp->maxQP, v); rcp->enableMaxQP = 1; }, [=] { return (long long)rcp->maxQP.qpIntra; }, false, "rcParams.maxQP"};
+	fields["initial_rc_qp"] = {[=](long long v) { qp(rcp->initialRCQP, v); rcp->enableInitialRCQP = 1; }, [=] { return (long long)rcp->initialRCQP.qpIntra; }, false, "rcParams.initialRCQP"};
+	where = "NV_ENC_CONFIG.";
+	F("mv_precision", cfg, mvPrecision)
+	where = "NV_ENC_INITIALIZE_PARAMS.";
+#define IP(f) F(snake_case(#f), ip, f)
+	IP(enableWeightedPrediction) IP(splitEncodeMode) IP(enableUniDirectionalB)
+#undef IP
+#define C(f) F(snake_case(#f), c, f)
+	if (codec == NV_ENC_CODEC_H264_GUID) {
+		auto* c = &cfg->encodeCodecConfig.h264Config;
+		where = "h264Config.";
+		C(hierarchicalPFrames) C(hierarchicalBFrames) C(enableFillerDataInsertion) C(level) C(disableDeblockingFilterIDC) C(adaptiveTransformMode) C(bdirectMode)
+		C(entropyCodingMode) C(tfLevel) F("max_ref_frames_l0", c, numRefL0) F("max_ref_frames_l1", c, numRefL1)
+	} else if (codec == NV_ENC_CODEC_HEVC_GUID) {
+		auto* c = &cfg->encodeCodecConfig.hevcConfig;
+		where = "hevcConfig.";
+		C(level) C(tier) C(minCUSize) C(maxCUSize) C(enableFillerDataInsertion) C(tfLevel) C(disableDeblockingFilterIDC)
+		F("max_ref_frames_l0", c, numRefL0) F("max_ref_frames_l1", c, numRefL1)
+	} else {
+		auto* c = &cfg->encodeCodecConfig.av1Config;
+		where = "av1Config.";
+		C(level) C(tier) C(minPartSize) C(maxPartSize) C(enableCustomTileConfig) C(numTileColumns) C(numTileRows) C(enableFilmGrainParams) C(tfLevel)
+		F("max_ref_frames_forward", c, numFwdRefs) F("max_ref_frames_backward", c, numBwdRefs)
+	}
+#undef C
+#undef F
+	return fields;
+}
+
+// What the options of NVENC take, where its field type does not say: its enums (nvEncodeAPI.h) and values with a meaning of their own.
+const std::map<std::string, std::string>& field_values() {
+	static const std::map<std::string, std::string> t = {
+		{"multi_pass", "0 off | 1 two passes, quarter resolution first | 2 two passes, full resolution first"},
+		{"lookahead_level", "0..3 | 15 auto (needs lookahead_frames above 0)"},
+		{"mv_precision", "0 default | 1 full pel | 2 half pel | 3 quarter pel"},
+		{"split_encode_mode", "0 auto | 1 forced, strips picked by the driver | 2 two strips | 3 three | 4 four | 15 off"},
+		{"adaptive_transform_mode", "0 auto | 1 off | 2 on"},
+		{"bdirect_mode", "0 auto | 1 off | 2 temporal | 3 spatial"},
+		{"entropy_coding_mode", "0 auto | 1 CABAC | 2 CAVLC"},
+		{"tf_level", "0 off | 4 temporal filter on"},
+		{"max_ref_frames_l0", "0 auto | 1..7"}, {"max_ref_frames_l1", "0 auto | 1..7"},
+		{"max_ref_frames_forward", "0 auto | 1..7"}, {"max_ref_frames_backward", "0 auto | 1..7"},
+		{"min_cu_size", "0 auto | 1 8x8 | 2 16x16 | 3 32x32 | 4 64x64"}, {"max_cu_size", "0 auto | 1 8x8 | 2 16x16 | 3 32x32 | 4 64x64"},
+		{"min_part_size", "0 auto | 1 4x4 | 2 8x8 | 3 16x16 | 4 32x32 | 5 64x64"}, {"max_part_size", "0 auto | 1 4x4 | 2 8x8 | 3 16x16 | 4 32x32 | 5 64x64"},
+		{"const_qp", "0..51 (AV1 0..255)"}, {"min_qp", "0..51 (AV1 0..255), also switches the minimum on"},
+		{"max_qp", "0..51 (AV1 0..255), also switches the maximum on"}, {"initial_rc_qp", "0..51 (AV1 0..255), also switches it on"},
+		{"target_quality", "0 auto | 1..51 (VBR)"},
+		{"tier", "main | high"},
+	};
+	return t;
+}
+
+// What a field holds, found by writing to it and reading it back: a bit field of one bit comes back as 0..1.
+std::string field_range(const Field& f) {
+	f.set(-1);
+	const long long all = f.get();
+	if (all == -1) { // signed
+		for (int b : {7, 15, 31}) {
+			const long long m = (1LL << b) - 1;
+			f.set(m + 1);
+			if (f.get() != m + 1) return std::to_string(-m - 1) + ".." + std::to_string(m);
+		}
+		return "number";
+	}
+	return all > 0 && all < 0xFFFFFFFFLL ? "0.." + std::to_string(all) : "0..";
 }
 
 // What the GPU and driver can encode for a codec; asked once by opening a throwaway session.
@@ -244,11 +353,9 @@ public:
 		}
 		NV_ENC_TUNING_INFO tune = NV_ENC_TUNING_INFO_HIGH_QUALITY;
 		if (take("tune", v)) {
-			if (v == "hq") tune = NV_ENC_TUNING_INFO_HIGH_QUALITY;
-			else if (v == "ll") tune = NV_ENC_TUNING_INFO_LOW_LATENCY;
-			else if (v == "ull") tune = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
-			else if (v == "lossless") tune = NV_ENC_TUNING_INFO_LOSSLESS;
-			else { fprintf(stderr, "nvenc: bad tune '%s'\n", v.c_str()); return false; }
+			bool found = false;
+			for (auto& [name, t] : tunes()) if (v == name) { tune = t; found = true; }
+			if (!found) { fprintf(stderr, "nvenc: bad tune '%s'\n", v.c_str()); return false; }
 		}
 
 		std::string profile;
@@ -284,12 +391,7 @@ public:
 			}
 		}
 		if (has_profile) { // the standard names, see options.h; left alone, the encoder picks the profile that fits the chroma layout and bit depth
-			static const std::map<std::string, const GUID*> h264 = {{"baseline", &NV_ENC_H264_PROFILE_BASELINE_GUID}, {"main", &NV_ENC_H264_PROFILE_MAIN_GUID},
-				{"high", &NV_ENC_H264_PROFILE_HIGH_GUID}, {"constrained_high", &NV_ENC_H264_PROFILE_CONSTRAINED_HIGH_GUID}, {"high10", &NV_ENC_H264_PROFILE_HIGH_10_GUID},
-				{"high422", &NV_ENC_H264_PROFILE_HIGH_422_GUID}, {"high444", &NV_ENC_H264_PROFILE_HIGH_444_GUID}};
-			static const std::map<std::string, const GUID*> hevc = {{"main", &NV_ENC_HEVC_PROFILE_MAIN_GUID}, {"main10", &NV_ENC_HEVC_PROFILE_MAIN10_GUID}, {"rext", &NV_ENC_HEVC_PROFILE_FREXT_GUID}};
-			static const std::map<std::string, const GUID*> av1 = {{"main", &NV_ENC_AV1_PROFILE_MAIN_GUID}};
-			const auto& table = p.codec == "h264" ? h264 : p.codec == "hevc" ? hevc : av1;
+			const auto& table = profiles(p.codec);
 			auto it = table.find(profile);
 			if (it == table.end()) { fprintf(stderr, "nvenc: profile '%s' is not available for nvenc/%s\n", profile.c_str(), p.codec.c_str()); return false; }
 			cfg.profileGUID = *it->second;
@@ -347,45 +449,7 @@ public:
 
 		NV_ENC_INITIALIZE_PARAMS ip{};
 
-		// Every other option is a field of NVENC's own structures, under the field's name (see the SDK's nvEncodeAPI.h), set to a number (or
-		// true/false); enums are their numeric values. Fields of the codec being used only. A QP option sets all three QPs of NV_ENC_QP.
-		std::map<std::string, std::function<void(long long)>> fields;
-		NV_ENC_RC_PARAMS& rcp = cfg.rcParams;
-#define RC(f) fields[snake_case(#f)] = [&](long long v) { rcp.f = (decltype(rcp.f))v; };
-		RC(maxBitRate) RC(vbvBufferSize) RC(vbvInitialDelay) RC(disableIadapt) RC(disableBadapt) RC(zeroReorderDelay) RC(enableNonRefP) RC(strictGOPTarget)
-		RC(targetQuality) RC(targetQualityLSB) RC(lowDelayKeyFrameScale) RC(yDcQPIndexOffset) RC(uDcQPIndexOffset) RC(vDcQPIndexOffset) RC(multiPass)
-		RC(cbQPIndexOffset) RC(crQPIndexOffset) RC(lookaheadLevel)
-#undef RC
-		auto qp = [](NV_ENC_QP& q, long long v) { q.qpInterP = q.qpInterB = q.qpIntra = (uint32_t)v; };
-		fields["const_qp"] = [&](long long v) { qp(rcp.constQP, v); };
-		fields["min_qp"] = [&](long long v) { qp(rcp.minQP, v); rcp.enableMinQP = 1; };
-		fields["max_qp"] = [&](long long v) { qp(rcp.maxQP, v); rcp.enableMaxQP = 1; };
-		fields["initial_rc_qp"] = [&](long long v) { qp(rcp.initialRCQP, v); rcp.enableInitialRCQP = 1; };
-		fields["mv_precision"] = [&](long long v) { cfg.mvPrecision = (decltype(cfg.mvPrecision))v; };
-#define IP(f) fields[snake_case(#f)] = [&](long long v) { ip.f = (decltype(ip.f))v; };
-		IP(enableWeightedPrediction) IP(splitEncodeMode) IP(enableUniDirectionalB)
-#undef IP
-		if (codec == NV_ENC_CODEC_H264_GUID) {
-			auto& c = cfg.encodeCodecConfig.h264Config;
-#define C(f) fields[snake_case(#f)] = [&](long long v) { c.f = (decltype(c.f))v; };
-#define CN(name, f) fields[name] = [&](long long v) { c.f = (decltype(c.f))v; };
-			C(hierarchicalPFrames) C(hierarchicalBFrames) C(enableFillerDataInsertion) C(level) C(disableDeblockingFilterIDC) C(adaptiveTransformMode) C(bdirectMode)
-			C(entropyCodingMode) C(tfLevel) CN("max_ref_frames_l0", numRefL0) CN("max_ref_frames_l1", numRefL1)
-#undef C
-		} else if (codec == NV_ENC_CODEC_HEVC_GUID) {
-			auto& c = cfg.encodeCodecConfig.hevcConfig;
-#define C(f) fields[snake_case(#f)] = [&](long long v) { c.f = (decltype(c.f))v; };
-			C(level) C(tier) C(minCUSize) C(maxCUSize) C(enableFillerDataInsertion) C(tfLevel) C(disableDeblockingFilterIDC)
-			CN("max_ref_frames_l0", numRefL0) CN("max_ref_frames_l1", numRefL1)
-#undef C
-		} else {
-			auto& c = cfg.encodeCodecConfig.av1Config;
-#define C(f) fields[snake_case(#f)] = [&](long long v) { c.f = (decltype(c.f))v; };
-			C(level) C(tier) C(minPartSize) C(maxPartSize) C(enableCustomTileConfig) C(numTileColumns) C(numTileRows) C(enableFilmGrainParams) C(tfLevel)
-			CN("max_ref_frames_forward", numFwdRefs) CN("max_ref_frames_backward", numBwdRefs)
-#undef C
-		}
-#undef CN
+		Fields fields = fields_for(codec, &cfg, &ip); // every other option
 		for (auto& [k, val] : o) {
 			auto it = fields.find(k);
 			if (it == fields.end()) { fprintf(stderr, "nvenc: unsupported option '%s'\n", k.c_str()); return false; }
@@ -404,9 +468,9 @@ public:
 				n = strtoll(val.c_str(), &end, 0);
 				if (end == val.c_str() || *end) { fprintf(stderr, "nvenc: bad value '%s' for '%s'\n", val.c_str(), k.c_str()); return false; }
 			}
-			it->second(n);
+			it->second.set(n);
 		}
-		if (rcp.lookaheadLevel != 0 && !rcp.enableLookahead) { // NVIDIA's user-mode library aborts the process on this (fast-fail) instead of returning an error
+		if (rc.lookaheadLevel != 0 && !rc.enableLookahead) { // NVIDIA's user-mode library aborts the process on this (fast-fail) instead of returning an error
 			fprintf(stderr, "nvenc: lookaheadLevel needs lookahead (rc-lookahead above 0)\n");
 			return false;
 		}
@@ -645,6 +709,36 @@ std::string nvenc_caps_json(const std::string& codec, int gpu) {
 	return out;
 }
 
+
+// The options open() reads itself (the `take` calls), then the fields.
+OptionList nvenc_options(const std::string& codec) {
+	OptionList out = {
+		{"preset", "p1 .. p7", "p1 fastest, p7 slowest (default p4)"},
+		{"tune", "", "default hq"},
+		{"profile", "", "left out, the encoder picks one that fits the chroma layout and bit depth"},
+		{"rate_control", "cbr | vbr", "default cbr"},
+		{"max_b_frames", "0..", "most B-frames in a row (0 = none)"},
+		{"lookahead_frames", "0..", "frames of lookahead for rate control (0 = off)"},
+		{"spatial_aq", "0 | auto | 1..15", "0 off, auto lets the driver pick the strength per frame"},
+		{"temporal_aq", "0 | 1", ""},
+	};
+	for (auto& [name, t] : tunes()) out[1].values += (out[1].values.empty() ? "" : " | ") + name;
+	for (auto& [name, guid] : profiles(codec)) out[2].values += (out[2].values.empty() ? "" : " | ") + name;
+	if (codec != "av1") out.push_back({"b_reference_mode", "none | middle | each", "B-frames as references"});
+	out.push_back({"max_ref_frames", "1..", "most reference frames"});
+	out.push_back({"num_ltr_frames", "0..", "long-term references: 0 off, above 0 on with that many frames"});
+	bool known;
+	const GUID guid = codec_guid(codec, known);
+	if (!known) return {};
+	NV_ENC_CONFIG cfg{};
+	NV_ENC_INITIALIZE_PARAMS ip{};
+	const Fields fields = fields_for(guid, &cfg, &ip);
+	for (auto& [name, f] : fields) {
+		auto v = field_values().find(name);
+		out.push_back({name, v != field_values().end() ? v->second : f.is_enum ? "number (an enum of nvEncodeAPI.h)" : field_range(f), f.native});
+	}
+	return out;
+}
 
 bool nvenc_supports(const std::string& codec, int chroma, int depth) {
 	static std::mutex m;

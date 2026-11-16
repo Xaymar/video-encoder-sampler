@@ -245,6 +245,59 @@ class Amf : public Encoder {
 		}
 	}
 
+	// The property names (see collect_names) of the last open(), before pre-analysis was switched on and after.
+	std::map<std::string, std::string> names_before_pa, names_all;
+
+	static std::string narrow(const wchar_t* w) {
+		std::string out;
+		for (; w && *w; w++) out += *w < 128 ? (char)*w : '?';
+		return out;
+	}
+	static std::string text(const amf::AMFVariantStruct& v) {
+		char b[64];
+		switch (v.type) {
+		case amf::AMF_VARIANT_BOOL: return v.boolValue ? "true" : "false";
+		case amf::AMF_VARIANT_INT64: return std::to_string(v.int64Value);
+		case amf::AMF_VARIANT_DOUBLE: snprintf(b, sizeof b, "%g", v.doubleValue); return b;
+		case amf::AMF_VARIANT_FLOAT: snprintf(b, sizeof b, "%g", (double)v.floatValue); return b;
+		case amf::AMF_VARIANT_SIZE: return std::to_string(v.sizeValue.width) + "x" + std::to_string(v.sizeValue.height);
+		case amf::AMF_VARIANT_RATE: return std::to_string(v.rateValue.num) + "/" + std::to_string(v.rateValue.den);
+		default: return {};
+		}
+	}
+
+public:
+	// For `ves --list-options`: every property the encoder of the last open() offers that can be written, with the range, names and default it gives for it.
+	OptionList options() const {
+		OptionList out;
+		for (auto& [name, native] : names_all) {
+			const amf::AMFPropertyInfo* pi = nullptr;
+			if (enc->GetPropertyInfo(wide(native).c_str(), &pi) != AMF_OK || !pi) continue;
+			if (!(pi->accessType & amf::AMF_PROPERTY_ACCESS_WRITE)) continue;
+			std::string values;
+			if (pi->type == amf::AMF_VARIANT_BOOL) values = "true | false";
+			else if (pi->pEnumDescription) {
+				for (const amf::AMFEnumDescriptionEntry* e = pi->pEnumDescription; e->name; e++) values += (values.empty() ? "" : " | ") + std::to_string(e->value) + " " + narrow(e->name);
+			} else if (pi->type == amf::AMF_VARIANT_INT64 || pi->type == amf::AMF_VARIANT_DOUBLE) {
+				const std::string lo = text(pi->minValue), hi = text(pi->maxValue);
+				values = !lo.empty() && !hi.empty() && lo != hi ? lo + ".." + hi : "number";
+			} else if (pi->type == amf::AMF_VARIANT_SIZE) values = "WxH";
+			else if (pi->type == amf::AMF_VARIANT_RATE) values = "num/den";
+			else continue; // set() cannot write it
+			std::string about = narrow(pi->desc);
+			if (about.empty()) about = native;
+			else about = native + ": " + about;
+			if (const std::string d = text(pi->defaultValue); !d.empty()) about += " (default " + d + ")";
+			if (!names_before_pa.count(name)) about += "; only with enable_pre_analysis on";
+			out.push_back({name, values, about});
+		}
+		out.push_back({"pre_filter", "0 | 1", "AMF's adaptive pre-encode filter (a denoiser tuned by the bitrate), a component in front of the encoder"});
+		out.push_back({"pre_filter_strength", "0..10", "default 4"});
+		out.push_back({"pre_filter_sensitivity", "0..10", "lower keeps more detail; default 4"});
+		return out;
+	}
+
+private:
 	// The pre-encode filter: AMF's adaptive filter (a denoiser tuned by the target bitrate), run on every picture before the encoder gets it.
 	amf::AMFComponentPtr filter_pp;
 	bool open_filter(const std::map<std::string, std::string>& opts, const Params& p) {
@@ -416,6 +469,7 @@ public:
 		// Pre-analysis adds its PA* properties to the encoder only once it is on, so those are looked up after it was set.
 		std::map<std::string, std::string> names;
 		collect_names(names);
+		names_before_pa = names;
 		auto apply = [&](const std::string& k, const std::string& v) {
 			auto it = names.find(k);
 			if (it == names.end()) {
@@ -428,6 +482,7 @@ public:
 		};
 		for (auto& [k, v] : native_opts) if (k == "enable_pre_analysis" && !apply(k, v)) return false;
 		collect_names(names);
+		names_all = names;
 		for (auto& [k, v] : native_opts) if (k != "enable_pre_analysis" && !apply(k, v)) return false;
 
 		if ((r = enc->Init(depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init");
@@ -532,9 +587,34 @@ bool amf_probe(const std::string& codec, int gpu, std::string& caps) {
 	return true;
 }
 
+// What `ves --list-options` shows for AMF: the properties of an encoder opened on AMD GPU `gpu`, asked with pre-analysis on (which adds its
+// properties) if the GPU can do that. Never closed, as in amf_probe: the process ends after the list.
+bool amf_options(const std::string& codec, int gpu, OptionList& out, std::string& why) {
+	Params p;
+	p.width = 1280; p.height = 720; p.bitrate = 5000000; p.gop = 60;
+	p.pix = planar_fmt(420, 8);
+	p.codec = codec;
+	p.options["gpu"] = std::to_string(gpu);
+	p.options["enable_pre_analysis"] = "true";
+	probing = true;
+	auto* probe = new Amf;
+	bool ok = probe->open(p, nullptr);
+	if (!ok) {
+		p.options.erase("enable_pre_analysis");
+		probe = new Amf;
+		ok = probe->open(p, nullptr);
+	}
+	probing = false;
+	if (!ok) { why = "AMD GPU " + std::to_string(gpu) + " cannot open an AMF " + codec + " encoder"; return false; }
+	out = probe->options();
+	return true;
+}
+
 #else
 // AMF's Linux runtime needs a Vulkan context (AMFContext::InitVulkan); not implemented, so the encoder reports itself as unavailable.
 #include <cstdio>
+
+#include "options.h"
 
 namespace {
 struct AmfUnavailable : Encoder {
@@ -549,4 +629,5 @@ std::string amf_caps_json(const std::string&, int) { return "null"; }
 bool amf_probe(const std::string&, int, std::string&) { fprintf(stderr, "amf: not supported on this platform\n"); return false; }
 void amf_dedicate_process(int) {}
 std::string amf_runtime() { return {}; }
+bool amf_options(const std::string&, int, OptionList&, std::string& why) { why = "AMF is not supported on this platform"; return false; }
 #endif

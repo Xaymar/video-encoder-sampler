@@ -122,3 +122,21 @@ public:
 } // namespace
 
 std::unique_ptr<Encoder> make_encoder_x265() { return std::make_unique<X265>(); }
+
+namespace {
+std::string join_names(const char* const* names) { // a library's list of names, snake_case
+	std::string out;
+	for (; *names; names++) out += (out.empty() ? "" : " | ") + snake_case(*names);
+	return out;
+}
+} // namespace
+
+// What open() reads itself, and the options with a list of names in x265.h; every other x265 option works too.
+OptionList x265_options() {
+	return {
+		{"preset", join_names(x265_preset_names), "default medium"},
+		{"tune", join_names(x265_tune_names), ""},
+		{"profile", join_names(x265_profile_names), "x265's own names (main444_10 is main444-10)"},
+		{"me", join_names(x265_motion_est_names), "motion estimation"},
+	};
+}

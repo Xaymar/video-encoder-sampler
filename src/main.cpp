@@ -49,6 +49,7 @@ extern "C" __declspec(dllimport) unsigned int __stdcall timeBeginPeriod(unsigned
 #include "pipeline.h"
 #include "ui.h"
 #include "vk_compute.h"
+#include "options.h"
 #include "remote.h"
 #include "vmaf.h"
 
@@ -678,6 +679,8 @@ Quick run (replaces the encoders and scenarios of the config file)
 
   -h, --help                this text
   -v, --version
+        --list-options [encoder[/codec]] [gpu]   every option of every encoder (or of one), with the values it takes, from the tables ves
+                            applies them with; AMF's come from the runtime of AMD GPU <gpu> (default 0)
 )HELP", f);
 }
 
@@ -1097,6 +1100,7 @@ int main(int argc, char** argv) {
 		if (ok) printf("ok %s\n", caps.c_str()); else printf("no\n");
 		exit_now(0);
 	}
+	if (argc >= 2 && std::string(argv[1]) == "--list-options") return list_options_main(argc, argv);
 	// `ves --encoder-process <encoder> <gpu>`: the process the encoders of one GPU (or one CPU encoder) run in, started by a sweep (see encoder_process.h).
 	if (argc >= 4 && std::string(argv[1]) == "--encoder-process") return encoder_process_main(argc, argv);
 	for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--worker") return run_worker(argc, argv);

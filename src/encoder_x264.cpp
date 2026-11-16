@@ -110,3 +110,24 @@ public:
 } // namespace
 
 std::unique_ptr<Encoder> make_encoder_x264() { return std::make_unique<X264>(); }
+
+namespace {
+std::string join_names(const char* const* names) { // a library's list of names, snake_case
+	std::string out;
+	for (; *names; names++) out += (out.empty() ? "" : " | ") + snake_case(*names);
+	return out;
+}
+} // namespace
+
+// What open() reads itself, and the options with a list of names in x264.h; every other x264 option works too.
+OptionList x264_options() {
+	return {
+		{"preset", join_names(x264_preset_names), "default medium"},
+		{"tune", join_names(x264_tune_names), "several joined with commas (film,fastdecode)"},
+		{"profile", join_names(x264_profile_names), ""},
+		{"me", join_names(x264_motion_est_names), "motion estimation"},
+		{"direct", join_names(x264_direct_pred_names), "direct MV prediction"},
+		{"b_pyramid", join_names(x264_b_pyramid_names), "(b_reference_mode sets it as well)"},
+		{"nal_hrd", join_names(x264_nal_hrd_names), ""},
+	};
+}
