@@ -494,10 +494,11 @@ static void load_config_json(const Json& root, Config& cfg) {
 				}
 			}
 			bool dropped_null = false;
-			auto add_value = [&](const Json& x) { if (x.type == Json::Null) dropped_null = true; else ax.values.push_back(x.text()); };
+			// "" is no value either: the option is not set, the same as not listing it (it is not passed on, and not part of the run's key or label).
+			auto add_value = [&](const Json& x) { if (x.type == Json::Null) dropped_null = true; else if (!x.text().empty()) ax.values.push_back(x.text()); };
 			if (list->type == Json::Arr) { for (auto& x : list->a) add_value(x); } else add_value(*list);
 			if (dropped_null) fprintf(stderr, "config: %s option '%s' lists null, which is no longer a value (it meant the preset's own, which ves cannot know); it is left out. To run without the option, do not list it\n", j.encoder.c_str(), k.c_str());
-			j.axes.push_back(std::move(ax));
+			if (!ax.values.empty()) j.axes.push_back(std::move(ax));
 		}
 		cfg.jobs.push_back(std::move(j));
 	});
@@ -631,7 +632,7 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 		else if (k == "res") res = split(v);
 		else if (k == "fps") fps = split(v);
 		else if (k == "upscale") upscale = v == "on" || v == "1" || v == "true";
-		else { Axis ax{k, {}}; for (auto& x : split(v)) ax.values.push_back(x); j.axes.push_back(std::move(ax)); }
+		else { Axis ax{k, {}}; for (auto& x : split(v)) if (!x.empty()) ax.values.push_back(x); if (!ax.values.empty()) j.axes.push_back(std::move(ax)); } // key= is not set
 	}
 	sc.shapes = make_shapes(res, fps);
 	for (auto& sh : sc.shapes) sh.upscale = upscale;
@@ -712,8 +713,8 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 			const size_t eq = o.find('=');
 			if (eq == std::string::npos) throw std::runtime_error("bad option '" + o + "', expected key=value");
 			Axis ax{o.substr(0, eq), {}, {}, {}};
-			for (auto& x : split(o.substr(eq + 1))) { if (x == "null") fprintf(stderr, "option %s: null is not a value any more and is left out%s", ax.key.c_str(), "\n"); else ax.values.push_back(x); }
-			job.axes.push_back(std::move(ax));
+			for (auto& x : split(o.substr(eq + 1))) { if (x == "null") fprintf(stderr, "option %s: null is not a value any more and is left out%s", ax.key.c_str(), "\n"); else if (!x.empty()) ax.values.push_back(x); }
+			if (!ax.values.empty()) job.axes.push_back(std::move(ax)); // key= is not set
 		}
 		else if (a == "--fixed") { for (auto& x : split(value())) job.fixed.insert(x); }
 		else if (a == "--no-prune") job.prune = false;
@@ -1148,6 +1149,8 @@ int main(int argc, char** argv) {
 	auto build_variant = [&](const Job& job, Options opts) {
 		Variant v;
 		v.opts = std::move(opts);
+		// An option set to "" is not set (a host's list from before this rule can still carry one): same run, key and label as without it.
+		for (auto it = v.opts.begin(); it != v.opts.end();) it = it->second.empty() ? v.opts.erase(it) : std::next(it);
 		for (auto& [k, val] : v.opts) v.label += " " + k + "=" + val;
 		v.key = key_encoder(job.encoder, job.codec, v.opts);
 		// Every GPU is a pool of its own, so GPUs work in parallel; CPU encoders share one pool.
