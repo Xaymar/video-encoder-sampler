@@ -33,7 +33,10 @@ bool Cond::holds(const Options& o) const {
 	return holds_value(it == o.end() ? nullptr : &it->second);
 }
 
-ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune) {
+bool is_default_key(const std::string& k) { return k == "preset" || k == "tune" || k == "profile" || k == "chroma" || k == "bitdepth" || k == "gpu"; }
+
+ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune,
+                       UnsetValue unset_value) : unset_value_(std::move(unset_value)) {
 	// The values of every option, without repeats (gpu=all is every GPU of the encoder's vendor).
 	std::vector<Ax> config;
 	for (auto* list : {&axes, &free_axes}) for (auto& a : *list) {
@@ -59,6 +62,9 @@ ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes
 			for (size_t j = 0; j < config.size(); j++) if (!placed[j] && j != k && config[j].key == c.key) return true;
 		return false;
 	};
+	if (unset_value_) // what defaults depend on first, so that a condition can ask for an unset option's default
+		for (size_t k = 0; k < config.size(); k++)
+			if (is_default_key(config[k].key) && config[k].requires_all.empty() && config[k].unless_any.empty()) { placed[k] = true; axes_.push_back(config[k]); }
 	while (axes_.size() < config.size()) {
 		bool progress = false;
 		for (size_t k = 0; k < config.size(); k++) if (!placed[k] && !waits(k)) { placed[k] = true; axes_.push_back(config[k]); progress = true; }
@@ -66,6 +72,7 @@ ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes
 	}
 	std::map<std::string, int> position;
 	for (size_t k = 0; k < axes_.size(); k++) position[axes_[k].key] = (int)k;
+	for (size_t k = 0; k < axes_.size(); k++) if (is_default_key(axes_[k].key)) default_axes_.push_back((int)k);
 	for (auto& a : axes_) {
 		auto at = [&](const Cond& c) { auto it = position.find(c.key); return it == position.end() ? -1 : it->second; };
 		for (auto& c : a.requires_all) a.conds.push_back({at(c), &c});
@@ -125,10 +132,27 @@ bool ComboTable::applies(size_t k, const std::vector<uint8_t>& r) const {
 	const Ax& a = axes_[k];
 	for (size_t i = 0; i < a.conds.size(); i++) {
 		const auto [at, c] = a.conds[i];
-		const std::string* have = at < 0 || (size_t)at >= k || r[(size_t)at] == UNSET ? nullptr : &axes_[(size_t)at].values[r[(size_t)at]];
+		const std::string* have = at >= 0 && (size_t)at >= k ? nullptr // comes later (a circle): not known
+		                        : at < 0 || r[(size_t)at] == UNSET || axes_[(size_t)at].values[r[(size_t)at]].empty() ? unset(c->key, r) : &axes_[(size_t)at].values[r[(size_t)at]];
 		if (c->holds_value(have) != (i < a.requires_n)) return false;
 	}
 	return true;
+}
+
+const std::string* ComboTable::unset(const std::string& key, const std::vector<uint8_t>& r) const {
+	if (!unset_value_) return nullptr;
+	Options base;
+	std::string id;
+	for (int k : default_axes_) {
+		const uint8_t v = r[(size_t)k];
+		if (v == UNSET || axes_[(size_t)k].values[v].empty()) continue;
+		base[axes_[(size_t)k].key] = axes_[(size_t)k].values[v];
+		id += axes_[(size_t)k].key + "=" + axes_[(size_t)k].values[v] + ";";
+	}
+	id += "|" + key;
+	auto it = unset_known_.find(id);
+	if (it == unset_known_.end()) it = unset_known_.emplace(id, unset_value_(base, key)).first;
+	return it->second.empty() ? nullptr : &it->second;
 }
 
 bool ComboTable::valid(const std::vector<uint8_t>& r) const {
