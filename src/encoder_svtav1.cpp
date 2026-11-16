@@ -140,3 +140,13 @@ public:
 } // namespace
 
 std::unique_ptr<Encoder> make_encoder_svtav1() { return std::make_unique<SvtAv1>(); }
+
+// What open() decides itself; every other SVT-AV1 option works too.
+OptionList svtav1_options() {
+	return {
+		{"preset", "number", "lower is slower; the range depends on the SVT-AV1 version"},
+		{"rc", "0 CRF | 1 VBR | 2 CBR", "default 2 (rate_control sets it with the prediction structure)"},
+		{"pred_struct", "1 low delay | 2 random access", "default 1; CBR needs low delay"},
+		{"lp", "0 | 2..6", "level of parallelism (0 automatic); 1 crashes SVT-AV1"},
+	};
+}

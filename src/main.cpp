@@ -49,6 +49,7 @@ extern "C" __declspec(dllimport) unsigned int __stdcall timeBeginPeriod(unsigned
 #include "pipeline.h"
 #include "ui.h"
 #include "vk_compute.h"
+#include "options.h"
 #include "remote.h"
 #include "vmaf.h"
 
@@ -386,12 +387,15 @@ static void parse_conds(const Json& j, std::vector<Cond>& out, const std::string
 }
 
 // Every combination of the axes on top of `base`.
-static std::vector<Options> expand(const std::string& encoder, const std::vector<Axis>& axes, const Options& base = {}) {
+static std::vector<Options> expand(const std::string& encoder, const std::vector<Axis>& axes, const Options& base = {}, const UnsetValue& unset_value = {}) {
 	// An option with conditions is placed after the options its conditions name, so the combinations that cannot be are never made: where its condition fails it
 	// stays unset (one branch, not one per value). The rest keeps the order it was written in. Conditions that go in circles are checked against what is placed.
 	std::vector<const Axis*> order;
 	{
 		std::vector<bool> placed(axes.size());
+		if (unset_value) // what defaults depend on first (as ComboTable does)
+			for (size_t k = 0; k < axes.size(); k++)
+				if (is_default_key(axes[k].key) && axes[k].requires_all.empty() && axes[k].unless_any.empty()) { placed[k] = true; order.push_back(&axes[k]); }
 		auto names_unplaced = [&](const Axis& ax) {
 			for (auto* list : {&ax.requires_all, &ax.unless_any}) for (auto& c : *list)
 				for (size_t k = 0; k < axes.size(); k++) if (!placed[k] && axes[k].key == c.key && &axes[k] != &ax) return true;
@@ -420,9 +424,19 @@ static std::vector<Options> expand(const std::string& encoder, const std::vector
 		next.reserve(combos.size() * (ruled ? 1 : values.size()));
 		for (auto& c : combos) {
 			if (ruled) {
+				// an option that is not set reads as the encoder's default where that is known
+				auto holds = [&](const Cond& cond) {
+					auto it = c.find(cond.key);
+					if (it != c.end() && !it->second.empty()) return cond.holds_value(&it->second);
+					if (!unset_value) return cond.holds_value(nullptr);
+					Options b;
+					for (auto& [k, v] : c) if (is_default_key(k) && !v.empty()) b[k] = v;
+					const std::string d = unset_value(b, cond.key);
+					return cond.holds_value(d.empty() ? nullptr : &d);
+				};
 				bool applies = true;
-				for (auto& r : ax.requires_all) applies &= r.holds(c);
-				for (auto& u : ax.unless_any) applies &= !u.holds(c);
+				for (auto& r : ax.requires_all) applies &= holds(r);
+				for (auto& u : ax.unless_any) applies &= !holds(u);
 				if (!applies) { next.push_back(std::move(c)); continue; }
 			}
 			for (auto& v : values) { Options n = c; n[ax.key] = v; next.push_back(std::move(n)); }
@@ -587,9 +601,13 @@ static void load_config_json(const Json& root, Config& cfg) {
 				}
 			}
 			bool dropped_null = false;
-			// "" is no value either: the option is not set, the same as not listing it (it is not passed on, and not part of the run's key or label).
-			auto add_value = [&](const Json& x) { if (x.type == Json::Null) dropped_null = true; else if (!x.text().empty()) ax.values.push_back(x.text()); };
+			// "" is the run without the option (it is not passed on, and not part of the run's key or label); alone it is the same as not listing the option.
+			auto add_value = [&](const Json& x) {
+				if (x.type == Json::Null) dropped_null = true;
+				else if (std::find(ax.values.begin(), ax.values.end(), x.text()) == ax.values.end()) ax.values.push_back(x.text());
+			};
 			if (list->type == Json::Arr) { for (auto& x : list->a) add_value(x); } else add_value(*list);
+			if (std::all_of(ax.values.begin(), ax.values.end(), [](const std::string& x) { return x.empty(); })) ax.values.clear();
 			if (dropped_null) fprintf(stderr, "config: %s option '%s' lists null, which is no longer a value (it meant the preset's own, which ves cannot know); it is left out. To run without the option, do not list it\n", j.encoder.c_str(), k.c_str());
 			if (!ax.values.empty()) j.axes.push_back(std::move(ax));
 		}
@@ -685,6 +703,9 @@ Quick run (replaces the encoders and scenarios of the config file)
 
   -h, --help                this text
   -v, --version
+        --list-options [encoder[/codec]] [gpu] [key=value ...]   every option of every encoder (or of one), with the values it takes, from the tables
+                            ves applies them with, and its default: what the encoder has with the key=value options (preset=slow tune=film) when the
+                            option is left out. AMF's come from the runtime of AMD GPU <gpu> (default 0)
 )HELP", f);
 }
 
@@ -810,8 +831,9 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 			const size_t eq = o.find('=');
 			if (eq == std::string::npos) throw std::runtime_error("bad option '" + o + "', expected key=value");
 			Axis ax{o.substr(0, eq), {}, {}, {}};
-			for (auto& x : split(o.substr(eq + 1))) { if (x == "null") fprintf(stderr, "option %s: null is not a value any more and is left out%s", ax.key.c_str(), "\n"); else if (!x.empty()) ax.values.push_back(x); }
-			if (!ax.values.empty()) job.axes.push_back(std::move(ax)); // key= is not set
+			for (auto& x : split(o.substr(eq + 1))) { if (x == "null") fprintf(stderr, "option %s: null is not a value any more and is left out%s", ax.key.c_str(), "\n"); else if (std::find(ax.values.begin(), ax.values.end(), x) == ax.values.end()) ax.values.push_back(x); }
+			if (std::all_of(ax.values.begin(), ax.values.end(), [](const std::string& x) { return x.empty(); })) ax.values.clear();
+			if (!ax.values.empty()) job.axes.push_back(std::move(ax)); // key= is not set; key=,3 is a run without it and one with 3
 		}
 		else if (a == "--fixed") { for (auto& x : split(value())) job.fixed.insert(x); }
 		else if (a == "--no-prune") job.prune = false;
@@ -1104,6 +1126,7 @@ int main(int argc, char** argv) {
 		if (ok) printf("ok %s\n", caps.c_str()); else printf("no\n");
 		exit_now(0);
 	}
+	if (argc >= 2 && std::string(argv[1]) == "--list-options") return list_options_main(argc, argv);
 	// `ves --encoder-process <encoder> <gpu>`: the process the encoders of one GPU (or one CPU encoder) run in, started by a sweep (see encoder_process.h).
 	if (argc >= 4 && std::string(argv[1]) == "--encoder-process") return encoder_process_main(argc, argv);
 	for (int i = 1; i < argc; i++) if (std::string(argv[i]) == "--worker") return run_worker(argc, argv);
@@ -1235,12 +1258,58 @@ int main(int argc, char** argv) {
 		const std::string *gpu_json = &NULL_JSON, *caps_json = &NULL_JSON;
 		Pool* pool = nullptr;
 		std::string model;     // distributed: the GPU model of the worker that runs it
+		std::string same_as_unset; // "option=value": the value is the preset's default and the option's list has "" too, so the run without it is the same run (not made)
 	};
 	// What an entry's options are made of in a scenario: the scenario only adds its chroma, bit depth and range, so scenarios that list the same ones share the
 	// entry's variants and option table (the sizes and bit rates are put around them later).
 	using ShareKey = std::tuple<const Job*, std::vector<std::string>, std::vector<std::string>, std::vector<std::string>>;
 	auto share_key = [](const Job& job, const Scenario& sc) { return ShareKey{&job, sc.chroma, sc.bitdepth, sc.range}; };
 	std::map<ShareKey, std::vector<Variant>> variants;
+	// The options of an entry whose list has "" (not set): for those, a value that is what the encoder has anyway (the default of the run's preset and tune, see
+	// encoder_defaults) is the same run as "", so it is not made. Conditions read an unset option as that default too (unset_value_for), so both make the same runs.
+	std::map<const Job*, std::set<std::string>> unset_too;
+	auto unset_options = [&](const Job& job) -> const std::set<std::string>& {
+		auto it = unset_too.find(&job);
+		if (it != unset_too.end()) return it->second;
+		std::set<std::string> keys;
+		for (auto& ax : job.axes) if (std::find(ax.values.begin(), ax.values.end(), std::string()) != ax.values.end()) keys.insert(ax.key);
+		for (const char* k : {"preset", "tune", "profile", "gpu", "chroma", "bitdepth", "range"}) keys.erase(k);
+		return unset_too[&job] = keys;
+	};
+	// What a condition reads for an option that is not set: the encoder's default with the run's preset, tune, profile, chroma, bit depth and GPU. Not known on a worker
+	// (it runs what the host listed) or for a distributed host's worker GPUs: then a condition reads "not set".
+	auto unset_value_for = [&](const Job& job) -> UnsetValue {
+		if (cfg.only_runs_set || (remote && is_gpu_encoder(job.encoder))) return {};
+		const Job* jp = &job;
+		return [jp](const Options& base, const std::string& key) -> std::string {
+			Options b = base;
+			int gpu = 0;
+			if (auto it = b.find("gpu"); it != b.end()) { gpu = atoi(it->second.c_str()); b.erase(it); }
+			b.erase("range");
+			std::string v;
+			default_of(jp->encoder, jp->codec, key, encoder_defaults(jp->encoder, jp->codec, gpu, b), v);
+			return v;
+		};
+	};
+	std::set<std::string> defaults_logged;
+	auto same_as_unset = [&](const Job& job, const Options& opts, int gpu) -> std::string {
+		if (cfg.only_runs_set || (remote && is_gpu_encoder(job.encoder))) return {}; // a worker runs what the host listed; the host cannot open a worker's GPU
+		const auto& keys = unset_options(job);
+		if (keys.empty()) return {};
+		Options base;
+		for (const char* k : {"preset", "tune", "profile", "chroma", "bitdepth"}) if (auto it = opts.find(k); it != opts.end()) base[k] = it->second;
+		std::string why;
+		const auto defaults = encoder_defaults(job.encoder, job.codec, gpu, base, &why);
+		if (defaults.empty()) {
+			std::string text;
+			for (auto& [k, val] : base) text += " " + k + "=" + val;
+			if (defaults_logged.insert(job.encoder + "/" + job.codec + text).second)
+				ui::log("Defaults of " + job.encoder + "/" + job.codec + text + " not known (" + why + "): runs with an option at its default are not skipped");
+			return {};
+		}
+		for (auto& [k, val] : opts) if (keys.count(k) && is_default(job.encoder, job.codec, k, val, defaults)) return k + "=" + val;
+		return {};
+	};
 	// One variant of an encoder entry from its options (the scenario's chroma, bit depth and range already among them): the label, the cache key, the GPU it runs
 	// on and the pool it counts against.
 	auto build_variant = [&](const Job& job, Options opts) {
@@ -1248,6 +1317,7 @@ int main(int argc, char** argv) {
 		v.opts = std::move(opts);
 		// An option set to "" is not set (a host's list from before this rule can still carry one): same run, key and label as without it.
 		for (auto it = v.opts.begin(); it != v.opts.end();) it = it->second.empty() ? v.opts.erase(it) : std::next(it);
+		v.same_as_unset = same_as_unset(job, v.opts, v.opts.count("gpu") ? atoi(v.opts.at("gpu").c_str()) : 0);
 		for (auto& [k, val] : v.opts) v.label += " " + k + "=" + val;
 		v.key = key_encoder(job.encoder, job.codec, v.opts);
 		// Every GPU is a pool of its own, so GPUs work in parallel; CPU encoders share one pool.
@@ -1312,7 +1382,7 @@ int main(int argc, char** argv) {
 			for (auto& ax : job.axes) if (ax.key != "gpu") axes_no_gpu.push_back(ax);
 			if (models.empty()) ui::log("no worker has a GPU that can encode " + job.encoder + "/" + job.codec + ": those runs are skipped");
 		}
-		for (const Options& base : expand(job.encoder, remote_gpu ? axes_no_gpu : job.axes))
+		for (const Options& base : expand(job.encoder, remote_gpu ? axes_no_gpu : job.axes, {}, unset_value_for(job)))
 			for (auto& chroma : axis(sc.chroma)) for (auto& bitdepth : axis(sc.bitdepth)) for (auto& range : axis(sc.range)) {
 				Options opts = base;
 				if (!chroma.empty()) opts["chroma"] = chroma;
@@ -1351,7 +1421,8 @@ int main(int argc, char** argv) {
 	struct LazyTable {
 		ComboTable table;
 		std::map<std::pair<ComboTable::Id, size_t>, const Variant*> made; // the variants made so far, by combination and worker GPU model (see LazyGroup::model)
-		LazyTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune) : table(encoder, axes, free_axes, fixed, prune) {}
+		LazyTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune, UnsetValue unset)
+			: table(encoder, axes, free_axes, fixed, prune, std::move(unset)) {}
 	};
 	struct LazyGroup {
 		LazyTable* lt = nullptr;
@@ -1368,6 +1439,7 @@ int main(int argc, char** argv) {
 	std::deque<LazyGroup> lazy_groups;
 	std::map<std::string, std::vector<LazyGroup*>> lazy_of_input;
 	std::map<std::string, std::map<std::string, size_t>> left_out; // input -> option -> combinations never made into runs because it showed no effect
+	std::map<std::string, std::map<std::string, size_t>> unset_same; // input -> "option=value" -> runs not made: the value is the preset's default and "" is planned
 	auto is_lazy = [&](const Job& job) { return job.prune && !cfg.only_runs_set; };
 	// Distributed: a GPU encoder's runs are made for every GPU model the workers have that can encode the codec (as in variants_of), and its "gpu" option (which GPU of
 	// the host) has no meaning. Each model is a lazy group of its own: the runs of two GPU models are pruned by their own scores.
@@ -1391,7 +1463,7 @@ int main(int argc, char** argv) {
 			if (!sc.range.empty()) free_axes.push_back(Axis{"range", sc.range, {}, {}});
 			std::vector<Axis> axes;
 			for (auto& ax : job.axes) if (!(remote && is_gpu_encoder(job.encoder) && ax.key == "gpu")) axes.push_back(ax);
-			slot = std::make_unique<LazyTable>(job.encoder, axes, free_axes, job.fixed, job.prune);
+			slot = std::make_unique<LazyTable>(job.encoder, axes, free_axes, job.fixed, job.prune, unset_value_for(job));
 		}
 		return *slot;
 	};
@@ -1490,8 +1562,9 @@ int main(int argc, char** argv) {
 						const std::string group_head = input + "|" + job.encoder + "/" + job.codec + "|" + std::to_string(br) + "|" + std::to_string(kf) + "|" + std::to_string(shape.w) + "x" + std::to_string(shape.h) + "@" + std::to_string(shape.fps.num) + "/" + std::to_string(shape.fps.den) + "|";
 						const auto key_parts = std::make_shared<const Task::KeyParts>(Task::KeyParts{key_head, key_run_text + key_tail});
 						// Makes the run of one variant. A lazy group keeps it, to make more runs later.
-						auto make_task = [jobp = &job, scp = &sc, shape_i = shape_index, id, input, br, kf, shape, head, key_parts, kf_text, group_head, folder, folder_path, folder_made, &tasks, &cfg](const Variant& v, LazyGroup* lg, ComboTable::Id combo) {
+						auto make_task = [jobp = &job, scp = &sc, shape_i = shape_index, id, input, br, kf, shape, head, key_parts, kf_text, group_head, folder, folder_path, folder_made, &tasks, &cfg, &unset_same](const Variant& v, LazyGroup* lg, ComboTable::Id combo) {
 							const Job& job = *jobp;
+							if (!v.same_as_unset.empty()) { unset_same[input][v.same_as_unset]++; return false; } // the run with the option left out is the same
 							Task t;
 							t.job = jobp; t.id = id; t.sc = scp; t.shape_i = shape_i; t.model = v.model;
 							t.r.input = input; t.r.bitrate = br; t.r.kf = kf; t.r.shape = shape;
@@ -1915,7 +1988,7 @@ int main(int argc, char** argv) {
 					std::vector<std::string> vals;
 					bool numeric = true;
 					for (auto& v : ax.values) {
-						if (std::find(vals.begin(), vals.end(), v) != vals.end()) continue;
+						if (v.empty() || std::find(vals.begin(), vals.end(), v) != vals.end()) continue; // "" (left out) is always run
 						vals.push_back(v);
 						char* end = nullptr;
 						strtod(v.c_str(), &end);
@@ -1930,6 +2003,8 @@ int main(int argc, char** argv) {
 			for (auto& [a, lo, hi] : sm->second) {
 				const std::string& name = job.axes[a].key;
 				const auto have = t.opts->find(name);
+				const auto& listed = job.axes[a].values;
+				if (have == t.opts->end() && std::find(listed.begin(), listed.end(), std::string()) != listed.end()) continue; // the run with it left out ("")
 				std::string key = std::to_string((uintptr_t)&job) + "|" + t.r.group + "|" + name + "|";
 				for (auto& [k, v] : *t.opts) if (k != name) key += k + "=" + v + ";";
 				auto [at, fresh] = line_ids.emplace(key, (int)lines.size());
@@ -2350,6 +2425,9 @@ int main(int argc, char** argv) {
 			f << "],\"left_out\":{";
 			bool first_option = true;
 			for (auto& [option, n] : left_out[input]) { f << (first_option ? "" : ",") << jq(option) << ":" << n; first_option = false; }
+			f << "},\"same_as_unset\":{";
+			first_option = true;
+			for (auto& [option, n] : unset_same[input]) { f << (first_option ? "" : ",") << jq(option) << ":" << n; first_option = false; }
 			f << "},\"groups\":[";
 			for (size_t i = 0; i < group_json[input].size(); i++) f << (i ? "," : "") << group_json[input][i];
 			f << "]}\n";
@@ -2366,6 +2444,15 @@ int main(int argc, char** argv) {
 		if (left) {
 			printf("\n%zu runs were never made: an option showed no effect, its lowest and highest value scored the same on every frame (see \"left_out\" in the result files)\n", left);
 			for (auto& [option, n] : by_option) printf("  %s: %zu\n", option.c_str(), n);
+		}
+	}
+	{
+		std::map<std::string, size_t> by_value;
+		size_t same = 0;
+		for (auto& [in, values] : unset_same) for (auto& [value, n] : values) { by_value[value] += n; same += n; }
+		if (same) {
+			printf("\n%zu runs were not made: an option had the value its preset and tune give it anyway, and the same run without the option (\"\") is planned (see \"same_as_unset\" in the result files)\n", same);
+			for (auto& [value, n] : by_value) printf("  %s: %zu\n", value.c_str(), n);
 		}
 	}
 	if (ignored) {

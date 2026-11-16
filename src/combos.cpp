@@ -16,7 +16,7 @@ bool Cond::number(const std::string& v, double& out) {
 }
 
 bool Cond::holds_value(const std::string* have_value) const {
-	if (!have_value) return false;
+	if (!have_value || have_value->empty()) return false; // "" is the option left out
 	double have = 0;
 	if (!op.empty()) {
 		if (!number(*have_value, have)) return false;
@@ -33,7 +33,10 @@ bool Cond::holds(const Options& o) const {
 	return holds_value(it == o.end() ? nullptr : &it->second);
 }
 
-ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune) {
+bool is_default_key(const std::string& k) { return k == "preset" || k == "tune" || k == "profile" || k == "chroma" || k == "bitdepth" || k == "gpu"; }
+
+ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune,
+                       UnsetValue unset_value) : unset_value_(std::move(unset_value)) {
 	// The values of every option, without repeats (gpu=all is every GPU of the encoder's vendor).
 	std::vector<Ax> config;
 	for (auto* list : {&axes, &free_axes}) for (auto& a : *list) {
@@ -59,6 +62,9 @@ ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes
 			for (size_t j = 0; j < config.size(); j++) if (!placed[j] && j != k && config[j].key == c.key) return true;
 		return false;
 	};
+	if (unset_value_) // what defaults depend on first, so that a condition can ask for an unset option's default
+		for (size_t k = 0; k < config.size(); k++)
+			if (is_default_key(config[k].key) && config[k].requires_all.empty() && config[k].unless_any.empty()) { placed[k] = true; axes_.push_back(config[k]); }
 	while (axes_.size() < config.size()) {
 		bool progress = false;
 		for (size_t k = 0; k < config.size(); k++) if (!placed[k] && !waits(k)) { placed[k] = true; axes_.push_back(config[k]); progress = true; }
@@ -66,6 +72,7 @@ ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes
 	}
 	std::map<std::string, int> position;
 	for (size_t k = 0; k < axes_.size(); k++) position[axes_[k].key] = (int)k;
+	for (size_t k = 0; k < axes_.size(); k++) if (is_default_key(axes_[k].key)) default_axes_.push_back((int)k);
 	for (auto& a : axes_) {
 		auto at = [&](const Cond& c) { auto it = position.find(c.key); return it == position.end() ? -1 : it->second; };
 		for (auto& c : a.requires_all) a.conds.push_back({at(c), &c});
@@ -86,15 +93,18 @@ ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes
 	// Which options can be pruned: those with something between their lowest and highest value.
 	for (size_t k = 0; k < axes_.size(); k++) {
 		Ax& a = axes_[k];
-		if (!prune || fixed.count(a.key) || a.key == "gpu" || a.key == "chroma" || a.key == "bitdepth" || a.key == "range" || a.values.size() < 3) continue;
+		// "" (the option left out) is no point of the range: it is always run, like the ends, and never pruned
+		std::vector<int> set;
+		for (int i = 0; i < (int)a.values.size(); i++) if (!a.values[(size_t)i].empty()) set.push_back(i);
+		if (!prune || fixed.count(a.key) || a.key == "gpu" || a.key == "chroma" || a.key == "bitdepth" || a.key == "range" || set.size() < 3) continue;
 		bool numeric = true;
-		for (auto& v : a.values) { double d; numeric &= Cond::number(v, d); }
+		for (int i : set) { double d; numeric &= Cond::number(a.values[(size_t)i], d); }
 		if (numeric) {
 			auto less = [&](int x, int y) { return atof(a.values[(size_t)x].c_str()) < atof(a.values[(size_t)y].c_str()); };
-			int lo = 0, hi = 0;
-			for (int i = 1; i < (int)a.values.size(); i++) { if (less(i, lo)) lo = i; if (less(hi, i)) hi = i; }
+			int lo = set.front(), hi = set.front();
+			for (int i : set) { if (less(i, lo)) lo = i; if (less(hi, i)) hi = i; }
 			a.lo = lo; a.hi = hi;
-		} else { a.lo = 0; a.hi = (int)a.values.size() - 1; } // not numbers (presets): the order of the list
+		} else { a.lo = set.front(); a.hi = set.back(); } // not numbers (presets): the order of the list
 		a.prunable = true;
 		prunable_.push_back((int)k);
 	}
@@ -122,10 +132,27 @@ bool ComboTable::applies(size_t k, const std::vector<uint8_t>& r) const {
 	const Ax& a = axes_[k];
 	for (size_t i = 0; i < a.conds.size(); i++) {
 		const auto [at, c] = a.conds[i];
-		const std::string* have = at < 0 || (size_t)at >= k || r[(size_t)at] == UNSET ? nullptr : &axes_[(size_t)at].values[r[(size_t)at]];
+		const std::string* have = at >= 0 && (size_t)at >= k ? nullptr // comes later (a circle): not known
+		                        : at < 0 || r[(size_t)at] == UNSET || axes_[(size_t)at].values[r[(size_t)at]].empty() ? unset(c->key, r) : &axes_[(size_t)at].values[r[(size_t)at]];
 		if (c->holds_value(have) != (i < a.requires_n)) return false;
 	}
 	return true;
+}
+
+const std::string* ComboTable::unset(const std::string& key, const std::vector<uint8_t>& r) const {
+	if (!unset_value_) return nullptr;
+	Options base;
+	std::string id;
+	for (int k : default_axes_) {
+		const uint8_t v = r[(size_t)k];
+		if (v == UNSET || axes_[(size_t)k].values[v].empty()) continue;
+		base[axes_[(size_t)k].key] = axes_[(size_t)k].values[v];
+		id += axes_[(size_t)k].key + "=" + axes_[(size_t)k].values[v] + ";";
+	}
+	id += "|" + key;
+	auto it = unset_known_.find(id);
+	if (it == unset_known_.end()) it = unset_known_.emplace(id, unset_value_(base, key)).first;
+	return it->second.empty() ? nullptr : &it->second;
 }
 
 bool ComboTable::valid(const std::vector<uint8_t>& r) const {
@@ -149,7 +176,7 @@ const std::vector<ComboTable::Id>& ComboTable::layer(size_t want) const {
 		if (!applies(level, current)) { current[level] = UNSET; generate(level + 1, mids, c + (a.radix - 1) * a.weight); return; } // the option stays unset, in one branch
 		for (size_t v = 0; v < a.values.size(); v++) {
 			current[level] = (uint8_t)v;
-			const bool mid = a.prunable && (int)v != a.lo && (int)v != a.hi;
+			const bool mid = a.prunable && (int)v != a.lo && (int)v != a.hi && !a.values[v].empty();
 			generate(level + 1, mids + mid, c + v * a.weight);
 		}
 		current[level] = UNSET;
@@ -171,7 +198,7 @@ void ComboTable::mid_lines(Id c, std::vector<Line>& out) const {
 	for (int p : prunable_) {
 		const Ax& a = axes_[(size_t)p];
 		const uint8_t v = r[(size_t)p];
-		if (v == UNSET || (int)v == a.lo || (int)v == a.hi) continue;
+		if (v == UNSET || (int)v == a.lo || (int)v == a.hi || a.values[v].empty()) continue;
 		r[(size_t)p] = (uint8_t)a.lo;
 		const int64_t lo = find(r);
 		r[(size_t)p] = (uint8_t)a.hi;

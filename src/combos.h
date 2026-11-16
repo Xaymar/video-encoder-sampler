@@ -2,6 +2,8 @@
 // The option combinations of one encoder entry, as rows of small integers (one per option, the index of its value) instead of option maps with strings: a big config has
 // millions of them for every input, bit rate and size, and only a few are ever run (see ComboTable::layer), so only the layers that are asked for are listed.
 #include <cstdint>
+#include <functional>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -20,13 +22,19 @@ struct Cond {
 	std::string json() const; // as the config writes it: true, a list of values, or a comparison
 };
 
-struct Axis { // one swept option. null is not a value: it would mean "whatever the preset gives", which is not known; leave the option out to run without it
+struct Axis { // one swept option. null is not a value: it would mean "whatever the preset gives", which is not known; leave the option out to run without it, or list "" (that run)
 	std::string key;
 	std::vector<std::string> values;
 	// Options that only matter in some combinations: where the condition does not hold the option is left unset.
 	std::vector<Cond> requires_all; // it is only set when all of these hold
 	std::vector<Cond> unless_any;   // it is only set when none of these holds
 };
+
+// What an option is when a combination leaves it unset ("", not listed, or its own condition failed): the encoder's default with the options in `base`
+// (preset, tune, profile, chroma, bitdepth, gpu: see default_keys), as encoder_defaults() reads it; "" when not known. Conditions read this instead of "not set".
+using UnsetValue = std::function<std::string(const Options& base, const std::string& key)>;
+// The options a default depends on, placed before all others so that conditions can ask for defaults.
+bool is_default_key(const std::string& key);
 
 class ComboTable {
 public:
@@ -36,7 +44,8 @@ public:
 	// `axes`: the swept options in the order of the config; `free_axes`: more options that take every value and are never pruned (the scenario's chroma, bit
 	// depth and range). `prune`: whether options with more than two values can be pruned; `fixed`: options that never are (nor are gpu, chroma, bitdepth, range).
 	// Nothing is listed here: a combination is a number, and a layer is listed when it is first asked for.
-	ComboTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune);
+	ComboTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune,
+	           UnsetValue unset_value = {});
 
 	Options options(Id combo) const;
 
@@ -68,6 +77,10 @@ private:
 	bool valid(const std::vector<uint8_t>& r) const;              // whether the combinations are made with this row
 	int64_t find(const std::vector<uint8_t>& r) const { return valid(r) ? (int64_t)id(r) : -1; }
 
+	UnsetValue unset_value_;
+	std::vector<int> default_axes_; // the axes of is_default_key, which come first
+	mutable std::map<std::string, std::string> unset_known_; // "base|key" -> unset_value_
+	const std::string* unset(const std::string& key, const std::vector<uint8_t>& r) const; // what a condition reads for an unset option; nullptr when not known
 	std::vector<Ax> axes_;          // in the order the combinations are made: an option after the ones its conditions name
 	std::vector<int> prunable_;     // indices into axes_
 	mutable std::vector<std::vector<Id>> layers_;

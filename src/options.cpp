@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <map>
 #include <cstdio>
 #include <set>
@@ -27,9 +28,31 @@ std::string kebab_case(const std::string& s) {
 	return out;
 }
 
+namespace {
+
+// The common options (see options.h), with the values tried to find out whether an encoder has one: each that translates is listed.
+struct Common {
+	const char* name;
+	const char* values; // shown as it is; nullptr lists the probe values that work
+	const char* about;
+	std::vector<const char*> probe;
+};
+const std::vector<Common>& commons() {
+	static const std::vector<Common> t = {
+		{"max_b_frames", "0..", "most B-frames in a row (0 = none)", {"1"}},
+		{"lookahead_frames", "0..", "frames of lookahead for rate control (0 = off)", {"8"}},
+		{"max_ref_frames", "1..", "most reference frames", {"2"}},
+		{"b_reference_mode", nullptr, "B-frames as references", {"none", "middle", "each"}},
+		{"rate_control", nullptr, "rate control mode at the target bitrate", {"cbr", "vbr"}},
+	};
+	return t;
+}
+
+} // namespace
+
 bool is_common_option(const std::string& key) {
-	static const std::set<std::string> common = {"max_b_frames", "lookahead_frames", "max_ref_frames", "b_reference_mode", "rate_control"};
-	return common.count(key) > 0;
+	for (auto& c : commons()) if (key == c.name) return true;
+	return false;
 }
 
 namespace {
@@ -119,6 +142,13 @@ const std::map<std::string, Names>& presets() {
 	return t;
 }
 
+// The levels of H.264 and HEVC, as 10 x level.
+const std::set<int>& levels(const std::string& codec) {
+	static const std::set<int> h264 = {10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52, 60, 61, 62};
+	static const std::set<int> hevc = {10, 20, 21, 30, 31, 40, 41, 50, 51, 52, 60, 61, 62};
+	return codec == "hevc" ? hevc : h264;
+}
+
 // Levels are written as the standards write them ("4.1"). The libraries number them differently: x264 and x265 read the name, the others take
 // 10 x level (30 x level for HEVC in NVENC and AMF), AV1 in NVENC and AMF an index counted from 2.0.
 bool translate_level(const std::string& enc, const std::string& codec, std::string& value, std::string& error) {
@@ -143,11 +173,9 @@ bool translate_level(const std::string& enc, const std::string& codec, std::stri
 	if (extra) return bad();
 	if (value.find('.') == std::string::npos) minor = 0;
 	const int n = major * 10 + minor;
-	static const std::set<int> h264 = {10, 11, 12, 13, 20, 21, 22, 30, 31, 32, 40, 41, 42, 50, 51, 52, 60, 61, 62};
-	static const std::set<int> hevc = {10, 20, 21, 30, 31, 40, 41, 50, 51, 52, 60, 61, 62};
 	if (av1) {
 		if (major < 2 || major > 7 || minor < 0 || minor > 3) return bad();
-	} else if (!(codec == "hevc" ? hevc : h264).count(n)) return bad();
+	} else if (!levels(codec).count(n)) return bad();
 	if (enc == "x264" || enc == "x265") { value = std::to_string(major) + "." + std::to_string(minor); if (minor == 0) value = std::to_string(major); return true; }
 	if (av1 && (enc == "nvenc" || enc == "amf")) value = std::to_string((major - 2) * 4 + minor);
 	else if (codec == "hevc" && (enc == "nvenc" || enc == "amf")) value = std::to_string(n * 3);
@@ -189,4 +217,118 @@ bool resolve_options(const std::string& encoder, const std::string& codec, const
 		}
 	}
 	return true;
+}
+
+namespace {
+
+std::string names_of(const std::map<std::string, Names>& table, const std::string& at) {
+	auto t = table.find(at);
+	if (t == table.end()) return {};
+	std::string out;
+	for (auto& [name, native] : t->second) out += (out.empty() ? "" : " | ") + name;
+	return out;
+}
+
+} // namespace
+
+OptionList ves_options(const std::string& enc, const std::string& codec) {
+	OptionList out;
+	const std::string at = enc + "/" + codec;
+	if (is_gpu_encoder(enc)) out.push_back({"gpu", "n | all", "which GPU of this vendor encodes (counted from 0); all sweeps every one"});
+	if (enc != "nvenc") { // NVENC reads the common options itself (its own list has them)
+		for (auto& c : commons()) {
+			std::string works;
+			for (const char* v : c.probe) {
+				NativeOptions native;
+				std::string error;
+				if (translate(enc, codec, c.name, v, native, error)) works += (works.empty() ? "" : " | ") + std::string(v);
+			}
+			if (!works.empty()) out.push_back({c.name, c.values ? c.values : works, c.about});
+		}
+	}
+	if (auto v = names_of(presets(), at); !v.empty()) out.push_back({"preset", v, "speed against quality"});
+	if (auto v = names_of(profiles(), at); !v.empty()) out.push_back({"profile", v, "left out, the encoder picks one that fits the chroma layout and bit depth"});
+	if (enc == "x265") out.push_back({"tier", "main | auto", "auto lets x265 use the high tier when the bitrate needs it; it cannot force it"});
+	else if (auto v = names_of(tiers(), at); !v.empty()) out.push_back({"tier", v, ""});
+	std::string lv = "auto";
+	if (codec == "av1") lv += " | 2.0 .. 7.3 (x.0 to x.3)";
+	else {
+		if (codec == "h264" && enc != "amf" && enc != "svtav1") lv += " | 1b";
+		for (int n : levels(codec)) lv += " | " + std::to_string(n / 10) + (n % 10 ? "." + std::to_string(n % 10) : "");
+	}
+	out.push_back({"level", lv, "as the standards write it; auto leaves it to the encoder"});
+	return out;
+}
+
+void merge_options(OptionList& list, const OptionList& more) {
+	for (auto& o : more) {
+		bool have = false;
+		for (auto& l : list) if (l.name == o.name) { have = true; if (l.about.empty()) l.about = o.about; break; }
+		if (!have) list.push_back(o);
+	}
+}
+
+std::vector<std::pair<std::string, std::string>> settings_from_sei(const uint8_t* data, size_t size) {
+	std::vector<std::pair<std::string, std::string>> out;
+	const std::string all((const char*)data, size);
+	size_t at = all.find("options: ");
+	if (at == std::string::npos) return out;
+	at += 9;
+	size_t end = at;
+	while (end < all.size() && (unsigned char)all[end] >= 32 && (unsigned char)all[end] < 127) end++;
+	const std::string text = all.substr(at, end - at);
+	for (size_t i = 0; i < text.size();) {
+		size_t j = text.find(' ', i);
+		if (j == std::string::npos) j = text.size();
+		const std::string tok = text.substr(i, j - i);
+		i = j + 1;
+		if (tok.empty()) continue;
+		const size_t eq = tok.find('=');
+		if (eq != std::string::npos) out.push_back({snake_case(tok.substr(0, eq)), tok.substr(eq + 1)});
+		else if (tok.compare(0, 3, "no-") == 0) out.push_back({snake_case(tok.substr(3)), "0"});
+		else out.push_back({snake_case(tok), "1"});
+	}
+	return out;
+}
+
+namespace {
+
+const std::string* lookup(const std::vector<std::pair<std::string, std::string>>& d, const std::string& key) {
+	for (auto& [k, v] : d) if (k == key) return &v;
+	return nullptr;
+}
+
+bool same_value(const std::string& a, const std::string& b) {
+	auto norm = [](const std::string& s) { return s == "true" || s == "on" ? std::string("1") : s == "false" || s == "off" ? std::string("0") : s; };
+	const std::string x = norm(a), y = norm(b);
+	if (x == y) return true;
+	char *ex = nullptr, *ey = nullptr;
+	const double dx = strtod(x.c_str(), &ex), dy = strtod(y.c_str(), &ey);
+	return !x.empty() && !y.empty() && !*ex && !*ey && dx == dy;
+}
+
+} // namespace
+
+bool default_of(const std::string& enc, const std::string& codec, const std::string& key, const std::vector<std::pair<std::string, std::string>>& d, std::string& value) {
+	if (const std::string* v = lookup(d, key)) { value = *v; return true; }
+	if ((key != "max_b_frames" && key != "lookahead_frames" && key != "max_ref_frames") || enc == "nvenc") return false;
+	// the library's own name for it (the numbers; the named values are spelled differently by the library): what the common option translates to, if it is one option
+	NativeOptions native;
+	std::string error;
+	const char* probe = key == "b_reference_mode" ? "none" : key == "rate_control" ? "cbr" : "1";
+	if (!translate(enc, codec, key, probe, native, error) || native.size() != 1) return false;
+	const std::string* v = lookup(d, snake_case(native[0].first));
+	if (!v) return false;
+	value = *v;
+	return true;
+}
+
+bool is_default(const std::string& enc, const std::string& codec, const std::string& key, const std::string& value, const std::vector<std::pair<std::string, std::string>>& d) {
+	if (const std::string* v = lookup(d, key)) return same_value(value, *v);
+	if (!is_common_option(key) || enc == "nvenc") return false;
+	NativeOptions native;
+	std::string error;
+	if (!translate(enc, codec, key, value, native, error) || native.size() != 1) return false;
+	const std::string* v = lookup(d, snake_case(native[0].first));
+	return v && same_value(native[0].second, *v);
 }
