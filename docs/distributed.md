@@ -97,9 +97,15 @@ same protocol version; an older worker is refused.
 
 A job's `ves` is ended with the worker, however the worker ends, and gets no copy of the worker's connection, which would keep the connection open after the worker is gone.
 
+## Best videos
+
+Workers run their jobs with `--no-videos`. With `"videos": "best"` (the default), once every run of an input is done the host picks the winner of each group (the
+highest rank-weighted Distorted Score after the overshoot penalty). A winner the host can run itself (a CPU encoder, or its own GPU) is encoded again on the host;
+a winner from a worker's GPU goes out as a *video job* to a worker with that GPU model, which encodes it again and sends the stream back (protocol 6). The host
+keeps the stream, and uploads it, only if its SHA-256 matches the stream that was scored; an encoder that does not give the same stream twice gets no video.
+
 ## Not done yet
 
-* **No encoded streams** come back (workers run with `--no-videos`), so best-videos mode keeps nothing from remote runs.
 * **Pruning goes in rounds.** The host plans lazily as a sweep on one machine does: the probes of an input go out as jobs first, and each next layer when the workers have sent the scores of the one before (each GPU model of the workers is pruned by its own scores). A round waits for its slowest job, so workers can sit idle at the end of one.
 * **No encryption.** The token only keeps strangers out; use a VPN or an SSH tunnel on untrusted networks.
 * **Inputs are sent whole**, once per worker, from the host; a transfer cannot resume.

@@ -22,8 +22,12 @@ struct RemoteJobSpec {
 	struct Run {
 		std::string result_file; // where the host keeps this run's result
 		std::string key;         // the host's cache key for it, which replaces the worker's in the stored file
+		std::string video_file;  // a video job: where the host puts the stream the worker sends
 	};
 	std::vector<Run> runs;
+	// A video job: its runs were scored before (they are the winners of their groups), and the worker encodes them again for their streams, which it sends back.
+	// Their results are not stored again; the caller checks each stream against the scored one.
+	bool videos = false;
 };
 
 struct RemoteHostOptions {

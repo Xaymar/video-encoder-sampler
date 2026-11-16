@@ -1683,6 +1683,53 @@ int main(int argc, char** argv) {
 		result_dirs.clear(); // the workers' results are there now
 	};
 
+	// Distributed, "videos": "best": the winners of groups that ran on a worker's GPU are encoded again by a worker with that GPU model, which sends the stream back.
+	// It is kept, and uploaded, if it is the stream that was scored (same SHA-256). Each winner is a job of its own; its result is not stored again.
+	auto remote_videos = [&](const std::vector<Task*>& winners) {
+		if (!remote || winners.empty()) return;
+		std::vector<RemoteJobSpec> jobs;
+		std::vector<Task*> asked;
+		for (Task* t : winners) {
+			const Shape& shape = t->sc->shapes[t->shape_i]; // as the scenario asks for it, as when it was scored: r.shape has what it came out as
+			RemoteJobSpec spec;
+			spec.videos = true;
+			spec.config = sub_config(cfg, *t->job, *t->sc, t->r.bitrate, t->r.kf, shape);
+			spec.input = t->r.input;
+			spec.encoder = t->job->encoder;
+			spec.codec = t->job->codec;
+			spec.model = t->model;
+			spec.name = "stream of " + t->r.label + " " + std::to_string(t->r.bitrate) + "k (" + file_name(t->r.input) + ")";
+			if (is_url(spec.input)) {
+				try { spec.path = local_path(spec.input); } catch (const std::exception& e) { ui::log("Input " + file_name(spec.input) + ": " + e.what()); continue; }
+			}
+			t->r.video_file = (fs::path(cfg.output_dir) / video_name_of(t->r)).string();
+			std::error_code ec;
+			fs::remove(t->r.video_file, ec); // what is there is not what comes now
+			spec.runs.push_back({t->result_file, t->key(), t->r.video_file});
+			jobs.push_back(std::move(spec));
+			asked.push_back(t);
+		}
+		if (jobs.empty()) return;
+		ui::log("remote: " + std::to_string(jobs.size()) + " best run(s) go to workers with their GPU to be encoded again for their streams");
+		remote->run_jobs(jobs);
+		for (Task* t : asked) {
+			Run& r = t->r;
+			std::error_code ec;
+			const std::string sha = fs::exists(r.video_file, ec) ? sha256_file(r.video_file) : std::string();
+			if (!sha.empty() && sha == r.video_sha256) {
+				r.video = video_name_of(r);
+				ui::log("Best of its group  " + r.label + ": stream kept (" + r.video + "), encoded again on a worker's " + t->model);
+				store_result(*t, t->result_file, cached_of(r), run_details(*t));
+				upload_video(*t);
+			} else {
+				fs::remove(r.video_file, ec);
+				ui::log("Best of its group  " + r.label + ": " + (sha.empty() ? std::string("no worker with ") + t->model + " sent its stream; no video"
+				                                                               : std::string("the stream a worker encoded again differs from the scored one (the encoder is not deterministic), so there is no video")));
+			}
+			r.video_file.clear();
+		}
+	};
+
 	// Whatever cannot work, or was done before, is finished right away. The rest is sorted by the frames it needs: runs with the
 	// same input, resolution, frame rate and pixel format share one decode.
 	std::map<std::string, std::vector<size_t>> uncached; // by input: the runs that have to be done, planned when their input comes up
@@ -2031,6 +2078,7 @@ int main(int argc, char** argv) {
 	// encoded again, and its stream is kept and uploaded if it is the one that was scored (same SHA-256). Streams of other runs left by earlier sweeps go.
 	if (cfg.best_videos) {
 		std::vector<size_t> again;
+		std::vector<Task*> remote_winners;
 		for (auto it = group_ok.begin(); it != group_ok.end();) {
 			auto& runs_ok = it->second;
 			if (runs_ok.empty() || runs_ok.front()->r.input != input_name) { ++it; continue; }
@@ -2055,7 +2103,7 @@ int main(int argc, char** argv) {
 			if (!r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) upload_video(*best); // kept by an earlier sweep
 			else if (r.result.empty()) {}
 			else if (r.video_sha256.empty()) ui::log("Best of its group  " + r.label + ": its result has no video_sha256, so a new encode cannot be checked against it; no video");
-			else if (!best->model.empty()) ui::log("Best of its group  " + r.label + ": it ran on a worker's " + best->model + ", which is not here; no video");
+			else if (!best->model.empty()) remote_winners.push_back(best); // a worker's GPU: a worker with it encodes it again
 			else {
 				r.video_file = (fs::path(cfg.output_dir) / video_name_of(r)).string();
 				again.push_back(best->index);
@@ -2066,6 +2114,7 @@ int main(int argc, char** argv) {
 			ui::log("Encoding the best run of " + std::to_string(again.size()) + " group(s) of " + file_name(input_name) + " again for their streams");
 			run_round(again, true);
 		}
+		remote_videos(remote_winners);
 	}
 	}
 	{ std::error_code ec; fs::remove_all(spool_dir, ec); }
