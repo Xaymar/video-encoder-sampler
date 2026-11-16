@@ -40,8 +40,8 @@ namespace fs = std::filesystem;
 
 namespace {
 
-enum : uint8_t { M_HELLO = 1, M_JOB = 2, M_NEED = 3, M_FILE_DATA = 4, M_FILE_END = 5, M_RESULT = 6, M_DONE = 7, M_PROGRESS = 8, M_SOURCE = 9, M_LOG = 10, M_PING = 11 };
-constexpr int kVersion = 5; // 5: dropped frames take the score of the frame on screen (a worker scoring the old way would store it under the new key)
+enum : uint8_t { M_HELLO = 1, M_JOB = 2, M_NEED = 3, M_FILE_DATA = 4, M_FILE_END = 5, M_RESULT = 6, M_DONE = 7, M_PROGRESS = 8, M_SOURCE = 9, M_LOG = 10, M_PING = 11, M_VIDEO = 12, M_VIDEO_END = 13 };
+constexpr int kVersion = 6; // 6: video jobs (the winners of their groups encoded again, their streams sent back). 5: dropped frames take the score of the frame on screen
 // Both sides say something at least every kPingEvery; one that has heard nothing for kSilence takes the other as gone (crashed, hung, or the machine is off) and ends
 // the connection: the host gives that worker's jobs to the others, the worker stops them and connects again.
 constexpr int kPingEvery = 10;      // seconds
@@ -209,13 +209,20 @@ struct RemoteHost::Impl {
 		return false;
 	}
 
-	// Stores a result file the worker sent. Returns whether it belonged to the job.
-	bool import_result(const RemoteJobSpec& job, const std::string& name, std::string content, std::string& stored_file) {
+	// The run of the job a result file the worker sent is for, or null.
+	static const RemoteJobSpec::Run* run_of(const RemoteJobSpec& job, const std::string& name, const std::string& content) {
 		std::string worker_options;
 		try { worker_options = options_of(Json::parse(content).find("key")->text()); } catch (const std::exception&) {}
 		const std::string want = result_prefix(name);
-		for (auto& r : job.runs) {
-			if (worker_options.empty() ? result_prefix(fs::path(r.result_file).filename().string()) != want : options_of(r.key) != worker_options) continue;
+		for (auto& r : job.runs)
+			if (worker_options.empty() ? result_prefix(fs::path(r.result_file).filename().string()) == want : options_of(r.key) == worker_options) return &r;
+		return nullptr;
+	}
+
+	// Stores a result file the worker sent. Returns whether it belonged to the job.
+	bool import_result(const RemoteJobSpec& job, const std::string& name, std::string content, std::string& stored_file) {
+		if (const RemoteJobSpec::Run* run = run_of(job, name, content)) {
+			const RemoteJobSpec::Run& r = *run;
 			if (!replace_key(content, r.key)) return false;
 			std::error_code ec;
 			fs::create_directories(fs::path(r.result_file).parent_path(), ec);
@@ -292,6 +299,8 @@ struct RemoteHost::Impl {
 			std::chrono::steady_clock::time_point seen = std::chrono::steady_clock::now(); // the last word of it (a job's `ves` prints its numbers four times a second)
 		};
 		std::map<size_t, Active> active; // jobs this worker has now, guarded by m
+		std::map<std::pair<size_t, std::string>, std::string> video_dest; // video jobs: (job, name of the result without .json) -> where the stream of that name goes
+		std::map<std::string, std::ofstream> videos_open;                 // streams coming in, by their .part file
 		std::mutex send_m;
 		std::atomic<bool> dead{false};
 		auto send = [&](uint8_t t, const std::string& p) {
@@ -350,7 +359,7 @@ struct RemoteHost::Impl {
 					std::string only; // the runs the host still needs: the worker leaves the others of the job out (it has the same option lists as the host)
 					for (auto& r : job.runs) only += (only.empty() ? "" : ",") + jq(options_of(r.key));
 					const std::string msg = "{\"id\":" + std::to_string(id) + ",\"name\":" + jq(job.name) + ",\"config\":" + jq(config) + ",\"input\":{\"url\":false" +
-					                        ",\"name\":" + jq(fs::path(file).filename().string()) + ",\"sha256\":" + jq(sha) + ",\"size\":" + size + "},\"parallel\":" + std::to_string(weight) + ",\"only\":[" + only + "]}";
+					                        ",\"name\":" + jq(fs::path(file).filename().string()) + ",\"sha256\":" + jq(sha) + ",\"size\":" + size + "},\"parallel\":" + std::to_string(weight) + ",\"only\":[" + only + "]" + (job.videos ? ",\"videos\":true" : "") + "}";
 					log("job " + job.name + " -> " + who + (job.model.empty() ? "" : " on " + job.model));
 					if (!send(M_JOB, msg)) throw std::runtime_error("connection lost");
 				} catch (const std::exception&) {
@@ -390,7 +399,12 @@ struct RemoteHost::Impl {
 				if (payload.size() < 6 + nl) continue;
 				const std::string name = fs::path(payload.substr(6, nl)).filename().string();
 				std::string stored_file;
-				if (id < jobs->size() && import_result((*jobs)[id], name, payload.substr(6 + nl), stored_file)) {
+				if (id < jobs->size() && (*jobs)[id].videos) { // scored before: only says which run the stream of the same name is
+					const RemoteJobSpec::Run* run = run_of((*jobs)[id], name, payload.substr(6 + nl));
+					if (run && !run->video_file.empty()) video_dest[{id, fs::path(name).stem().string()}] = run->video_file;
+					std::lock_guard lock(m);
+					if (auto a = active.find(id); a != active.end()) a->second.seen = std::chrono::steady_clock::now();
+				} else if (id < jobs->size() && import_result((*jobs)[id], name, payload.substr(6 + nl), stored_file)) {
 					size_t now;
 					{
 						std::lock_guard lock(m);
@@ -403,6 +417,37 @@ struct RemoteHost::Impl {
 					for (auto& r : (*jobs)[id].runs) wanted += "\n  " + result_prefix(fs::path(r.result_file).filename().string());
 					log("remote: the result " + result_prefix(name) + " from " + who + " is not one of the runs of the job " + (*jobs)[id].name + ", which are:" + wanted);
 				}
+			} else if (type == M_VIDEO || type == M_VIDEO_END) { // a video job's stream, in pieces: id, name length (2 bytes), name, data
+				if (payload.size() < 6) continue;
+				const size_t id = id_of(payload);
+				const size_t nl = (uint8_t)payload[4] | ((uint8_t)payload[5] << 8);
+				if (payload.size() < 6 + nl) continue;
+				const std::string stem = fs::path(payload.substr(6, nl)).stem().string();
+				auto d = video_dest.find({id, stem});
+				if (d == video_dest.end()) continue; // no run of the job (its result did not come first): left out
+				{
+					std::lock_guard lock(m);
+					if (auto a = active.find(id); a != active.end()) a->second.seen = std::chrono::steady_clock::now();
+				}
+				const std::string part = d->second + ".part";
+				auto f = videos_open.find(part);
+				if (f == videos_open.end()) {
+					std::error_code ec;
+					fs::create_directories(fs::path(part).parent_path(), ec);
+					f = videos_open.emplace(part, std::ofstream(part, std::ios::binary | std::ios::trunc)).first;
+				}
+				if (type == M_VIDEO) { f->second.write(payload.data() + 6 + nl, (std::streamsize)(payload.size() - 6 - nl)); continue; }
+				const bool good = (bool)f->second;
+				f->second.close();
+				videos_open.erase(f);
+				std::error_code ec;
+				if (good) fs::rename(part, d->second, ec);
+				if (!good || ec) { fs::remove(part, ec); log("remote: the stream " + d->second + " from " + who + " could not be written"); }
+				else {
+					std::lock_guard lock(m);
+					active[id].stored++;
+				}
+				video_dest.erase(d);
 			} else if (type == M_SOURCE) {
 				if (payload.size() < 5) continue;
 				const size_t id = id_of(payload);
@@ -471,11 +516,13 @@ struct RemoteHost::Impl {
 					left--;
 				}
 				const RemoteJobSpec& job = (*jobs)[id];
-				log("job " + job.name + " done on " + who + ": " + std::to_string(stored) + " of " + std::to_string(job.runs.size()) + " results" + (ok ? "" : " (the worker reported a failure)"));
+				log("job " + job.name + " done on " + who + ": " + std::to_string(stored) + " of " + std::to_string(job.runs.size()) + (job.videos ? " streams" : " results") + (ok ? "" : " (the worker reported a failure)"));
 				cv.notify_all();
 			}
 		}
 
+		for (auto& [part, f] : videos_open) { f.close(); std::error_code ec; fs::remove(part, ec); } // half a stream is no stream
+		videos_open.clear();
 		// The connection is gone: what this worker was running goes back to the queue.
 		log("worker " + who + (conn->timed_out() ? " said nothing for " + std::to_string(kSilenceMs / 1000) + " s (crashed or hung?): dropped" : " disconnected"));
 		{
@@ -1118,7 +1165,9 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 					std::ofstream f(dir / "config.jsonc", std::ios::binary);
 					f << job.find("config")->text();
 				}
-				std::vector<std::string> args{"--plain", "--progress", "--config", (dir / "config.jsonc").string(), "--input", input, "--output", (dir / "out").string(), "--no-videos",
+				const Json* vj = job.find("videos");
+				const bool videos = vj && flag_set(vj->text()); // the runs were scored before: they are encoded again for their streams, which go to the host
+				std::vector<std::string> args{"--plain", "--progress", "--config", (dir / "config.jsonc").string(), "--input", input, "--output", (dir / "out").string(), videos ? "--all-videos" : "--no-videos",
 				                               "--cache", (fs::path(workdir) / "cache").string(), "--upload", "off", "--trust-downloads", "--short-names"};
 				args.insert(args.end(), extra_args.begin(), extra_args.end());
 				if (const Json* only = job.find("only"); only && !only->a.empty()) {
@@ -1175,6 +1224,29 @@ int remote_worker(const std::string& host, int port, const std::string& token, c
 				ok = code == 0 && !silenced;
 				if (!ok && !silenced) log("job " + jname + " failed with code " + std::to_string(code)); // what it said came as it said it
 				send_results(); // what the last progress line did not see
+				if (ok && videos) { // each stream after its result, which tells the host whose it is
+					std::error_code ec3;
+					for (auto& folder : fs::directory_iterator(dir / "out", ec3)) {
+						if (!folder.is_directory()) continue;
+						for (auto& f : fs::directory_iterator(folder.path(), ec3)) {
+							if (f.path().extension() != ".mp4" || !sent_names.count(f.path().stem().string() + ".json")) continue;
+							const std::string n = f.path().filename().string();
+							std::string head = id_bytes(id);
+							head += (char)(n.size() & 255);
+							head += (char)(n.size() >> 8);
+							head += n;
+							std::ifstream in_f(f.path(), std::ios::binary);
+							std::string chunk(kChunk, '\0');
+							bool sent = true;
+							while (sent && in_f) {
+								in_f.read(chunk.data(), (std::streamsize)kChunk);
+								const size_t got = (size_t)in_f.gcount();
+								if (got) sent = send(M_VIDEO, head + chunk.substr(0, got));
+							}
+							if (sent && send(M_VIDEO_END, head)) log("job " + jname + ": stream " + n + " sent");
+						}
+					}
+				}
 			}
 			fs::remove_all(dir, ec2);
 			if (ok && sent_results == 0) log("job " + jname + " made no results");
