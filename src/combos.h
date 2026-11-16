@@ -39,7 +39,7 @@ bool is_default_key(const std::string& key);
 class ComboTable {
 public:
 	static constexpr uint8_t UNSET = 255;
-	using Id = uint64_t; // a combination: its row as a number with one digit per option (the value's index, or one more for "not set")
+	using Id = uint64_t; // a combination: its row as a number with one digit per option (the value's index, or the option's digit for "not set")
 
 	// `axes`: the swept options in the order of the config; `free_axes`: more options that take every value and are never pruned (the scenario's chroma, bit
 	// depth and range). `prune`: whether options with more than two values can be pruned; `fixed`: options that never are (nor are gpu, chroma, bitdepth, range).
@@ -69,7 +69,11 @@ private:
 		size_t requires_n = 0;                          // how many of conds are requires_all
 		int lo = -1, hi = -1;                           // index of the lowest and highest value of a prunable option
 		bool prunable = false;
-		Id radix = 1, weight = 1;                       // values + 1 ("not set"); the digit's place value
+		// The digit of "not set": the index of "" when it is listed (both leave the option out, and a row can only be one of them: "" where the option's conditions
+		// hold, not set where they do not), else one more than the values; -1 for an option without conditions, which is always set. Every option having a digit
+		// of its own for "not set" made a big config's combinations too many to number.
+		int unset_digit = -1;
+		Id radix = 1, weight = 1;                       // how many digits; the digit's place value
 	};
 	std::vector<uint8_t> row(Id c) const;
 	Id id(const std::vector<uint8_t>& r) const;

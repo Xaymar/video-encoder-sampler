@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -671,21 +672,47 @@ void exit_now(int code) {
 	std::_Exit(code);
 }
 
+namespace {
+// Where a crash is told: stderr as it was when the process started. The live display points stderr at a pipe that a thread of this process empties, and that
+// thread dies with the process, so a crash written there was never seen (ves ended with nothing on the screen but its exit code).
+#ifdef _WIN32
+HANDLE crash_out = INVALID_HANDLE_VALUE;
+void crash_write(const char* text, size_t n) {
+	DWORD put;
+	WriteFile(crash_out != INVALID_HANDLE_VALUE ? crash_out : GetStdHandle(STD_ERROR_HANDLE), text, (DWORD)n, &put, nullptr); // nothing that takes a lock: the crash may have happened while it was held
+}
+#else
+int crash_out = -1;
+void crash_write(const char* text, size_t n) { if (write(crash_out >= 0 ? crash_out : 2, text, n) < 0) {} }
+#endif
+void crash_write(const std::string& text) { crash_write(text.data(), text.size()); }
+
+// An exception nobody caught (in a thread, or one thrown where nothing may throw): its message, then the abort.
+void end_on_terminate() {
+	std::string what = "crashed: an error nobody caught";
+	if (auto e = std::current_exception()) {
+		try { std::rethrow_exception(e); }
+		catch (const std::exception& x) { what += ": "; what += x.what(); }
+		catch (...) {}
+	}
+	crash_write(what + "\n");
+	std::abort();
+}
+} // namespace
+
 #ifdef _WIN32
 namespace {
 LONG WINAPI end_on_exception(EXCEPTION_POINTERS* e) {
 	const DWORD code = e && e->ExceptionRecord ? e->ExceptionRecord->ExceptionCode : 1;
-	char b[96];
-	const int n = snprintf(b, sizeof b, "crashed: exception 0x%08lx\n", (unsigned long)code);
-	DWORD put;
-	WriteFile(GetStdHandle(STD_ERROR_HANDLE), b, (DWORD)n, &put, nullptr); // nothing that takes a lock: the crash may have happened while it was held
+	char b[160];
+	const int n = snprintf(b, sizeof b, code == 0xE06D7363 ? "crashed: exception 0x%08lx (a C++ error nobody caught)\n" : "crashed: exception 0x%08lx\n", (unsigned long)code);
+	crash_write(b, (size_t)n);
 	TerminateProcess(GetCurrentProcess(), (UINT)code);
 	return EXCEPTION_EXECUTE_HANDLER;
 }
 void end_on_abort(int) {
 	static const char msg[] = "crashed: abort\n";
-	DWORD put;
-	WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, sizeof msg - 1, &put, nullptr);
+	crash_write(msg, sizeof msg - 1);
 	TerminateProcess(GetCurrentProcess(), 3);
 }
 void end_on_bad_parameter(const wchar_t*, const wchar_t*, const wchar_t*, unsigned, uintptr_t) { end_on_abort(0); }
@@ -693,6 +720,12 @@ void end_on_bad_parameter(const wchar_t*, const wchar_t*, const wchar_t*, unsign
 #endif
 
 void end_crashes_at_once() {
+#ifdef _WIN32
+	DuplicateHandle(GetCurrentProcess(), GetStdHandle(STD_ERROR_HANDLE), GetCurrentProcess(), &crash_out, 0, FALSE, DUPLICATE_SAME_ACCESS); // not inherited
+#else
+	crash_out = fcntl(2, F_DUPFD_CLOEXEC, 3);
+#endif
+	std::set_terminate(end_on_terminate);
 #ifdef _WIN32
 	// No "has stopped working" box, no box for a missing drive or DLL; inherited by the processes this one starts.
 	SetErrorMode(GetErrorMode() | SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
