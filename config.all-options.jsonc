@@ -2,7 +2,7 @@
 // alone is about 10^11 runs, x265's 10^14), so enable an encoder only after cutting its options down to the ones you want to compare.
 //
 // Notes:
-//  - An option with a list of values is swept; [] ignores it. null is not a value (the preset's own is not known to ves); leave an option out to run without it.
+//  - An option with a list of values is swept; [] ignores it. null is not a value (the preset's own is not known to ves); leave an option out to run without it ("" counts as left out).
 //  - Every combination is encoded. Runs that end up with exactly the same stream (options that changed nothing) are merged in the ranking afterwards.
 //  - Names are snake_case. max_b_frames, lookahead_frames, max_ref_frames, b_reference_mode and rate_control are common: the same name and
 //    meaning on every encoder that supports them. The rest are each library's own, converted (aq-mode is aq_mode, NVENC's enableLTR is enable_ltr).
