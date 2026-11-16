@@ -2213,7 +2213,14 @@ int main(int argc, char** argv) {
 				}
 			}
 			Run& r = best->r;
-			if (!r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) upload_video(*best); // kept by an earlier sweep
+			// A stream an earlier sweep kept is used if it is the one that was scored; anything else there is encoded again.
+			bool kept = false;
+			if (!r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) {
+				kept = !r.video_sha256.empty() && sha256_file((fs::path(cfg.output_dir) / r.video).string()) == r.video_sha256;
+				if (kept) { ui::log("Best of its group  " + r.label + ": its stream from an earlier sweep is there (" + r.video + "), no new encode needed"); upload_video(*best); }
+				else { std::error_code ec; fs::remove(fs::path(cfg.output_dir) / r.video, ec); r.video.clear(); }
+			}
+			if (kept) {}
 			else if (r.result.empty()) {}
 			else if (r.video_sha256.empty()) ui::log("Best of its group  " + r.label + ": its result has no video_sha256, so a new encode cannot be checked against it; no video");
 			else if (!best->model.empty()) remote_winners.push_back(best); // a worker's GPU: a worker with it encodes it again
