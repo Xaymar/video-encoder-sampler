@@ -65,11 +65,15 @@ struct Shared {
 	VkQueue xqueue{};
 	uint32_t xfamily = 0;
 	bool has_x = false;
+	// A second compute queue (of the compute family), for work that runs beside the main queue's (begin2()); none if the family has too few
+	// queues, or VES_VMAF_NO_SECOND_COMPUTE is set.
+	VkQueue cqueue2{};
+	bool has_c2 = false;
 	VkPhysicalDeviceMemoryProperties mem{};
 	double timestamp_ns = 0; // nanoseconds per timestamp tick; 0 if the compute queue has no timestamps
 	VkDescriptorSetLayout dsl{};
 	VkPipelineLayout layout{};
-	std::mutex queue_lock, xqueue_lock, pipe_lock;
+	std::mutex queue_lock, xqueue_lock, cqueue2_lock, pipe_lock;
 	std::map<std::string, VkPipeline> pipelines;
 };
 
@@ -179,11 +183,14 @@ Shared* bring_up(int index, std::string& why) {
 				}
 			if (!s.has_x && qf[s.family].queueCount >= 2) { s.xfamily = s.family; s.has_x = true; }
 		}
-		float prio[2] = {1.0f, 1.0f};
+		const char* no_c2 = getenv("VES_VMAF_NO_SECOND_COMPUTE");
+		const uint32_t used = 1 + (s.has_x && s.xfamily == s.family ? 1 : 0);
+		if (!(no_c2 && atoi(no_c2) > 0) && qf[s.family].queueCount > used) s.has_c2 = true;
+		float prio[3] = {1.0f, 1.0f, 1.0f};
 		VkDeviceQueueCreateInfo qcis[2]{{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
 		uint32_t qcount = 1;
 		qcis[0].queueFamilyIndex = s.family;
-		qcis[0].queueCount = s.has_x && s.xfamily == s.family ? 2 : 1;
+		qcis[0].queueCount = used + (s.has_c2 ? 1 : 0);
 		qcis[0].pQueuePriorities = prio;
 		if (s.has_x && s.xfamily != s.family) {
 			qcis[1].queueFamilyIndex = s.xfamily;
@@ -201,6 +208,7 @@ Shared* bring_up(int index, std::string& why) {
 		chk(vkCreateDevice(s.phys, &dci, nullptr, &s.dev), "vkCreateDevice");
 		vkGetDeviceQueue(s.dev, s.family, 0, &s.queue);
 		if (s.has_x) vkGetDeviceQueue(s.dev, s.xfamily, s.xfamily == s.family ? 1 : 0, &s.xqueue);
+		if (s.has_c2) vkGetDeviceQueue(s.dev, s.family, used, &s.cqueue2);
 		VkDescriptorSetLayoutBinding b[kBindings];
 		for (int i = 0; i < kBindings; i++) b[i] = {(uint32_t)i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 		VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -235,10 +243,15 @@ struct Vk::Impl {
 		VkCommandBuffer xcmd{}; // copies on the second queue (upload_begin()), which the slot's next submit() waits for through xsem
 		VkSemaphore xsem{};
 		bool xpending = false;
+		VkCommandBuffer cmd2{}; // work on the second compute queue (begin2()), with its own fence, which wait() waits for as well
+		VkFence fence2{};
+		VkSemaphore xsem2{};    // the copies, for the second compute queue
+		bool xpending2 = false, pending2 = false;
 	};
 	VkCommandPool xpool{};
 	std::vector<Slot> slots;
-	VkCommandBuffer cmd{}; // the one being recorded (compute queue)
+	VkCommandBuffer cmd{}; // the one being recorded (either compute queue)
+	bool second = false;   // ... and it is the second one's
 	VkCommandBuffer xrec{}; // the one being recorded (second queue)
 	VkDescriptorPool dpool{};
 	std::vector<std::pair<VkBuffer, VkDeviceMemory>> owned;
@@ -284,6 +297,18 @@ Vk::Vk(int device, int slots) : impl(new Impl) {
 			chk(vkAllocateCommandBuffers(s.dev, &cai, &sl.cmd), "command buffer");
 			VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
 			chk(vkCreateFence(s.dev, &fi, nullptr, &sl.fence), "fence");
+			if (s.has_c2) {
+				VkCommandBufferAllocateInfo cai2{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+				cai2.commandPool = impl->pool;
+				cai2.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+				cai2.commandBufferCount = 1;
+				chk(vkAllocateCommandBuffers(s.dev, &cai2, &sl.cmd2), "command buffer (second queue)");
+				chk(vkCreateFence(s.dev, &fi, nullptr, &sl.fence2), "fence");
+				if (s.has_x) {
+					VkSemaphoreCreateInfo smi{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+					chk(vkCreateSemaphore(s.dev, &smi, nullptr, &sl.xsem2), "semaphore");
+				}
+			}
 			if (s.has_x) {
 				VkCommandBufferAllocateInfo xai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
 				xai.commandPool = impl->xpool;
@@ -315,6 +340,8 @@ void Vk::release() {
 		if (sl.fence) vkDestroyFence(s.dev, sl.fence, nullptr);
 		if (sl.stamps) vkDestroyQueryPool(s.dev, sl.stamps, nullptr);
 		if (sl.xsem) vkDestroySemaphore(s.dev, sl.xsem, nullptr);
+		if (sl.xsem2) vkDestroySemaphore(s.dev, sl.xsem2, nullptr);
+		if (sl.fence2) vkDestroyFence(s.dev, sl.fence2, nullptr);
 	}
 	if (impl->pool) vkDestroyCommandPool(s.dev, impl->pool, nullptr);
 	if (impl->xpool) vkDestroyCommandPool(s.dev, impl->xpool, nullptr);
@@ -430,6 +457,7 @@ Pipe Vk::pipeline(const char* name, const std::vector<Buf*>& bindings) {
 void Vk::begin(int slot) {
 	Impl::Slot& sl = impl->slots.at(slot);
 	impl->cmd = sl.cmd;
+	impl->second = false;
 	vkResetCommandBuffer(impl->cmd, 0);
 	VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -439,6 +467,7 @@ void Vk::begin(int slot) {
 
 void Vk::stamp(int slot, int which) {
 	Impl::Slot& sl = impl->slots.at(slot);
+	if (impl->second) return; // the stamps time the main queue's work only
 	// bottom of pipe: written once every command before it, in this submission and the ones before on the queue, is done
 	if (sl.stamps) vkCmdWriteTimestamp(impl->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.stamps, (uint32_t)which);
 }
@@ -481,20 +510,58 @@ void Vk::upload_copy(const Buf& src, const Buf& dst, VkDeviceSize size) {
 	vkCmdCopyBuffer(impl->xrec, src.buf, dst.buf, 1, &c);
 }
 
-void Vk::upload_submit(int slot) {
+void Vk::upload_submit(int slot, bool for_second) {
 	Shared& s = *impl->s;
 	Impl::Slot& sl = impl->slots.at(slot);
 	chk(vkEndCommandBuffer(sl.xcmd), "end (copies)");
 	VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
 	si.commandBufferCount = 1;
 	si.pCommandBuffers = &sl.xcmd;
-	si.signalSemaphoreCount = 1;
-	si.pSignalSemaphores = &sl.xsem;
+	const VkSemaphore sems[2] = {sl.xsem, sl.xsem2};
+	for_second = for_second && sl.xsem2;
+	si.signalSemaphoreCount = for_second ? 2 : 1;
+	si.pSignalSemaphores = sems;
 	{
 		std::lock_guard lock(s.xqueue_lock);
 		chk(vkQueueSubmit(s.xqueue, 1, &si, VK_NULL_HANDLE), "submit (copies)");
 	}
 	sl.xpending = true;
+	sl.xpending2 = for_second;
+}
+
+bool Vk::second_compute() const { return impl->s->has_c2; }
+
+void Vk::begin2(int slot) {
+	Impl::Slot& sl = impl->slots.at(slot);
+	impl->cmd = sl.cmd2;
+	impl->second = true;
+	vkResetCommandBuffer(impl->cmd, 0);
+	VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	chk(vkBeginCommandBuffer(impl->cmd, &bi), "begin (second queue)");
+}
+
+void Vk::submit2(int slot) {
+	Shared& s = *impl->s;
+	Impl::Slot& sl = impl->slots.at(slot);
+	chk(vkEndCommandBuffer(sl.cmd2), "end (second queue)");
+	VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+	si.commandBufferCount = 1;
+	si.pCommandBuffers = &sl.cmd2;
+	const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+	if (sl.xpending2) {
+		si.waitSemaphoreCount = 1;
+		si.pWaitSemaphores = &sl.xsem2;
+		si.pWaitDstStageMask = &wait_stage;
+		sl.xpending2 = false;
+	}
+	vkResetFences(s.dev, 1, &sl.fence2);
+	{
+		std::lock_guard lock(s.cqueue2_lock);
+		chk(vkQueueSubmit(s.cqueue2, 1, &si, sl.fence2), "submit (second queue)");
+	}
+	sl.pending2 = true;
+	impl->second = false;
 }
 
 void Vk::submit(int slot) {
@@ -519,7 +586,14 @@ void Vk::submit(int slot) {
 
 void Vk::memory(uint64_t& device_local, uint64_t& host) const { device_local = impl->device_bytes; host = impl->host_bytes; }
 
-void Vk::wait(int slot) { chk(vkWaitForFences(impl->s->dev, 1, &impl->slots.at(slot).fence, VK_TRUE, ~0ull), "wait"); }
+void Vk::wait(int slot) {
+	Impl::Slot& sl = impl->slots.at(slot);
+	chk(vkWaitForFences(impl->s->dev, 1, &sl.fence, VK_TRUE, ~0ull), "wait");
+	if (sl.pending2) {
+		chk(vkWaitForFences(impl->s->dev, 1, &sl.fence2, VK_TRUE, ~0ull), "wait (second queue)");
+		sl.pending2 = false;
+	}
+}
 
 double Vk::gpu_seconds(int slot, int from, int to) {
 	Impl::Slot& sl = impl->slots.at(slot);

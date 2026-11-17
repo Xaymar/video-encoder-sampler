@@ -599,6 +599,7 @@ public:
 		if (!au.empty()) init_adm();
 		if (cambi_on) init_cambi(f);
 		if (!su.empty()) init_speed(f);
+		speed2 = !su.empty() && vk.second_compute() && !part_timing;
 		uint64_t dev0, host0, dev1, host1;
 		vk.memory(dev0, host0);
 		init_slots();
@@ -648,7 +649,7 @@ public:
 			vk.upload_copy(sl.in_ref, sl.dev_ref);
 			vk.upload_copy(sl.in_dis, sl.dev_dis);
 			if (!su.empty()) for (int p = 0; p < 4; p++) vk.upload_copy(sl.in_chroma[p], sl.dev_chroma[p]);
-			vk.upload_submit(k);
+			vk.upload_submit(k, speed2);
 		}
 		record(k, index);
 		{
@@ -704,12 +705,12 @@ private:
 			vk.copy(sl.dev_ref, raw_ref);
 			vk.copy(sl.dev_dis, raw_dis);
 			if (motion) vk.copy(sl.dev_ref, mfr[cur]);
-			if (!su.empty()) for (int p = 0; p < 4; p++) vk.copy(sl.dev_chroma[p], sraw[p]);
+			if (!su.empty() && !speed2) for (int p = 0; p < 4; p++) vk.copy(sl.dev_chroma[p], sraw[p]);
 			vk.barrier();
 		} else { // from system memory, once each: motion's copy of the reference comes from VRAM
 			vk.copy(sl.in_ref, raw_ref);
 			vk.copy(sl.in_dis, raw_dis);
-			if (!su.empty()) for (int p = 0; p < 4; p++) vk.copy(sl.in_chroma[p], sraw[p]);
+			if (!su.empty() && !speed2) for (int p = 0; p < 4; p++) vk.copy(sl.in_chroma[p], sraw[p]);
 			vk.barrier();
 			if (motion) { vk.copy(raw_ref, mfr[cur]); vk.barrier(); }
 		}
@@ -795,6 +796,34 @@ private:
 		part_done(3);
 		if (cambi_on) record_cambi(sl);
 		part_done(4);
+		if (!su.empty() && !speed2) record_speed(part_done);
+		else {
+			part_done(5); // no SpEED here: its parts take no time
+			part_done(6);
+			part_done(7);
+		}
+		part_done(8);
+		// the sums the shaders wrote, into the slot's own buffers (CAMBI's are written there directly)
+		vk.barrier();
+		for (auto& [from, to] : sl.out) vk.copy(*from, to);
+		vk.barrier();
+		vk.stamp(slot, 1);
+		vk.submit(slot);
+		if (speed2) { // SpEED on the second compute queue: its frames in order there, its buffers its own
+			vk.begin2(slot);
+			vk.barrier();
+			for (int p = 0; p < 4; p++) vk.copy(vk.async_upload() ? sl.dev_chroma[p] : sl.in_chroma[p], sraw[p]);
+			vk.barrier();
+			record_speed([](int) {});
+			vk.barrier();
+			for (auto& [from, to] : sl.out2) vk.copy(*from, to);
+			vk.barrier();
+			vk.submit2(slot);
+		}
+	}
+
+	// SpEED's work for a frame (sraw holds its chroma planes): the decimation, then its statistics step by step, all units at each step.
+	template <class PartDone> void record_speed(PartDone part_done) {
 		for (auto& u : su) {
 			for (int p = 0; p < 4; p++) {
 				SpeedPC pc = u.spc;
@@ -804,7 +833,7 @@ private:
 				vk.dispatch((uint32_t)((u.spc.DW + 7) / 8), (uint32_t)((u.spc.DH + 7) / 8));
 			}
 		}
-		if (!su.empty()) { // the rest of SpEED, step by step, all units at each step
+		{ // the rest of SpEED, step by step, all units at each step
 			auto step = [&](Pipe SpeedUnit::*pipe, auto groups_x, uint32_t gy) {
 				vk.barrier();
 				for (auto& u : su) {
@@ -826,18 +855,7 @@ private:
 			part_done(7);
 			step(&SpeedUnit::sblocks, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.nb + 63) / 64); }, 4);
 			step(&SpeedUnit::sscore, one, 2);
-		} else {
-			part_done(5); // no SpEED: its parts take no time
-			part_done(6);
-			part_done(7);
 		}
-		part_done(8);
-		// the sums the shaders wrote, into the slot's own buffers (CAMBI's are written there directly)
-		vk.barrier();
-		for (auto& [from, to] : sl.out) vk.copy(*from, to);
-		vk.barrier();
-		vk.stamp(slot, 1);
-		vk.submit(slot);
 	}
 
 	// The features of the frame in a slot, for every model, from the sums the GPU left there.
@@ -959,6 +977,7 @@ private:
 		Buf ccval[5], cpart[5];
 		Pipe cp_cval[5];
 		std::vector<std::pair<const Buf*, Buf>> out; // the shared buffer the GPU wrote, the slot's copy
+		std::vector<std::pair<const Buf*, Buf>> out2; // the same for SpEED's, when it runs on the second compute queue
 		std::vector<Features> feats;
 		std::string error;
 		std::thread worker;
@@ -975,6 +994,9 @@ private:
 	bool part_timing = false;
 	// VES_SPEED_CHECK=1: SpEED is also worked out on the CPU (from the GPU's decimated planes, as before it all moved to the GPU) and compared
 	bool speed_check = false;
+	// SpEED on the device's second compute queue (Vk::second_compute()), beside the other features: its last steps are small and one after another, so
+	// on the main queue the GPU mostly waited on them. Not with VES_SCORE_TIMING, whose timestamps are on the main queue.
+	bool speed2 = false;
 	mutable std::mutex check_lock;
 	mutable struct { size_t values = 0, differ = 0, flags = 0; double largest = 0; } check;
 	const std::vector<Model>& ms;
@@ -1101,8 +1123,9 @@ private:
 					}
 			}
 			for (auto& u : su) {
-				sl.sfin.push_back(mirror(u.sfin));
-				if (speed_check) sl.sout.push_back(mirror(u.sout));
+				auto mirror2 = [&](const Buf& from) { Buf to = vk.buffer(from.size, 2); (speed2 ? sl.out2 : sl.out).emplace_back(&from, to); return to; };
+				sl.sfin.push_back(mirror2(u.sfin));
+				if (speed_check) sl.sout.push_back(mirror2(u.sout));
 			}
 			if (cambi_on) {
 				for (int s = 0; s < 5; s++) {

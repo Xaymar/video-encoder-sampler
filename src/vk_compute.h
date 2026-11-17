@@ -76,7 +76,13 @@ public:
 	bool async_upload() const;
 	void upload_begin(int slot);
 	void upload_copy(const Buf& src, const Buf& dst, VkDeviceSize size = 0);
-	void upload_submit(int slot);
+	void upload_submit(int slot, bool for_second = false); // for_second: the slot's next submit2() waits for these copies too
+	// A second compute queue (second_compute(): the device has one), for work that needs nothing from the main queue's and can run beside it:
+	// begin2() records the slot's work for it (with bind/push/dispatch/copy/barrier as usual; stamp() does nothing there), submit2() submits it, and
+	// wait() waits for it as well. Work on it runs in submission order only against itself.
+	bool second_compute() const;
+	void begin2(int slot);
+	void submit2(int slot);
 	void submit(int slot = 0);
 	void wait(int slot = 0); // until the slot's last submission is done
 	// GPU time between two of the slot's stamps (by default start and end) in its last finished submission; -1 if the device has no timestamps or
