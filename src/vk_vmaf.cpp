@@ -553,6 +553,14 @@ bool models_compatible(const std::vector<Model>& ms, std::string& why) {
 // in a slot of its own (the frames going in, the sums coming back, a command buffer and a fence). The GPU still works on one frame after the other: the
 // buffers in between are shared by the slots.
 constexpr int kSlots = 4;
+// VES_SCORE_TIMING's split of the GPU time: the parts of a frame's work in order, each between two timestamps (stamp 0 starts the first part,
+// stamps 2.. end the others, stamp 1 ends the last). Only recorded with VES_SCORE_TIMING (barriers keep the parts apart).
+const char* const kGpuParts[] = {"copy in", "motion", "VIF", "ADM", "CAMBI", "SpEED decimation", "SpEED covariances", "SpEED eigenvalues and QR",
+                                 "SpEED blocks and score", "copy out"};
+constexpr int kGpuPartCount = (int)(sizeof kGpuParts / sizeof kGpuParts[0]);
+static_assert(kGpuPartCount + 1 <= Vk::kStamps, "a timestamp per part");
+inline int part_stamp(int part) { return part == kGpuPartCount - 1 ? 1 : 2 + part; } // the stamp that ends `part`
+inline int part_start(int part) { return part == 0 ? 0 : 2 + part - 1; }
 constexpr int N_SPEED_PAIRS = 25 * 26 / 2; // covariances per SpEED plane (the matrix is symmetric)
 
 class VkVmaf {
@@ -563,6 +571,7 @@ public:
 		ysize = (size_t)W * H;
 		plane_bytes = ysize * bps;
 		if (const char* e = getenv("VES_SPEED_CHECK"); e && atoi(e) > 0) speed_check = true;
+		if (const char* e = getenv("VES_SCORE_TIMING"); e && atoi(e) > 0) part_timing = true;
 		raw_size = (plane_bytes + 3) / 4 * 4 + 4;
 		raw_ref = vk.buffer(raw_size, 1);
 		raw_dis = vk.buffer(raw_size, 1);
@@ -660,9 +669,11 @@ public:
 		std::lock_guard lock(mutex);
 		copy = t_copy; wait = t_wait; gpu = t_gpu; results = t_results;
 	}
-	void speed_timing(double parts[3]) {
+	void gpu_parts(std::vector<std::pair<std::string, double>>& parts) {
 		std::lock_guard lock(mutex);
-		for (int i = 0; i < 3; i++) parts[i] = t_speed[i];
+		parts.clear();
+		if (t_parts_frames == 0) return;
+		for (int i = 0; i < kGpuPartCount; i++) parts.emplace_back(kGpuParts[i], t_parts[i]);
 	}
 	// Memory: device local and other in all, and what each slot adds of that (frames in, sums out).
 	uint64_t mem_device = 0, mem_host = 0, mem_slot = 0;
@@ -675,6 +686,11 @@ private:
 		// The frames before on the queue (this scorer's other slots) are done with the shared buffers before this one writes them.
 		vk.barrier();
 		vk.stamp(slot, 0);
+		auto part_done = [&](int part) { // VES_SCORE_TIMING: the end of one part of the work
+			if (!part_timing) return;
+			vk.barrier();
+			vk.stamp(slot, part_stamp(part));
+		};
 		const int cur = (int)(index % 3);
 		const bool motion = need_stride[0] || need_stride[1];
 		vk.copy(sl.in_ref, raw_ref);
@@ -682,6 +698,7 @@ private:
 		if (motion) vk.copy(sl.in_ref, mfr[cur]);
 		if (!su.empty()) for (int p = 0; p < 4; p++) vk.copy(sl.in_chroma[p], sraw[p]);
 		vk.barrier();
+		part_done(0);
 		bool* with_motion = sl.with_motion;
 		with_motion[0] = with_motion[1] = false;
 		for (int k = 0; k < 2; k++) {
@@ -694,6 +711,7 @@ private:
 			vk.bind(my[k][prev][cur]); vk.dispatch(gx, gy); vk.barrier();
 			vk.bind(mx[k][prev][cur]); vk.dispatch(gx, gy); vk.barrier();
 		}
+		part_done(1);
 		auto groups = [](int a, int b) { return std::make_pair((uint32_t)((a + 15) / 16), (uint32_t)((b + 15) / 16)); };
 		if (!vif_egl.empty()) {
 			for (int s = 0; s < 4; s++) {
@@ -716,6 +734,7 @@ private:
 				}
 			}
 		}
+		part_done(2);
 		if (!au.empty()) {
 			for (int s = 0; s < 4; s++) {
 				// the wavelets and the denominator, once
@@ -758,7 +777,9 @@ private:
 				}
 			}
 		}
+		part_done(3);
 		if (cambi_on) record_cambi(sl);
+		part_done(4);
 		for (auto& u : su) {
 			for (int p = 0; p < 4; p++) {
 				SpeedPC pc = u.spc;
@@ -779,24 +800,23 @@ private:
 			};
 			auto pixels = [](const SpeedUnit& u) { return (uint32_t)((u.stpc.DW * u.stpc.DH + 63) / 64); };
 			auto one = [](const SpeedUnit&) { return 1u; };
-			// timestamps for VES_SCORE_TIMING's SpEED split: 2 before, 3 after the covariances, 4 after eigenvalues and QR, 5 after the rest
-			vk.barrier();
-			vk.stamp(slot, 2);
+			part_done(5);
 			step(&SpeedUnit::sblur_v, pixels, 4);
 			step(&SpeedUnit::sblur_h, pixels, 4);
 			step(&SpeedUnit::smean, one, 4);
 			step(&SpeedUnit::scenter, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.subw * u.stpc.subh + 63) / 64); }, 4);
 			step(&SpeedUnit::scov, [](const SpeedUnit&) { return (uint32_t)((N_SPEED_PAIRS + 31) / 32); }, 4);
-			vk.barrier();
-			vk.stamp(slot, 3);
+			part_done(6);
 			step(&SpeedUnit::ssmall_p, one, 4);
-			vk.barrier();
-			vk.stamp(slot, 4);
+			part_done(7);
 			step(&SpeedUnit::sblocks, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.nb + 63) / 64); }, 4);
 			step(&SpeedUnit::sscore, one, 2);
-			vk.barrier();
-			vk.stamp(slot, 5);
+		} else {
+			part_done(5); // no SpEED: its parts take no time
+			part_done(6);
+			part_done(7);
 		}
+		part_done(8);
 		// the sums the shaders wrote, into the slot's own buffers (CAMBI's are written there directly)
 		vk.barrier();
 		for (auto& [from, to] : sl.out) vk.copy(*from, to);
@@ -932,7 +952,9 @@ private:
 	bool stop = false;
 	std::vector<std::vector<Features>> feats; // collected, in frame order
 	double t_gpu = 0, t_results = 0;
-	double t_speed[3] = {0, 0, 0}; // SpEED's GPU time: blur and covariances, eigenvalues and QR, blocks and score
+	double t_parts[kGpuPartCount] = {}; // VES_SCORE_TIMING: GPU seconds per part of the work (kGpuParts), over t_parts_frames frames
+	long long t_parts_frames = 0;
+	bool part_timing = false;
 	// VES_SPEED_CHECK=1: SpEED is also worked out on the CPU (from the GPU's decimated planes, as before it all moved to the GPU) and compared
 	bool speed_check = false;
 	mutable std::mutex check_lock;
@@ -999,14 +1021,21 @@ private:
 			}
 			std::vector<Features> f;
 			std::string error;
-			double gpu = 0, res = 0, sp[3] = {-1, -1, -1};
+			double gpu = 0, res = 0, parts[kGpuPartCount];
+			bool parts_ok = false;
 			try {
 				const auto t0 = clock::now();
 				vk.wait(k);
 				const auto t1 = clock::now();
 				gpu = vk.gpu_seconds(k);
 				if (gpu < 0) gpu = std::chrono::duration<double>(t1 - t0).count(); // no timestamps: how long it was waited for
-				for (int i = 0; i < 3; i++) sp[i] = vk.gpu_seconds(k, 2 + i, 3 + i); // SpEED's parts (-1 without SpEED or timestamps)
+				if (part_timing) {
+					parts_ok = true;
+					for (int i = 0; i < kGpuPartCount; i++) {
+						parts[i] = vk.gpu_seconds(k, part_start(i), part_stamp(i));
+						if (parts[i] < 0) parts_ok = false;
+					}
+				}
 				f = results(sl);
 				res = std::chrono::duration<double>(clock::now() - t1).count();
 			} catch (const std::exception& e) {
@@ -1016,8 +1045,10 @@ private:
 			{
 				std::lock_guard lock(mutex);
 				t_gpu += gpu; t_results += res;
-				if (sp[0] >= 0 && sp[1] >= 0 && sp[2] >= 0)
-					for (int i = 0; i < 3; i++) t_speed[i] += sp[i];
+				if (parts_ok) {
+					for (int i = 0; i < kGpuPartCount; i++) t_parts[i] += parts[i];
+					t_parts_frames++;
+				}
 				sl.feats = std::move(f);
 				sl.error = std::move(error);
 				sl.state = Slot::Done;
@@ -1586,9 +1617,9 @@ void GpuVmaf::timing(double& copy, double& wait, double& gpu, double& results) c
 	if (impl->gpu) impl->gpu->timing(copy, wait, gpu, results);
 }
 
-void GpuVmaf::speed_timing(double parts[3]) const {
-	parts[0] = parts[1] = parts[2] = 0;
-	if (impl->gpu) impl->gpu->speed_timing(parts);
+void GpuVmaf::gpu_parts(std::vector<std::pair<std::string, double>>& parts) const {
+	parts.clear();
+	if (impl->gpu) impl->gpu->gpu_parts(parts);
 }
 
 void GpuVmaf::memory(uint64_t& device_local, uint64_t& host, uint64_t& per_frame, int& frames) const {
@@ -1673,7 +1704,7 @@ std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::vector<std::string>&, int, c
 bool GpuVmaf::add(const uint8_t* const[3], const size_t[3], const uint8_t* const[3], const size_t[3]) { return false; }
 bool GpuVmaf::finish(std::vector<std::vector<double>>&, std::vector<std::vector<std::map<std::string, double>>>*) { return false; }
 void GpuVmaf::timing(double& copy, double& wait, double& gpu, double& results) const { copy = wait = gpu = results = 0; }
-void GpuVmaf::speed_timing(double parts[3]) const { parts[0] = parts[1] = parts[2] = 0; }
+void GpuVmaf::gpu_parts(std::vector<std::pair<std::string, double>>& parts) const { parts.clear(); }
 void GpuVmaf::memory(uint64_t& device_local, uint64_t& host, uint64_t& per_frame, int& frames) const { device_local = host = per_frame = 0; frames = 0; }
 
 #endif
