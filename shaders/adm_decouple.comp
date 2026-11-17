@@ -22,12 +22,17 @@ float to_float(int64_t v) {
 }
 
 // The restored value for one band, from the reference value o and the distorted value t.
+// The products here are taken as unsigned magnitudes and their sign: on AMD's RDNA 3 Windows driver (LLPC, 26.10.1) the signed 64-bit product of
+// two negative values in the scale 0 path came out wrong (k 0 where the reference and distorted values were both negative), which put ADM's
+// scale 0 numerator 1.4-3.9% low. A negative product gives k <= 0, clamped to 0, so only positive products need the division.
 int restore(int o, int t, bool angle_flag) {
 	int64_t k;
-	if (pc.scale == 0) {
-		k = o == 0 ? 32768l : ((int64_t(div_lookup[o + 32768]) * int64_t(t) + 16384l) >> 15);
-	} else if (o == 0) {
+	if (o == 0) {
 		k = 32768l;
+	} else if (pc.scale == 0) {
+		const int dl = div_lookup[o + 32768];
+		if ((dl < 0) != (t < 0) || t == 0) k = 0l;
+		else k = int64_t((uint64_t(uint(abs(dl))) * uint64_t(uint(abs(t))) + 16384ul) >> 15);
 	} else {
 		const uint a = uint(abs(o));
 		int shift = 0;
@@ -36,11 +41,14 @@ int restore(int o, int t, bool angle_flag) {
 			shift = findMSB(a) - 14;                       // 17 - clz
 			msb = (a + (1u << uint(shift - 1))) >> uint(shift);
 		}
-		const int64_t sign = o < 0 ? -1l : 1l;
-		k = ((int64_t(div_lookup[int(msb) + 32768]) * int64_t(t)) * sign + (1l << (14 + shift))) >> (15 + shift);
+		const int dl = div_lookup[int(msb) + 32768];   // msb > 0: dl > 0
+		if ((o < 0) != (t < 0) || t == 0) k = 0l;
+		else k = int64_t((uint64_t(uint(dl)) * uint64_t(uint(abs(t))) + (1ul << uint(14 + shift))) >> uint(15 + shift));
 	}
-	k = k < 0l ? 0l : (k > 32768l ? 32768l : k);
-	int rst = int(((k * int64_t(o)) + 16384l) >> 15);
+	k = k > 32768l ? 32768l : k;
+	// (k o + 16384) >> 15, rounding down as an arithmetic shift does, from the magnitude
+	const uint64_t ko = uint64_t(k) * uint64_t(uint(abs(o)));
+	int rst = o >= 0 ? int((ko + 16384ul) >> 15) : -int((ko + 16383ul) >> 15);
 	if (pc.scale == 0) rst = sext16(rst);
 	const float rst_f = (float(k) / 32768.0) * (float(o) / 64.0);
 	if (angle_flag && rst_f != 0.0) {
