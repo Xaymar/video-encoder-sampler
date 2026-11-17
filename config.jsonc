@@ -94,6 +94,8 @@
 	//   "url": "https://ves.example.com",
 	//   "key": "ves_...",    // from the website's account page; or leave it out and set the VES_API_KEY environment variable
 	//   "videos": true,      // false: upload the results but not the encoded videos
+	//   "skip_known": true,  // before running, ask the site which runs it has (anyone's, same key: options, GPU and driver, library versions, models) and
+	//                        // download their results instead of running them (--no-skip-known runs everything)
 	// },
 
 	// ---- Settings: caching, saved streams, decoding and memory ------------------------------------------------------------

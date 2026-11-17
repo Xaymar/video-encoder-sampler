@@ -2,6 +2,7 @@
 // Uploads results (and their encoded videos) to the VES website, see docs/api.md of that project: GET /api/v1/me, POST /api/v1/check and
 // POST /api/v1/upload in chunks. Nothing here stops a sweep: whatever cannot be uploaded is reported and left for the next run.
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -10,6 +11,7 @@ struct UploadOptions {
 	std::string url;     // the site's address, e.g. https://ves.example.com
 	std::string key;     // the API key (ves_...), from the account page
 	bool videos = true;  // also upload the encoded videos where the site allows it
+	bool skip_known = true; // before running, ask the site which runs it has (by anyone, same key) and take their results from it instead
 };
 
 struct UploadItem {
@@ -30,6 +32,12 @@ public:
 	~Uploader(); // waits like finish()
 	void add(UploadItem item);
 	void finish(); // waits until everything added is sent or given up on, and says how it went
+
+	// Which of these runs the site has stored, by anyone (POST /api/v1/known, in batches): SHA-256 of a run's key -> the run's uuid on the site. Waits until
+	// the sign-in is through. Empty when the site cannot be asked (not signed in, an older site, a failure, which is logged).
+	std::map<std::string, std::string> known(const std::vector<std::string>& key_sha256);
+	// Downloads the result file of a run on the site (GET /api/v1/run/<uuid>/result) to `file`, written whole or not at all. Callable from several threads.
+	bool fetch_result(const std::string& uuid, const std::string& file, std::string& why);
 
 private:
 	struct Impl;

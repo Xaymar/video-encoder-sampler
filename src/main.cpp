@@ -129,6 +129,7 @@ struct Run {
 	VmafDetail detail;          // the extra models' scores and the chroma values
 	bool cached = false;    // taken from the result cache instead of being run
 	bool uploaded = false;  // handed to the uploader when the worker sent it
+	bool from_site = false; // its result was downloaded from the site (another machine or user ran it), not run here
 	bool imported = false;  // its result came from a worker: written again with this sweep's details (the input's name and URL are the host's, not the worker's copy)
 	std::vector<std::string> identical; // labels of the runs that produced exactly the same stream (left out of the ranking, see below)
 	std::string group;      // what runs must share for identical output to mean identical scores
@@ -543,6 +544,7 @@ static void load_config_json(const Json& root, Config& cfg) {
 		if (auto* x = u->find("url")) cfg.upload.url = x->text();
 		if (auto* x = u->find("key")) cfg.upload.key = x->text();
 		if (auto* x = u->find("videos")) cfg.upload.videos = !(x->text() == "0" || x->text() == "false");
+		if (auto* x = u->find("skip_known")) cfg.upload.skip_known = !(x->text() == "0" || x->text() == "false");
 	}
 	if (auto* v = setting("videos")) {
 		cfg.save_videos = !(v->text() == "0" || v->text() == "false");
@@ -647,6 +649,7 @@ Paths
         --upload <url>      after the sweep, upload the results (and videos) to this VES website, e.g. https://ves.example.com ("off" disables it)
         --upload-key <key>  the API key from the website's account page; better in the config ("upload": {"key": ...}) or the VES_API_KEY environment variable
         --no-upload-videos  upload the results but not the encoded videos
+        --no-skip-known     run everything, also runs the site already has (by default those are skipped and their results downloaded)
         --hw-decode <auto|off|name>  decode the sources on the GPU when their first frames match a software decode exactly (default: auto);
                             a name is a device type (cuda, d3d11va, d3d12va, dxva2, qsv, amf, vaapi, vulkan) or a hardware decoder (hevc_cuvid, h264_qsv, ...)
         --decode-gpu <auto|own|n|name>  the GPU the sources are decoded on (default: auto, the fastest GPU: discrete first, then the most VRAM); own: the GPU
@@ -766,7 +769,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	std::optional<int> threads;
 	std::optional<double> penalty;
 	std::optional<std::string> vmaf_device, vmaf_gpu;
-	bool videos = true, all_videos = false, upload_videos = true, quick = false, upscale = false;
+	bool videos = true, all_videos = false, upload_videos = true, skip_known = true, quick = false, upscale = false;
 	std::set<std::string> only_lines; // --only-runs
 	bool short_names = false;
 	bool only_set = false;
@@ -792,6 +795,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--upload") upload_url = value();
 		else if (a == "--upload-key") upload_key = value();
 		else if (a == "--no-upload-videos") upload_videos = false;
+		else if (a == "--no-skip-known") skip_known = false;
 		else if (a == "--plain") cfg.plain = true;
 		else if (a == "--log") log_path = value();
 		else if (a == "--low-memory") cfg.low_memory = true;
@@ -866,6 +870,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	if (upload_url) cfg.upload.url = *upload_url == "off" ? "" : *upload_url;
 	if (upload_key) cfg.upload.key = *upload_key;
 	cfg.upload.videos = cfg.upload.videos && upload_videos;
+	cfg.upload.skip_known = cfg.upload.skip_known && skip_known;
 	if (cache) cfg.cache_dir = *cache == "off" ? "" : *cache;
 	if (log_path) cfg.log_file = *log_path == "off" ? "" : *log_path;
 	if (model) set_models(cfg.vo, *model);
@@ -1774,7 +1779,7 @@ static int run(int argc, char** argv) {
 		// Only the stream of the group's winner stays, decided when the group is complete (see `finish`).
 		if (cfg.best_videos) group_ok[r.group].push_back(&t);
 		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf rwm %.3f mean %.3f min %.3f p5 %.3f%s%s%s%s  [wave %.1fs: encoder busy %.1f, starved %.1f; decoder backed up %.1f; scorer starved %.1f]", r.tag.c_str(), r.label.c_str(), r.kbps,
-		         fs_.rwm, fs_.mean, fs_.min, fs_.p5, rel, r.cached ? " (cached)" : "",
+		         fs_.rwm, fs_.mean, fs_.min, fs_.p5, rel, r.from_site ? " (from the site)" : r.cached ? " (cached)" : "",
 		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.enc_busy_s, r.enc_starved_s, r.decode_blocked_s, r.score_starved_s);
 		ui::log(line);
 	};
@@ -1924,6 +1929,55 @@ static int run(int argc, char** argv) {
 		}
 	};
 
+	// Runs the site has already (anyone ran them, here or on another machine, with the very same key: input, encoder and options, GPU and driver, library
+	// versions, scoring models) are not run again: before runs are settled, the site is asked for their keys, a batch at a time, and the result files of
+	// those it has are downloaded into the output folder, where settle() finds them like the results of an earlier sweep (and the next sweep finds them there
+	// without asking). They are not uploaded again. Their streams are not here; with "videos": "best" a winner among them is encoded again as usual.
+	int site_hits = 0, site_failed = 0;
+	auto site_prefetch = [&](const std::vector<size_t>& idx) {
+		if (!uploader || !cfg.upload.skip_known || cfg.output_dir.empty()) return;
+		std::vector<size_t> ask;
+		std::vector<std::string> hashes;
+		for (size_t i : idx) {
+			Task& t = tasks[i];
+			if (t.done || t.result_file.empty() || result_listed(t.result_file)) continue;
+			ask.push_back(i);
+			hashes.push_back(sha256_bytes(t.key()));
+		}
+		if (ask.empty()) return;
+		const auto known = uploader->known(hashes);
+		if (known.empty()) return;
+		std::vector<std::pair<size_t, std::string>> get; // run, uuid
+		for (size_t k = 0; k < ask.size(); k++) if (auto it = known.find(hashes[k]); it != known.end()) get.push_back({ask[k], it->second});
+		ui::log("Site: " + std::to_string(get.size()) + " of " + std::to_string(ask.size()) + " runs are on the site already; their results are downloaded instead of running them");
+		std::atomic<size_t> next{0};
+		std::vector<char> ok(get.size(), 0);
+		std::mutex log_m;
+		auto work = [&] {
+			for (size_t g; (g = next++) < get.size();) {
+				Task& t = tasks[get[g].first];
+				std::string why;
+				CachedRun check;
+				if (!uploader->fetch_result(get[g].second, t.result_file, why)) {}
+				else if (!result_load(t.result_file, t.key(), check)) { why = "the file is not this run's result, or lacks the distorted score"; std::error_code ec; fs::remove(t.result_file, ec); }
+				else { ok[g] = 1; continue; }
+				std::lock_guard lock(log_m);
+				ui::log("Site " + t.r.label + ": its result on the site cannot be used (" + why + "); it is run here");
+			}
+		};
+		std::vector<std::thread> threads;
+		for (int n = 0; n < 8 && (size_t)n < get.size(); n++) threads.emplace_back(work);
+		for (auto& th : threads) th.join();
+		for (size_t g = 0; g < get.size(); g++) {
+			if (!ok[g]) { site_failed++; continue; }
+			Task& t = tasks[get[g].first];
+			auto [dir, name] = split_file(t.result_file);
+			if (auto it = result_dirs.find(dir); it != result_dirs.end()) it->second.insert(name);
+			t.r.from_site = t.r.uploaded = true;
+			site_hits++;
+		}
+	};
+
 	// Whatever cannot work, or was done before, is finished right away. The rest is sorted by the frames it needs: runs with the
 	// same input, resolution, frame rate and pixel format share one decode.
 	std::map<std::string, std::vector<size_t>> uncached; // by input: the runs that have to be done, planned when their input comes up
@@ -1959,6 +2013,11 @@ static int run(int argc, char** argv) {
 		}
 		return false;
 	};
+	{
+		std::vector<size_t> all(tasks.size());
+		for (size_t i = 0; i < all.size(); i++) all[i] = i;
+		site_prefetch(all);
+	}
 	for (size_t i = 0; i < tasks.size(); i++) if (!settle(i)) {
 		const std::string& in = tasks[i].r.input;
 		if (!uncached.count(in)) input_order.push_back(in);
@@ -2062,7 +2121,7 @@ static int run(int argc, char** argv) {
 			const size_t at = tasks.size();
 			if (!g.make(lazy_variant(*g.lt, *g.job, c, g.model), &g, c)) { g.status[c] = 2; continue; }
 			total = (int)tasks.size();
-			if (!settle(at)) added.push_back(at);
+			added.push_back(at); // settled by the caller, after the site was asked about the whole layer
 		}
 		return true;
 	};
@@ -2090,6 +2149,9 @@ static int run(int argc, char** argv) {
 		const size_t first = tasks.size();
 		create_input_tasks(input_name);
 		total = (int)tasks.size();
+		std::vector<size_t> made;
+		for (size_t i = first; i < tasks.size(); i++) made.push_back(i);
+		site_prefetch(made);
 		for (size_t i = first; i < tasks.size(); i++) {
 			if (!settle(i)) uncached[input_name].push_back(i);
 		}
@@ -2304,7 +2366,10 @@ static int run(int argc, char** argv) {
 		todo.clear();
 		for (bool progress = true; progress && todo.empty();) {
 			progress = false;
-			for (LazyGroup* g : lazy_of_input[input_name]) progress |= advance(*g, todo);
+			std::vector<size_t> made;
+			for (LazyGroup* g : lazy_of_input[input_name]) progress |= advance(*g, made);
+			site_prefetch(made);
+			for (size_t at : made) if (!settle(at)) todo.push_back(at);
 		}
 		if (todo.empty()) break;
 	}
@@ -2374,6 +2439,7 @@ static int run(int argc, char** argv) {
 	}
 	{ std::error_code ec; fs::remove_all(spool_dir, ec); }
 	stop_encoder_processes();
+	if (site_hits || site_failed) ui::log("Site: " + std::to_string(site_hits) + " runs were not run here, their results came from the site" + (site_failed ? " (" + std::to_string(site_failed) + " could not be downloaded and were run)" : ""));
 	if (uploader) uploader->finish(); // the live display stays up while the last uploads go out
 	ui::stop();
 
