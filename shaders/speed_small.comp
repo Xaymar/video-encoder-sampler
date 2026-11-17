@@ -44,14 +44,14 @@ void givens(float a, float b, out float c, out float s) {
 	else if (abs(b) > abs(a)) {
 		const float t = fdiv(-a, b);
 		precise float q = 1.0 + t * t;
-		const float s1 = rf(ddiv(1.0LF, dsqrt(double(q))));
+		const float s1 = rsqrt_f(q);
 		s = s1;
 		precise float cc = s1 * t;
 		c = cc;
 	} else {
 		const float t = fdiv(-b, a);
 		precise float q = 1.0 + t * t;
-		const float c1 = rf(ddiv(1.0LF, dsqrt(double(q))));
+		const float c1 = rsqrt_f(q);
 		c = c1;
 		precise float ss = c1 * t;
 		s = ss;
