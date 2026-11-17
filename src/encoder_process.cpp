@@ -537,7 +537,6 @@ struct Device {
 std::mutex abandoned_m;
 std::vector<std::shared_ptr<Device>>* abandoned = new std::vector<std::shared_ptr<Device>>; // never freed: their threads may still use them
 std::atomic<size_t> abandoned_count{0};
-size_t abandoned_encoder_processes() { return abandoned_count.load(); }
 void Device::abandon() {
 	if (!abandoned) { abandoned = true; abandoned_count++; }
 	if (reader.joinable()) reader.detach();
@@ -1037,6 +1036,8 @@ void run_wave_here(uint32_t id, const std::string& body) {
 
 
 } // namespace
+
+size_t abandoned_encoder_processes() { return abandoned_count.load(); }
 
 void set_isolated_encoders(bool on) { isolation = on; }
 bool isolated_encoders() { return isolation; }
