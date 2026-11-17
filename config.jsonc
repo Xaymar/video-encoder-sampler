@@ -160,6 +160,18 @@
 			// "parallel": 2,                // runs of this pool in one wave (default 2 for GPU encoders, 1 for the CPU ones)
 			// "fixed": ["preset"],          // options of this encoder that are never pruned
 			// "prune": false,               // this encoder only: run every combination
+			// Rules between options: a combination where one fails is never made (not run, not counted, not retried). A rule is an expression that must
+			// hold, or { "if": ..., "then": ..., "else": ... } ("then"/"else": an expression, a rule, or a list of them). Expressions take option names,
+			// numbers, 'words' in single quotes, true/false, ( ), and or not (&& || !), == != < <= > >=, x in [...], x not in [...], + - * / %,
+			// set(name) (the combination sets it itself), min(), max(), abs(), floor(), ceil(). An unset option reads as its preset/tune default where ves can
+			// ask the encoder (not for a distributed host's worker GPUs); what is not known leaves the rule undecided, and an undecided rule drops nothing.
+			// Write a minus between names with spaces ("a - b"): "b-adapt" is one name.
+			// "rules": [
+			// 	// NVENC: B-frames as references need a DPB of at least 3, and "each" at least as many as there are B-frames
+			// 	{ "if": "b_reference_mode in ['middle', 'each'] and set(max_ref_frames)", "then": "max_ref_frames >= 3" },
+			// 	{ "if": "b_reference_mode == 'each' and set(max_ref_frames)", "then": "max_ref_frames >= max_b_frames" },
+			// 	"lookahead_frames <= 8 * max(max_b_frames, 1)",
+			// ],
 		},
 		{
 			"enabled": false,
