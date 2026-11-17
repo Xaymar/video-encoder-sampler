@@ -1,0 +1,14 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 64) in;
+#include "speed_common.glsl"
+// speed.c's 3x3 blur (vif_filter1d_s), the vertical pass: tmp = sum over fi of f[fi] * plane[mirror(i - fw / 2 + fi)][j], in the order of fi.
+int mirror(int i, int n) { return i < 0 ? -i : (i >= n ? 2 * n - i - 2 : i); }
+void main() {
+	const int n = pc.DW * pc.DH, k = int(gl_GlobalInvocationID.x), p = int(gl_WorkGroupID.y);
+	if (k >= n) return;
+	const int i = k / pc.DW, j = k % pc.DW, base = p * n;
+	precise float acc = 0.0;
+	for (int fi = 0; fi < pc.fw; fi++) acc += filt[fi] * dec[base + mirror(i - pc.fw / 2 + fi, pc.DH) * pc.DW + j];
+	tmpv[base + k] = acc;
+}

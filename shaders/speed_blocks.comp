@@ -1,0 +1,46 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 64) in;
+#include "speed_common.glsl"
+// One invocation per 5x5 block of a plane: the rest of est_params(). Its column of the independent term, Q times it, back substitution with R
+// (zeros if the matrix cannot be inverted), the pointwise product divided by 25, its sum (the variance) and the entropy over the eigenvalues.
+void main() {
+	const int b = int(gl_GlobalInvocationID.x), p = int(gl_WorkGroupID.y);
+	if (b >= pc.nb) return;
+	const int in0 = p * SMALL, base = p * pc.DW * pc.DH;
+	const int bi = b / pc.nbh, bj = b % pc.nbh;
+	float y[N], tr[N], xs[N];
+	for (int r = 0; r < N; r++) y[r] = prep[base + (5 * bi + r / 5) * pc.DW + 5 * bj + r % 5];
+	const bool bad = small[in0 + 2 * N * N + N] != 0.0;
+	if (bad) {
+		for (int i = 0; i < N; i++) xs[i] = 0.0;
+	} else {
+		for (int i = 0; i < N; i++) {
+			precise float acc = 0.0;
+			for (int k = 0; k < N; k++) acc += small[in0 + i * N + k] * y[k];
+			tr[i] = acc;
+		}
+		for (int i = N - 1; i >= 0; i--) {
+			precise float it = tr[i];
+			for (int k = i + 1; k < N; k++) it -= xs[k] * small[in0 + N * N + i * N + k];
+			xs[i] = fdiv(it, small[in0 + N * N + i * N + i]);
+		}
+	}
+	precise float sum = 0.0;
+	for (int i = 0; i < N; i++) {
+		precise float prod = xs[i] * y[i];
+		const float z = fdiv(prod, 25.0);
+		if (i == 0) sum = z; else sum += z;
+	}
+	float ent = 0.0;
+	for (int k = 0; k < N; k++) {
+		const float e = small[in0 + 2 * N * N + k];
+		const float L = e < 0.0 ? 0.0 : e;
+		precise float a = L * sum + pc.sigma_nn;
+		precise double term = log2d(double(a)) + pc.log2_2pie;
+		precise double acc = double(ent) + term;
+		ent = rf(acc);
+	}
+	blk[p * 2 * pc.nb + b] = ent;
+	blk[p * 2 * pc.nb + pc.nb + b] = sum;
+}

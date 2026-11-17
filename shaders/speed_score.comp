@@ -1,0 +1,36 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 1) in;
+#include "speed_common.glsl"
+// One workgroup per chroma plane (q: reference plane q, decoded plane q + 2): get_speed_score() over the blocks, one after another as on the CPU,
+// and what the scorer makes of a matrix that could not be inverted (one of the two: 0).
+void main() {
+	const int q = int(gl_WorkGroupID.y), r0 = q * 2 * pc.nb, d0 = (q + 2) * 2 * pc.nb;
+	const bool err_ref = small[q * SMALL + 2 * N * N + N] != 0.0, err_dis = small[(q + 2) * SMALL + 2 * N * N + N] != 0.0;
+	precise float score = 0.0;
+	for (int i = 0; i < pc.nb; i++) {
+		const float re = blk[r0 + i], de = blk[d0 + i], rv = blk[r0 + pc.nb + i], dv = blk[d0 + pc.nb + i];
+		if (re < pc.base_entropy && de < pc.base_entropy) {
+			score += 0.0;
+		} else {
+			precise float one_r = 1.0 + rv, one_d = 1.0 + dv;
+			precise float rd = rv + dv;
+			double lr, ld;
+			if (pc.mode == 0) { lr = log2d(double(one_r)); ld = log2d(double(one_d)); }
+			else if (pc.mode == 1) { lr = log2d(double(one_r)); ld = lr; }
+			else if (pc.mode == 2) { lr = log2d(double(one_d)); ld = lr; }
+			else if (pc.mode == 3) { precise double m = 1.0LF + double(rd) * 0.5LF; lr = log2d(m); ld = lr; }
+			else if (pc.mode == 4) { precise double m = 1.0LF + double(rd) * 0.5LF; lr = log2d(double(one_r)); ld = log2d(m); }
+			else if (pc.mode == 5) { precise double m = 1.0LF + (0.75LF * double(rv) + 0.25LF * double(dv)); lr = log2d(double(one_r)); ld = log2d(m); }
+			else { precise double m = 1.0LF + (0.25LF * double(rv) + 0.75LF * double(dv)); lr = log2d(double(one_r)); ld = log2d(m); }
+			precise double sr = double(re) * lr, sdd = double(de) * ld;
+			const float spatial_ref = rf(sr), spatial_dis = rf(sdd);
+			precise float diff = spatial_ref - spatial_dis;
+			score += abs(diff);
+		}
+	}
+	float res = fdiv(score, float(pc.nb));
+	if (err_ref != err_dis) res = 0.0;
+	fin[q * 2] = res;
+	fin[q * 2 + 1] = (err_ref || err_dis) ? 1.0 : 0.0;
+}
