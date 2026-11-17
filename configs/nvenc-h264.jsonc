@@ -40,15 +40,15 @@
 				"spatial_aq": [0, "auto"],   // 0 off, auto: the driver picks the strength per frame; a fixed strength 1..15 [H aqStrength] is always worse (user's tests)
 				"temporal_aq": [0, 1],
 				"strict_gop_target": [0, 1],
-				"zero_reorder_delay": [0, 1],   // no reordering: no B-frames, no temporal filter [H]
-				"enable_non_ref_p": [0, 1],
+				"zero_reorder_delay": [0],   // only allowed without B-frames, and there it changed nothing [T 2026-11-17, RTX 4080 SUPER]
+				"enable_non_ref_p": [0],   // only allowed without B-frames, and there it changed nothing [T 2026-11-17, RTX 4080 SUPER]
 				"enable_weighted_prediction": [0, 1],   // not with B-frames [H][G 8.7]
 				"low_delay_key_frame_scale": ["", 1, 2, 4, 8, 16],   // I- to P-frame bits with CBR and a single-frame VBV, which only ll and ull use; 2 for ll and 1 for ull by default, no range given [H]
 				"mv_precision": [0, 1, 2, 3],   // 0 default (quarter pel), 1 full, 2 half, 3 quarter
 				"b_reference_mode": ["none", "middle", "each", "hierarchical"],
 				// "hierarchical_b_frames": [0, 1],   // H.264's older flag for what b_reference_mode "hierarchical" does (same requirements [T])
 				"hierarchical_p_frames": [0, 1],
-				"bdirect_mode": [0, 1, 2, 3],   // 0 auto, 1 off, 2 temporal, 3 spatial: B-frames only
+				"bdirect_mode": [0, 1, 3],   // 0 auto, 1 off, 2 temporal, 3 spatial: B-frames only; 2 made the same stream as 0 every time [T 2026-11-17]
 				"max_ref_frames": ["", 1, 2, 3, 4, 6, 8, 16],   // "": the driver's DPB size
 				"max_ref_frames_l0": [0, 1, 2, 3, 4, 7],   // 0 auto, 1..7 [H NV_ENC_NUM_REF_FRAMES]
 				"max_ref_frames_l1": [0, 1, 2, 3],   // 0 auto, 1..7: the backward list, B-frames only
@@ -166,6 +166,26 @@
 						{ "op": "==", "left": { "option": "zero_reorder_delay" }, "right": 0 },
 						{ "op": "==", "left": { "option": "hierarchical_p_frames" }, "right": 0 },   // initialize fails with status 8 (invalid parameter) [T 2026-11-17, RTX 4080 SUPER]
 					],
+				},
+
+				// Found with --check [T 2026-11-17, RTX 4080 SUPER], 1 s of 1080p60 CBR at p4 (configs/check/nvenc-h264-bframes.jsonc):
+				// - hierarchical P-frames drop the B-frames: B-frame count, B reference mode and direct mode made the same stream as none at all.
+				// - the direct mode only changed anything while B-frames are not references (b_reference_mode "none").
+				// - long-term references with a DPB of 1 made the same stream as none; the DPB needs room for them and a short-term reference.
+				{
+					"if": { "op": "==", "left": { "option": "hierarchical_p_frames" }, "right": 1 },
+					"require": { "op": "==", "left": { "option": "max_b_frames" }, "right": 0 },
+				},
+				{
+					"if": { "op": "!=", "left": { "option": "bdirect_mode" }, "right": 0 },
+					"require": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "none" },
+				},
+				{
+					"if": { "op": "and", "args": [
+						{ "op": ">", "left": { "option": "num_ltr_frames" }, "right": 0 },
+						{ "set": "max_ref_frames" },
+					] },
+					"require": { "op": ">", "left": { "option": "max_ref_frames" }, "right": { "option": "num_ltr_frames" } },
 				},
 			],
 		},
