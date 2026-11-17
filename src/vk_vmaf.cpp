@@ -575,6 +575,7 @@ public:
 		plane_bytes = ysize * bps;
 		if (const char* e = getenv("VES_SPEED_CHECK"); e && atoi(e) > 0) speed_check = true;
 		if (const char* e = getenv("VES_SCORE_TIMING"); e && atoi(e) > 0) part_timing = true;
+		if (const char* e = getenv("VES_ADM_DUMP"); e && *e) adm_dump = e;
 		raw_size = (plane_bytes + 3) / 4 * 4 + 4;
 		raw_ref = vk.buffer(raw_size, 1);
 		raw_dis = vk.buffer(raw_size, 1);
@@ -795,6 +796,14 @@ private:
 					}
 				}
 			}
+		}
+		if (!adm_dump.empty() && !au.empty() && index == 1) {
+			vk.barrier();
+			const VkDeviceSize nc = acur[0].size - 16, nm = au[0].cm[0].size - 16, nd = aden[0].size - 16;
+			if (!adump.buf) adump = vk.buffer(nc + nm + nd + 16, 2);
+			vk.copy_range(acur[0], 0, adump, 0, nc);
+			vk.copy_range(au[0].cm[0], 0, adump, nc, nm);
+			vk.copy_range(aden[0], 0, adump, nc + nm, nd);
 		}
 		part_done(3);
 		if (cambi_on) record_cambi(sl);
@@ -1024,7 +1033,10 @@ private:
 	// adm
 	int sw[4], sh[4], bw[4], bh[4];
 	std::vector<AdmUnit> au;
-	Buf acur[4], acopy[4], aden[4], atmp, adiv; // acopy: the bands the units after the first work on, one after another
+	Buf acur[4], acopy[4], aden[4], atmp, adiv;
+	// VES_ADM_DUMP=<file>: frame 1's ADM bands and sums of scale 0 (acur[0], unit 0's cm, aden) written to that file, for comparing GPUs
+	std::string adm_dump;
+	Buf adump; // acopy: the bands the units after the first work on, one after another
 	Pipe adwt_v[4], adwt_h[4], aden_p[4];
 	// cambi
 	bool cambi_on = false;
@@ -1078,6 +1090,14 @@ private:
 					for (int i = 0; i < kGpuPartCount; i++) {
 						parts[i] = vk.gpu_seconds(k, part_start(i), part_stamp(i));
 						if (parts[i] < 0) parts_ok = false;
+					}
+				}
+				if (!adm_dump.empty() && adump.buf && sl.index == 1) {
+					if (FILE* o = fopen(adm_dump.c_str(), "wb")) {
+						const int32_t hdr[4] = {bw[0], bh[0], 20, (int)au[0].cm[0].size - 16};
+						fwrite(hdr, sizeof hdr, 1, o);
+						fwrite(adump.map, 1, adump.size - 16, o);
+						fclose(o);
 					}
 				}
 				f = results(sl);

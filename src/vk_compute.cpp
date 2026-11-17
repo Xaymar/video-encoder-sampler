@@ -477,6 +477,11 @@ void Vk::copy(const Buf& src, const Buf& dst, VkDeviceSize size) {
 	vkCmdCopyBuffer(impl->cmd, src.buf, dst.buf, 1, &c);
 }
 
+void Vk::copy_range(const Buf& src, VkDeviceSize src_off, const Buf& dst, VkDeviceSize dst_off, VkDeviceSize size) {
+	VkBufferCopy c{src_off, dst_off, size};
+	vkCmdCopyBuffer(impl->cmd, src.buf, dst.buf, 1, &c);
+}
+
 void Vk::bind(const Pipe& p) {
 	vkCmdBindPipeline(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
 	vkCmdBindDescriptorSets(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, impl->s->layout, 0, 1, &p.set, 0, nullptr);
