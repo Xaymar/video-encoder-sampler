@@ -1,36 +1,22 @@
 #version 450
 #extension GL_GOOGLE_include_directive : enable
-layout(local_size_x = 384) in;
+layout(local_size_x = 32) in;
 #include "speed_common.glsl"
-// One workgroup per plane: compute_covariance_matrix() with the scalar kernel. The 25 means (float sums in row order), then the 325 covariances
-// (double sums in row order), one invocation each: each sum is one chain, as on the CPU.
-shared float mean_s[N];
+// One invocation per covariance (325 per plane), in small workgroups so they spread over the whole GPU (double arithmetic is slow on most GPUs, and
+// a workgroup runs on one compute unit): each sum is one chain in row order, as on the CPU, of the products of speed_center's centred samples.
 void main() {
-	const int t = int(gl_LocalInvocationID.x), p = int(gl_WorkGroupID.y), base = p * pc.DW * pc.DH;
-	if (t < N) {
-		const int r = t / 5, c = t % 5;
-		precise float s = 0.0;
-		for (int i = 0; i < pc.subh; i++)
-			for (int j = 0; j < pc.subw; j++) s += prep[base + (i + r) * pc.DW + j + c];
-		mean_s[t] = fdiv(s, float(pc.subw * pc.subh));
-	}
-	barrier();
+	const int t = int(gl_GlobalInvocationID.x), p = int(gl_WorkGroupID.y), S = pc.subw * pc.subh;
 	if (t >= N * (N + 1) / 2) return;
 	int x = 0;
 	while ((x + 1) * (x + 2) / 2 <= t) x++;
 	const int y = t - x * (x + 1) / 2;
-	const int ox = base + (x / 5) * pc.DW + x % 5, oy = base + (y / 5) * pc.DW + y % 5;
-	const double mx = double(mean_s[x]), my = double(mean_s[y]);
+	const int cx = (p * N + x) * S, cy = (p * N + y) * S;
 	precise double acc = 0.0LF;
-	for (int i = 0; i < pc.subh; i++) {
-		const int row = i * pc.DW;
-		for (int j = 0; j < pc.subw; j++) {
-			precise double dx = double(prep[ox + row + j]) - mx;
-			precise double dy = double(prep[oy + row + j]) - my;
-			acc += dx * dy;
-		}
+	for (int s = 0; s < S; s++) {
+		precise double d = cen[cx + s] * cen[cy + s];
+		acc += d;
 	}
-	const float cv = rf(ddiv(acc, double(pc.subw * pc.subh)));
+	const float cv = rf(ddiv(acc, double(S)));
 	covm[p * N * N + x * N + y] = cv;
 	covm[p * N * N + y * N + x] = cv;
 }

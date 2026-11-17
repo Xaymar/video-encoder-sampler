@@ -208,7 +208,7 @@ struct Vk::Impl {
 	struct Slot {
 		VkCommandBuffer cmd{};
 		VkFence fence{};
-		VkQueryPool stamps{}; // two timestamps: the work began, the work ended
+		VkQueryPool stamps{}; // kStamps timestamps: 0 the work began, 1 it ended, the rest for parts of it
 	};
 	std::vector<Slot> slots;
 	VkCommandBuffer cmd{}; // the one being recorded
@@ -253,7 +253,7 @@ Vk::Vk(int device, int slots) : impl(new Impl) {
 			if (s.timestamp_ns > 0) {
 				VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
 				qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
-				qi.queryCount = 2;
+				qi.queryCount = kStamps;
 				chk(vkCreateQueryPool(s.dev, &qi, nullptr, &sl.stamps), "query pool");
 			}
 		}
@@ -382,7 +382,7 @@ void Vk::begin(int slot) {
 	VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	chk(vkBeginCommandBuffer(impl->cmd, &bi), "begin");
-	if (sl.stamps) vkCmdResetQueryPool(impl->cmd, sl.stamps, 0, 2);
+	if (sl.stamps) vkCmdResetQueryPool(impl->cmd, sl.stamps, 0, kStamps);
 }
 
 void Vk::stamp(int slot, int which) {
@@ -429,11 +429,14 @@ void Vk::memory(uint64_t& device_local, uint64_t& host) const { device_local = i
 
 void Vk::wait(int slot) { chk(vkWaitForFences(impl->s->dev, 1, &impl->slots.at(slot).fence, VK_TRUE, ~0ull), "wait"); }
 
-double Vk::gpu_seconds(int slot) {
+double Vk::gpu_seconds(int slot, int from, int to) {
 	Impl::Slot& sl = impl->slots.at(slot);
-	if (!sl.stamps) return -1;
+	if (!sl.stamps || from < 0 || to < 0 || from >= kStamps || to >= kStamps) return -1;
 	uint64_t t[2] = {0, 0};
-	if (vkGetQueryPoolResults(impl->s->dev, sl.stamps, 0, 2, sizeof t, t, sizeof t[0], VK_QUERY_RESULT_64_BIT) != VK_SUCCESS || t[1] < t[0]) return -1;
+	// one at a time: a stamp this submission did not write is not ready (VK_NOT_READY), and then there is no time for it
+	if (vkGetQueryPoolResults(impl->s->dev, sl.stamps, (uint32_t)from, 1, sizeof t[0], &t[0], sizeof t[0], VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return -1;
+	if (vkGetQueryPoolResults(impl->s->dev, sl.stamps, (uint32_t)to, 1, sizeof t[1], &t[1], sizeof t[1], VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return -1;
+	if (t[1] < t[0]) return -1;
 	return (double)(t[1] - t[0]) * impl->s->timestamp_ns * 1e-9;
 }
 #endif
