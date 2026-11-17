@@ -54,16 +54,20 @@ double div_residual(double a, double b, double q) { // a - q b
 	precise double r = (a - p) - e;
 	return r;
 }
+// |a - q b| only grows away from the true quotient, so a candidate whose neighbours have larger residuals is the closest: when the GPU's own
+// quotient (or root) already is, nothing more is needed (most GPUs round these correctly; llvmpipe does not).
 double ddiv(double a, double b) {
 	if (a == 0.0LF || b == 0.0LF || isinf(a) || isinf(b) || isnan(a) || isnan(b)) return a / b;
 	precise double q = a / b;
-	for (int i = 0; i < 2; i++) { precise double c = q + div_residual(a, b, q) / b; q = c; }
-	double best = q, bd = abs(div_residual(a, b, q));
-	const double lo = nudge(q, false), hi = nudge(q, true);
-	const double dl = abs(div_residual(a, b, lo)), dh = abs(div_residual(a, b, hi));
-	if (dl < bd) { best = lo; bd = dl; }
-	if (dh < bd) best = hi;
-	return best;
+	for (int pass = 0; pass < 2; pass++) {
+		const double bd = abs(div_residual(a, b, q));
+		const double lo = nudge(q, false), hi = nudge(q, true);
+		const double dl = abs(div_residual(a, b, lo)), dh = abs(div_residual(a, b, hi));
+		if (bd <= dl && bd <= dh) return q;
+		if (pass == 1) return dl < dh ? lo : hi;
+		for (int i = 0; i < 2; i++) { precise double c = q + div_residual(a, b, q) / b; q = c; }
+	}
+	return q;
 }
 double sqrt_residual(double x, double s) { // x - s s
 	double p, e;
@@ -74,21 +78,67 @@ double sqrt_residual(double x, double s) { // x - s s
 double dsqrt(double x) {
 	if (!(x > 0.0LF) || isinf(x)) return sqrt(x);
 	precise double s = sqrt(x);
-	for (int i = 0; i < 2; i++) { precise double c = s + sqrt_residual(x, s) / (2.0LF * s); s = c; }
 	// x - c^2 = (sqrt x - c)(sqrt x + c): the neighbour with the smallest residual is the closest (no square root of a double lies on a midpoint)
-	double best = s, bd = abs(sqrt_residual(x, s));
-	const double lo = nudge(s, false), hi = nudge(s, true);
-	const double dl = abs(sqrt_residual(x, lo)), dh = abs(sqrt_residual(x, hi));
-	if (dl < bd) { best = lo; bd = dl; }
-	if (dh < bd) best = hi;
-	return best;
+	for (int pass = 0; pass < 2; pass++) {
+		const double bd = abs(sqrt_residual(x, s));
+		const double lo = nudge(s, false), hi = nudge(s, true);
+		const double dl = abs(sqrt_residual(x, lo)), dh = abs(sqrt_residual(x, hi));
+		if (bd <= dl && bd <= dh) return s;
+		if (pass == 1) return dl < dh ? lo : hi;
+		for (int i = 0; i < 2; i++) { precise double c = s + sqrt_residual(x, s) / (2.0LF * s); s = c; }
+	}
+	return s;
 }
 // A double rounded to float, as C's (float) does. Not just float(d): compilers (Mesa's NIR, for one) take double(float(d)) for d, as if it had not
 // been rounded, and a float that came from a double is often taken back to double here; a multiply by 1 they cannot see through keeps it rounded.
 float rf(double d) { precise float f = float(d) * pc.one; return f; }
-// C's float division (the double quotient of two floats rounds to the correctly rounded float) and (float)sqrt((double)x)
-float fdiv(float a, float b) { return rf(ddiv(double(a), double(b))); }
-float dsqrt_f(float x) { return rf(dsqrt(double(x))); }
+// C's float division (the double quotient of two floats rounds to the correctly rounded float) and (float)sqrt((double)x): the correctly rounded
+// float. Fast way: the GPU's float result, moved to the float whose rounding interval holds the true value. The midpoints between floats have 25
+// bits, so b times one (or one squared) is exact in double and the comparisons are exact; a true value never lies on a midpoint. Only for normal
+// numbers (a GPU may flush the others): else the double way.
+const float FLT_NORMAL = 1.17549435e-38, FLT_BIG = 1.0e38;
+bool normal_f(float x) { const float m = abs(x); return m >= FLT_NORMAL && m <= FLT_BIG; }
+float up_f(float x) { return uintBitsToFloat(floatBitsToUint(x) + 1u); }   // the next float above x > 0
+float down_f(float x) { return uintBitsToFloat(floatBitsToUint(x) - 1u); } // the next float below x > 0
+float fdiv(float a, float b) {
+	const float aa = abs(a), ab = abs(b);
+	float q = aa / ab;
+	if (!normal_f(a) || !normal_f(b) || !normal_f(q)) return rf(ddiv(double(a), double(b)));
+	const double A = double(aa), B = double(ab);
+	int i = 0;
+	for (; i < 8; i++) { // q too small while the true quotient is at or above the midpoint to the next float
+		precise double mid = (double(q) + double(up_f(q))) * 0.5LF;
+		precise double bm = B * mid;
+		if (A >= bm) q = up_f(q); else break;
+	}
+	int j = 0;
+	for (; j < 8; j++) { // q too big while it is below the midpoint to the float before
+		precise double mid = (double(q) + double(down_f(q))) * 0.5LF;
+		precise double bm = B * mid;
+		if (A < bm) q = down_f(q); else break;
+	}
+	if (i == 8 || j == 8) return rf(ddiv(double(a), double(b))); // the GPU's quotient was far off
+	return (a < 0.0) != (b < 0.0) ? -q : q;
+}
+float dsqrt_f(float x) {
+	float s = sqrt(x);
+	if (!normal_f(x) || x < 0.0 || !normal_f(s)) return rf(dsqrt(double(x)));
+	const double X = double(x);
+	int i = 0;
+	for (; i < 8; i++) {
+		precise double mid = (double(s) + double(up_f(s))) * 0.5LF;
+		precise double m2 = mid * mid;
+		if (X >= m2) s = up_f(s); else break;
+	}
+	int j = 0;
+	for (; j < 8; j++) {
+		precise double mid = (double(s) + double(down_f(s))) * 0.5LF;
+		precise double m2 = mid * mid;
+		if (X < m2) s = down_f(s); else break;
+	}
+	if (i == 8 || j == 8) return rf(dsqrt(double(x)));
+	return s;
+}
 int sgn(float x) { return x >= 0.0 ? 1 : -1; }
 float pyth(float x, float y) { precise float s = x * x + y * y; return dsqrt_f(s); }
 
