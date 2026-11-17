@@ -1,0 +1,10 @@
+[0:v]fps=60,scale=1920:1080:flags=bicubic,setsar=1,format=yuv420p,split=3[f1][f2][f3];
+[f1]trim=duration=0.8,setpts=PTS-STARTPTS,fade=t=out:st=0.4:d=0.4[s1];
+[f3]trim=start_frame=30:end_frame=31,scale=3600:2025:flags=lanczos,loop=loop=23:size=1,setpts=N/60/TB,crop=1280:1080:x='t*4000':y='300+t*500'[pan];
+gradients=s=640x1080:r=60:d=0.4:speed=0.03:n=4,format=yuv420p[g];
+[pan][g]hstack=2,setsar=1[s2];
+mandelbrot=s=1920x1080:r=60:maxiter=512:start_scale=1.5:end_scale=0.5:end_pts=24,trim=duration=0.4,format=yuv420p,setsar=1[s3];
+[f2]trim=start_frame=0:end_frame=1,loop=loop=23:size=1,setpts=N/60/TB[bg];
+testsrc2=s=700x700:r=60:d=0.4,format=yuv420p[box];
+[bg][box]overlay=x='610+1400*sin(PI*t/0.4)':y=190:eof_action=endall,setsar=1[s4];
+[s1][s2][s3][s4]concat=n=4:v=1:a=0,format=yuv420p[out]

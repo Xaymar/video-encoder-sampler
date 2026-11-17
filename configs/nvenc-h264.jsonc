@@ -48,7 +48,7 @@
 				"b_reference_mode": ["none", "middle", "each", "hierarchical"],
 				// "hierarchical_b_frames": [0, 1],   // H.264's older flag for what b_reference_mode "hierarchical" does (same requirements [T])
 				"hierarchical_p_frames": [0, 1],
-				"bdirect_mode": [0, 1, 3],   // 0 auto, 1 off, 2 temporal, 3 spatial: B-frames only; 2 made the same stream as 0 every time [T 2026-11-17]
+				"bdirect_mode": [0, 1, 2, 3],   // 0 auto, 1 off, 2 temporal, 3 spatial: B-frames only (2 matched 0 on 1 s of racing footage [T 2026-11-17], maybe only for that content)
 				"max_ref_frames": ["", 1, 2, 3, 4, 6, 8, 16],   // "": the driver's DPB size
 				"max_ref_frames_l0": [0, 1, 2, 3, 4, 7],   // 0 auto, 1..7 [H NV_ENC_NUM_REF_FRAMES]
 				"max_ref_frames_l1": [0, 1, 2, 3],   // 0 auto, 1..7: the backward list, B-frames only
