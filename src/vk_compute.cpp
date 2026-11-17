@@ -65,8 +65,8 @@ struct Shared {
 	VkQueue xqueue{};
 	uint32_t xfamily = 0;
 	bool has_x = false;
-	// A second compute queue (of the compute family), for work that runs beside the main queue's (begin2()); none if the family has too few
-	// queues, or VES_VMAF_NO_SECOND_COMPUTE is set.
+	// A second compute queue (of the compute family), for work that runs beside the main queue's (begin2()). Off unless VES_VMAF_SECOND_COMPUTE=1:
+	// measured on an RTX 4080 and an AMD iGPU it gave no gain (up to 5% slower at 1080p); none either if the family has too few queues.
 	VkQueue cqueue2{};
 	bool has_c2 = false;
 	VkPhysicalDeviceMemoryProperties mem{};
@@ -183,9 +183,9 @@ Shared* bring_up(int index, std::string& why) {
 				}
 			if (!s.has_x && qf[s.family].queueCount >= 2) { s.xfamily = s.family; s.has_x = true; }
 		}
-		const char* no_c2 = getenv("VES_VMAF_NO_SECOND_COMPUTE");
+		const char* c2 = getenv("VES_VMAF_SECOND_COMPUTE");
 		const uint32_t used = 1 + (s.has_x && s.xfamily == s.family ? 1 : 0);
-		if (!(no_c2 && atoi(no_c2) > 0) && qf[s.family].queueCount > used) s.has_c2 = true;
+		if (c2 && atoi(c2) > 0 && qf[s.family].queueCount > used) s.has_c2 = true;
 		float prio[3] = {1.0f, 1.0f, 1.0f};
 		VkDeviceQueueCreateInfo qcis[2]{{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
 		uint32_t qcount = 1;
