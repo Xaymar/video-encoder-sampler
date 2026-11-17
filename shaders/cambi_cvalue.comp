@@ -5,9 +5,10 @@ layout(local_size_x = 16, local_size_y = 16) in;
 #include "cambi_common.glsl"
 // The banding value (c value) of every pixel of one scale (calculate_c_values in cambi.c): from how many flat pixels of the window around it have
 // its value and values a few steps above and below it. Each workgroup also writes how many of its values are not 0, and their sum.
+// With pc.OW < 0 the c values are already there (cambi_cslide made them), and only the sums are made.
 layout(std430, binding = 0) readonly buffer Img { uint img[]; };
 layout(std430, binding = 1) readonly buffer Mask { uint mask[]; };
-layout(std430, binding = 2) writeonly buffer CVal { float cval[]; };
+layout(std430, binding = 2) buffer CVal { float cval[]; };
 layout(std430, binding = 3) readonly buffer Tables { int tvi[32]; int weight[32]; float recip[]; } tb;
 layout(std430, binding = 4) writeonly buffer Part { double part[]; }; // per workgroup: count of values that are not 0, their sum
 
@@ -50,7 +51,8 @@ int get_count(Counts c, int k) {
 void main() {
 	const int j = int(gl_GlobalInvocationID.x), i = int(gl_GlobalInvocationID.y);
 	const int pad = pc.pad, nd = pc.nd;
-	const bool tiled = pad <= MAXPAD;
+	const bool sums_only = pc.OW < 0;
+	const bool tiled = pad <= MAXPAD && !sums_only;
 	const int tw = TILE + 2 * pad;
 	if (tiled) {
 		const int r0 = int(gl_WorkGroupID.y) * TILE - pad, c0 = int(gl_WorkGroupID.x) * TILE - pad;
@@ -58,7 +60,9 @@ void main() {
 		barrier();
 	}
 	float c_value = 0.0;
-	if (j < pc.W && i < pc.H && mask[i * pc.W + j] != 0u) {
+	if (sums_only) {
+		if (j < pc.W && i < pc.H) c_value = cval[i * pc.W + j];
+	} else if (j < pc.W && i < pc.H && mask[i * pc.W + j] != 0u) {
 		const int v = int(img[i * pc.W + j]);
 		const int compact = v - pc.band_base;
 		if (compact >= 0 && compact < pc.band_size) {
@@ -94,7 +98,7 @@ void main() {
 			}
 		}
 	}
-	if (j < pc.W && i < pc.H) cval[i * pc.W + j] = c_value;
+	if (j < pc.W && i < pc.H && !sums_only) cval[i * pc.W + j] = c_value;
 	const uint lid = gl_LocalInvocationIndex;
 	ssum[lid] = double(c_value);
 	scnt[lid] = c_value != 0.0 ? 1u : 0u;

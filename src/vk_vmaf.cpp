@@ -978,7 +978,7 @@ private:
 		std::vector<std::array<Buf, 4>> vpart, cm, aimb; // per VIF unit, per ADM unit (aimb: units with AIM)
 		std::vector<Buf> sfin, sout;                    // per SpEED unit: its scores; its decimated planes (only for VES_SPEED_CHECK)
 		Buf ccval[5], cpart[5];
-		Pipe cp_cval[5];
+		Pipe cp_cval[5], cp_slide[5];
 		std::vector<std::pair<const Buf*, Buf>> out; // the shared buffer the GPU wrote, the slot's copy
 		std::vector<std::pair<const Buf*, Buf>> out2; // the same for SpEED's, when it runs on the second compute queue
 		std::vector<Features> feats;
@@ -1035,6 +1035,7 @@ private:
 	Buf cidx, cfull, cdith, cmask0, cimg[5], cmask[5], ctmp, ctab;
 	Pipe cp_pre, cp_dither, cp_mask, cp_dec[5], cp_mode_h[5], cp_mode_v[5];
 	uint32_t cgroups[5] = {};
+	bool cslide = false; // c values by cambi_cslide
 	// speed: the chroma planes once, the decimation per unit
 	int cw = 0, ch = 0;
 	Buf sraw[4];
@@ -1135,6 +1136,7 @@ private:
 					sl.ccval[s] = vk.buffer((size_t)cg.sw[s] * cg.sh[s] * 4 + 16, 2);
 					sl.cpart[s] = vk.buffer((size_t)cgroups[s] * 16 + 16, 2);
 					sl.cp_cval[s] = vk.pipeline("cambi_cvalue", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab, &sl.cpart[s]});
+					if (cslide) sl.cp_slide[s] = vk.pipeline("cambi_cslide", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab});
 				}
 			}
 		}
@@ -1403,6 +1405,10 @@ private:
 			cpc.mask_index = (uint16_t)((7 * 7 + 3 * (lg - 11) - 1) >> 1);
 		}
 		cpc.pad = cg.pad;
+		{ // cambi_cslide takes windows up to 65 and up to 4 contrast steps; VES_CAMBI_NO_SLIDE=1 keeps cambi_cvalue's direct counts
+			const char* e = getenv("VES_CAMBI_NO_SLIDE");
+			cslide = cg.pad <= 32 && nd <= 4 && !(e && atoi(e) > 0);
+		}
 		cpc.bpc = bpc;
 		cpc.anti_dither = anti_dither ? 1 : 0;
 		cp_pre = vk.pipeline("cambi_pre", {&raw_dis, &cidx, &cfull});
@@ -1448,6 +1454,12 @@ private:
 			vk.push(&pc, sizeof pc);
 			vk.bind(cp_mode_v[s]); vk.dispatch(g.first, g.second); vk.barrier();
 			pc.anti_dither = cpc.anti_dither;
+			if (cslide) { // the c values with sliding counts, then cambi_cvalue only sums them
+				pc.OH = 128;
+				vk.push(&pc, sizeof pc);
+				vk.bind(sl.cp_slide[s]); vk.dispatch((uint32_t)((w + 63) / 64), (uint32_t)((h + 127) / 128)); vk.barrier();
+				pc.OW = -1; pc.OH = h;
+			}
 			vk.push(&pc, sizeof pc);
 			vk.bind(sl.cp_cval[s]); vk.dispatch(g.first, g.second); vk.barrier();
 			pw = w; ph = h;
