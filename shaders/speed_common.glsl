@@ -139,6 +139,37 @@ float dsqrt_f(float x) {
 	if (i == 8 || j == 8) return rf(dsqrt(double(x)));
 	return s;
 }
+// (float)(1.0 / sqrt((double)q)), as the CPU's Givens rotation has it, without the double division and square root: the GPU's inverse square root,
+// moved to the float whose rounding interval holds the true value 1/sqrt(q). For a midpoint m between two floats, 1/sqrt(q) >= m exactly when
+// m^2 q <= 1; m has 25 bits, so m^2 is exact in double and m^2 q is exact as p + e (two_prod). The CPU rounds twice (the root, then the quotient, to
+// double) before rounding to float, which can only matter when the true value is within a few double units of a midpoint: there (|m^2 q - 1| below
+// 2^-46), and for numbers that are not normal, the double way.
+double rsqrt_side(double mid, double Q) { // m^2 q - 1
+	precise double m2 = mid * mid;
+	double p, e;
+	two_prod(m2, Q, p, e);
+	precise double r = (p - 1.0LF) + e;
+	return r;
+}
+float rsqrt_f(float q) {
+	float y = inversesqrt(q);
+	if (!normal_f(q) || q < 0.0 || !normal_f(y)) return rf(ddiv(1.0LF, dsqrt(double(q))));
+	const double Q = double(q), close = 1.4210854715202004e-14LF; // 2^-46
+	int i = 0;
+	for (; i < 8; i++) { // y too small while the true value is at or above the midpoint to the next float
+		const double r = rsqrt_side((double(y) + double(up_f(y))) * 0.5LF, Q);
+		if (abs(r) < close) return rf(ddiv(1.0LF, dsqrt(Q)));
+		if (r <= 0.0LF) y = up_f(y); else break;
+	}
+	int j = 0;
+	for (; j < 8; j++) { // y too big while the true value is below the midpoint to the float before
+		const double r = rsqrt_side((double(y) + double(down_f(y))) * 0.5LF, Q);
+		if (abs(r) < close) return rf(ddiv(1.0LF, dsqrt(Q)));
+		if (r > 0.0LF) y = down_f(y); else break;
+	}
+	if (i == 8 || j == 8) return rf(ddiv(1.0LF, dsqrt(Q)));
+	return y;
+}
 int sgn(float x) { return x >= 0.0 ? 1 : -1; }
 float pyth(float x, float y) { precise float s = x * x + y * y; return dsqrt_f(s); }
 

@@ -68,9 +68,22 @@ public:
 	void push(const void* data, uint32_t size);
 	void dispatch(uint32_t x, uint32_t y = 1);
 	void copy(const Buf& src, const Buf& dst, VkDeviceSize size = 0); // size 0: the smaller of the two buffers
+	void copy_range(const Buf& src, VkDeviceSize src_off, const Buf& dst, VkDeviceSize dst_off, VkDeviceSize size);
 	void barrier();
 	static constexpr int kStamps = 12;
 	void stamp(int slot, int which); // timestamp `which` (0: start, 1: end of the slot's work; up to kStamps - 1 for parts of it), see gpu_seconds()
+	// Copies on a second queue (async_upload(): the device has one), so that copying a frame in overlaps the compute work on frames before it:
+	// upload_begin() records into the slot's own command buffer for it, upload_submit() submits it, and the slot's next submit() waits for it.
+	bool async_upload() const;
+	void upload_begin(int slot);
+	void upload_copy(const Buf& src, const Buf& dst, VkDeviceSize size = 0);
+	void upload_submit(int slot, bool for_second = false); // for_second: the slot's next submit2() waits for these copies too
+	// A second compute queue (second_compute(): the device has one), for work that needs nothing from the main queue's and can run beside it:
+	// begin2() records the slot's work for it (with bind/push/dispatch/copy/barrier as usual; stamp() does nothing there), submit2() submits it, and
+	// wait() waits for it as well. Work on it runs in submission order only against itself.
+	bool second_compute() const;
+	void begin2(int slot);
+	void submit2(int slot);
 	void submit(int slot = 0);
 	void wait(int slot = 0); // until the slot's last submission is done
 	// GPU time between two of the slot's stamps (by default start and end) in its last finished submission; -1 if the device has no timestamps or

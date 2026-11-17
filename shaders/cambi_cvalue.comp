@@ -5,9 +5,10 @@ layout(local_size_x = 16, local_size_y = 16) in;
 #include "cambi_common.glsl"
 // The banding value (c value) of every pixel of one scale (calculate_c_values in cambi.c): from how many flat pixels of the window around it have
 // its value and values a few steps above and below it. Each workgroup also writes how many of its values are not 0, and their sum.
+// With pc.OW < 0 the c values are already there (cambi_cslide made them), and only the sums are made.
 layout(std430, binding = 0) readonly buffer Img { uint img[]; };
 layout(std430, binding = 1) readonly buffer Mask { uint mask[]; };
-layout(std430, binding = 2) writeonly buffer CVal { float cval[]; };
+layout(std430, binding = 2) buffer CVal { float cval[]; };
 layout(std430, binding = 3) readonly buffer Tables { int tvi[32]; int weight[32]; float recip[]; } tb;
 layout(std430, binding = 4) writeonly buffer Part { double part[]; }; // per workgroup: count of values that are not 0, their sum
 
@@ -18,19 +19,40 @@ shared int tile[(TILE + 2 * MAXPAD) * (TILE + 2 * MAXPAD)];
 shared double ssum[256];
 shared uint scnt[256];
 
-// A sample as the histograms see it: its value if it is flat and within the band, else -1.
+// A sample as the histograms see it: its value if it is flat and within the band, else NOT_COUNTED (so far below any value that q - v + nd is
+// negative whatever v is).
+const int NOT_COUNTED = -65536;
 int counted(int r, int c) {
-	if (r < 0 || c < 0 || r >= pc.H || c >= pc.W) return -1;
+	if (r < 0 || c < 0 || r >= pc.H || c >= pc.W) return NOT_COUNTED;
 	const int o = r * pc.W + c;
-	if (mask[o] == 0u) return -1;
+	if (mask[o] == 0u) return NOT_COUNTED;
 	const int v = int(img[o]);
-	return (v - pc.band_base) >= 0 && (v - pc.band_base) < pc.band_size ? v : -1;
+	return (v - pc.band_base) >= 0 && (v - pc.band_base) < pc.band_size ? v : NOT_COUNTED;
+}
+
+// The 2 nd + 1 <= 17 counts of the window, 16 bits each (a window has fewer than 4226 samples), four to a 64-bit word: kept in registers (an array
+// indexed by the sample's value would live in slow local memory), each sample adding to its word without a branch.
+struct Counts { uint64_t w0, w1, w2, w3, w4; };
+void count(inout Counts c, uint k) {
+	const uint64_t inc = 1ul << (16u * (k & 3u));
+	const uint wi = k >> 2u;
+	c.w0 += wi == 0u ? inc : 0ul;
+	c.w1 += wi == 1u ? inc : 0ul;
+	c.w2 += wi == 2u ? inc : 0ul;
+	c.w3 += wi == 3u ? inc : 0ul;
+	c.w4 += wi == 4u ? inc : 0ul;
+}
+int get_count(Counts c, int k) {
+	const int wi = k >> 2;
+	const uint64_t w = wi == 0 ? c.w0 : wi == 1 ? c.w1 : wi == 2 ? c.w2 : wi == 3 ? c.w3 : c.w4;
+	return int((w >> uint64_t(16 * (k & 3))) & 65535ul);
 }
 
 void main() {
 	const int j = int(gl_GlobalInvocationID.x), i = int(gl_GlobalInvocationID.y);
 	const int pad = pc.pad, nd = pc.nd;
-	const bool tiled = pad <= MAXPAD;
+	const bool sums_only = pc.OW < 0;
+	const bool tiled = pad <= MAXPAD && !sums_only;
 	const int tw = TILE + 2 * pad;
 	if (tiled) {
 		const int r0 = int(gl_WorkGroupID.y) * TILE - pad, c0 = int(gl_WorkGroupID.x) * TILE - pad;
@@ -38,25 +60,36 @@ void main() {
 		barrier();
 	}
 	float c_value = 0.0;
-	if (j < pc.W && i < pc.H && mask[i * pc.W + j] != 0u) {
+	if (sums_only) {
+		if (j < pc.W && i < pc.H) c_value = cval[i * pc.W + j];
+	} else if (j < pc.W && i < pc.H && mask[i * pc.W + j] != 0u) {
 		const int v = int(img[i * pc.W + j]);
 		const int compact = v - pc.band_base;
 		if (compact >= 0 && compact < pc.band_size) {
-			int cnt[2 * MAXD + 1];
-			for (int k = 0; k <= 2 * nd; k++) cnt[k] = 0;
-			for (int dr = -pad; dr <= pad; dr++) {
-				for (int dc = -pad; dc <= pad; dc++) {
-					const int q = tiled ? tile[(int(gl_LocalInvocationID.y) + pad + dr) * tw + int(gl_LocalInvocationID.x) + pad + dc] : counted(i + dr, j + dc);
-					const int k = q - v + nd;
-					if (q >= 0 && k >= 0 && k <= 2 * nd) cnt[k]++;
+			Counts cnt = Counts(0ul, 0ul, 0ul, 0ul, 0ul);
+			const uint span = uint(2 * nd), off = uint(nd - v);
+			if (tiled) {
+				const int base = int(gl_LocalInvocationID.y) * tw + int(gl_LocalInvocationID.x);
+				for (int dr = 0; dr <= 2 * pad; dr++) {
+					const int row = base + dr * tw;
+					for (int dc = 0; dc <= 2 * pad; dc++) {
+						const uint k = uint(tile[row + dc]) + off;
+						if (k <= span) count(cnt, k);
+					}
 				}
+			} else {
+				for (int dr = -pad; dr <= pad; dr++)
+					for (int dc = -pad; dc <= pad; dc++) {
+						const uint k = uint(counted(i + dr, j + dc)) + off;
+						if (k <= span) count(cnt, k);
+					}
 			}
-			const int p0 = cnt[nd];
+			const int p0 = get_count(cnt, nd);
 			const int value = v + nd; // as cambi.c has it: tvi[] is in the same offset space
 			for (int d = 0; d < nd; d++) {
 				if (value <= tb.tvi[d] && value + d + 1 > pc.vlt_luma) {
-					const int p1 = cnt[nd + d + 1];
-					const int p2 = compact - d - 1 >= 0 ? cnt[nd - d - 1] : 0;
+					const int p1 = get_count(cnt, nd + d + 1);
+					const int p2 = compact - d - 1 >= 0 ? get_count(cnt, nd - d - 1) : 0;
 					precise float val;
 					if (p1 > p2) val = float(tb.weight[d] * p0 * p1) * tb.recip[p1 + p0];
 					else val = float(tb.weight[d] * p0 * p2) * tb.recip[p2 + p0];
@@ -65,7 +98,7 @@ void main() {
 			}
 		}
 	}
-	if (j < pc.W && i < pc.H) cval[i * pc.W + j] = c_value;
+	if (j < pc.W && i < pc.H && !sums_only) cval[i * pc.W + j] = c_value;
 	const uint lid = gl_LocalInvocationIndex;
 	ssum[lid] = double(c_value);
 	scnt[lid] = c_value != 0.0 ? 1u : 0u;

@@ -1,0 +1,141 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64, local_size_y = 1) in;
+#include "cambi_common.glsl"
+// The c values of one scale (calculate_c_values in cambi.c), with the window's counts kept as cambi.c keeps them: as the window moves down a row,
+// the row entering it is added and the row leaving it taken away, so a pixel costs O(window) instead of cambi_cvalue's O(window^2). Writes only the
+// c values; cambi_cvalue then makes the per workgroup sums from them (pc.OW < 0), so the scores are those of cambi_cvalue exactly.
+// Adapted from libvmaf-fast's CVALUES_SLIDE (fast/vulkan/shaders/cambi.slang, Copyright 4KVCD, BSD-2-Clause-Patent).
+//
+// A workgroup takes a tile of S columns and a band of pc.OH rows. In shared memory it keeps, per column its windows reach, how many flat, in-band
+// pixels of each value the window's rows have there (a byte: at most 2 * pad + 1 <= 65); a pixel's count of a value is the sum of the bytes of its
+// window's 2 * pad + 1 columns. The values are taken VALUES at a time (value window k: CORE k - nd .. CORE k + CORE + nd - 1, for the pixels of
+// value CORE k .. CORE k + CORE - 1, which read their value +- nd), only the value windows the tile's pixels are in. For pad <= 32 and nd <= 4.
+layout(std430, binding = 0) readonly buffer Img { uint img[]; };
+layout(std430, binding = 1) readonly buffer Mask { uint mask[]; };
+layout(std430, binding = 2) writeonly buffer CVal { float cval[]; };
+layout(std430, binding = 3) readonly buffer Tables { int tvi[32]; int weight[32]; float recip[]; } tb;
+
+const int S = 64;                         // the tile's columns: a thread each
+const int MAX_PAD = 32;
+const int COLS = S + 2 * MAX_PAD;         // the columns its windows reach
+const int WORDS = COLS / 4;
+const int VALUES = 64;                    // a window of values
+const int MAX_ROWS = 128;                 // rows per workgroup, at most
+const int MAX_WORDS = (2 * MAX_PAD + 3) / 4 + 1; // the words a window's 2 * pad + 1 columns are in, at most
+const int NONE = 0x10000;                 // a pixel not counted (above every value window: one compare tells)
+
+shared uint gCounts[VALUES * WORDS];      // [value - the window's first][column], a byte each
+shared uint gWindows;                     // the value windows the tile's pixels are in (bits)
+shared uint gRowWindows[MAX_ROWS];        // and each row's
+
+// Row r's pixel in local column lc: its value less the band's base if it is flat and in the band (counted), else NONE.
+int pixel_compact(int r, int x0, uint lc) {
+	const int col = x0 - pc.pad + int(lc);
+	if (r < 0 || r >= pc.H || col < 0 || col >= pc.W || int(lc) >= S + 2 * pc.pad) return NONE;
+	const int o = r * pc.W + col;
+	const int compact = int(img[o]) - pc.band_base;
+	return mask[o] != 0u && compact >= 0 && compact < pc.band_size ? compact : NONE;
+}
+
+// A counted pixel of local column lc added (or taken away), if its value is in the value window that starts at first.
+void count_pixel(int compact, uint lc, int first, bool remove) {
+	const uint local = uint(compact - first); // NONE and values below the window: past VALUES too
+	if (local >= uint(VALUES)) return;
+	const uint one = 1u << ((lc & 3u) * 8u);
+	atomicAdd(gCounts[local * uint(WORDS) + (lc >> 2)], remove ? 0u - one : one);
+}
+
+// The pixels of value first + local in the window of the tile's column t.
+uint window_count(int local, uint t) {
+	const uint base = uint(local) * uint(WORDS) + (t >> 2), last = t + uint(2 * pc.pad);
+	const uint words = (last >> 2) - (t >> 2);
+	uint sum = 0u;
+	for (uint k = 0u; k < uint(MAX_WORDS); k++) {
+		if (k > words) break;
+		uint bytes = gCounts[base + k];
+		if (k == 0u) bytes &= 0xFFFFFFFFu << ((t & 3u) * 8u);
+		if (k == words) bytes &= 0xFFFFFFFFu >> ((3u - (last & 3u)) * 8u);
+		sum += (bytes & 0x00FF00FFu) + ((bytes >> 8) & 0x00FF00FFu);
+	}
+	return (sum & 0xFFFFu) + (sum >> 16);
+}
+
+void main() {
+	const uint t = gl_LocalInvocationIndex;
+	const int w = pc.W, h = pc.H, pad = pc.pad, nd = pc.nd;
+	const int core = VALUES - 2 * nd;
+	const int x0 = int(gl_WorkGroupID.x) * S, y0 = int(gl_WorkGroupID.y) * pc.OH;
+	const int y1 = min(y0 + pc.OH, h);
+	const int x = x0 + int(t);
+	const int rows = y1 - y0;
+	if (t == 0u) gWindows = 0u;
+	for (int i = int(t); i < rows; i += S) gRowWindows[i] = 0u;
+	barrier();
+	// The value windows the tile's counted pixels are in, in all and row by row; the other pixels' c values are 0.
+	uint windows = 0u;
+	if (x < w)
+		for (int y = y0; y < y1; y++) {
+			const int o = y * w + x;
+			const int compact = int(img[o]) - pc.band_base;
+			if (mask[o] != 0u && compact >= 0 && compact < pc.band_size) {
+				const uint bit = 1u << uint(compact / core);
+				windows |= bit;
+				atomicOr(gRowWindows[y - y0], bit);
+			} else cval[o] = 0.0;
+		}
+	atomicOr(gWindows, windows);
+	barrier();
+	uint todo = gWindows;
+	while (todo != 0u) {
+		const int k = findLSB(todo);
+		const uint bit = 1u << uint(k);
+		todo &= todo - 1u;
+		const int first = k * core - nd;
+		// The window slides from the first row with pixels in it to the last.
+		int ys = rows, ye = -1;
+		for (int i = 0; i < rows; i++)
+			if ((gRowWindows[i] & bit) != 0u) { ys = min(ys, i); ye = i; }
+		ys += y0;
+		ye += y0;
+		for (uint i = t; i < uint(VALUES * WORDS); i += uint(S)) gCounts[i] = 0u;
+		barrier();
+		// The window of row ys, but its last row (added by the first step).
+		for (int r = ys - pad; r < ys + pad; r++) {
+			count_pixel(pixel_compact(r, x0, t), t, first, false);
+			count_pixel(pixel_compact(r, x0, t + uint(S)), t + uint(S), first, false);
+		}
+		// Each row's step: its entering and leaving rows' pixels, and its own (the tile's column).
+		for (int y = ys; y <= ye; y++) {
+			count_pixel(pixel_compact(y + pad, x0, t), t, first, false);
+			count_pixel(pixel_compact(y + pad, x0, t + uint(S)), t + uint(S), first, false);
+			if (y > ys) { // the row leaving it (row ys's window was counted whole)
+				count_pixel(pixel_compact(y - pad - 1, x0, t), t, first, true);
+				count_pixel(pixel_compact(y - pad - 1, x0, t + uint(S)), t + uint(S), first, true);
+			}
+			if ((gRowWindows[y - y0] & bit) == 0u) continue; // nothing to read: no barrier (uniform over the workgroup)
+			barrier();
+			const int own = x < w ? pixel_compact(y, x0, t + uint(pad)) : NONE;
+			if (own != NONE && own / core == k) {
+				const int compact = own, v = own + pc.band_base;
+				const int local = compact - first; // nd .. VALUES - nd - 1: its value +- nd are in the window
+				const int p0 = int(window_count(local, t));
+				const int value = v + nd; // as cambi.c has it: tvi[] is in the same offset space
+				float c = 0.0;
+				for (int d = 0; d < nd; d++) {
+					if (value <= tb.tvi[d] && value + d + 1 > pc.vlt_luma) {
+						const int p1 = int(window_count(local + d + 1, t));
+						const int p2 = compact - d - 1 >= 0 ? int(window_count(local - d - 1, t)) : 0;
+						precise float val;
+						if (p1 > p2) val = float(tb.weight[d] * p0 * p1) * tb.recip[p1 + p0];
+						else val = float(tb.weight[d] * p0 * p2) * tb.recip[p2 + p0];
+						if (val > c) c = val;
+					}
+				}
+				cval[y * w + x] = c;
+			}
+			barrier();
+		}
+		barrier();
+	}
+}

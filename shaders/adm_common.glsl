@@ -13,6 +13,8 @@ layout(push_constant) uniform PC {
 	int shc0, shc1, shc2;       // cubing shifts of the contrast masking (scale 0: per band; else shc0) / of the denominator
 	int bpc;                    // bits per sample of the frame (scale 0)
 	int aim;                    // csf and contrast masking: 0 for the DLM (the restored part, masked by the additive impairment), 1 for VMAF v1's AIM (the other way round)
+	int egl_int;                // adm_enhn_gain_limit when it is a whole number 1..1000 (decouple then needs no doubles), else -1
+	int dbg;                    // VES_ADM_DUMP: decouple writes its k, angle flag and unclamped restored value (of the h band) into AH, AV, AD
 } pc;
 
 layout(std430, binding = 0) buffer Cur { int cur[]; };            // 20 blocks of BW*BH

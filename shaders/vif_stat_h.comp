@@ -19,6 +19,60 @@ int log2_64(uint64_t t) {
 	return int(log2_table[uint(t >> uint64_t(k))]) + 2048 * k;
 }
 
+// The fast path for a pixel's residual sv_sq and gain term (int64_t)(g * g * sigma1_sq), with no double arithmetic: one exact integer
+// division and a few floats, or false where the floats cannot settle the result (then the double code below decides). Adapted from
+// libvmaf-fast's fast_gain() (fast/vulkan/shaders/vif_stats.slang, Copyright 4KVCD, BSD-2-Clause-Patent), for one gain limit.
+//
+// With D = sigma1 + eps as a double, g = sigma12 / D and P = sigma12^2 / sigma1 = Q + R / sigma1 (Q, R exact integers):
+//   g * sigma12 = P / (1 + e),  g^2 * sigma1 = P / (1 + e)^2,  e = (D - sigma1) / sigma1 < 2^-34,
+// so the double residual is (sigma2 - Q) + (c - R / sigma1) and the double gain term Q + (R / sigma1 - c2), c = P e / (1 + e), c2 = 2c to
+// within c 2^-34. The doubles' own rounding (g to 53 bits, the residual, the gain term's two products: at most (P + sigma2) 2^-51) and the
+// floats' error here are covered by the margins Er and Et; closer to an integer than those, the double path decides. g > limit is exactly
+// sigma12 > limit * sigma1 (D exceeds sigma1 by under 2^-17, far less than 1 / limit), and the capped term limit^2 * sigma1 is exact.
+bool fast_gain(int sigma12, int sigma1, int sigma2, int limit, out int sv, out int64_t term) {
+	sv = 0;
+	term = 0l;
+	const uint64_t S = uint64_t(uint(sigma12)) * uint64_t(uint(sigma12));
+	const int64_t divisor = int64_t(sigma1);
+	const float inv = 1.0 / float(uint(sigma1));
+	const float estimate = (float(uint(S >> 32)) * 4294967296.0 + float(uint(S))) * inv;
+	if (!(estimate < 70368744177664.0)) return false;  // 2^46
+	// Q = S / sigma1 exactly: the estimate (within 2^25), two corrections from the remainder, then the last unit.
+	const uint high = uint(estimate * 2.3283064e-10);
+	int64_t q = int64_t((uint64_t(high) << 32) | uint64_t(uint(estimate - float(high) * 4294967296.0)));
+	int64_t rem = int64_t(S) - q * divisor;
+	for (int round = 0; round < 2; round++) {
+		const float remainder = float(int(rem >> 32)) * 4294967296.0 + float(uint(rem));
+		const int64_t d = int64_t(int(floor(remainder * inv)));
+		q += d;
+		rem -= d * divisor;
+	}
+	if (rem < 0l) { q--; rem += divisor; }
+	else if (rem >= divisor) { q++; rem -= divisor; }
+	if (rem < 0l || rem >= divisor || q < 0l) return false;
+	const float fraction = float(uint(rem)) * inv;  // R / sigma1
+	const float P = float(uint(uint64_t(q) >> 32)) * 4294967296.0 + float(uint(q)) + fraction;
+	const float c = P * (6.5536e-6 * inv);  // P eps / sigma1
+	// The residual: max((int)(sigma2 - g * sigma12), 0).
+	const float phi = c - fraction;
+	const float Er = (c + 1.0) * 1.9073486e-6 + (P + float(sigma2)) * 3.5527137e-15;  // 2^-19, 2^-48
+	const float whole = floor(phi);
+	if (phi - whole < Er || whole + 1.0 - phi < Er) return false;
+	const int64_t residual = int64_t(sigma2) - q + int64_t(int(whole));
+	sv = residual > 0l ? int(residual) : 0;
+	// The gain term, g capped at the limit.
+	if (uint64_t(uint(sigma12)) > uint64_t(limit) * uint64_t(uint(sigma1))) {
+		term = int64_t(uint64_t(limit) * uint64_t(limit) * uint64_t(uint(sigma1)));
+	} else {
+		const float psi = fraction - 2.0 * c;
+		const float Et = (c + 1.0) * 1.9073486e-6 + P * 7.1054274e-15;  // 2^-19, 2^-47
+		const float part = floor(psi);
+		if (psi - part < Et || part + 1.0 - psi < Et) return false;
+		term = q + int64_t(int(part));
+	}
+	return true;
+}
+
 void main() {
 	const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
 	int64_t num_log = 0l, den_log = 0l, num_non = 0l, den_non = 0l;
@@ -49,17 +103,28 @@ void main() {
 		if (sigma1_sq >= sigma_nsq) {
 			den_log = int64_t(log2_32(uint(sigma_nsq + sigma1_sq)) - 2048 * 17);
 			if (sigma12 > 0 && sigma2_sq > 0) {
-				const double eps = 65536.0LF * 1.0e-10LF;
-				precise double g = double(sigma12) / (double(sigma1_sq) + eps);
-				precise double sv = double(sigma2_sq) - g * double(sigma12);
-				int sv_sq = int(sv);
-				sv_sq = max(sv_sq, 0);
-				g = min(g, pc.egl);
+				int sv_sq;
+				int64_t gs_int;
+				bool fast = pc.egl_int > 0 && fast_gain(sigma12, sigma1_sq, sigma2_sq, pc.egl_int, sv_sq, gs_int);
+#ifdef VIF_VERIFY
+				int fsv = sv_sq; int64_t fgs = gs_int; bool was_fast = fast; fast = false;
+#endif
+				if (!fast) {
+					const double eps = 65536.0LF * 1.0e-10LF;
+					precise double g = double(sigma12) / (double(sigma1_sq) + eps);
+					precise double sv = double(sigma2_sq) - g * double(sigma12);
+					sv_sq = max(int(sv), 0);
+					g = min(g, pc.egl);
+					precise double gg = g * g;
+					precise double gs = gg * double(sigma1_sq);
+					gs_int = int64_t(gs);
+				}
 				const uint numer1 = uint(sv_sq) + uint(sigma_nsq);
-				precise double gg = g * g;
-				precise double gs = gg * double(sigma1_sq);
-				const int64_t numer1_tmp = int64_t(gs) + int64_t(numer1);
+				const int64_t numer1_tmp = gs_int + int64_t(numer1);
 				num_log = int64_t(log2_64(uint64_t(numer1_tmp)) - log2_64(uint64_t(numer1)));
+#ifdef VIF_VERIFY
+				if (was_fast && (fsv != sv_sq || fgs != gs_int)) num_log += 1l << 50;  // test builds: a disagreement wrecks the score
+#endif
 			}
 		} else {
 			num_non = int64_t(sigma2_sq);
