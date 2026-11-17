@@ -68,14 +68,55 @@
 				// "num_ltr_frames": [0, 1, 2, 4],   // long-term references exclude B-frames: use them with "max_b_frames": [0]
 				"max_ref_frames_l1": [1, 2],   // 0 = automatic, up to 7
 			},
-			"rules": [   // combinations that cannot work are not made (see config.jsonc): B-frames as references need max_ref_frames >= 3, "each" >= max_b_frames
+			"rules": [   // combinations NVENC refuses are not made (see config.jsonc)
+				// lookahead_level only with lookahead
 				{
-					"if": { "op": "and", "args": [{ "op": "in", "left": { "option": "b_reference_mode" }, "right": ["middle", "each"] }, { "set": "max_ref_frames" }] },
+					"if": { "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
+					"then": { "op": "==", "left": { "option": "lookahead_level" }, "right": 0 },
+				},
+				// without B-frames only
+				{
+					"if": { "op": ">", "left": { "option": "max_b_frames" }, "right": 0 },
 					"then": [
-						{ "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 },
+						{ "op": "==", "left": { "option": "enable_non_ref_p" }, "right": 0 },
+						{ "op": "==", "left": { "option": "enable_weighted_prediction" }, "right": 0 },
+					],
+					// with B-frames only
+					"else": [
+						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 0 },
+						{ "op": "==", "left": { "option": "hierarchical_b_frames" }, "right": 0 },
+						{ "op": "==", "left": { "option": "b_reference_mode" }, "right": "none" },
+					],
+				},
+				// hierarchical B-frames (NVENC docs): B-frames in a row + 1 a power of two (1..32), no lookahead level, no multi-pass,
+				// adaptive I- and B-frames off, split encoding auto or off. ves always sets enablePTD.
+				{
+					"if": { "op": "==", "left": { "option": "hierarchical_b_frames" }, "right": 1 },
+					"then": [
+						{ "op": "in", "left": { "op": "+", "left": { "option": "max_b_frames" }, "right": 1 }, "right": [2, 4, 8, 16, 32] },
+						{ "op": "or", "args": [
+							{ "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
+							{ "op": "==", "left": { "option": "lookahead_level" }, "right": 0 },
+						] },
+						{ "op": "==", "left": { "option": "multi_pass" }, "right": 0 },
+						{ "op": "==", "left": { "option": "disable_iadapt" }, "right": 1 },
+						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 1 },
+						{ "op": "in", "left": { "option": "split_encode_mode" }, "right": [0, 15] },
+					],
+				},
+				// "each" needs at least 2 B-frames
+				{
+					"if": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "each" },
+					"then": { "op": ">", "left": { "option": "max_b_frames" }, "right": 1 },
+				},
+				// the DPB holds at least one more frame than there are B-frames; with B-frames as references at least 3
+				{
+					"if": { "set": "max_ref_frames" },
+					"then": [
+						{ "op": ">=", "left": { "option": "max_ref_frames" }, "right": { "op": "+", "left": { "option": "max_b_frames" }, "right": 1 } },
 						{
-							"if": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "each" },
-							"then": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": { "option": "max_b_frames" } },
+							"if": { "op": "in", "left": { "option": "b_reference_mode" }, "right": ["middle", "each"] },
+							"then": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 },
 						},
 					],
 				},
@@ -124,14 +165,55 @@
 				"max_ref_frames_l1": [1, 2],   // 0 = automatic, up to 7
 				"max_ref_frames": [3, 4],   // B-frames as references need at least 3
 			},
-			"rules": [   // combinations that cannot work are not made (see config.jsonc): B-frames as references need max_ref_frames >= 3, "each" >= max_b_frames
+			"rules": [   // combinations NVENC refuses are not made (see config.jsonc)
+				// lookahead_level only with lookahead
 				{
-					"if": { "op": "and", "args": [{ "op": "in", "left": { "option": "b_reference_mode" }, "right": ["middle", "each"] }, { "set": "max_ref_frames" }] },
+					"if": { "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
+					"then": { "op": "==", "left": { "option": "lookahead_level" }, "right": 0 },
+				},
+				// without B-frames only
+				{
+					"if": { "op": ">", "left": { "option": "max_b_frames" }, "right": 0 },
 					"then": [
-						{ "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 },
+						{ "op": "==", "left": { "option": "enable_non_ref_p" }, "right": 0 },
+						{ "op": "==", "left": { "option": "enable_weighted_prediction" }, "right": 0 },
+					],
+					// with B-frames only
+					"else": [
+						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 0 },
+						{ "op": "==", "left": { "option": "hierarchical_b_frames" }, "right": 0 },
+						{ "op": "==", "left": { "option": "b_reference_mode" }, "right": "none" },
+					],
+				},
+				// hierarchical B-frames (NVENC docs): B-frames in a row + 1 a power of two (1..32), no lookahead level, no multi-pass,
+				// adaptive I- and B-frames off, split encoding auto or off. ves always sets enablePTD.
+				{
+					"if": { "op": "==", "left": { "option": "hierarchical_b_frames" }, "right": 1 },
+					"then": [
+						{ "op": "in", "left": { "op": "+", "left": { "option": "max_b_frames" }, "right": 1 }, "right": [2, 4, 8, 16, 32] },
+						{ "op": "or", "args": [
+							{ "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
+							{ "op": "==", "left": { "option": "lookahead_level" }, "right": 0 },
+						] },
+						{ "op": "==", "left": { "option": "multi_pass" }, "right": 0 },
+						{ "op": "==", "left": { "option": "disable_iadapt" }, "right": 1 },
+						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 1 },
+						{ "op": "in", "left": { "option": "split_encode_mode" }, "right": [0, 15] },
+					],
+				},
+				// "each" needs at least 2 B-frames
+				{
+					"if": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "each" },
+					"then": { "op": ">", "left": { "option": "max_b_frames" }, "right": 1 },
+				},
+				// the DPB holds at least one more frame than there are B-frames; with B-frames as references at least 3
+				{
+					"if": { "set": "max_ref_frames" },
+					"then": [
+						{ "op": ">=", "left": { "option": "max_ref_frames" }, "right": { "op": "+", "left": { "option": "max_b_frames" }, "right": 1 } },
 						{
-							"if": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "each" },
-							"then": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": { "option": "max_b_frames" } },
+							"if": { "op": "in", "left": { "option": "b_reference_mode" }, "right": ["middle", "each"] },
+							"then": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 },
 						},
 					],
 				},
