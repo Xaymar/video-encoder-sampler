@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -2549,22 +2550,42 @@ static int run(int argc, char** argv) {
 		else { failed++; failed_runs[t.r.input].push_back(t.r.label); if (check) failed_why[t.r.input].push_back(t.r.label + (t.r.reason.empty() ? std::string() : ": " + t.r.reason)); }
 	}
 	if (check) { // the report of --check: what failed, and which runs made the same stream (an option that changed nothing)
+		// To stdout, and to the --log file too: a console keeps only so many lines, and this report is often longer.
+		auto say = [](const char* fmt, ...) {
+			char small[1024];
+			va_list ap, ap2;
+			va_start(ap, fmt);
+			va_copy(ap2, ap);
+			const int n = vsnprintf(small, sizeof small, fmt, ap);
+			va_end(ap);
+			std::string text;
+			if (n >= (int)sizeof small) { text.resize((size_t)n + 1); vsnprintf(text.data(), text.size(), fmt, ap2); text.resize((size_t)n); }
+			else if (n > 0) text.assign(small, (size_t)n);
+			va_end(ap2);
+			fputs(text.c_str(), stdout);
+			for (size_t at = 0; at < text.size();) {
+				size_t e = text.find('\n', at);
+				if (e == std::string::npos) e = text.size();
+				if (e > at) ui::log_file_only(text.substr(at, e - at));
+				at = e + 1;
+			}
+		};
 		size_t ran = runs.size() + (size_t)identical;
-		printf("\nChecked %zu runs: %zu made a stream, %d failed, %d ignored\n", ran + (size_t)failed, ran, failed, ignored);
+		say("\nChecked %zu runs: %zu made a stream, %d failed, %d ignored\n", ran + (size_t)failed, ran, failed, ignored);
 		for (auto& [input, lines] : failed_why) {
-			printf("\nFailed (%s):\n", file_name(input).c_str());
-			for (auto& l : lines) printf("  %s\n", l.c_str());
+			say("\nFailed (%s):\n", file_name(input).c_str());
+			for (auto& l : lines) say("  %s\n", l.c_str());
 		}
 		bool header = false;
 		for (auto& r : runs) if (!r.identical.empty()) {
-			if (!header) { printf("\nSame stream as another run (the options that differ changed nothing):\n"); header = true; }
-			printf("  %s (%s, %lld kbps)\n", r.label.c_str(), file_name(r.input).c_str(), (long long)r.bitrate);
-			for (auto& l : r.identical) printf("    = %s\n", l.c_str());
+			if (!header) { say("\nSame stream as another run (the options that differ changed nothing):\n"); header = true; }
+			say("  %s (%s, %lld kbps)\n", r.label.c_str(), file_name(r.input).c_str(), (long long)r.bitrate);
+			for (auto& l : r.identical) say("    = %s\n", l.c_str());
 		}
-		if (!header) printf("\nNo two runs made the same stream.\n");
+		if (!header) say("\nNo two runs made the same stream.\n");
 		if (ignored) {
-			printf("\nIgnored:\n");
-			for (auto& [why, n] : ignored_why) printf("  %d: %s\n", n, why.c_str());
+			say("\nIgnored:\n");
+			for (auto& [why, n] : ignored_why) say("  %d: %s\n", n, why.c_str());
 		}
 		return failed ? 2 : 0;
 	}

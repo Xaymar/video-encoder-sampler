@@ -618,6 +618,8 @@ void log_plain(const std::string& line) {
 	if (!is_live) emit(line + "\n");
 }
 
+void log_file_only(const std::string& line) { to_log_file(line); }
+
 bool open_log(const std::string& path, const std::string& first_line, std::string& err) {
 	FILE* f = fopen(path.c_str(), "ab"); // appended to: a restart keeps what came before
 	if (!f) { err = "cannot open the log file '" + path + "'"; return false; }
