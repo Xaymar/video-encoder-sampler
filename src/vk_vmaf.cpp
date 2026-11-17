@@ -404,6 +404,7 @@ struct AdmPC {
 	int shc0, shc1, shc2;
 	int bpc;
 	int aim;
+	int egl_int;
 };
 struct CambiPC { int W, H, OW, OH, bpc, anti_dither, mask_index, pad, nd, vlt_luma, band_base, band_size; };
 struct SpeedPC { int W, H, SW, SH, DW, DH, bpc, fw, scaled, out_off; float scaler; };
@@ -1203,6 +1204,7 @@ private:
 				pc.SW = sw[s]; pc.SH = sh[s]; pc.BW = bw[s]; pc.BH = bh[s]; pc.scale = s; pc.bpc = bpc;
 				pc.prevN = s ? bw[s - 1] * bh[s - 1] : 0;
 				pc.egl = o.egl; pc.cos1sq = cos_1deg_sq;
+				pc.egl_int = o.egl >= 1.0 && o.egl <= 1000.0 && o.egl == (double)(int)o.egl ? (int)o.egl : -1;
 				const int w = bw[s], h = bh[s];
 				int dl = w * 0.1 - 0.5 - 1, dt = h * 0.1 - 0.5 - 1, dr = w - dl + 2, db = h - dt + 2;
 				if (dl < 0) dl = 0;

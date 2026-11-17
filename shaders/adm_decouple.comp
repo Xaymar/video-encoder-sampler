@@ -5,18 +5,18 @@ layout(local_size_x = 16, local_size_y = 16) in;
 #include "adm_common.glsl"
 // Splits the distorted bands into the part that follows the reference (restored) and the rest (additive impairment).
 
-// (float)v as C has it: rounded once. Above 2^53, float(v) may go through double and round twice (llvmpipe does), which flips the
-// angle test of a few samples at scales 1 to 3; so the low bits are folded into a sticky bit first, which double holds exactly.
+// (float)v as C has it: rounded once. The magnitude is cut to 32 bits first, the bits shifted out folded into a sticky lowest bit; that
+// bit sits 8 places below where a float rounds, so float(uint) (correctly rounded) rounds as the whole value would, and ldexp is exact.
 float to_float(int64_t v) {
 	const uint64_t a = uint64_t(v < 0l ? -v : v);
 	const uint hi = uint(a >> 32);
 	float f;
-	if (hi < (1u << 21)) f = float(double(a)); // below 2^53: exact as a double
+	if (hi == 0u) f = float(uint(a));
 	else {
-		const int s = 32 + findMSB(hi) - 52;
-		uint64_t q = a >> s;
-		if ((a & ((1ul << s) - 1ul)) != 0ul) q |= 1ul;
-		f = float(double(q) * double(1ul << s));
+		const int s = findMSB(hi) + 1;
+		uint q = uint(a >> s);
+		if ((uint(a) & (s >= 32 ? 0xffffffffu : (1u << s) - 1u)) != 0u) q |= 1u;  // s is 1..32
+		f = ldexp(float(q), s);
 	}
 	return v < 0l ? -f : f;
 }
@@ -43,12 +43,15 @@ int restore(int o, int t, bool angle_flag) {
 	int rst = int(((k * int64_t(o)) + 16384l) >> 15);
 	if (pc.scale == 0) rst = sext16(rst);
 	const float rst_f = (float(k) / 32768.0) * (float(o) / 64.0);
-	if (angle_flag && rst_f > 0.0) {
-		precise double m = double(rst) * pc.egl;     // C: MIN of a double and an int is a double, converted back when assigned
-		rst = (m < double(t)) ? int(m) : t;
-	} else if (angle_flag && rst_f < 0.0) {
-		precise double m = double(rst) * pc.egl;
-		rst = (m > double(t)) ? int(m) : t;
+	if (angle_flag && rst_f != 0.0) {
+		// C: MIN (or MAX) of the double rst * limit and t, converted back when assigned; with a whole limit that is exact in integers.
+		if (pc.egl_int > 0) {
+			const int64_t m = int64_t(rst) * int64_t(pc.egl_int);
+			rst = (rst_f > 0.0 ? m < int64_t(t) : m > int64_t(t)) ? int(m) : t;
+		} else {
+			precise double m = double(rst) * pc.egl;
+			rst = (rst_f > 0.0 ? m < double(t) : m > double(t)) ? int(m) : t;
+		}
 	}
 	if (pc.scale == 0) rst = sext16(rst);
 	return rst;
@@ -63,9 +66,21 @@ void main() {
 	const int64_t ot_dp = int64_t(oh) * int64_t(th) + int64_t(ov) * int64_t(tv);
 	const int64_t o_mag_sq = int64_t(oh) * int64_t(oh) + int64_t(ov) * int64_t(ov);
 	const int64_t t_mag_sq = int64_t(th) * int64_t(th) + int64_t(tv) * int64_t(tv);
-	precise double dp = double(to_float(ot_dp)) / 4096.0;
-	precise double rhs = (double(pc.cos1sq) * (double(to_float(o_mag_sq)) / 4096.0)) * (double(to_float(t_mag_sq)) / 4096.0);
-	const bool angle_flag = (dp >= 0.0) && (dp * dp >= rhs);
+	// C: dp = (float)ot_dp / 4096.0 in double, dp * dp >= cos1sq * a * b in double. dp * dp is exact in double (24 bit factors); the right side
+	// rounds once. Floats settle the test unless the two sides are within 2^-20 of each other (float rounding is under 2^-22 here, and no
+	// value gets near the float limits: the sides are at most 2^102, at least 2^-24 unless zero); then the doubles decide.
+	const float dpf = to_float(ot_dp) * 0.000244140625, af = to_float(o_mag_sq) * 0.000244140625, bf = to_float(t_mag_sq) * 0.000244140625;  // / 4096, exactly (a division need not be)
+	bool angle_flag = false;
+	if (dpf >= 0.0) {
+		const float d2 = dpf * dpf, r = (pc.cos1sq * af) * bf;
+		if (d2 >= r * 1.00000095367431640625) angle_flag = true;       // 1 + 2^-20
+		else if (d2 < r * 0.99999904632568359375) angle_flag = false;  // 1 - 2^-20
+		else {
+			precise double dp = double(dpf);
+			precise double rhs = (double(pc.cos1sq) * double(af)) * double(bf);
+			angle_flag = dp * dp >= rhs;
+		}
+	}
 	const int rh = restore(oh, th, angle_flag), rv = restore(ov, tv, angle_flag), rd = restore(od, td, angle_flag);
 	cur[XH * N + o] = rh; cur[XV * N + o] = rv; cur[XD * N + o] = rd;
 	int ah = th - rh, av = tv - rv, ad = td - rd;
