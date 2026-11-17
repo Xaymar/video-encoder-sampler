@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "encoder.h"
+#include "rules.h"
 
 // A condition on another option: that it is set, set to one of some values, or compares so with a number (">=2").
 struct Cond {
@@ -45,7 +46,7 @@ public:
 	// depth and range). `prune`: whether options with more than two values can be pruned; `fixed`: options that never are (nor are gpu, chroma, bitdepth, range).
 	// Nothing is listed here: a combination is a number, and a layer is listed when it is first asked for.
 	ComboTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune,
-	           UnsetValue unset_value = {});
+	           UnsetValue unset_value = {}, Rules rules = {});
 
 	Options options(Id combo) const;
 
@@ -79,6 +80,7 @@ private:
 	Id id(const std::vector<uint8_t>& r) const;
 	bool applies(size_t k, const std::vector<uint8_t>& r) const; // whether option k is set, given the options before it
 	bool valid(const std::vector<uint8_t>& r) const;              // whether the combinations are made with this row
+	bool rules_hold(const std::vector<int>& which, const std::vector<uint8_t>& r) const; // whether these rules hold for the options of r that are known
 	int64_t find(const std::vector<uint8_t>& r) const { return valid(r) ? (int64_t)id(r) : -1; }
 
 	UnsetValue unset_value_;
@@ -87,6 +89,11 @@ private:
 	const std::string* unset(const std::string& key, const std::vector<uint8_t>& r) const; // what a condition reads for an unset option; nullptr when not known
 	std::vector<Ax> axes_;          // in the order the combinations are made: an option after the ones its conditions name
 	std::vector<int> prunable_;     // indices into axes_
+	std::map<std::string, int> position_; // option -> index into axes_
+	Rules rules_;
+	std::vector<std::vector<int>> rules_at_; // per option: the rules that can be judged once it is chosen (all the options they read come before or at it)
+	std::vector<int> all_rules_;
+	bool none_ = false;             // a rule that reads no option fails: no combination is made
 	mutable std::vector<std::vector<Id>> layers_;
 	mutable std::vector<bool> listed_;
 };

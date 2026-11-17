@@ -37,7 +37,7 @@ bool Cond::holds(const Options& o) const {
 bool is_default_key(const std::string& k) { return k == "preset" || k == "tune" || k == "profile" || k == "chroma" || k == "bitdepth" || k == "gpu"; }
 
 ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune,
-                       UnsetValue unset_value) : unset_value_(std::move(unset_value)) {
+                       UnsetValue unset_value, Rules rules) : unset_value_(std::move(unset_value)), rules_(std::move(rules)) {
 	// The values of every option, without repeats (gpu=all is every GPU of the encoder's vendor).
 	std::vector<Ax> config;
 	for (auto* list : {&axes, &free_axes}) for (auto& a : *list) {
@@ -71,7 +71,7 @@ ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes
 		for (size_t k = 0; k < config.size(); k++) if (!placed[k] && !waits(k)) { placed[k] = true; axes_.push_back(config[k]); progress = true; }
 		if (!progress) for (size_t k = 0; k < config.size(); k++) if (!placed[k]) { placed[k] = true; axes_.push_back(config[k]); } // a circle
 	}
-	std::map<std::string, int> position;
+	std::map<std::string, int>& position = position_;
 	for (size_t k = 0; k < axes_.size(); k++) position[axes_[k].key] = (int)k;
 	for (size_t k = 0; k < axes_.size(); k++) if (is_default_key(axes_[k].key)) default_axes_.push_back((int)k);
 	for (auto& a : axes_) {
@@ -118,6 +118,16 @@ ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes
 		} else { a.lo = set.front(); a.hi = set.back(); } // not numbers (presets): the order of the list
 		a.prunable = true;
 		prunable_.push_back((int)k);
+	}
+	// A rule is judged once every option it reads is chosen; an unset option reads as its default, which depends on the options of is_default_key.
+	rules_at_.assign(axes_.size(), {});
+	for (size_t i = 0; i < rules_.size(); i++) {
+		int at = -1;
+		for (auto& name : rules_.names(i)) { auto it = position_.find(name); if (it != position_.end()) at = std::max(at, it->second); }
+		for (int k : default_axes_) at = std::max(at, k);
+		all_rules_.push_back((int)i);
+		if (at >= 0) rules_at_[(size_t)at].push_back((int)i);
+		else if (!rules_hold({(int)i}, std::vector<uint8_t>(axes_.size(), UNSET))) none_ = true;
 	}
 	layers_.resize(layers());
 	listed_.assign(layers(), false);
@@ -168,7 +178,23 @@ const std::string* ComboTable::unset(const std::string& key, const std::vector<u
 }
 
 bool ComboTable::valid(const std::vector<uint8_t>& r) const {
+	if (none_) return false;
 	for (size_t k = 0; k < axes_.size(); k++) if ((r[k] != UNSET) != applies(k, r)) return false;
+	return rules_hold(all_rules_, r);
+}
+
+bool ComboTable::rules_hold(const std::vector<int>& which, const std::vector<uint8_t>& r) const {
+	if (which.empty()) return true;
+	const Rules::Lookup look = [&](const std::string& key, bool& set) -> const std::string* {
+		auto it = position_.find(key);
+		if (it != position_.end()) {
+			const uint8_t v = r[(size_t)it->second];
+			if (v != UNSET && !axes_[(size_t)it->second].values[v].empty()) { set = true; return &axes_[(size_t)it->second].values[v]; }
+		}
+		set = false;
+		return unset(key, r);
+	};
+	for (int i : which) if (!rules_.holds((size_t)i, look)) return false;
 	return true;
 }
 
@@ -181,13 +207,19 @@ const std::vector<ComboTable::Id>& ComboTable::layer(size_t want) const {
 	std::vector<size_t> prunable_after(n + 1, 0); // prunable options from k on
 	for (size_t k = n; k-- > 0;) prunable_after[k] = prunable_after[k + 1] + axes_[k].prunable;
 	std::vector<uint8_t> current(n, UNSET);
+	if (none_) return out;
 	std::function<void(size_t, size_t, Id)> generate = [&](size_t level, size_t mids, Id c) {
 		if (mids > want || mids + prunable_after[level] < want) return;
 		if (level == n) { out.push_back(c); return; }
 		const Ax& a = axes_[level];
-		if (!applies(level, current)) { current[level] = UNSET; generate(level + 1, mids, c + (Id)a.unset_digit * a.weight); return; } // the option stays unset, in one branch
+		if (!applies(level, current)) { // the option stays unset, in one branch
+			current[level] = UNSET;
+			if (rules_hold(rules_at_[level], current)) generate(level + 1, mids, c + (Id)a.unset_digit * a.weight);
+			return;
+		}
 		for (size_t v = 0; v < a.values.size(); v++) {
 			current[level] = (uint8_t)v;
+			if (!rules_hold(rules_at_[level], current)) continue; // a rule between options says this cannot work
 			const bool mid = a.prunable && (int)v != a.lo && (int)v != a.hi && !a.values[v].empty();
 			generate(level + 1, mids + mid, c + v * a.weight);
 		}

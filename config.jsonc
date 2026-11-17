@@ -154,6 +154,12 @@
 				// "b_reference_mode": { "values": ["none", "middle"], "requires": { "max_b_frames": ">=2" } },
 				// "weighted_prediction": { "values": [0, 1], "unless": { "max_b_frames": ">=1" } },
 				// "b_adapt": { "values": [0, 1], "requires": "max_b_frames" },                          // only with max_b_frames set (its default counts)
+				// "only_if" limits single values: a combination with that value where the condition fails is never made (conditions as in "rules" below):
+				// "enable_non_ref_p": { "values": [0, 1], "only_if": { "1": { "op": "==", "left": { "option": "max_b_frames" }, "right": 0 } } },
+				// "b_reference_mode": { "values": ["none", "middle", "each"], "only_if": {
+				// 	"middle": { "op": ">", "left": { "option": "max_b_frames" }, "right": 0 },
+				// 	"each": { "op": ">", "left": { "option": "max_b_frames" }, "right": 1 },
+				// } },
 				// "spatial_aq": [0, "auto", 1, 8, 15],     // 0 is off, "auto" is on with the driver picking the strength, 1..15 is on with that strength
 				// "gpu": [0],                                    // which NVIDIA GPU; ["all"] uses every one, each in a pool of its own
 			},
@@ -162,6 +168,31 @@
 			// "parallel": 2,                // runs of this pool in one wave (default 2 for GPU encoders, 1 for the CPU ones)
 			// "fixed": ["preset"],          // options of this encoder that are never pruned
 			// "prune": false,               // this encoder only: run every combination
+			// Rules between options: a combination where one fails is never made (not run, not counted, not retried). A rule is an expression that must
+			// hold, or { "if": expr, "require": rules, "else_require": rules } ("require"/"else_require": a rule or a list of them, so they nest). Expressions are JSON:
+			//   a number, true/false or a string (a value); { "option": "name" } (its value); { "set": "name" } (the combination sets it itself, not its default)
+			//   { "op": "==" | "!=" | "<" | "<=" | ">" | ">=" | "+" | "-" | "*" | "/" | "%", "left": expr, "right": expr }
+			//   { "op": "and" | "or" | "min" | "max", "args": [expr, ...] }      ("and"/"or" also take "left" and "right")
+			//   { "op": "in" | "not in", "left": expr, "right": [expr, ...] }
+			//   { "op": "not" | "neg" | "abs" | "floor" | "ceil", "value": expr }
+			// An unset option reads as its preset/tune default where ves can ask the encoder (not for a distributed host's worker GPUs); what is not known leaves
+			// the rule undecided, and an undecided rule drops nothing.
+			// "rules": [
+			// 	// NVENC: B-frames as references need a DPB (max_ref_frames) of at least 3, and "each" at least as many as there are B-frames
+			// 	{
+			// 		"if": { "op": "and", "args": [
+			// 			{ "op": "in", "left": { "option": "b_reference_mode" }, "right": ["middle", "each"] },
+			// 			{ "set": "max_ref_frames" },   // left to the driver it picks a working one
+			// 		] },
+			// 		"require": [
+			// 			{ "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 },
+			// 			{
+			// 				"if": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "each" },
+			// 				"require": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": { "option": "max_b_frames" } },
+			// 			},
+			// 		],
+			// 	},
+			// ],
 		},
 		{
 			"enabled": false,
