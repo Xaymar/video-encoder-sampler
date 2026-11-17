@@ -69,7 +69,7 @@ public:
 	void dispatch(uint32_t x, uint32_t y = 1);
 	void copy(const Buf& src, const Buf& dst, VkDeviceSize size = 0); // size 0: the smaller of the two buffers
 	void barrier();
-	static constexpr int kStamps = 8;
+	static constexpr int kStamps = 12;
 	void stamp(int slot, int which); // timestamp `which` (0: start, 1: end of the slot's work; up to kStamps - 1 for parts of it), see gpu_seconds()
 	void submit(int slot = 0);
 	void wait(int slot = 0); // until the slot's last submission is done

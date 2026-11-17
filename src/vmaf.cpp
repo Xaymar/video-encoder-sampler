@@ -162,7 +162,7 @@ struct Scorer {
 	// The GPU scorer's parts of add() and finish() (copying in, waiting for a frame in flight) and its background work (GPU, results); see GpuVmaf::timing().
 	virtual bool timing(double& copy, double& wait, double& gpu, double& results) const { copy = wait = gpu = results = 0; return false; }
 	virtual std::string memory() const { return {}; }
-	virtual void speed_timing(double parts[3]) const { parts[0] = parts[1] = parts[2] = 0; }
+	virtual void gpu_parts(std::vector<std::pair<std::string, double>>& parts) const { parts.clear(); }
 };
 
 // Where a scoring pass spends its time, in seconds, for VES_SCORE_TIMING=1: one line per pass when it ends. Per thread: a pass runs on one.
@@ -278,7 +278,7 @@ public:
 		return gpu->add(rd, rs, dd, ds);
 	}
 	bool timing(double& copy, double& wait, double& g, double& results) const override { gpu->timing(copy, wait, g, results); return true; }
-	void speed_timing(double parts[3]) const override { gpu->speed_timing(parts); }
+	void gpu_parts(std::vector<std::pair<std::string, double>>& parts) const override { gpu->gpu_parts(parts); }
 	std::string memory() const override {
 		uint64_t device, host, per_frame;
 		int frames;
@@ -438,13 +438,20 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 		double copy, wait, gpu, results;
 		const bool split = scorer->timing(copy, wait, gpu, results);
 		const double all_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - c.began).count(), per = 1000.0 / (double)m;
-		char b[512];
+		char b[1024];
 		// score = copy in + waiting (+ a little); GPU and results run alongside, several frames at once, and only show in score through the waiting
-		double sp[3];
-		scorer->speed_timing(sp);
-		char sb[160] = "";
-		if (sp[0] + sp[1] + sp[2] > 0) snprintf(sb, sizeof sb, " (of which SpEED %.2f: blur and covariances %.2f, eigenvalues and QR %.2f, blocks and score %.2f)", (sp[0] + sp[1] + sp[2]) * per, sp[0] * per, sp[1] * per, sp[2] * per);
-		if (split) snprintf(b, sizeof b, " (copy in %.2f, waiting for frames in flight %.2f; alongside: GPU %.2f%s, results %.2f)", copy * per, wait * per, gpu * per, sb, results * per);
+		// the GPU's parts (VES_SCORE_TIMING puts timestamps around each): those that took any time
+		std::vector<std::pair<std::string, double>> parts;
+		scorer->gpu_parts(parts);
+		std::string sb;
+		for (auto& [name, s] : parts) {
+			if (s * per < 0.005) continue;
+			char pb[96];
+			snprintf(pb, sizeof pb, "%s%s %.2f", sb.empty() ? " (" : ", ", name.c_str(), s * per);
+			sb += pb;
+		}
+		if (!sb.empty()) sb += ")";
+		if (split) snprintf(b, sizeof b, " (copy in %.2f, waiting for frames in flight %.2f; alongside: GPU %.2f%s, results %.2f)", copy * per, wait * per, gpu * per, sb.c_str(), results * per);
 		else b[0] = 0;
 		std::string sc = b;
 		fprintf(stderr, "vmaf timing, %s %dx%d %d-bit %d, %lld frames, %.1f fps: ms per frame: decode %.2f, waiting for packets %.2f, reference %.2f, convert %.2f, score %.2f%s, rest %.2f%s\n",
