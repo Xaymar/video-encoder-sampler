@@ -74,6 +74,7 @@ struct Job {
 	std::vector<Axis> axes;
 	bool prune = true;                 // skip runs of an option that shows no effect (judged on the scores of the runs themselves)
 	std::set<std::string> fixed;       // options that are never pruned
+	Rules rules;                       // combinations that cannot work, between options (see rules.h)
 };
 
 // One sub-sweep: every combination of its lists is tested with every encoder. Several scenarios let a setup
@@ -581,7 +582,7 @@ static void load_config_json(const Json& root, Config& cfg) {
 		j.prune = default_prune && !off(e.find("prune"));
 		if (auto* f = e.find("fixed")) for (auto& x : f->a) j.fixed.insert(x.text());
 		for (auto& [k, v] : e.o)
-			if (k != "enabled" && k != "encoder" && k != "codec" && k != "pool" && k != "parallel" && k != "scenarios" && k != "options" && k != "fixed" && k != "prune")
+			if (k != "enabled" && k != "encoder" && k != "codec" && k != "pool" && k != "parallel" && k != "scenarios" && k != "options" && k != "fixed" && k != "prune" && k != "rules")
 				fprintf(stderr, "warning: %sencoder entry key '%s' is not known and is ignored\n", v.where().c_str(), k.c_str());
 		auto* name = e.find("encoder");
 		if (!name) throw std::runtime_error(e.where() + "encoder entry without 'encoder'");
@@ -593,8 +594,10 @@ static void load_config_json(const Json& root, Config& cfg) {
 		if (auto* o = e.find("options")) for (auto& [k, v] : o->o) {
 			Axis ax{k, {}, {}, {}};
 			const Json* list = &v;
-			if (v.type == Json::Obj) { // { "values": [...], "requires": "other" or ["a", "b"], "unless": "other" or [...] }
-				for (auto& [rk, rv] : v.o) if (rk != "values" && rk != "requires" && rk != "unless") throw std::runtime_error(rv.where() + "option '" + k + "' has an unknown key '" + rk + "' (it takes values, requires and unless)");
+			const Json* only_if = nullptr;
+			if (v.type == Json::Obj) { // { "values": [...], "requires": "other" or ["a", "b"], "unless": "other" or [...], "only_if": { value: condition } }
+				for (auto& [rk, rv] : v.o) if (rk != "values" && rk != "requires" && rk != "unless" && rk != "only_if") throw std::runtime_error(rv.where() + "option '" + k + "' has an unknown key '" + rk + "' (it takes values, requires, unless and only_if)");
+				only_if = v.find("only_if");
 				list = v.find("values");
 				if (!list) throw std::runtime_error(v.where() + "option '" + k + "' needs 'values'");
 				for (auto* rule : {&ax.requires_all, &ax.unless_any}) {
@@ -611,7 +614,34 @@ static void load_config_json(const Json& root, Config& cfg) {
 			if (list->type == Json::Arr) { for (auto& x : list->a) add_value(x); } else add_value(*list);
 			if (std::all_of(ax.values.begin(), ax.values.end(), [](const std::string& x) { return x.empty(); })) ax.values.clear();
 			if (dropped_null) fprintf(stderr, "config: %s option '%s' lists null, which is no longer a value (it meant the preset's own, which ves cannot know); it is left out. To run without the option, do not list it\n", j.encoder.c_str(), k.c_str());
+			// "only_if": { "1": condition }: the value is only run where the condition holds (see rules.h). It is a rule "if the option is 1, the condition
+			// must hold", so a combination with the value where the condition fails is never made.
+			if (only_if) {
+				if (only_if->type != Json::Obj) throw std::runtime_error(only_if->where() + "option '" + k + "': 'only_if' takes an object of value to condition");
+				for (auto& [value, cond] : only_if->o) {
+					if (std::find(ax.values.begin(), ax.values.end(), value) == ax.values.end())
+						fprintf(stderr, "config: %s%s option '%s': only_if names the value '%s', which the option does not list\n", cond.where().c_str(), j.encoder.c_str(), k.c_str(), value.c_str());
+					Json name; name.type = Json::Obj; name.o.push_back({"option", Json{}}); name.o[0].second.type = Json::Str; name.o[0].second.s = k;
+					Json val; val.type = Json::Str; val.s = value;
+					Json is; is.type = Json::Obj; is.line = cond.line;
+					Json op; op.type = Json::Str; op.s = "==";
+					is.o = {{"op", op}, {"left", name}, {"right", val}};
+					Json rule; rule.type = Json::Obj; rule.line = cond.line;
+					rule.o = {{"if", is}, {"require", cond}};
+					j.rules.parse(rule);
+				}
+			}
 			if (!ax.values.empty()) j.axes.push_back(std::move(ax));
+		}
+		if (auto* r = e.find("rules")) {
+			j.rules.parse(*r);
+			// A misspelt name reads as an unset option: say so for names the entry does not list.
+			for (auto& name : j.rules.names()) {
+				bool listed = is_default_key(name) || name == "range";
+				for (auto& ax : j.axes) listed |= ax.key == name;
+				if (!listed) fprintf(stderr, "config: %s%s rules read '%s', which the entry does not list: it reads as the encoder's default where that is known\n",
+				                     r->where().c_str(), j.encoder.c_str(), name.c_str());
+			}
 		}
 		cfg.jobs.push_back(std::move(j));
 	});
@@ -982,7 +1012,9 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 			o << "}";
 		}
 	}
-	o << "}}]}";
+	o << "}";
+	if (!job.rules.empty()) o << ",\"rules\":" << job.rules.json(); // the worker makes the same combinations
+	o << "}]}";
 	return o.str();
 }
 
@@ -1297,6 +1329,23 @@ static int run(int argc, char** argv) {
 			return v;
 		};
 	};
+	// Whether the entry's rules let a combination be made (as ComboTable does it); an unset option reads as its default.
+	auto rules_allow = [&](const Job& job, const Options& opts) {
+		if (job.rules.empty()) return true;
+		const UnsetValue unset = unset_value_for(job);
+		Options base;
+		for (auto& [k, v] : opts) if (is_default_key(k) && !v.empty()) base[k] = v;
+		std::map<std::string, std::string> defaults;
+		return job.rules.holds([&](const std::string& key, bool& set) -> const std::string* {
+			auto it = opts.find(key);
+			if (it != opts.end() && !it->second.empty()) { set = true; return &it->second; }
+			set = false;
+			if (!unset) return nullptr;
+			auto d = defaults.find(key);
+			if (d == defaults.end()) d = defaults.emplace(key, unset(base, key)).first;
+			return d->second.empty() ? nullptr : &d->second;
+		});
+	};
 	std::set<std::string> defaults_logged;
 	auto same_as_unset = [&](const Job& job, const Options& opts, int gpu) -> std::string {
 		if (cfg.only_runs_set || (remote && is_gpu_encoder(job.encoder))) return {}; // a worker runs what the host listed; the host cannot open a worker's GPU
@@ -1394,6 +1443,7 @@ static int run(int argc, char** argv) {
 				if (!chroma.empty()) opts["chroma"] = chroma;
 				if (!bitdepth.empty()) opts["bitdepth"] = bitdepth;
 				if (!range.empty()) opts["range"] = range;
+				if (!rules_allow(job, opts)) continue;
 				Variant v = build_variant(job, std::move(opts));
 				if (!remote_gpu) { out.push_back(std::move(v)); continue; }
 				for (auto& m : models) {
@@ -1427,8 +1477,9 @@ static int run(int argc, char** argv) {
 	struct LazyTable {
 		ComboTable table;
 		std::map<std::pair<ComboTable::Id, size_t>, const Variant*> made; // the variants made so far, by combination and worker GPU model (see LazyGroup::model)
-		LazyTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune, UnsetValue unset)
-			: table(encoder, axes, free_axes, fixed, prune, std::move(unset)) {}
+		LazyTable(const std::string& encoder, const std::vector<Axis>& axes, const std::vector<Axis>& free_axes, const std::set<std::string>& fixed, bool prune, UnsetValue unset,
+		          const Rules& rules)
+			: table(encoder, axes, free_axes, fixed, prune, std::move(unset), rules) {}
 	};
 	struct LazyGroup {
 		LazyTable* lt = nullptr;
@@ -1469,7 +1520,7 @@ static int run(int argc, char** argv) {
 			if (!sc.range.empty()) free_axes.push_back(Axis{"range", sc.range, {}, {}});
 			std::vector<Axis> axes;
 			for (auto& ax : job.axes) if (!(remote && is_gpu_encoder(job.encoder) && ax.key == "gpu")) axes.push_back(ax);
-			slot = std::make_unique<LazyTable>(job.encoder, axes, free_axes, job.fixed, job.prune, unset_value_for(job));
+			slot = std::make_unique<LazyTable>(job.encoder, axes, free_axes, job.fixed, job.prune, unset_value_for(job), job.rules);
 		}
 		return *slot;
 	};
