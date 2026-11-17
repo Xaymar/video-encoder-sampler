@@ -7,7 +7,7 @@ layout(push_constant) uniform PC {
 	int scale;    // 0..3: the scale being scored, or being made by a subsample kernel (its filter table)
 	int srckind;  // how the source planes are stored: 0 bytes, 1 16 bit, 2 one 32 bit word per sample
 	int bpc;      // bits per component of the source video
-	int pad;
+	int egl_int;  // vif_enhn_gain_limit when it is a whole number 1..1000, else -1 (then only the double path is used)
 	double egl;   // vif_enhn_gain_limit
 } pc;
 

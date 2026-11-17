@@ -390,7 +390,9 @@ void csf_factors(const AdmOpts& o, int scale, float& f1, float& f2) {
 	}
 }
 
-struct VifPC { int W, H, scale, srckind, bpc, pad; double egl; };
+struct VifPC { int W, H, scale, srckind, bpc, egl_int; double egl; };
+// The gain limit as the VIF statistic's fast path takes it: a whole number from 1 to 1000, else -1 (the exact double path only).
+static int vif_egl_int(double egl) { return egl >= 1.0 && egl <= 1000.0 && egl == (double)(int)egl ? (int)egl : -1; }
 struct AdmPC {
 	int SW, SH, BW, BH, scale, prevN;
 	double egl;
@@ -732,7 +734,7 @@ private:
 		if (!vif_egl.empty()) {
 			for (int s = 0; s < 4; s++) {
 				if (s > 0) {
-					VifPC pc{vw[s - 1], vh[s - 1], s, s == 1 ? (bps == 2 ? 1 : 0) : 2, bpc, 0, vif_egl[0]};
+					VifPC pc{vw[s - 1], vh[s - 1], s, s == 1 ? (bps == 2 ? 1 : 0) : 2, bpc, -1, vif_egl[0]};
 					vk.push(&pc, sizeof pc);
 					vk.bind(vsub_v[s]);
 					auto g = groups(vw[s - 1], vh[s - 1] / 2);
@@ -742,7 +744,7 @@ private:
 					vk.dispatch(g.first, g.second); vk.barrier();
 				}
 				for (size_t u = 0; u < vif_egl.size(); u++) { // the statistics with each enhancement gain limit
-					VifPC pc{vw[s], vh[s], s, s == 0 ? (bps == 2 ? 1 : 0) : 2, bpc, 0, vif_egl[u]};
+					VifPC pc{vw[s], vh[s], s, s == 0 ? (bps == 2 ? 1 : 0) : 2, bpc, vif_egl_int(vif_egl[u]), vif_egl[u]};
 					vk.push(&pc, sizeof pc);
 					auto g = groups(vw[s], vh[s]);
 					vk.bind(vstat_v[u][s]); vk.dispatch(g.first, g.second); vk.barrier();
