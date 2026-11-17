@@ -1428,9 +1428,10 @@ private:
 			cpc.mask_index = (uint16_t)((7 * 7 + 3 * (lg - 11) - 1) >> 1);
 		}
 		cpc.pad = cg.pad;
-		{ // cambi_cslide takes windows up to 65 and up to 4 contrast steps; VES_CAMBI_NO_SLIDE=1 keeps cambi_cvalue's direct counts
-			const char* e = getenv("VES_CAMBI_NO_SLIDE");
-			cslide = cg.pad <= 32 && nd <= 4 && !(e && atoi(e) > 0);
+		{ // cambi_cslide takes windows up to 65 and up to 4 contrast steps. Opt-in (VES_CAMBI_SLIDE=1) until it has been checked on real GPUs (so far
+		  // llvmpipe only); else cambi_cvalue's direct counts
+			const char* e = getenv("VES_CAMBI_SLIDE");
+			cslide = cg.pad <= 32 && nd <= 4 && e && atoi(e) > 0;
 		}
 		cpc.bpc = bpc;
 		cpc.anti_dither = anti_dither ? 1 : 0;
