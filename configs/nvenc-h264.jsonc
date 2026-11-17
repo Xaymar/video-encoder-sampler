@@ -43,8 +43,8 @@
 				"zero_reorder_delay": [0],   // only allowed without B-frames, and there it changed nothing [T 2026-11-17, RTX 4080 SUPER]
 				"enable_non_ref_p": [0],   // only allowed without B-frames, and there it changed nothing [T 2026-11-17, RTX 4080 SUPER]
 				"enable_weighted_prediction": [0, 1],   // not with B-frames [H][G 8.7]
-				"low_delay_key_frame_scale": ["", 1, 2, 4, 8, 16],   // I- to P-frame bits with CBR and a single-frame VBV, which only ll and ull use; 2 for ll and 1 for ull by default, no range given [H]
-				"mv_precision": [0, 1, 2, 3],   // 0 default (quarter pel), 1 full, 2 half, 3 quarter
+				"low_delay_key_frame_scale": [""],   // I- to P-frame bits with CBR and a single-frame VBV (ll and ull) [H]; 1, 16 and unset made the same stream with every tune [T 2026-11-17, RTX 4080 SUPER, 1 s with one key frame]
+				"mv_precision": [0, 1, 2],   // 0 default, 1 full, 2 half, 3 quarter: 3 made the same stream as 0 every time [T 2026-11-17]
 				"b_reference_mode": ["none", "middle", "each", "hierarchical"],
 				// "hierarchical_b_frames": [0, 1],   // H.264's older flag for what b_reference_mode "hierarchical" does (same requirements [T])
 				"hierarchical_p_frames": [0, 1],
@@ -55,7 +55,7 @@
 				"num_ltr_frames": [0, 1, 2, 4],   // long-term references (trust mode): not with B-frames [H enableLTR][G 8.8]
 				"tf_level": [0, 4],   // temporal filter: 4 or more B-frames, no zero reorder delay [H tfLevel]
 				// "entropy_coding_mode": [0, 1, 2],   // 0 auto, 1 CABAC, 2 CAVLC: every decoder has CABAC and it is clearly better
-				"adaptive_transform_mode": [0, 1, 2],   // 8x8 transform: 0 auto, 1 off, 2 on
+				"adaptive_transform_mode": [0, 1],   // 8x8 transform: 0 auto, 1 off, 2 on: 2 made the same stream as 0 every time (auto turns it on for high) [T 2026-11-17]
 				"disable_deblocking_filter_idc": [0, 1, 2],   // [H] range 0..2, as in H.264 7.4.3
 				"cb_qp_index_offset": [-6, -3, 0, 3],   // chroma_qp_index_offset, -12..12 (H.264 7.4.2.2); lower gives chroma more bits
 				"cr_qp_index_offset": [-6, -3, 0, 3],   // second_chroma_qp_index_offset, -12..12
