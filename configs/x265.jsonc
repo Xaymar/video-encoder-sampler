@@ -26,8 +26,8 @@
 			"encoder": "x265",
 			"options": {
 				"preset": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"],
-				"tune": ["", "psnr", "ssim", "grain", "animation", "fastdecode", "zerolatency"],
-				"profile": ["", "main", "main10"],   // "": what the picture needs (main, main10, or a main444 / main422 one)
+				"tune": ["", "grain", "animation"],   // psnr and ssim only game those metrics; fastdecode and zerolatency trade quality for speed and delay
+				// "profile": [...],   // x265 picks main, main10 or a 4:2:2 / 4:4:4 one from the picture
 				"max_b_frames": [0, 2, 4, 8, 16],   // bframes, 0..16
 				"b_adapt": ["", 0, 1, 2],
 				"b_reference_mode": ["", "none", "middle"],   // b-pyramid
@@ -70,23 +70,13 @@
 				"cbqpoffs": ["", -6, -3, 0],   // -12..12 [C]
 				"crqpoffs": ["", -6, -3, 0],
 				// "scenecut": ["", 0, 40],
-				// "open_gop": ["", 0, 1],
+				// "open_gop": [...],   // needs a key frame range (min and max); ves sets a fixed key frame interval, which wants closed GOPs
 				// "frame_threads": [...], "wpp": [...],   // threading: small side effects on the stream only
 				// "mcstf": [1],   // temporal filter: needs 5 or more B-frames and lookahead beyond them [E][C]
 				// "tier": ["main", "auto"],   // only matters for the level's bitrate limits
 				// "vbv_maxrate": [...], "vbv_bufsize": [...],   // kbit/s and kbit, so the same value means a different buffer at every bitrate
 			},
 			"rules": [
-				// Profiles: main is 8-bit 4:2:0 and main10 is 4:2:0 [x265 param_apply_profile]; the others follow from the picture ("").
-				{
-					"if": { "set": "profile" },
-					"require": { "op": "==", "left": { "option": "chroma" }, "right": 420 },
-				},
-				{
-					"if": { "op": "==", "left": { "option": "profile" }, "right": "main" },
-					"require": { "op": "!=", "left": { "option": "bitdepth" }, "right": 10 },
-				},
-
 				// "Lookahead depth must be greater than the max consecutive bframe count" [C] (encoder_open fails).
 				{
 					"if": { "op": ">", "left": { "option": "max_b_frames" }, "right": 0 },

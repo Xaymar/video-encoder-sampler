@@ -310,9 +310,17 @@ bool same_value(const std::string& a, const std::string& b) {
 	auto norm = [](const std::string& s) { return s == "true" || s == "on" ? std::string("1") : s == "false" || s == "off" ? std::string("0") : s; };
 	const std::string x = norm(a), y = norm(b);
 	if (x == y) return true;
-	char *ex = nullptr, *ey = nullptr;
-	const double dx = strtod(x.c_str(), &ex), dy = strtod(y.c_str(), &ey);
-	return !x.empty() && !y.empty() && !*ex && !*ey && dx == dy;
+	// Numbers compare as numbers, also in lists such as x264's psy_rd "1.0:0.0" against its "1.00:0.00".
+	const char *px = x.c_str(), *py = y.c_str();
+	if (!*px || !*py) return false;
+	for (;;) {
+		char *ex = nullptr, *ey = nullptr;
+		const double dx = strtod(px, &ex), dy = strtod(py, &ey);
+		if (ex == px || ey == py || dx != dy) return false;
+		if (!*ex && !*ey) return true;
+		if (*ex != *ey || (*ex != ':' && *ex != ',')) return false;
+		px = ex + 1; py = ey + 1;
+	}
 }
 
 } // namespace

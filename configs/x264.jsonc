@@ -25,14 +25,14 @@
 			"encoder": "x264",
 			"options": {
 				"preset": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"],
-				"tune": ["", "film", "animation", "grain", "stillimage", "psnr", "ssim", "fastdecode", "zerolatency"],   // one of the first six can be joined with fastdecode and/or zerolatency ("film,zerolatency")
-				"profile": ["", "baseline", "main", "high"],   // "": what the picture needs (high, or high10 / high422 / high444 for the others)
+				"tune": ["", "film", "animation", "grain", "stillimage"],   // psnr and ssim only game those metrics; fastdecode and zerolatency trade quality for speed and delay
+				"profile": ["", "high"],   // high for 8-bit 4:2:0 (the older profiles are no use any more); "": high10 / high422 / high444 for the others
 				"max_b_frames": [0, 1, 2, 3, 5, 8],   // bframes, 0..16
 				"b_adapt": ["", 0, 1, 2],   // 0 fixed, 1 fast, 2 trellis
 				"b_pyramid": ["", "none", "strict", "normal"],   // B-frames as references (the common b_reference_mode has none and middle = normal)
 				"weightb": ["", 0, 1],
 				"direct": ["", "none", "spatial", "temporal", "auto"],
-				"open_gop": ["", 0, 1],
+				// "open_gop": [...],   // needs a key frame range (min and max); ves sets a fixed key frame interval, which wants closed GOPs
 				"max_ref_frames": [1, 2, 4, 8, 16],   // ref, 1..16
 				"mixed_refs": ["", 0, 1],
 				"weightp": ["", 0, 1, 2],   // 0 off, 1 simple (blind), 2 smart
@@ -63,36 +63,23 @@
 				// "qpmin": [...], "qpmax": [...],   // QP limits only take quality away from the rate control's own choice
 			},
 			"rules": [
-				// Profiles [P]: baseline forces no B-frames, CAVLC, no 8x8 transform, flat matrices and no weighted P; main forces no 8x8 transform and
-				// flat matrices. The 8-bit 4:2:0 profiles fail with anything else [P]: the others follow from the picture ("").
+				// High is 8-bit 4:2:0 [P]: it runs for those pictures, and the encoder's own pick ("") for the others.
 				{
-					"if": { "op": "==", "left": { "option": "profile" }, "right": "baseline" },
-					"require": [
-						{ "op": "==", "left": { "option": "max_b_frames" }, "right": 0 },
-						{ "op": "not", "value": { "set": "cabac" } },
-						{ "op": "not", "value": { "set": "weightp" } },
-					],
-				},
-				{
-					"if": { "op": "in", "left": { "option": "profile" }, "right": ["baseline", "main"] },
-					"require": { "op": "not", "value": { "set": "8x8dct" } },   // (and cqm, if you list it)
-				},
-				{
-					"if": { "set": "profile" },
-					"require": [
-						{ "op": "!=", "left": { "option": "bitdepth" }, "right": 10 },
-						{ "op": "==", "left": { "option": "chroma" }, "right": 420 },
-					],
+					"if": { "op": "or", "args": [
+						{ "op": "==", "left": { "option": "bitdepth" }, "right": 10 },
+						{ "op": "!=", "left": { "option": "chroma" }, "right": 420 },
+					] },
+					"require": { "op": "not", "value": { "set": "profile" } },
+					"else_require": { "set": "profile" },
 				},
 
-				// Without B-frames x264 turns off adaptive B, direct prediction, weighted B and open GOP [V]; B-pyramid needs 2 or more [V].
+				// Without B-frames x264 turns off adaptive B, direct prediction, and weighted B [V]; B-pyramid needs 2 or more [V].
 				{
 					"if": { "op": "==", "left": { "option": "max_b_frames" }, "right": 0 },
 					"require": [
 						{ "op": "not", "value": { "set": "b_adapt" } },
 						{ "op": "not", "value": { "set": "direct" } },
 						{ "op": "not", "value": { "set": "weightb" } },
-						{ "op": "not", "value": { "set": "open_gop" } },
 					],
 				},
 				{

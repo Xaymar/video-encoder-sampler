@@ -26,7 +26,7 @@
 			"options": {
 				"preset": [0, 2, 4, 6, 8, 10, 12, 13],   // 0 slowest .. 13 fastest (every second one, to stay under the limit)
 				"rate_control": ["cbr", "vbr"],
-				"tune": [0, 1, 5],   // 0 visual quality, 1 PSNR, 5 VMAF (random access only); 2 SSIM, 3 IQ and 4 MS-SSIM need CRF [S]
+				"tune": [0],   // visual quality; 1 PSNR and 5 VMAF only game those metrics; 2 SSIM, 3 IQ and 4 MS-SSIM need CRF [S]
 				"lookahead_frames": ["", 0, 16, 60, 120],   // lookahead, 0..120; "": auto [P]
 				"hierarchical_levels": ["", 2, 3, 4, 5],   // 0..5 [S]
 				"enable_dg": ["", 0, 1],   // dynamic mini-GOP
@@ -72,12 +72,11 @@
 			},
 			"rules": [
 				// CBR needs low delay [S] (ves pairs them); "Forward key frames (intra refresh type 1) are not supported with CBR" [S];
-				// tune VMAF "only supports random access" [S]. The buffer size is "only applicable for CBR" [P].
+				// (tune VMAF "only supports random access" [S], if you list it.) The buffer size is "only applicable for CBR" [P].
 				{
 					"if": { "op": "==", "left": { "option": "rate_control" }, "right": "cbr" },
 					"require": [
 						{ "op": "!=", "left": { "option": "irefresh_type" }, "right": 1 },
-						{ "op": "!=", "left": { "option": "tune" }, "right": 5 },
 					],
 					"else_require": { "op": "not", "value": { "set": "buf_sz" } },
 				},
