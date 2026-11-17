@@ -126,12 +126,14 @@ void get(Reader& r, ScaleOptions& s) { s.upscaler = r.str(); s.downscaler = r.st
 void put(Writer& w, const VmafOptions& v) {
 	w.str(v.model).num(v.threads).str(v.device).str(v.gpu).num(v.encoder_vendor).num(v.encoder_gpu).num((uint32_t)v.extra_models.size());
 	for (auto& m : v.extra_models) w.str(m);
+	w.num(v.check_seconds);
 }
 void get(Reader& r, VmafOptions& v) {
 	v.model = r.str(); v.threads = r.num<int>(); v.device = r.str(); v.gpu = r.str(); v.encoder_vendor = r.num<unsigned>(); v.encoder_gpu = r.num<int>();
 	v.extra_models.clear();
 	const uint32_t n = r.num<uint32_t>();
 	for (uint32_t i = 0; i < n && r.ok; i++) v.extra_models.push_back(r.str());
+	v.check_seconds = r.num<double>();
 }
 template <class T> void get_list(Reader& r, std::vector<T>& v) {
 	v.clear();
@@ -1026,7 +1028,7 @@ void run_wave_here(uint32_t id, const std::string& body) {
 	w.num((uint8_t)fr.ok).num(fr.frames).num((int64_t)feed_rp.blocked_ms).str(si.decoder);
 	for (auto& run : runs) {
 		const EncodeJob& ej = run.enc;
-		w.num((uint8_t)(ej.ok ? 1 : ej.no_session ? 2 : 0)).num(ej.kbps).num(ej.output.count).num(ej.output.bytes).num(ej.output.hash);
+		w.num((uint8_t)(ej.ok ? 1 : ej.no_session ? 2 : 0)).num(ej.kbps).num(ej.output.count).num(ej.output.bytes).num(ej.output.hash).num(ej.output.pictures);
 		w.num((int64_t)ej.rp->busy_ms).num((int64_t)ej.rp->starved_ms).num((uint8_t)run.score_ok).num((int64_t)run.score_rp->starved_ms);
 		put_list(w, run.scores);
 		put(w, run.detail);
@@ -1149,6 +1151,7 @@ bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vect
 			ej.output.count = r.num<long long>();
 			ej.output.bytes = r.num<long long>();
 			ej.output.hash = r.num<uint64_t>();
+			ej.output.pictures = r.num<uint64_t>();
 			const int64_t busy = r.num<int64_t>(), starved = r.num<int64_t>();
 			run->score_ok = r.num<uint8_t>() != 0;
 			const int64_t score_starved = r.num<int64_t>();

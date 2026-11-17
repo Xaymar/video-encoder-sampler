@@ -391,7 +391,7 @@ constexpr long long IDLE_BEYOND = 2 * (long long)DECODE_AHEAD + 16;
 
 // Decodes the input once for the whole wave, while nothing that reads the frames holds it back (FrameHistory::held(): the encoders' feed DECODE_AHEAD frames
 // behind, a busy scorer SCORE_BEHIND frames behind).
-void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& held, bool& ok, RunProgress* rp) {
+void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& held, bool& ok, RunProgress* rp, long long limit = 0) {
 	Picture frame;
 	long long n = 0;
 	int r;
@@ -406,6 +406,7 @@ void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& h
 			}
 		}
 		if (!raw.read()) { r = -1; break; } // everything that took frames has ended (failed): nothing to decode for
+		if (limit && n >= limit) { r = 0; break; } // --check: only the start of the input
 		if ((r = src.next(frame)) != 1) break;
 		raw.push(std::move(frame));
 		frame = Picture();
@@ -414,7 +415,7 @@ void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& h
 	}
 	ok = r == 0;
 	if (r < 0 && raw.read()) fprintf(stderr, "decoding the input failed after %lld frames\n", n);
-	if (ok && src.frame_count() && src.frame_count() != n) {
+	if (ok && src.frame_count() && src.frame_count() != n && !(limit && n == limit)) {
 		fprintf(stderr, "the file lists %lld frames but %lld were decoded\n", src.frame_count(), n);
 		ok = false;
 	}
@@ -425,7 +426,8 @@ void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& h
 // Takes the decoded frames, drops frames to the target rate, scales and converts, and hands the result to the encoders and to the distorted scores (`enc`).
 // Frame rate conversion drops frames before scaling. Each source frame falls into a slot of the output timeline (its real presentation time times the rate,
 // rounded down) and only the first frame in each slot is kept. `shown[n]` records which encoded frame is on screen at source frame n, for scoring.
-void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Plan& pl, const ScaleOptions& so, Broadcast& bc, FrameHistory& enc, FeedResult& fr, bool& ok, RunProgress* rp) {
+void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Plan& pl, const ScaleOptions& so, Broadcast& bc, FrameHistory& enc, FeedResult& fr, bool& ok, RunProgress* rp,
+                   bool keep_for_scores = true) {
 	const Shape& e = pl.enc;
 	auto scaler = make_converter();
 	Picture frame, scaled;
@@ -433,7 +435,7 @@ void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Pl
 	long long kept = 0;
 	ok = true;
 	auto hand_on = [&](const Picture& p) {
-		enc.push(p);
+		if (keep_for_scores) enc.push(p);
 		if (!bc.push(p, rp)) ok = false; // every encoder gave up
 	};
 	auto queue_scaled = [&] {
@@ -559,8 +561,20 @@ public:
 
 } // namespace
 
-bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRun*>& runs, const ScaleOptions& so, const VmafOptions& vo, RunProgress* feed_rp, FeedResult& fr) {
+bool run_wave(const std::string& input, const SourceInfo& planned, std::vector<WaveRun*>& runs, const ScaleOptions& so, const VmafOptions& vo, RunProgress* feed_rp, FeedResult& fr) {
 	const size_t n = runs.size();
+	// --check: the start of the input is encoded and nothing is scored; the runs' bitrates and frame counts are of that part.
+	const bool check = vo.check_seconds > 0;
+	SourceInfo si = planned;
+	long long limit = 0;
+	if (check && si.framerate.value() > 0) {
+		limit = std::max<long long>(1, std::llround(vo.check_seconds * si.framerate.value()));
+		if (si.frame_count > 0 && limit >= si.frame_count) limit = 0; // the input is no longer than that
+		else {
+			si.frame_count = limit;
+			si.duration = (double)limit / si.framerate.value();
+		}
+	}
 	auto src = open_source(input);
 	if (!src) {
 		fprintf(stderr, "cannot open %s\n", input.c_str());
@@ -582,7 +596,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 		PacketQueue* pq = packets.back().get();
 		PacketQueue* dq = dist_packets.back().get();
 		Holding* hd = holding.back().get();
-		runs[i]->enc.tee = [pq, dq, hd](const uint8_t* d, size_t size) { hd->out++; changed.notify(); const bool a = pq->push(d, size), b = dq->push(d, size); return a || b; };
+		if (!check) runs[i]->enc.tee = [pq, dq, hd](const uint8_t* d, size_t size) { hd->out++; changed.notify(); const bool a = pq->push(d, size), b = dq->push(d, size); return a || b; };
 		if (runs[i]->enc.rp) { // frames the encoder gets: fewer than the source's when the frame rate is lowered
 			const Plan& pl = *runs[i]->enc.plan;
 			runs[i]->enc.rp->begin(1, pl.convert_rate ? std::max<long long>(1, std::llround(si.duration * pl.enc.fps.value())) : std::max<long long>(1, si.frame_count));
@@ -591,7 +605,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 
 	// The scoring formats, and a reference of each, converted from the decoded frames.
 	std::vector<Fmt> formats;
-	for (auto* r : runs) if (std::find(formats.begin(), formats.end(), r->enc.plan->score_fmt) == formats.end()) formats.push_back(r->enc.plan->score_fmt);
+	if (!check) for (auto* r : runs) if (std::find(formats.begin(), formats.end(), r->enc.plan->score_fmt) == formats.end()) formats.push_back(r->enc.plan->score_fmt);
 	struct Group {
 		Fmt fmt;
 		std::vector<size_t> members, readers;
@@ -632,7 +646,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 	}
 	const size_t feed_reader = raw.add_reader(DECODE_AHEAD);
 	std::vector<size_t> dist_readers;
-	for (size_t i = 0; i < n; i++) {
+	if (!check) for (size_t i = 0; i < n; i++) {
 		PacketQueue* dq = dist_packets[i].get();
 		Holding* hd = holding[i].get();
 		dist_readers.push_back(enc_frames.add_reader(SCORE_BEHIND, [dq] { return dq->waiting.load(); }, [hd] { return hd->frames(); }));
@@ -645,8 +659,8 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 	const int decode_handle = ui::attach(&decode_rp, input.substr(slash == std::string::npos ? 0 : slash + 1), "decode");
 
 	bool decode_ok = false, feed_ok = false;
-	std::thread decoder([&] { decode_input(*src, raw, [&] { return raw.held() || enc_frames.held() || raw.too_far(IDLE_BEYOND) || enc_frames.too_far(IDLE_BEYOND); }, decode_ok, &decode_rp); });
-	std::thread feeder([&] { feed_encoders(*src, raw, feed_reader, *runs[0]->enc.plan, so, bc, enc_frames, fr, feed_ok, feed_rp); });
+	std::thread decoder([&] { decode_input(*src, raw, [&] { return raw.held() || enc_frames.held() || raw.too_far(IDLE_BEYOND) || enc_frames.too_far(IDLE_BEYOND); }, decode_ok, &decode_rp, limit); });
+	std::thread feeder([&] { feed_encoders(*src, raw, feed_reader, *runs[0]->enc.plan, so, bc, enc_frames, fr, feed_ok, feed_rp, !check); });
 	std::vector<std::thread> threads;
 	for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {
 		consume(runs[i]->enc, si, bc.at(i), holding[i].get(), [&, i] {
@@ -683,7 +697,7 @@ bool run_wave(const std::string& input, const SourceInfo& si, std::vector<WaveRu
 		});
 	}
 	// The distorted score: each encode against the frames its encoder got, at their size and frame rate, with every model.
-	for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {
+	if (!check) for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {
 		WaveRun& run = *runs[i];
 		const Plan& pl = *run.enc.plan;
 		PacketQueue& pq = *dist_packets[i];

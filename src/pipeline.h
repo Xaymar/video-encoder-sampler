@@ -6,6 +6,7 @@
 // scoring: the original frames in each scoring format (the true score) and the frames the encoders got (the distorted score) are kept
 // until every scorer has used them, and the decode waits for a scorer that falls far behind (see run_wave).
 #include <condition_variable>
+#include <cstring>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -21,11 +22,33 @@
 struct OutputInfo {
 	long long count = 0, bytes = 0;
 	uint64_t hash = 1469598103934665603ull; // FNV-1a over every packet and its size
+	// The same without the encoder's own settings text: x264 and x265 write their options into an SEI NAL unit, so two runs whose options changed
+	// nothing in the pictures still differ there. Equal: the same pictures (what --check compares).
+	uint64_t pictures = 1469598103934665603ull;
 	void add(const uint8_t* d, size_t n) {
 		for (int i = 0; i < 8; i++) hash = (hash ^ (uint8_t)((uint64_t)n >> (8 * i))) * 1099511628211ull;
 		for (size_t i = 0; i < n; i++) hash = (hash ^ d[i]) * 1099511628211ull;
 		count++;
 		bytes += (long long)n;
+		add_pictures(d, n);
+	}
+private:
+	static bool has(const uint8_t* b, const uint8_t* e, const char* text) {
+		const size_t len = strlen(text);
+		for (; b + len <= e; b++) if (memcmp(b, text, len) == 0) return true;
+		return false;
+	}
+	void add_pictures(const uint8_t* d, size_t n) {
+		const uint8_t* end = d + n;
+		auto mix = [&](const uint8_t* b, const uint8_t* e) { for (; b < e; b++) pictures = (pictures ^ *b) * 1099511628211ull; };
+		if (!has(d, end, "options: ")) { mix(d, end); return; }
+		// Annex B: the NAL units between start codes; the one with the settings text is left out.
+		auto next_start = [&](const uint8_t* p) { for (; p + 3 <= end; p++) if (p[0] == 0 && p[1] == 0 && p[2] == 1) return p; return end; };
+		for (const uint8_t* s = next_start(d); s < end;) {
+			const uint8_t* e = next_start(s + 3);
+			if (!has(s, e, "options: ")) mix(s, e);
+			s = e;
+		}
 	}
 };
 
