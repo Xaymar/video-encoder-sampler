@@ -614,12 +614,12 @@ static void load_config_json(const Json& root, Config& cfg) {
 		}
 		if (auto* r = e.find("rules")) {
 			j.rules.parse(*r);
-			// A word without quotes is an option name: "b_reference_mode == each" asks for an option "each". Say so for names the entry does not list.
+			// A misspelt name reads as an unset option: say so for names the entry does not list.
 			for (auto& name : j.rules.names()) {
 				bool listed = is_default_key(name) || name == "range";
 				for (auto& ax : j.axes) listed |= ax.key == name;
-				if (!listed) fprintf(stderr, "config: %s%s rules read '%s', which the entry does not list: it reads as the encoder's default where that is known. A word as a value needs quotes ('%s')\n",
-				                     r->where().c_str(), j.encoder.c_str(), name.c_str(), name.c_str());
+				if (!listed) fprintf(stderr, "config: %s%s rules read '%s', which the entry does not list: it reads as the encoder's default where that is known\n",
+				                     r->where().c_str(), j.encoder.c_str(), name.c_str());
 			}
 		}
 		cfg.jobs.push_back(std::move(j));

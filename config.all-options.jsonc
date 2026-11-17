@@ -68,9 +68,17 @@
 				// "num_ltr_frames": [0, 1, 2, 4],   // long-term references exclude B-frames: use them with "max_b_frames": [0]
 				"max_ref_frames_l1": [1, 2],   // 0 = automatic, up to 7
 			},
-			"rules": [   // combinations that cannot work are not made (see config.jsonc)
-				{ "if": "b_reference_mode in ['middle', 'each'] and set(max_ref_frames)", "then": "max_ref_frames >= 3" },
-				{ "if": "b_reference_mode == 'each' and set(max_ref_frames)", "then": "max_ref_frames >= max_b_frames" },
+			"rules": [   // combinations that cannot work are not made (see config.jsonc): B-frames as references need max_ref_frames >= 3, "each" >= max_b_frames
+				{
+					"if": { "op": "and", "args": [{ "op": "in", "left": { "option": "b_reference_mode" }, "right": ["middle", "each"] }, { "set": "max_ref_frames" }] },
+					"then": [
+						{ "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 },
+						{
+							"if": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "each" },
+							"then": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": { "option": "max_b_frames" } },
+						},
+					],
+				},
 			],
 		},
 		// NVIDIA, HEVC (the shared options as for H.264, then the HEVC ones)
@@ -116,9 +124,17 @@
 				"max_ref_frames_l1": [1, 2],   // 0 = automatic, up to 7
 				"max_ref_frames": [3, 4],   // B-frames as references need at least 3
 			},
-			"rules": [   // combinations that cannot work are not made (see config.jsonc)
-				{ "if": "b_reference_mode in ['middle', 'each'] and set(max_ref_frames)", "then": "max_ref_frames >= 3" },
-				{ "if": "b_reference_mode == 'each' and set(max_ref_frames)", "then": "max_ref_frames >= max_b_frames" },
+			"rules": [   // combinations that cannot work are not made (see config.jsonc): B-frames as references need max_ref_frames >= 3, "each" >= max_b_frames
+				{
+					"if": { "op": "and", "args": [{ "op": "in", "left": { "option": "b_reference_mode" }, "right": ["middle", "each"] }, { "set": "max_ref_frames" }] },
+					"then": [
+						{ "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 },
+						{
+							"if": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "each" },
+							"then": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": { "option": "max_b_frames" } },
+						},
+					],
+				},
 			],
 		},
 		// NVIDIA, AV1 (the shared options as for H.264, then the AV1 ones)

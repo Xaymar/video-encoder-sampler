@@ -124,197 +124,6 @@ namespace {
 
 using Ptr = std::shared_ptr<const RuleExpr>;
 
-class Parser {
-public:
-	Parser(const std::string& text, const std::string& where, std::set<std::string>& names) : t_(text), where_(where), names_(names) {}
-
-	Ptr parse() {
-		Ptr e = or_();
-		skip();
-		if (p_ < t_.size()) fail("unexpected '" + t_.substr(p_, 1) + "'");
-		return e;
-	}
-
-private:
-	const std::string& t_;
-	std::string where_;
-	std::set<std::string>& names_;
-	size_t p_ = 0;
-
-	[[noreturn]] void fail(const std::string& why) const {
-		throw std::runtime_error(where_ + "rule '" + t_ + "', column " + std::to_string(p_ + 1) + ": " + why);
-	}
-	void skip() { while (p_ < t_.size() && isspace((unsigned char)t_[p_])) p_++; }
-	bool ident_start(size_t i) const { return i < t_.size() && (isalpha((unsigned char)t_[i]) || t_[i] == '_'); }
-	bool ident_char(size_t i) const {
-		if (i >= t_.size()) return false;
-		const unsigned char c = (unsigned char)t_[i];
-		return isalnum(c) || c == '_' || ((c == '-' || c == '.') && ident_start(i + 1)); // "b-adapt"; "a-1" is a minus
-	}
-	// The next word without taking it ("" when there is none).
-	std::string peek_word() {
-		skip();
-		if (!ident_start(p_)) return {};
-		size_t e = p_;
-		while (ident_char(e)) e++;
-		return t_.substr(p_, e - p_);
-	}
-	bool word(const char* w) {
-		if (peek_word() != w) return false;
-		p_ += strlen(w);
-		return true;
-	}
-	bool sym(const char* s) {
-		skip();
-		if (t_.compare(p_, strlen(s), s) != 0) return false;
-		if (s[0] == '<' || s[0] == '>' || s[0] == '=' || s[0] == '!') // "<" is not the start of "<="
-			if (!s[1] && p_ + 1 < t_.size() && t_[p_ + 1] == '=') return false;
-		p_ += strlen(s);
-		return true;
-	}
-	static Ptr node(RuleExpr::Op op, std::vector<Ptr> args) {
-		auto e = std::make_shared<RuleExpr>();
-		e->op = op;
-		e->args = std::move(args);
-		return e;
-	}
-
-	Ptr or_() {
-		Ptr a = and_();
-		while (word("or") || sym("||")) a = node(RuleExpr::Or, {a, and_()});
-		return a;
-	}
-	Ptr and_() {
-		Ptr a = not_();
-		while (word("and") || sym("&&")) a = node(RuleExpr::And, {a, not_()});
-		return a;
-	}
-	Ptr not_() {
-		if (word("not") || (peek_char() == '!' && !next_is('=') && sym("!"))) return node(RuleExpr::Not, {not_()});
-		return cmp();
-	}
-	char peek_char() { skip(); return p_ < t_.size() ? t_[p_] : 0; }
-	bool next_is(char c) const { return p_ + 1 < t_.size() && t_[p_ + 1] == c; }
-	Ptr cmp() {
-		Ptr a = add();
-		static const std::pair<const char*, RuleExpr::Op> ops[] = {{"==", RuleExpr::Eq}, {"!=", RuleExpr::Ne}, {"<=", RuleExpr::Le}, {">=", RuleExpr::Ge},
-		                                                           {"<", RuleExpr::Lt}, {">", RuleExpr::Gt}, {"=", RuleExpr::Eq}};
-		for (auto& [s, op] : ops) if (sym(s)) {
-			Ptr b = add();
-			if (peek_cmp()) fail("comparisons do not chain: write 'a < b and b < c'");
-			return node(op, {a, b});
-		}
-		const size_t at = p_;
-		bool negated = false;
-		if (word("not")) {
-			if (peek_word() != "in") { p_ = at; return a; }
-			negated = true;
-		}
-		if (word("in")) {
-			skip();
-			if (!sym("[")) fail("'in' takes a list: x in [1, 2]");
-			std::vector<Ptr> args{a};
-			if (!sym("]")) {
-				do args.push_back(add()); while (sym(","));
-				if (!sym("]")) fail("expected ']' or ','");
-			}
-			return node(negated ? RuleExpr::NotIn : RuleExpr::In, std::move(args));
-		}
-		return a;
-	}
-	bool peek_cmp() {
-		skip();
-		const char c = p_ < t_.size() ? t_[p_] : 0;
-		return c == '<' || c == '>' || c == '=' || (c == '!' && next_is('='));
-	}
-	Ptr add() {
-		Ptr a = mul();
-		for (;;) {
-			if (sym("+")) a = node(RuleExpr::Add, {a, mul()});
-			else if (sym("-")) a = node(RuleExpr::Sub, {a, mul()});
-			else return a;
-		}
-	}
-	Ptr mul() {
-		Ptr a = unary();
-		for (;;) {
-			if (sym("*")) a = node(RuleExpr::Mul, {a, unary()});
-			else if (sym("/")) a = node(RuleExpr::Div, {a, unary()});
-			else if (sym("%")) a = node(RuleExpr::Mod, {a, unary()});
-			else return a;
-		}
-	}
-	Ptr unary() {
-		if (sym("-")) return node(RuleExpr::Neg, {unary()});
-		if (sym("+")) return unary();
-		return primary();
-	}
-	Ptr primary() {
-		skip();
-		if (p_ >= t_.size()) fail("the rule ends where a value was expected");
-		const char c = t_[p_];
-		if (c == '(') {
-			p_++;
-			Ptr e = or_();
-			if (!sym(")")) fail("expected ')'");
-			return e;
-		}
-		if (c == '\'' || c == '"') {
-			const size_t start = ++p_;
-			while (p_ < t_.size() && t_[p_] != c) p_++;
-			if (p_ >= t_.size()) { p_ = start - 1; fail("the string is not closed"); }
-			auto e = std::make_shared<RuleExpr>();
-			e->value = Value::str(t_.substr(start, p_ - start));
-			p_++;
-			return e;
-		}
-		if (isdigit((unsigned char)c) || (c == '.' && p_ + 1 < t_.size() && isdigit((unsigned char)t_[p_ + 1]))) {
-			char* end = nullptr;
-			const double d = strtod(t_.c_str() + p_, &end);
-			p_ = (size_t)(end - t_.c_str());
-			auto e = std::make_shared<RuleExpr>();
-			e->value = Value::num(d);
-			return e;
-		}
-		const std::string w = peek_word();
-		if (w.empty()) fail("unexpected '" + std::string(1, c) + "'");
-		p_ += w.size();
-		if (w == "true" || w == "false") { auto e = std::make_shared<RuleExpr>(); e->value = Value::boolean(w == "true"); return e; }
-		if (w == "and" || w == "or" || w == "not" || w == "in") { p_ -= w.size(); fail("'" + w + "' where a value was expected"); }
-		if (sym("(")) { // a function
-			if (w == "set") {
-				const std::string n = peek_word();
-				if (n.empty()) fail("set() takes an option name: set(max_b_frames)");
-				p_ += n.size();
-				if (!sym(")")) fail("expected ')'");
-				names_.insert(n);
-				auto e = std::make_shared<RuleExpr>();
-				e->op = RuleExpr::Set;
-				e->name = n;
-				return e;
-			}
-			static const std::pair<const char*, RuleExpr::Op> fns[] = {{"min", RuleExpr::Min}, {"max", RuleExpr::Max}, {"abs", RuleExpr::Abs}, {"floor", RuleExpr::Floor}, {"ceil", RuleExpr::Ceil}};
-			for (auto& [name, op] : fns) if (w == name) {
-				std::vector<Ptr> args;
-				if (!sym(")")) {
-					do args.push_back(or_()); while (sym(","));
-					if (!sym(")")) fail("expected ')' or ','");
-				}
-				const bool one = op == RuleExpr::Abs || op == RuleExpr::Floor || op == RuleExpr::Ceil;
-				if (one ? args.size() != 1 : args.empty()) fail(w + "() takes " + (one ? "one value" : "one or more values"));
-				return node(op, std::move(args));
-			}
-			p_ -= w.size() + 1;
-			fail("'" + w + "' is not a function (set, min, max, abs, floor, ceil)");
-		}
-		names_.insert(w);
-		auto e = std::make_shared<RuleExpr>();
-		e->op = RuleExpr::Name;
-		e->name = w;
-		return e;
-	}
-};
-
 std::string quote(const std::string& s) {
 	std::string o = "\"";
 	for (unsigned char c : s) {
@@ -325,27 +134,122 @@ std::string quote(const std::string& s) {
 	return o + "\"";
 }
 
+// The JSON of a parsed value, compact: a worker gets the host's rules as they were written.
+std::string dump(const Json& j) {
+	switch (j.type) {
+	case Json::Null: return "null";
+	case Json::Bool: return j.s == "1" || j.s == "true" ? "true" : "false";
+	case Json::Num: return j.s;
+	case Json::Str: return quote(j.s);
+	case Json::Arr: { std::string o = "["; for (size_t i = 0; i < j.a.size(); i++) o += (i ? "," : "") + dump(j.a[i]); return o + "]"; }
+	case Json::Obj: { std::string o = "{"; for (size_t i = 0; i < j.o.size(); i++) o += (i ? "," : "") + quote(j.o[i].first) + ":" + dump(j.o[i].second); return o + "}"; }
+	}
+	return "null";
+}
+
+Ptr constant(Value v) { auto e = std::make_shared<RuleExpr>(); e->value = std::move(v); return e; }
+
+// An expression: a number, true/false or a string (a value), {"option": name}, {"set": name}, or {"op": ..., ...}:
+//   "==" "!=" "<" "<=" ">" ">=" "+" "-" "*" "/" "%"   with "left" and "right"
+//   "and" "or"                                        with "args": [...] (or "left" and "right")
+//   "in" "not in"                                     with "left" and "right": [values]
+//   "not" "neg" "abs" "floor" "ceil"                  with "value"
+//   "min" "max"                                       with "args": [...]
+Ptr parse_expr(const Json& j, std::set<std::string>& names) {
+	switch (j.type) {
+	case Json::Num: return constant(Value::option(j.s));
+	case Json::Bool: return constant(Value::boolean(j.s == "1" || j.s == "true"));
+	case Json::Str: return constant(Value::option(j.s)); // "4" is the number 4, as an option's value is
+	case Json::Null: throw std::runtime_error(j.where() + "null is not a value in a rule");
+	case Json::Arr: throw std::runtime_error(j.where() + "a list is only a value as the right side of \"in\"");
+	case Json::Obj: break;
+	}
+	auto name_of = [&](const char* key) -> std::string {
+		const Json* n = j.find(key);
+		if (j.o.size() != 1) throw std::runtime_error(j.where() + "{\"" + key + "\": name} takes nothing else");
+		if (n->type != Json::Str || n->s.empty()) throw std::runtime_error(n->where() + "\"" + key + "\" takes an option name");
+		names.insert(n->s);
+		return n->s;
+	};
+	if (j.find("option") || j.find("set")) {
+		auto e = std::make_shared<RuleExpr>();
+		e->op = j.find("option") ? RuleExpr::Name : RuleExpr::Set;
+		e->name = name_of(e->op == RuleExpr::Name ? "option" : "set");
+		return e;
+	}
+	const Json* opj = j.find("op");
+	if (!opj) throw std::runtime_error(j.where() + "an expression object needs \"op\" (or is {\"option\": name} or {\"set\": name})");
+	if (opj->type != Json::Str) throw std::runtime_error(opj->where() + "\"op\" takes a string such as \"==\"");
+	const std::string op = opj->s;
+	static const std::pair<const char*, RuleExpr::Op> binary[] = {{"==", RuleExpr::Eq}, {"!=", RuleExpr::Ne}, {"<", RuleExpr::Lt}, {"<=", RuleExpr::Le}, {">", RuleExpr::Gt},
+	                                                             {">=", RuleExpr::Ge}, {"+", RuleExpr::Add}, {"-", RuleExpr::Sub}, {"*", RuleExpr::Mul}, {"/", RuleExpr::Div},
+	                                                             {"%", RuleExpr::Mod}};
+	static const std::pair<const char*, RuleExpr::Op> unary[] = {{"not", RuleExpr::Not}, {"neg", RuleExpr::Neg}, {"abs", RuleExpr::Abs}, {"floor", RuleExpr::Floor}, {"ceil", RuleExpr::Ceil}};
+	static const std::pair<const char*, RuleExpr::Op> many[] = {{"and", RuleExpr::And}, {"or", RuleExpr::Or}, {"min", RuleExpr::Min}, {"max", RuleExpr::Max}};
+	auto only = [&](std::initializer_list<const char*> keys) {
+		for (auto& [k, v] : j.o) {
+			bool ok = k == "op";
+			for (const char* x : keys) ok |= k == x;
+			if (!ok) {
+				std::string list;
+				for (const char* x : keys) list += std::string(list.empty() ? "" : ", ") + "\"" + x + "\"";
+				throw std::runtime_error(v.where() + "\"op\": \"" + op + "\" takes " + list + ", not \"" + k + "\"");
+			}
+		}
+	};
+	auto need = [&](const char* key) -> const Json& {
+		const Json* v = j.find(key);
+		if (!v) throw std::runtime_error(j.where() + "\"op\": \"" + op + "\" needs \"" + key + "\"");
+		return *v;
+	};
+	auto node = [](RuleExpr::Op o, std::vector<Ptr> args) { auto e = std::make_shared<RuleExpr>(); e->op = o; e->args = std::move(args); return e; };
+	for (auto& [s, o] : binary) if (op == s) { only({"left", "right"}); return node(o, {parse_expr(need("left"), names), parse_expr(need("right"), names)}); }
+	for (auto& [s, o] : unary) if (op == s) { only({"value"}); return node(o, {parse_expr(need("value"), names)}); }
+	for (auto& [s, o] : many) if (op == s) {
+		std::vector<Ptr> args;
+		if (j.find("args")) {
+			only({"args"});
+			const Json& a = need("args");
+			if (a.type != Json::Arr || a.a.empty()) throw std::runtime_error(a.where() + "\"args\" takes a list of one or more expressions");
+			for (auto& x : a.a) args.push_back(parse_expr(x, names));
+		} else {
+			only({"left", "right"});
+			args = {parse_expr(need("left"), names), parse_expr(need("right"), names)};
+		}
+		if (o == RuleExpr::And || o == RuleExpr::Or) // as a chain of pairs
+			while (args.size() > 1) { Ptr b = args.back(); args.pop_back(); Ptr a = args.back(); args.back() = node(o, {a, b}); }
+		if (o == RuleExpr::And || o == RuleExpr::Or) return args[0];
+		return node(o, std::move(args));
+	}
+	if (op == "in" || op == "not in") {
+		only({"left", "right"});
+		const Json& r = need("right");
+		if (r.type != Json::Arr) throw std::runtime_error(r.where() + "\"right\" of \"" + op + "\" takes a list");
+		std::vector<Ptr> args{parse_expr(need("left"), names)};
+		for (auto& x : r.a) args.push_back(parse_expr(x, names));
+		return node(op == "in" ? RuleExpr::In : RuleExpr::NotIn, std::move(args));
+	}
+	throw std::runtime_error(opj->where() + "unknown \"op\" \"" + op + "\" (== != < <= > >= + - * / % and or not in \"not in\" neg abs floor ceil min max)");
+}
+
 void parse_list(const Json& j, std::vector<Rules::Rule>& out, std::set<std::string>& names);
 
+// A rule: an expression that must hold, or {"if": expression, "then": rules, "else": rules}, where rules are a rule or a list of them.
 Rules::Rule parse_rule(const Json& j, std::set<std::string>& names) {
 	Rules::Rule r;
-	if (j.type == Json::Obj) {
+	if (j.type != Json::Obj && j.type != Json::Bool) throw std::runtime_error(j.where() + "a rule is an expression object ({\"op\": ...}) or {\"if\": ..., \"then\": ..., \"else\": ...}");
+	r.text = dump(j);
+	if (j.find("if")) {
 		for (auto& [k, v] : j.o)
-			if (k != "if" && k != "then" && k != "else") throw std::runtime_error(v.where() + "a rule has an unknown key '" + k + "' (it takes if, then and else)");
-		const Json* c = j.find("if");
+			if (k != "if" && k != "then" && k != "else") throw std::runtime_error(v.where() + "a rule with \"if\" has an unknown key '" + k + "' (it takes if, then and else)");
 		const Json* t = j.find("then");
 		const Json* e = j.find("else");
-		if (!c) throw std::runtime_error(j.where() + "a rule object needs 'if' (or write the rule as a plain expression)");
-		if (!t && !e) throw std::runtime_error(j.where() + "a rule with 'if' needs 'then' or 'else'");
-		if (c->type != Json::Str) throw std::runtime_error(c->where() + "'if' takes an expression in a string");
-		r.text = c->s;
-		r.cond = Parser(r.text, c->where(), r.names).parse();
+		if (!t && !e) throw std::runtime_error(j.where() + "a rule with \"if\" needs \"then\" or \"else\"");
+		r.cond = parse_expr(*j.find("if"), r.names);
 		if (t) parse_list(*t, r.then_, r.names);
 		if (e) { parse_list(*e, r.else_, r.names); r.has_else = true; }
-	} else if (j.type == Json::Str) {
-		r.text = j.s;
-		r.expr = Parser(r.text, j.where(), r.names).parse();
-	} else throw std::runtime_error(j.where() + "a rule is an expression in a string or an object with if/then/else");
+	} else if (j.find("then") || j.find("else")) throw std::runtime_error(j.where() + "\"then\" and \"else\" need \"if\"");
+	else r.expr = parse_expr(j, r.names);
 	names.insert(r.names.begin(), r.names.end());
 	return r;
 }
@@ -363,19 +267,7 @@ bool rule_holds(const Rules::Rule& r, const Rules::Lookup& look) {
 	return true;
 }
 
-std::string rule_json(const Rules::Rule& r) {
-	if (r.expr) return quote(r.text);
-	std::string o = "{\"if\":" + quote(r.text);
-	for (auto* list : {&r.then_, &r.else_}) {
-		if (list == &r.else_ && !r.has_else) continue;
-		if (list == &r.then_ && r.then_.empty()) continue;
-		o += list == &r.then_ ? ",\"then\":[" : ",\"else\":[";
-		for (size_t i = 0; i < list->size(); i++) o += (i ? "," : "") + rule_json((*list)[i]);
-		o += "]";
-	}
-	return o + "}";
-}
-
+std::string rule_json(const Rules::Rule& r) { return r.text; }
 } // namespace
 
 void Rules::parse(const Json& j) {

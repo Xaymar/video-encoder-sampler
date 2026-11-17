@@ -2,21 +2,25 @@
 // Rules between options of one encoder entry: combinations that cannot work (NVENC with B-frames as references and fewer than 3 reference frames) are never made.
 //
 //   "rules": [
-//     { "if": "b_reference_mode in ['middle', 'each']", "then": "max_ref_frames >= 3" },
-//     { "if": "b_reference_mode == 'each'", "then": "max_ref_frames >= max_b_frames" },
-//     "lookahead_frames <= 32"
+//     { "if": { "op": "in", "left": { "option": "b_reference_mode" }, "right": ["middle", "each"] },
+//       "then": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 } },
+//     { "op": "<=", "left": { "option": "lookahead_frames" }, "right": 32 }
 //   ]
 //
-// A rule is an expression that must hold, or an object { "if": ..., "then": ..., "else": ... } where "then" must hold when "if" does and "else" (optional) when it
-// does not. "then" and "else" are an expression, a rule object or a list of them, so rules nest. A combination is made only when every rule holds.
+// A rule is an expression that must hold, or { "if": ..., "then": ..., "else": ... } where "then" must hold when "if" does and "else" (optional) when it
+// does not. "then" and "else" are a rule or a list of them, so rules nest. A combination is made only when every rule holds.
 //
-// Expressions: numbers, strings in '' (or "" escaped in JSON), true, false, option names, ( ), [a, b] lists for `in`;
-//   or ||   and &&   not !   == != < <= > >=   x in [...]   x not in [...]   + - * / %   unary -
-//   set(name): the combination sets that option itself (not its default); min(a, ...), max(a, ...), abs(x), floor(x), ceil(x)
+// Expressions are JSON: a number, true/false or a string (a value), { "option": name } (its value), { "set": name } (whether the combination sets it itself,
+// not its default), or { "op": ..., ... }:
+//   "==" "!=" "<" "<=" ">" ">=" "+" "-" "*" "/" "%"   with "left" and "right"
+//   "and" "or"                                        with "args": [...] (or "left" and "right")
+//   "in" "not in"                                     with "left" and "right": [values]
+//   "not" "neg" "abs" "floor" "ceil"                  with "value"
+//   "min" "max"                                       with "args": [...]
+// Numbers compare as numbers ("4" == 4.0), words as text; a word is true unless it is "", false, none, off or disabled.
 // An option the combination leaves unset ("", not listed, or its condition failed) reads as the encoder's default with the combination's preset, tune and
-// profile, as requires/unless do. A name joins words with - only when a letter follows ("b-adapt"), so subtract with spaces ("a - b").
-// What is not known (an unset option without a known default, a word compared with < or used in arithmetic) leaves the rule undecided, and an undecided rule
-// drops nothing: rules only leave out combinations they can show to be wrong.
+// profile, as requires/unless do. What is not known (an unset option without a known default, a word compared with < or used in arithmetic) leaves the rule
+// undecided, and an undecided rule drops nothing: rules only leave out combinations they can show to be wrong.
 #include <functional>
 #include <memory>
 #include <set>
@@ -31,21 +35,21 @@ public:
 	// The option's value and whether the combination sets it; nullptr (with set false) when it is unset and its default is not known.
 	using Lookup = std::function<const std::string*(const std::string& key, bool& set)>;
 
-	void parse(const Json& j); // the entry's "rules": a rule or a list of them; throws with the line and column of what is wrong
+	void parse(const Json& j); // the entry's "rules": a rule or a list of them; throws with the line of what is wrong
 	bool empty() const { return rules_.empty(); }
 	size_t size() const { return rules_.size(); }
 	const std::set<std::string>& names(size_t rule) const { return rules_[rule].names; } // the options rule `rule` reads (nested rules too)
 	std::set<std::string> names() const;
 	bool holds(size_t rule, const Lookup& look) const; // false only when the rule is shown not to hold
 	bool holds(const Lookup& look) const { for (size_t i = 0; i < rules_.size(); i++) if (!holds(i, look)) return false; return true; }
-	std::string text(size_t rule) const { return rules_[rule].text; } // as written, for messages
+	std::string text(size_t rule) const { return rules_[rule].text; } // as JSON, for messages
 	std::string json() const; // the list as the config writes it (a worker gets the host's rules)
 
 	struct Rule {
 		std::shared_ptr<const RuleExpr> expr, cond; // expr: a plain rule; cond: an if
 		std::vector<Rule> then_, else_;
 		bool has_else = false;
-		std::string text;  // the expression, or of an if its condition
+		std::string text;  // the rule as JSON
 		std::set<std::string> names;
 	};
 
