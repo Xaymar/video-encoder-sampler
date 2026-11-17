@@ -3,12 +3,12 @@
 //
 //   "rules": [
 //     { "if": { "op": "in", "left": { "option": "b_reference_mode" }, "right": ["middle", "each"] },
-//       "then": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 } },
+//       "require": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 } },
 //     { "op": "<=", "left": { "option": "lookahead_frames" }, "right": 32 }
 //   ]
 //
-// A rule is an expression that must hold, or { "if": ..., "then": ..., "else": ... } where "then" must hold when "if" does and "else" (optional) when it
-// does not. "then" and "else" are a rule or a list of them, so rules nest. A combination is made only when every rule holds.
+// A rule is an expression that must hold, or { "if": ..., "require": ..., "else_require": ... } where "require" must hold when "if" does and "else_require" (optional) when it
+// does not. "require" and "else_require" are a rule or a list of them, so rules nest. A combination is made only when every rule holds.
 //
 // Expressions are JSON: a number, true/false or a string (a value), { "option": name } (its value), { "set": name } (whether the combination sets it itself,
 // not its default), or { "op": ..., ... }:

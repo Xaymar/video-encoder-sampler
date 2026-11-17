@@ -72,17 +72,17 @@
 				// lookahead_level only with lookahead
 				{
 					"if": { "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
-					"then": { "op": "==", "left": { "option": "lookahead_level" }, "right": 0 },
+					"require": { "op": "==", "left": { "option": "lookahead_level" }, "right": 0 },
 				},
 				// without B-frames only
 				{
 					"if": { "op": ">", "left": { "option": "max_b_frames" }, "right": 0 },
-					"then": [
+					"require": [
 						{ "op": "==", "left": { "option": "enable_non_ref_p" }, "right": 0 },
 						{ "op": "==", "left": { "option": "enable_weighted_prediction" }, "right": 0 },
 					],
 					// with B-frames only
-					"else": [
+					"else_require": [
 						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 0 },
 						{ "op": "==", "left": { "option": "hierarchical_b_frames" }, "right": 0 },
 						{ "op": "==", "left": { "option": "b_reference_mode" }, "right": "none" },
@@ -92,7 +92,7 @@
 				// adaptive I- and B-frames off, split encoding auto or off. ves always sets enablePTD.
 				{
 					"if": { "op": "==", "left": { "option": "hierarchical_b_frames" }, "right": 1 },
-					"then": [
+					"require": [
 						{ "op": "in", "left": { "op": "+", "left": { "option": "max_b_frames" }, "right": 1 }, "right": [2, 4, 8, 16, 32] },
 						{ "op": "or", "args": [
 							{ "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
@@ -107,16 +107,16 @@
 				// "each" needs at least 2 B-frames
 				{
 					"if": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "each" },
-					"then": { "op": ">", "left": { "option": "max_b_frames" }, "right": 1 },
+					"require": { "op": ">", "left": { "option": "max_b_frames" }, "right": 1 },
 				},
 				// the DPB holds at least one more frame than there are B-frames; with B-frames as references at least 3
 				{
 					"if": { "set": "max_ref_frames" },
-					"then": [
+					"require": [
 						{ "op": ">=", "left": { "option": "max_ref_frames" }, "right": { "op": "+", "left": { "option": "max_b_frames" }, "right": 1 } },
 						{
 							"if": { "op": "in", "left": { "option": "b_reference_mode" }, "right": ["middle", "each"] },
-							"then": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 },
+							"require": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 },
 						},
 					],
 				},
@@ -169,17 +169,17 @@
 				// lookahead_level only with lookahead
 				{
 					"if": { "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
-					"then": { "op": "==", "left": { "option": "lookahead_level" }, "right": 0 },
+					"require": { "op": "==", "left": { "option": "lookahead_level" }, "right": 0 },
 				},
 				// without B-frames only
 				{
 					"if": { "op": ">", "left": { "option": "max_b_frames" }, "right": 0 },
-					"then": [
+					"require": [
 						{ "op": "==", "left": { "option": "enable_non_ref_p" }, "right": 0 },
 						{ "op": "==", "left": { "option": "enable_weighted_prediction" }, "right": 0 },
 					],
 					// with B-frames only
-					"else": [
+					"else_require": [
 						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 0 },
 						{ "op": "==", "left": { "option": "hierarchical_b_frames" }, "right": 0 },
 						{ "op": "==", "left": { "option": "b_reference_mode" }, "right": "none" },
@@ -189,7 +189,7 @@
 				// adaptive I- and B-frames off, split encoding auto or off. ves always sets enablePTD.
 				{
 					"if": { "op": "==", "left": { "option": "hierarchical_b_frames" }, "right": 1 },
-					"then": [
+					"require": [
 						{ "op": "in", "left": { "op": "+", "left": { "option": "max_b_frames" }, "right": 1 }, "right": [2, 4, 8, 16, 32] },
 						{ "op": "or", "args": [
 							{ "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
@@ -204,16 +204,16 @@
 				// "each" needs at least 2 B-frames
 				{
 					"if": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "each" },
-					"then": { "op": ">", "left": { "option": "max_b_frames" }, "right": 1 },
+					"require": { "op": ">", "left": { "option": "max_b_frames" }, "right": 1 },
 				},
 				// the DPB holds at least one more frame than there are B-frames; with B-frames as references at least 3
 				{
 					"if": { "set": "max_ref_frames" },
-					"then": [
+					"require": [
 						{ "op": ">=", "left": { "option": "max_ref_frames" }, "right": { "op": "+", "left": { "option": "max_b_frames" }, "right": 1 } },
 						{
 							"if": { "op": "in", "left": { "option": "b_reference_mode" }, "right": ["middle", "each"] },
-							"then": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 },
+							"require": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 },
 						},
 					],
 				},

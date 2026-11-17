@@ -592,8 +592,10 @@ static void load_config_json(const Json& root, Config& cfg) {
 		if (auto* o = e.find("options")) for (auto& [k, v] : o->o) {
 			Axis ax{k, {}, {}, {}};
 			const Json* list = &v;
-			if (v.type == Json::Obj) { // { "values": [...], "requires": "other" or ["a", "b"], "unless": "other" or [...] }
-				for (auto& [rk, rv] : v.o) if (rk != "values" && rk != "requires" && rk != "unless") throw std::runtime_error(rv.where() + "option '" + k + "' has an unknown key '" + rk + "' (it takes values, requires and unless)");
+			const Json* only_if = nullptr;
+			if (v.type == Json::Obj) { // { "values": [...], "requires": "other" or ["a", "b"], "unless": "other" or [...], "only_if": { value: condition } }
+				for (auto& [rk, rv] : v.o) if (rk != "values" && rk != "requires" && rk != "unless" && rk != "only_if") throw std::runtime_error(rv.where() + "option '" + k + "' has an unknown key '" + rk + "' (it takes values, requires, unless and only_if)");
+				only_if = v.find("only_if");
 				list = v.find("values");
 				if (!list) throw std::runtime_error(v.where() + "option '" + k + "' needs 'values'");
 				for (auto* rule : {&ax.requires_all, &ax.unless_any}) {
@@ -610,6 +612,23 @@ static void load_config_json(const Json& root, Config& cfg) {
 			if (list->type == Json::Arr) { for (auto& x : list->a) add_value(x); } else add_value(*list);
 			if (std::all_of(ax.values.begin(), ax.values.end(), [](const std::string& x) { return x.empty(); })) ax.values.clear();
 			if (dropped_null) fprintf(stderr, "config: %s option '%s' lists null, which is no longer a value (it meant the preset's own, which ves cannot know); it is left out. To run without the option, do not list it\n", j.encoder.c_str(), k.c_str());
+			// "only_if": { "1": condition }: the value is only run where the condition holds (see rules.h). It is a rule "if the option is 1, the condition
+			// must hold", so a combination with the value where the condition fails is never made.
+			if (only_if) {
+				if (only_if->type != Json::Obj) throw std::runtime_error(only_if->where() + "option '" + k + "': 'only_if' takes an object of value to condition");
+				for (auto& [value, cond] : only_if->o) {
+					if (std::find(ax.values.begin(), ax.values.end(), value) == ax.values.end())
+						fprintf(stderr, "config: %s%s option '%s': only_if names the value '%s', which the option does not list\n", cond.where().c_str(), j.encoder.c_str(), k.c_str(), value.c_str());
+					Json name; name.type = Json::Obj; name.o.push_back({"option", Json{}}); name.o[0].second.type = Json::Str; name.o[0].second.s = k;
+					Json val; val.type = Json::Str; val.s = value;
+					Json is; is.type = Json::Obj; is.line = cond.line;
+					Json op; op.type = Json::Str; op.s = "==";
+					is.o = {{"op", op}, {"left", name}, {"right", val}};
+					Json rule; rule.type = Json::Obj; rule.line = cond.line;
+					rule.o = {{"if", is}, {"require", cond}};
+					j.rules.parse(rule);
+				}
+			}
 			if (!ax.values.empty()) j.axes.push_back(std::move(ax));
 		}
 		if (auto* r = e.find("rules")) {

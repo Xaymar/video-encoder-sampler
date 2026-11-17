@@ -234,21 +234,21 @@ Ptr parse_expr(const Json& j, std::set<std::string>& names) {
 
 void parse_list(const Json& j, std::vector<Rules::Rule>& out, std::set<std::string>& names);
 
-// A rule: an expression that must hold, or {"if": expression, "then": rules, "else": rules}, where rules are a rule or a list of them.
+// A rule: an expression that must hold, or {"if": expression, "require": rules, "else_require": rules}, where rules are a rule or a list of them.
 Rules::Rule parse_rule(const Json& j, std::set<std::string>& names) {
 	Rules::Rule r;
-	if (j.type != Json::Obj && j.type != Json::Bool) throw std::runtime_error(j.where() + "a rule is an expression object ({\"op\": ...}) or {\"if\": ..., \"then\": ..., \"else\": ...}");
+	if (j.type != Json::Obj && j.type != Json::Bool) throw std::runtime_error(j.where() + "a rule is an expression object ({\"op\": ...}) or {\"if\": ..., \"require\": ..., \"else_require\": ...}");
 	r.text = dump(j);
 	if (j.find("if")) {
 		for (auto& [k, v] : j.o)
-			if (k != "if" && k != "then" && k != "else") throw std::runtime_error(v.where() + "a rule with \"if\" has an unknown key '" + k + "' (it takes if, then and else)");
-		const Json* t = j.find("then");
-		const Json* e = j.find("else");
-		if (!t && !e) throw std::runtime_error(j.where() + "a rule with \"if\" needs \"then\" or \"else\"");
+			if (k != "if" && k != "require" && k != "else_require") throw std::runtime_error(v.where() + "a rule with \"if\" has an unknown key '" + k + "' (it takes if, require and else_require)");
+		const Json* t = j.find("require");
+		const Json* e = j.find("else_require");
+		if (!t && !e) throw std::runtime_error(j.where() + "a rule with \"if\" needs \"require\" or \"else_require\"");
 		r.cond = parse_expr(*j.find("if"), r.names);
 		if (t) parse_list(*t, r.then_, r.names);
 		if (e) { parse_list(*e, r.else_, r.names); r.has_else = true; }
-	} else if (j.find("then") || j.find("else")) throw std::runtime_error(j.where() + "\"then\" and \"else\" need \"if\"");
+	} else if (j.find("require") || j.find("else_require")) throw std::runtime_error(j.where() + "\"require\" and \"else_require\" need \"if\"");
 	else r.expr = parse_expr(j, r.names);
 	names.insert(r.names.begin(), r.names.end());
 	return r;
