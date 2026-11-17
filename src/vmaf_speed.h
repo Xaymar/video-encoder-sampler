@@ -21,6 +21,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#if defined(__SSE2__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
 
 namespace vmaf_speed {
 
@@ -148,7 +151,16 @@ static void matrix_mul(Matrix *dst, const Matrix *x, const Matrix *y)
     matrix_zero(dst);
     for (int i = 0; i < x->rows; i++) {
         for (int k = 0; k < x->cols; k++) {
-            for (int j = 0; j < y->cols; j++) {
+            int j = 0;
+#if defined(__SSE2__) || defined(_M_X64)
+            // (not libvmaf's: four columns per instruction; each element gets the same float operations in the same order)
+            const __m128 xik = _mm_set1_ps(x->data[i * x->cols + k]);
+            for (; j + 4 <= y->cols; j += 4) {
+                float *d = &dst->data[i * dst->cols + j];
+                _mm_storeu_ps(d, _mm_add_ps(_mm_loadu_ps(d), _mm_mul_ps(xik, _mm_loadu_ps(&y->data[k * y->cols + j]))));
+            }
+#endif
+            for (; j < y->cols; j++) {
                 dst->data[i * dst->cols + j] +=
                     x->data[i * x->cols + k] * y->data[k * y->cols + j];
             }
@@ -686,11 +698,91 @@ static float compute_covariance(SpeedDimensions dim, const float *data,
     return result / (dim.submatrix_width * dim.submatrix_height);
 }
 
+// (Not libvmaf's.) What compute_covariance_matrix() works out with compute_cov_kernel_scalar() for a 5x5 block, bit for bit the same, about four times
+// faster. Each of the 325 sums is still taken over the samples in row order with the same double operations ((x - mean x) * (y - mean y), added up),
+// but four sums advance side by side in one pair of SSE2 registers, from samples centred once instead of 25 times; the samples are taken in runs
+// that stay in the L1 cache while every pair goes over them. One sum at a time, the scalar kernel was most of the GPU scorer's CPU time per frame.
+static void compute_covariance_matrix_scalar_5(SpeedDimensions dim, const float *data, float *cov_mat, float *means, size_t stride_px)
+{
+    enum { B = DEFAULT_BLOCK_SIZE, E = B * B, EP = 28, CH = (E + 3) / 4, RUN = 128 };
+    // compute_mean() for the 25 offsets side by side (each a float sum in row order, as there)
+    // (offsets r, 0..3 of a block row are next to each other in memory: four sums in one register, the fifth alone)
+    alignas(16) float msum[E] = {};
+    for (int r = 0; r < B; r++) {
+#if defined(__SSE2__) || defined(_M_X64)
+        __m128 m4 = _mm_setzero_ps();
+#endif
+        float m1 = 0;
+        for (size_t i = 0; i < dim.submatrix_height; i++) {
+            const float *row = data + (i + r) * stride_px;
+            for (size_t j = 0; j < dim.submatrix_width; j++) {
+#if defined(__SSE2__) || defined(_M_X64)
+                m4 = _mm_add_ps(m4, _mm_loadu_ps(row + j));
+#else
+                for (int c = 0; c < 4; c++) msum[r * B + c] += row[j + c];
+#endif
+                m1 += row[j + 4];
+            }
+        }
+#if defined(__SSE2__) || defined(_M_X64)
+        _mm_storeu_ps(&msum[r * B], m4);
+#endif
+        msum[r * B + 4] = m1;
+    }
+    double mean[E];
+    for (int x = 0; x < E; x++) {
+        means[x] = msum[x] / (dim.submatrix_width * dim.submatrix_height);
+        mean[x] = means[x];
+    }
+    // acc[x][c]: the sums of pairs (x, 4c .. 4c + 3); pairs with y > x are worked out too and dropped
+    alignas(16) double acc[E][CH * 4] = {};
+    alignas(16) double centred[RUN][EP];
+    const size_t w = dim.submatrix_width, n = w * dim.submatrix_height;
+    for (size_t p0 = 0; p0 < n; p0 += RUN) {
+        const int run = (int)(n - p0 < RUN ? n - p0 : RUN);
+        for (int q = 0; q < run; q++) {
+            const size_t i = (p0 + q) / w, j = (p0 + q) % w;
+            for (int x = 0; x < E; x++) centred[q][x] = (double)data[(i + x / B) * stride_px + j + x % B] - mean[x];
+            for (int x = E; x < EP; x++) centred[q][x] = 0;
+        }
+        for (int x = 0; x < E; x++) {
+            for (int c = 0; c * 4 <= x; c++) {
+#if defined(__SSE2__) || defined(_M_X64)
+                __m128d a0 = _mm_load_pd(&acc[x][4 * c]), a1 = _mm_load_pd(&acc[x][4 * c + 2]);
+                for (int q = 0; q < run; q++) {
+                    const __m128d vx = _mm_set1_pd(centred[q][x]);
+                    a0 = _mm_add_pd(a0, _mm_mul_pd(vx, _mm_load_pd(&centred[q][4 * c])));
+                    a1 = _mm_add_pd(a1, _mm_mul_pd(vx, _mm_load_pd(&centred[q][4 * c + 2])));
+                }
+                _mm_store_pd(&acc[x][4 * c], a0);
+                _mm_store_pd(&acc[x][4 * c + 2], a1);
+#else
+                double a[4] = {acc[x][4 * c], acc[x][4 * c + 1], acc[x][4 * c + 2], acc[x][4 * c + 3]};
+                for (int q = 0; q < run; q++)
+                    for (int k = 0; k < 4; k++) a[k] += centred[q][x] * centred[q][4 * c + k];
+                for (int k = 0; k < 4; k++) acc[x][4 * c + k] = a[k];
+#endif
+            }
+        }
+    }
+    for (int x = 0; x < E; x++) {
+        for (int y = 0; y <= x; y++) {
+            const float covariance = acc[x][y] / (dim.submatrix_width * dim.submatrix_height);
+            cov_mat[x * E + y] = covariance;
+            cov_mat[y * E + x] = covariance;
+        }
+    }
+}
+
 static void compute_covariance_matrix(SpeedDimensions dim, const float *data,
                                       float *cov_mat, float *means,
                                       size_t stride_px,
                                       compute_cov_kernel_fn kernel)
 {
+    if (kernel == compute_cov_kernel_scalar && dim.block_size == DEFAULT_BLOCK_SIZE) {
+        compute_covariance_matrix_scalar_5(dim, data, cov_mat, means, stride_px);
+        return;
+    }
     for (size_t start_row = 0; start_row < dim.block_size; start_row++) {
         for (size_t start_col = 0; start_col < dim.block_size; start_col++) {
             means[start_row * dim.block_size + start_col] =
@@ -698,6 +790,7 @@ static void compute_covariance_matrix(SpeedDimensions dim, const float *data,
         }
     }
     size_t elements_in_block = dim.block_size * dim.block_size;
+
 
     for (size_t x_index = 0; x_index < dim.elements_in_block; x_index++) {
         for (size_t y_index = 0; y_index <= x_index; y_index++) {

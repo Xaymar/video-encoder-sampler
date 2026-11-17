@@ -114,9 +114,12 @@ int GpuVmaf::pick_device(const std::string& spec, unsigned encoder_vendor, int e
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 
 #include "json.h"
 #include "vk_compute.h"
@@ -402,6 +405,7 @@ struct AdmPC {
 };
 struct CambiPC { int W, H, OW, OH, bpc, anti_dither, mask_index, pad, nd, vlt_luma, band_base, band_size; };
 struct SpeedPC { int W, H, SW, SH, DW, DH, bpc, fw, scaled, out_off; float scaler; };
+struct SpeedStatPC { int DW, DH, fw, subw, subh, nbh, nbv, nb, mode; float sigma_nn, nn_floor, base_entropy, one; double log2_2pie; }; // speed_common.glsl
 
 // --- CAMBI: luminance (luminance_tools.c) and the thresholds that follow from it (cambi.c) ---
 struct LumaRange { int foot, head; };
@@ -529,9 +533,9 @@ std::string cambi_gpu_key(const CambiOpts& o) {
 	snprintf(b, sizeof b, "%.17g %.17g %d %d %d %s", o.tvi, o.vlt, o.window, o.max_log_contrast, o.high_res_speedup, o.eotf.c_str());
 	return b;
 }
-std::string speed_gpu_key(const SpeedOpts& o) {
+std::string speed_gpu_key(const SpeedOpts& o) { // all of SpEED runs on the GPU: every option but the clip to speed_max_val
 	char b[256];
-	snprintf(b, sizeof b, "%.17g %.17g %s", o.kernelscale, o.prescale, o.prescale_method.c_str());
+	snprintf(b, sizeof b, "%.17g %.17g %s %.17g %.17g %d", o.kernelscale, o.prescale, o.prescale_method.c_str(), (double)(float)o.sigma_nn, (double)(float)o.nn_floor, o.weight_var_mode);
 	return b;
 }
 // Several models scored in one pass must agree on CAMBI's options (one CAMBI pass).
@@ -545,14 +549,22 @@ bool models_compatible(const std::vector<Model>& ms, std::string& why) {
 	return true;
 }
 
+// Frames a scorer has in flight at once: while the GPU works on one, the CPU copies the next ones in and works out the results of the ones before, each
+// in a slot of its own (the frames going in, the sums coming back, a command buffer and a fence). The GPU still works on one frame after the other: the
+// buffers in between are shared by the slots.
+constexpr int kSlots = 4;
+
 class VkVmaf {
+	struct Slot; // below
+
 public:
-	VkVmaf(int device, const std::vector<Model>& models, const GpuVmafFrame& f) : vk(device), ms(models), W(f.w), H(f.h), bpc(f.depth), bps(f.depth > 8 ? 2 : 1) {
+	VkVmaf(int device, const std::vector<Model>& models, const GpuVmafFrame& f) : vk(device, kSlots), ms(models), W(f.w), H(f.h), bpc(f.depth), bps(f.depth > 8 ? 2 : 1) {
 		ysize = (size_t)W * H;
 		plane_bytes = ysize * bps;
+		if (const char* e = getenv("VES_SPEED_CHECK"); e && atoi(e) > 0) speed_check = true;
 		raw_size = (plane_bytes + 3) / 4 * 4 + 4;
-		raw_ref = vk.buffer(raw_size, 0);
-		raw_dis = vk.buffer(raw_size, 0);
+		raw_ref = vk.buffer(raw_size, 1);
+		raw_dis = vk.buffer(raw_size, 1);
 		// which model uses which shared part
 		for (auto& m : ms) {
 			if (m.motion) need_stride[m.motion_o.five_frame ? 1 : 0] = true;
@@ -577,32 +589,96 @@ public:
 		if (!au.empty()) init_adm();
 		if (cambi_on) init_cambi(f);
 		if (!su.empty()) init_speed(f);
+		uint64_t dev0, host0, dev1, host1;
+		vk.memory(dev0, host0);
+		init_slots();
+		vk.memory(dev1, host1);
+		mem_device = dev1; mem_host = host1;
+		mem_slot = (dev1 - dev0 + host1 - host0) / kSlots;
+		for (int i = 0; i < kSlots; i++) slots[i].worker = std::thread([this, i] { work(i); });
 	}
 
-	// Scores one frame pair, for every model. `index` 0 has no motion.
-	double t_copy = 0, t_gpu = 0, t_results = 0; // seconds, see GpuVmaf::timing()
-	std::vector<Features> process(const uint8_t* const ref[3], const size_t ref_stride[3], const uint8_t* const dis[3], const size_t dis_stride[3], size_t index) {
+	~VkVmaf() {
+		{
+			std::lock_guard lock(mutex);
+			stop = true;
+		}
+		changed.notify_all();
+		for (auto& sl : slots) if (sl.worker.joinable()) sl.worker.join(); // each waits for its frame on the GPU first: the buffers go away after this
+		if (speed_check)
+			fprintf(stderr, "vmaf (GPU): VES_SPEED_CHECK: %zu SpEED values, %zu differ from the CPU's, largest difference %.3g, error flags differ %zu times\n",
+			        check.values, check.differ, check.largest, check.flags);
+	}
+
+	// Copies a frame pair in and has the GPU score it, for every model; returns once it is on its way (or, with all slots busy, once the oldest one is
+	// done). Frame `index` 0 has no motion. Throws when scoring an earlier frame failed.
+	void submit(const uint8_t* const ref[3], const size_t ref_stride[3], const uint8_t* const dis[3], const size_t dis_stride[3], size_t index) {
 		using clock = std::chrono::steady_clock;
+		const int k = (int)(index % kSlots);
+		Slot& sl = slots[k];
 		const auto t0 = clock::now();
+		collect(k);
+		const auto t1 = clock::now();
+		t_wait += std::chrono::duration<double>(t1 - t0).count();
 		auto put = [&](void* dst, const uint8_t* src, size_t stride, int w, int h) {
 			const size_t row = (size_t)w * bps;
 			if (stride == row) memcpy(dst, src, row * h);
 			else for (int y = 0; y < h; y++) memcpy((uint8_t*)dst + (size_t)y * row, src + (size_t)y * stride, row);
 		};
-		put(raw_ref.map, ref[0], ref_stride[0], W, H);
-		put(raw_dis.map, dis[0], dis_stride[0], W, H);
+		put(sl.in_ref.map, ref[0], ref_stride[0], W, H);
+		put(sl.in_dis.map, dis[0], dis_stride[0], W, H);
+		if (!su.empty()) {
+			put(sl.in_chroma[0].map, ref[1], ref_stride[1], cw, ch);
+			put(sl.in_chroma[1].map, ref[2], ref_stride[2], cw, ch);
+			put(sl.in_chroma[2].map, dis[1], dis_stride[1], cw, ch);
+			put(sl.in_chroma[3].map, dis[2], dis_stride[2], cw, ch);
+		}
+		record(k, index);
+		{
+			std::lock_guard lock(mutex);
+			sl.index = index;
+			sl.state = Slot::Busy;
+		}
+		changed.notify_all();
+		t_copy += std::chrono::duration<double>(clock::now() - t1).count();
+	}
+
+	// Every frame's features (per frame, per model), in order, once the GPU and the results are done with all of them. Throws if one failed.
+	std::vector<std::vector<Features>> finish(size_t frames) {
+		using clock = std::chrono::steady_clock;
+		const auto t0 = clock::now();
+		for (size_t i = frames > (size_t)kSlots ? frames - kSlots : 0; i < frames; i++) collect((int)(i % kSlots)); // the frames still out, oldest first
+		t_wait += std::chrono::duration<double>(clock::now() - t0).count();
+		return std::move(feats);
+	}
+
+	// Seconds so far: copying frames in and recording their work (the caller's thread), waiting for a free slot (the caller's thread), the GPU's work
+	// (from timestamps; else from submitting to done), and the results (on the slots' threads, alongside the rest).
+	double t_copy = 0, t_wait = 0;
+	void timing(double& copy, double& wait, double& gpu, double& results) {
+		std::lock_guard lock(mutex);
+		copy = t_copy; wait = t_wait; gpu = t_gpu; results = t_results;
+	}
+	// Memory: device local and other in all, and what each slot adds of that (frames in, sums out).
+	uint64_t mem_device = 0, mem_host = 0, mem_slot = 0;
+
+private:
+	// The work of frame `index` into the command buffer of slot `slot`, submitted.
+	void record(int slot, size_t index) {
+		Slot& sl = slots[slot];
+		vk.begin(slot);
+		// The frames before on the queue (this scorer's other slots) are done with the shared buffers before this one writes them.
+		vk.barrier();
+		vk.stamp(slot, 0);
 		const int cur = (int)(index % 3);
 		const bool motion = need_stride[0] || need_stride[1];
-		if (motion) put(mfr[cur].map, ref[0], ref_stride[0], W, H);
-		if (!su.empty()) {
-			put(sraw[0].map, ref[1], ref_stride[1], cw, ch);
-			put(sraw[1].map, ref[2], ref_stride[2], cw, ch);
-			put(sraw[2].map, dis[1], dis_stride[1], cw, ch);
-			put(sraw[3].map, dis[2], dis_stride[2], cw, ch);
-		}
-		const auto t1 = clock::now();
-		vk.begin();
-		bool with_motion[2] = {false, false};
+		vk.copy(sl.in_ref, raw_ref);
+		vk.copy(sl.in_dis, raw_dis);
+		if (motion) vk.copy(sl.in_ref, mfr[cur]);
+		if (!su.empty()) for (int p = 0; p < 4; p++) vk.copy(sl.in_chroma[p], sraw[p]);
+		vk.barrier();
+		bool* with_motion = sl.with_motion;
+		with_motion[0] = with_motion[1] = false;
 		for (int k = 0; k < 2; k++) {
 			const int stride = k + 1;
 			if (!need_stride[k] || index < (size_t)stride) continue;
@@ -677,7 +753,7 @@ public:
 				}
 			}
 		}
-		if (cambi_on) record_cambi();
+		if (cambi_on) record_cambi(sl);
 		for (auto& u : su) {
 			for (int p = 0; p < 4; p++) {
 				SpeedPC pc = u.spc;
@@ -687,20 +763,40 @@ public:
 				vk.dispatch((uint32_t)((u.spc.DW + 7) / 8), (uint32_t)((u.spc.DH + 7) / 8));
 			}
 		}
-		vk.submit_wait();
-		const auto t2 = clock::now();
-		struct Results { // counted when process() returns
-			double& to; clock::time_point from;
-			~Results() { to += std::chrono::duration<double>(clock::now() - from).count(); }
-		} results{t_results, t2};
-		t_copy += std::chrono::duration<double>(t1 - t0).count();
-		t_gpu += std::chrono::duration<double>(t2 - t1).count();
+		if (!su.empty()) { // the rest of SpEED, step by step, all units at each step
+			auto step = [&](Pipe SpeedUnit::*pipe, auto groups_x, uint32_t gy) {
+				vk.barrier();
+				for (auto& u : su) {
+					vk.push(&u.stpc, sizeof u.stpc);
+					vk.bind(u.*pipe);
+					vk.dispatch(groups_x(u), gy);
+				}
+			};
+			auto pixels = [](const SpeedUnit& u) { return (uint32_t)((u.stpc.DW * u.stpc.DH + 63) / 64); };
+			auto one = [](const SpeedUnit&) { return 1u; };
+			step(&SpeedUnit::sblur_v, pixels, 4);
+			step(&SpeedUnit::sblur_h, pixels, 4);
+			step(&SpeedUnit::scov, one, 4);
+			step(&SpeedUnit::ssmall_p, one, 4);
+			step(&SpeedUnit::sblocks, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.nb + 63) / 64); }, 4);
+			step(&SpeedUnit::sscore, one, 2);
+		}
+		// the sums the shaders wrote, into the slot's own buffers (CAMBI's are written there directly)
+		vk.barrier();
+		for (auto& [from, to] : sl.out) vk.copy(*from, to);
+		vk.barrier();
+		vk.stamp(slot, 1);
+		vk.submit(slot);
+	}
 
+	// The features of the frame in a slot, for every model, from the sums the GPU left there.
+	std::vector<Features> results(const Slot& sl) const {
+		const bool* with_motion = sl.with_motion;
 		// the sums, once for each shared part
 		double sad_raw[2] = {0, 0};
 		for (int k = 0; k < 2; k++) {
 			if (!with_motion[k]) continue;
-			const uint32_t* p = (const uint32_t*)mpart[k].map;
+			const uint32_t* p = (const uint32_t*)sl.mpart[k].map;
 			uint64_t sum = 0;
 			for (uint32_t q = 0; q < gx * gy; q++) sum += p[q];
 			sad_raw[k] = (double)sum / 256. / ((double)W * H);
@@ -708,7 +804,7 @@ public:
 		std::vector<std::array<double, 4>> vif(vif_egl.size());
 		for (size_t u = 0; u < vif_egl.size(); u++) {
 			for (int s = 0; s < 4; s++) {
-				const int64_t* p = (const int64_t*)vpart[u][s].map;
+				const int64_t* p = (const int64_t*)sl.vpart[u][s].map;
 				int64_t sum[4] = {0, 0, 0, 0};
 				for (uint32_t k = 0; k < vgroups[s]; k++) for (int q = 0; q < 4; q++) sum[q] += p[k * 4 + q];
 				const float num = (float)(sum[0] / 2048.0 + (sum[3] - ((sum[2]) / 16384.0) / (65025.0)));
@@ -718,8 +814,6 @@ public:
 		}
 		std::map<std::pair<int, double>, Features> adm_done; // by unit and noise weight
 		std::map<double, double> cambi_done; // by topk (before the clip to max_val)
-		std::map<std::string, std::array<float, 2>> speed_done; // u and v by unit and host-side options
-		std::map<std::string, std::array<bool, 2>> speed_err;
 		std::vector<Features> out(ms.size());
 		for (size_t i = 0; i < ms.size(); i++) {
 			const Model& m = ms[i];
@@ -732,28 +826,22 @@ public:
 			if (m.adm) {
 				const auto key = std::make_pair(adm_of[i], m.adm_o.noise_weight);
 				auto it = adm_done.find(key);
-				if (it == adm_done.end()) { Features a; adm_scores(au[adm_of[i]], m.adm_o.noise_weight, a); it = adm_done.emplace(key, a).first; }
+				if (it == adm_done.end()) { Features a; adm_scores(sl, adm_of[i], m.adm_o.noise_weight, a); it = adm_done.emplace(key, a).first; }
 				f.adm2 = it->second.adm2; f.aim = it->second.aim;
 				for (int s = 0; s < 4; s++) { f.adm[s] = it->second.adm[s]; f.adm_num[s] = it->second.adm_num[s]; f.adm_den[s] = it->second.adm_den[s]; }
 			}
 			if (m.cambi) {
 				auto it = cambi_done.find(m.cambi_o.topk);
-				if (it == cambi_done.end()) it = cambi_done.emplace(m.cambi_o.topk, cambi_score(m.cambi_o.topk)).first;
+				if (it == cambi_done.end()) it = cambi_done.emplace(m.cambi_o.topk, cambi_score(sl, m.cambi_o.topk)).first;
 				f.cambi = std::min(it->second, m.cambi_o.max_val);
 			}
 			if (m.speed) {
 				const SpeedOpts& o = m.speed_o;
-				char b[160];
-				snprintf(b, sizeof b, "%d %.17g %.17g %d", speed_of[i], o.sigma_nn, o.nn_floor, o.weight_var_mode);
-				auto it = speed_done.find(b);
-				if (it == speed_done.end()) {
-					bool eu, ev;
-					const float u = speed_plane(su[speed_of[i]], o, 0, eu), v = speed_plane(su[speed_of[i]], o, 1, ev);
-					it = speed_done.emplace(b, std::array<float, 2>{u, v}).first;
-					speed_err[b] = {eu, ev};
-				}
-				const float u = it->second[0], v = it->second[1];
-				const bool err_u = speed_err[b][0], err_v = speed_err[b][1];
+				const int k = speed_of[i];
+				const float* fin = (const float*)sl.sfin[k].map; // U score, U failed, V score, V failed
+				const float u = fin[0], v = fin[2];
+				const bool err_u = fin[1] != 0, err_v = fin[3] != 0;
+				if (speed_check) check_speed(sl, k, u, v, err_u, err_v);
 				float uv;
 				if (err_u && !err_v) uv = v;
 				else if (err_v && !err_u) uv = u;
@@ -765,7 +853,19 @@ public:
 		return out;
 	}
 
-private:
+	void check_speed(const Slot& sl, int k, float u, float v, bool eu, bool ev) const {
+		const SpeedUnit& un = su[k];
+		const float* out = (const float*)sl.sout[k].map;
+		bool cu, cv;
+		const float ru = speed_plane(un, out, un.o, 0, cu), rv = speed_plane(un, out, un.o, 1, cv);
+		std::lock_guard lock(check_lock);
+		for (auto [g, c] : {std::make_pair(u, ru), std::make_pair(v, rv)}) {
+			check.values++;
+			if (memcmp(&g, &c, sizeof g) != 0) { check.differ++; check.largest = std::max(check.largest, std::fabs((double)g - c)); }
+		}
+		if (cu != eu || cv != ev) check.flags++;
+	}
+
 	struct AdmHost { int left, top, right, bottom; uint32_t shift_inner; int shift_cub[3]; float rfactor[3]; uint32_t i_rfactor[3]; int den_cub; };
 	// ADM with one set of the options the shaders use. Unit 0 works in the buffers the wavelets write; the others on a copy of their bands.
 	struct AdmUnit {
@@ -787,8 +887,39 @@ private:
 		Pipe spipe[4];
 		std::vector<float> sfilter3;
 		int sfw3 = 0;
+		// the statistics (speed_common.glsl): blur, the plane minus its blur, covariance matrices, their eigenvalues and QR, per block results, scores
+		SpeedStatPC stpc{};
+		Buf stmp, sprep, sfilt3, scovm, ssmall, sblk, sfin;
+		Pipe sblur_v, sblur_h, scov, ssmall_p, sblocks, sscore;
+	};
+	// One frame in flight: its frames going in (system memory the GPU copies from), the sums coming back (host cached memory the GPU copies them to,
+	// or CAMBI's c values, which its last shader writes there directly), and the thread that waits for the GPU and works out its results.
+	struct Slot {
+		enum State { Free, Busy, Done } state = Free; // Busy: submitted, the thread has it; Done: its feats (or error) wait to be collected
+		size_t index = 0;
+		bool with_motion[2] = {false, false};
+		Buf in_ref, in_dis, in_chroma[4];
+		Buf mpart[2], aden[4];
+		std::vector<std::array<Buf, 4>> vpart, cm, aimb; // per VIF unit, per ADM unit (aimb: units with AIM)
+		std::vector<Buf> sfin, sout;                    // per SpEED unit: its scores; its decimated planes (only for VES_SPEED_CHECK)
+		Buf ccval[5], cpart[5];
+		Pipe cp_cval[5];
+		std::vector<std::pair<const Buf*, Buf>> out; // the shared buffer the GPU wrote, the slot's copy
+		std::vector<Features> feats;
+		std::string error;
+		std::thread worker;
 	};
 	Vk vk; // first: it releases the buffers and sets below when it goes away
+	std::array<Slot, kSlots> slots;
+	std::mutex mutex;
+	std::condition_variable changed;
+	bool stop = false;
+	std::vector<std::vector<Features>> feats; // collected, in frame order
+	double t_gpu = 0, t_results = 0;
+	// VES_SPEED_CHECK=1: SpEED is also worked out on the CPU (from the GPU's decimated planes, as before it all moved to the GPU) and compared
+	bool speed_check = false;
+	mutable std::mutex check_lock;
+	mutable struct { size_t values = 0, differ = 0, flags = 0; double largest = 0; } check;
 	const std::vector<Model>& ms;
 	int W, H;
 	int bpc = 8, bps = 1; // bits per sample, bytes per sample
@@ -819,21 +950,103 @@ private:
 	CambiGeom cg;
 	CambiPC cpc{};
 	bool anti_dither = false;
-	Buf cidx, cfull, cdith, cmask0, cimg[5], cmask[5], ctmp, ccval[5], cpart[5], ctab;
-	Pipe cp_pre, cp_dither, cp_mask, cp_dec[5], cp_mode_h[5], cp_mode_v[5], cp_cval[5];
+	Buf cidx, cfull, cdith, cmask0, cimg[5], cmask[5], ctmp, ctab;
+	Pipe cp_pre, cp_dither, cp_mask, cp_dec[5], cp_mode_h[5], cp_mode_v[5];
 	uint32_t cgroups[5] = {};
 	// speed: the chroma planes once, the decimation per unit
 	int cw = 0, ch = 0;
 	Buf sraw[4];
 	std::vector<SpeedUnit> su;
 
+	// Waits until slot k is not busy and takes its frame's features, if it has one (in frame order: the slots are used in turn).
+	void collect(int k) {
+		Slot& sl = slots[k];
+		std::unique_lock lock(mutex);
+		changed.wait(lock, [&] { return sl.state != Slot::Busy; });
+		if (sl.state != Slot::Done) return;
+		sl.state = Slot::Free;
+		if (!sl.error.empty()) throw std::runtime_error(sl.error);
+		if (sl.index != feats.size()) throw std::runtime_error("frames came back out of order");
+		feats.push_back(std::move(sl.feats));
+	}
+
+	// The thread of slot k: waits for its frame on the GPU, then works out the features.
+	void work(int k) {
+		using clock = std::chrono::steady_clock;
+		Slot& sl = slots[k];
+		for (;;) {
+			{
+				std::unique_lock lock(mutex);
+				changed.wait(lock, [&] { return sl.state == Slot::Busy || stop; });
+				if (sl.state != Slot::Busy) return;
+			}
+			std::vector<Features> f;
+			std::string error;
+			double gpu = 0, res = 0;
+			try {
+				const auto t0 = clock::now();
+				vk.wait(k);
+				const auto t1 = clock::now();
+				gpu = vk.gpu_seconds(k);
+				if (gpu < 0) gpu = std::chrono::duration<double>(t1 - t0).count(); // no timestamps: how long it was waited for
+				f = results(sl);
+				res = std::chrono::duration<double>(clock::now() - t1).count();
+			} catch (const std::exception& e) {
+				error = e.what();
+				if (error.empty()) error = "scoring failed";
+			}
+			{
+				std::lock_guard lock(mutex);
+				t_gpu += gpu; t_results += res;
+				sl.feats = std::move(f);
+				sl.error = std::move(error);
+				sl.state = Slot::Done;
+			}
+			changed.notify_all();
+		}
+	}
+
+	// Each slot's buffers: the frames in, a copy of every sum buffer the shaders write, and CAMBI's c values (whose shader writes into the slot).
+	void init_slots() {
+		for (Slot& sl : slots) {
+			sl.in_ref = vk.buffer(raw_size, 3);
+			sl.in_dis = vk.buffer(raw_size, 3);
+			if (!su.empty()) for (int p = 0; p < 4; p++) sl.in_chroma[p] = vk.buffer(sraw[p].size, 3);
+			auto mirror = [&](const Buf& from) { Buf to = vk.buffer(from.size, 2); sl.out.emplace_back(&from, to); return to; };
+			for (int k = 0; k < 2; k++) if (need_stride[k]) sl.mpart[k] = mirror(mpart[k]);
+			sl.vpart.resize(vpart.size());
+			for (size_t u = 0; u < vpart.size(); u++) for (int s = 0; s < 4; s++) sl.vpart[u][s] = mirror(vpart[u][s]);
+			if (!au.empty()) {
+				for (int s = 0; s < 4; s++) sl.aden[s] = mirror(aden[s]);
+				sl.cm.resize(au.size());
+				sl.aimb.resize(au.size());
+				for (size_t u = 0; u < au.size(); u++)
+					for (int s = 0; s < 4; s++) {
+						sl.cm[u][s] = mirror(au[u].cm[s]);
+						if (au[u].aim) sl.aimb[u][s] = mirror(au[u].aimb[s]);
+					}
+			}
+			for (auto& u : su) {
+				sl.sfin.push_back(mirror(u.sfin));
+				if (speed_check) sl.sout.push_back(mirror(u.sout));
+			}
+			if (cambi_on) {
+				for (int s = 0; s < 5; s++) {
+					sl.ccval[s] = vk.buffer((size_t)cg.sw[s] * cg.sh[s] * 4 + 16, 2);
+					sl.cpart[s] = vk.buffer((size_t)cgroups[s] * 16 + 16, 2);
+					sl.cp_cval[s] = vk.pipeline("cambi_cvalue", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab, &sl.cpart[s]});
+				}
+			}
+		}
+	}
+
 	void init_motion() {
 		gx = (W + 15) / 16; gy = (H + 15) / 16;
-		for (auto& b : mfr) b = vk.buffer(raw_size, 0);
+		for (auto& b : mfr) b = vk.buffer(raw_size, 1);
 		mtmp = vk.buffer(ysize * 4, 1);
 		for (int k = 0; k < 2; k++) {
 			if (!need_stride[k]) continue;
-			mpart[k] = vk.buffer((size_t)gx * gy * 4, 2);
+			mpart[k] = vk.buffer((size_t)gx * gy * 4, 1);
 			for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) {
 				if (a == b) continue;
 				std::vector<Buf*> bind{&mfr[a], &mfr[b], &mtmp, &mpart[k]};
@@ -850,7 +1063,7 @@ private:
 		vstat_v.resize(vif_egl.size()); vstat_h.resize(vif_egl.size());
 		for (int s = 0; s < 4; s++) {
 			vgroups[s] = ((vw[s] + 15) / 16) * ((vh[s] + 15) / 16);
-			for (auto& p : vpart) p[s] = vk.buffer((size_t)vgroups[s] * 4 * 8, 2);
+			for (auto& p : vpart) p[s] = vk.buffer((size_t)vgroups[s] * 4 * 8, 1);
 		}
 		vtmp = vk.buffer(ysize * 5 * 4 + 16, 1);
 		vlog = vk.buffer(65536 * 4, 0);
@@ -930,15 +1143,15 @@ private:
 		for (int s = 0; s < 4; s++) {
 			const size_t N = (size_t)bw[s] * bh[s];
 			acur[s] = vk.buffer(20 * N * 4 + 16, 1);
-			aden[s] = vk.buffer((size_t)bh[s] * 3 * 8 + 16, 2);
+			aden[s] = vk.buffer((size_t)bh[s] * 3 * 8 + 16, 1);
 			for (size_t u = 0; u < au.size(); u++) {
 				AdmUnit& a = au[u];
 				// The units are recorded one after another, each finished (barrier) before the next copies the bands, and only their sums (cm, aimb) are read
 				// afterwards: one copy of the bands serves every unit after the first. A copy of its own for each took 70 MB per unit at 2560x1440.
 				if (u == 1) acopy[s] = vk.buffer(20 * N * 4 + 16, 1);
 				a.cur[s] = u == 0 ? acur[s] : acopy[s];
-				a.cm[s] = vk.buffer((size_t)bh[s] * 3 * 8 + 16, 2);
-				if (a.aim) a.aimb[s] = vk.buffer((size_t)bh[s] * 3 * 8 + 16, 2);
+				a.cm[s] = vk.buffer((size_t)bh[s] * 3 * 8 + 16, 1);
+				if (a.aim) a.aimb[s] = vk.buffer((size_t)bh[s] * 3 * 8 + 16, 1);
 			}
 		}
 		atmp = vk.buffer((size_t)4 * bh[0] * W * 4 + 16, 1);
@@ -992,13 +1205,14 @@ private:
 		return (parts[0] + parts[1]) + parts[2];
 	}
 
-	void adm_scores(const AdmUnit& a, double noise_weight, Features& f) const {
+	void adm_scores(const Slot& sl, int unit, double noise_weight, Features& f) const {
+		const AdmUnit& a = au[unit];
 		double num = 0, den = 0, aim_num = 0, num_s[4], den_s[4];
 		for (int s = 0; s < 4; s++) {
 			const AdmHost& hs = a.ah[s];
-			const int64_t* dn = (const int64_t*)aden[s].map;
-			const float num_scale = adm_num(a, s, (const int64_t*)a.cm[s].map, noise_weight);
-			const float aim_scale = a.aim ? adm_num(a, s, (const int64_t*)a.aimb[s].map, 0.0) : 0.0f;
+			const int64_t* dn = (const int64_t*)sl.aden[s].map;
+			const float num_scale = adm_num(a, s, (const int64_t*)sl.cm[unit][s].map, noise_weight);
+			const float aim_scale = a.aim ? adm_num(a, s, (const int64_t*)sl.aimb[unit][s].map, 0.0) : 0.0f;
 			uint64_t acc_d[3] = {0, 0, 0};
 			int32_t shift_accum, shift_cub = 0;
 			if (s == 0) {
@@ -1062,9 +1276,7 @@ private:
 			const size_t n = (size_t)cg.sw[s] * cg.sh[s];
 			if (s == 0 && !cg.speedup) { cimg[0] = *src; cmask[0] = cmask0; }
 			else { cimg[s] = vk.buffer(n * 4 + 16, 1); cmask[s] = vk.buffer(n * 4 + 16, 1); }
-			ccval[s] = vk.buffer(n * 4 + 16, 2);
-			cgroups[s] = (uint32_t)(((cg.sw[s] + 15) / 16) * ((cg.sh[s] + 15) / 16));
-			cpart[s] = vk.buffer((size_t)cgroups[s] * 16 + 16, 2);
+			cgroups[s] = (uint32_t)(((cg.sw[s] + 15) / 16) * ((cg.sh[s] + 15) / 16)); // c values and their sums: in each slot
 		}
 		ctmp = vk.buffer((size_t)cg.sw[0] * cg.sh[0] * 4 + 16, 1);
 		// tvi[32], weight[32], then the reciprocal table
@@ -1103,11 +1315,10 @@ private:
 			}
 			cp_mode_h[s] = vk.pipeline("cambi_mode", {&cimg[s], &ctmp});
 			cp_mode_v[s] = cp_mode_h[s];
-			cp_cval[s] = vk.pipeline("cambi_cvalue", {&cimg[s], &cmask[s], &ccval[s], &ctab, &cpart[s]});
 		}
 	}
 
-	void record_cambi() {
+	void record_cambi(const Slot& sl) {
 		auto groups = [](int a, int b) { return std::make_pair((uint32_t)((a + 15) / 16), (uint32_t)((b + 15) / 16)); };
 		const int ew = cg.ew, eh = cg.eh;
 		CambiPC pc = cpc;
@@ -1137,26 +1348,26 @@ private:
 			vk.bind(cp_mode_v[s]); vk.dispatch(g.first, g.second); vk.barrier();
 			pc.anti_dither = cpc.anti_dither;
 			vk.push(&pc, sizeof pc);
-			vk.bind(cp_cval[s]); vk.dispatch(g.first, g.second); vk.barrier();
+			vk.bind(sl.cp_cval[s]); vk.dispatch(g.first, g.second); vk.barrier();
 			pw = w; ph = h;
 		}
 	}
 
 	// cambi.c, cambi_score(): the mean of the largest topk of the c values of each scale, weighted by scale.
-	double cambi_score(double topk) const { // before the clip to cambi_max_val, which each model does
+	double cambi_score(const Slot& sl, double topk) const { // before the clip to cambi_max_val, which each model does
 		static const int scale_weights[5] = {16, 8, 4, 2, 1};
 		double score = 0;
 		for (int s = 0; s < 5; s++) {
 			const int n = cg.sw[s] * cg.sh[s];
 			int k = (int)(topk * n);
 			k = k < 1 ? 1 : (k > n ? n : k);
-			const double* p = (const double*)cpart[s].map;
+			const double* p = (const double*)sl.cpart[s].map;
 			double nonzero = 0, sum = 0;
 			for (uint32_t g = 0; g < cgroups[s]; g++) { nonzero += p[2 * g]; sum += p[2 * g + 1]; }
 			double v;
 			if (nonzero <= k) v = sum / k; // the top k are all the values that are not 0, and zeros
 			else {
-				std::vector<float> c((const float*)ccval[s].map, (const float*)ccval[s].map + n);
+				std::vector<float> c((const float*)sl.ccval[s].map, (const float*)sl.ccval[s].map + n);
 				std::nth_element(c.begin(), c.begin() + (k - 1), c.end(), std::greater<float>());
 				double t = 0;
 				for (int i = 0; i < k; i++) t += c[i];
@@ -1171,7 +1382,7 @@ private:
 	void init_speed(const GpuVmafFrame& f) {
 		chroma_size(f.chroma, W, H, cw, ch);
 		const size_t craw = ((size_t)cw * ch * bps + 3) / 4 * 4 + 4;
-		for (auto& b : sraw) b = vk.buffer(craw, 0);
+		for (auto& b : sraw) b = vk.buffer(craw, 1);
 		for (SpeedUnit& u : su) {
 			const SpeedOpts& o = u.o;
 			u.sd = speed_dims(cw, ch, o.prescale);
@@ -1218,13 +1429,42 @@ private:
 			u.spc.DW = SW / 16; u.spc.DH = SH / 16;
 			u.spc.bpc = bpc; u.spc.fw = fw; u.spc.scaled = scaled ? 1 : 0;
 			u.spc.scaler = bpc == 10 ? 4.0f : 1.0f;
-			u.sout = vk.buffer((size_t)4 * u.spc.DW * u.spc.DH * 4 + 16, 2);
+			u.sout = vk.buffer((size_t)4 * u.spc.DW * u.spc.DH * 4 + 16, 1);
 			for (int p = 0; p < 4; p++) u.spipe[p] = vk.pipeline("speed_dec", {&sraw[p], &u.stab, &u.sfilt, &u.sout});
+			// the rest of SpEED, on what speed_dec wrote
+			const auto& sd = u.sd;
+			if ((int)sd.operating_width != u.spc.DW || (int)sd.operating_height != u.spc.DH) throw std::runtime_error("SpEED's decimated size does not add up");
+			if (u.sfw3 > 128) throw std::runtime_error("SpEED's blur is too wide");
+			SpeedStatPC& st = u.stpc;
+			st.DW = u.spc.DW; st.DH = u.spc.DH; st.fw = u.sfw3;
+			st.subw = (int)sd.submatrix_width; st.subh = (int)sd.submatrix_height;
+			st.nbh = (int)sd.num_blocks_horizontal; st.nbv = (int)sd.num_blocks_vertical; st.nb = (int)sd.num_blocks;
+			st.mode = o.weight_var_mode;
+			st.sigma_nn = (float)o.sigma_nn; st.nn_floor = (float)o.nn_floor; st.one = 1.0f;
+			// get_speed_score()'s base entropy and est_params()'s log2(2 pi e), with the CPU's log2 as there
+			st.log2_2pie = vmaf_speed::log2(2 * M_PI * M_E);
+			st.base_entropy = (float)(sd.elements_in_block * (vmaf_speed::log2((1 + st.nn_floor) * st.sigma_nn) + vmaf_speed::log2(2 * M_PI * M_E)));
+			const size_t n = (size_t)st.DW * st.DH;
+			u.stmp = vk.buffer(4 * n * 4 + 16, 1);
+			u.sprep = vk.buffer(4 * n * 4 + 16, 1);
+			u.sfilt3 = vk.buffer(128 * 4, 0);
+			memcpy(u.sfilt3.map, u.sfilter3.data(), 128 * 4);
+			u.scovm = vk.buffer(4 * 625 * 4 + 16, 1);
+			u.ssmall = vk.buffer(4 * 1280 * 4 + 16, 1);
+			u.sblk = vk.buffer((size_t)4 * 2 * st.nb * 4 + 16, 1);
+			u.sfin = vk.buffer(4 * 4 + 16, 1);
+			const std::vector<Buf*> sb{&u.sout, &u.stmp, &u.sprep, &u.sfilt3, &u.scovm, &u.ssmall, &u.sblk, &u.sfin};
+			u.sblur_v = vk.pipeline("speed_blur_v", sb);
+			u.sblur_h = vk.pipeline("speed_blur_h", sb);
+			u.scov = vk.pipeline("speed_cov", sb);
+			u.ssmall_p = vk.pipeline("speed_small", sb);
+			u.sblocks = vk.pipeline("speed_blocks", sb);
+			u.sscore = vk.pipeline("speed_score", sb);
 		}
 	}
 
 	// speed.c from filter_and_downscale()'s 3x3 blur on: the score of one plane pair (ref p, dis p + 2); `err` if a covariance matrix was singular.
-	float speed_plane(const SpeedUnit& u, const SpeedOpts& o, int p, bool& err) const {
+	float speed_plane(const SpeedUnit& u, const float* out, const SpeedOpts& o, int p, bool& err) const { // out: the unit's decimated planes
 		using namespace vmaf_speed;
 		const auto& sd = u.sd;
 		const int dw = (int)sd.operating_width, dh = (int)sd.operating_height;
@@ -1242,7 +1482,6 @@ private:
 		s.compute_cov_kernel = compute_cov_kernel_scalar;
 		s.ref_results.entropies = ent_ref.data(); s.ref_results.variances = var_ref.data();
 		s.dis_results.entropies = ent_dis.data(); s.dis_results.variances = var_dis.data();
-		const float* out = (const float*)u.sout.map;
 		std::vector<float> frame((size_t)dw * dh), blur((size_t)dw * dh), row(dw);
 		auto prepare = [&](int plane) {
 			memcpy(frame.data(), out + (size_t)plane * dw * dh, frame.size() * 4);
@@ -1264,7 +1503,8 @@ private:
 struct GpuVmaf::Impl {
 	std::vector<Model> models;
 	std::unique_ptr<VkVmaf> gpu;
-	std::vector<std::vector<Features>> feats; // per frame, per model
+	size_t frames = 0; // submitted
+	std::vector<std::vector<Features>> feats; // per frame, per model (once finished)
 };
 
 GpuVmaf::GpuVmaf() : impl(new Impl) {}
@@ -1309,7 +1549,8 @@ std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::vector<std::string>& model_p
 
 bool GpuVmaf::add(const uint8_t* const ref[3], const size_t ref_stride[3], const uint8_t* const dis[3], const size_t dis_stride[3]) {
 	try {
-		impl->feats.push_back(impl->gpu->process(ref, ref_stride, dis, dis_stride, impl->feats.size()));
+		impl->gpu->submit(ref, ref_stride, dis, dis_stride, impl->frames);
+		impl->frames++;
 	} catch (const std::exception& e) {
 		fprintf(stderr, "vmaf (GPU): %s\n", e.what());
 		return false;
@@ -1317,11 +1558,22 @@ bool GpuVmaf::add(const uint8_t* const ref[3], const size_t ref_stride[3], const
 	return true;
 }
 
-void GpuVmaf::timing(double& copy, double& gpu, double& results) const {
-	copy = impl->gpu ? impl->gpu->t_copy : 0; gpu = impl->gpu ? impl->gpu->t_gpu : 0; results = impl->gpu ? impl->gpu->t_results : 0;
+void GpuVmaf::timing(double& copy, double& wait, double& gpu, double& results) const {
+	copy = wait = gpu = results = 0;
+	if (impl->gpu) impl->gpu->timing(copy, wait, gpu, results);
+}
+
+void GpuVmaf::memory(uint64_t& device_local, uint64_t& host, uint64_t& per_frame, int& frames) const {
+	device_local = impl->gpu->mem_device; host = impl->gpu->mem_host; per_frame = impl->gpu->mem_slot; frames = kSlots;
 }
 
 bool GpuVmaf::finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<std::map<std::string, double>>>* features) {
+	try {
+		impl->feats = impl->gpu->finish(impl->frames);
+	} catch (const std::exception& e) {
+		fprintf(stderr, "vmaf (GPU): %s\n", e.what());
+		return false;
+	}
 	const size_t n = impl->feats.size(), nm = impl->models.size();
 	scores.assign(nm, std::vector<double>(n, 0.0));
 	if (features) features->assign(nm, std::vector<std::map<std::string, double>>(n));
@@ -1392,6 +1644,7 @@ bool GpuVmaf::supported(const std::vector<std::string>&, int, const GpuVmafFrame
 std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::vector<std::string>&, int, const GpuVmafFrame&, std::string& why) { why = "built without Vulkan"; return nullptr; }
 bool GpuVmaf::add(const uint8_t* const[3], const size_t[3], const uint8_t* const[3], const size_t[3]) { return false; }
 bool GpuVmaf::finish(std::vector<std::vector<double>>&, std::vector<std::vector<std::map<std::string, double>>>*) { return false; }
-void GpuVmaf::timing(double& copy, double& gpu, double& results) const { copy = gpu = results = 0; }
+void GpuVmaf::timing(double& copy, double& wait, double& gpu, double& results) const { copy = wait = gpu = results = 0; }
+void GpuVmaf::memory(uint64_t& device_local, uint64_t& host, uint64_t& per_frame, int& frames) const { device_local = host = per_frame = 0; frames = 0; }
 
 #endif

@@ -159,7 +159,9 @@ struct Scorer {
 	virtual bool add(const Picture& ref, const Picture& dis) = 0;
 	// Per model: the scores and, for a model with SpEED chroma, its U and V values (else empty).
 	virtual bool finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<double>>& u, std::vector<std::vector<double>>& v) = 0;
-	virtual bool timing(double& copy, double& gpu, double& results) const { copy = gpu = results = 0; return false; } // the GPU scorer's parts of add()
+	// The GPU scorer's parts of add() and finish() (copying in, waiting for a frame in flight) and its background work (GPU, results); see GpuVmaf::timing().
+	virtual bool timing(double& copy, double& wait, double& gpu, double& results) const { copy = wait = gpu = results = 0; return false; }
+	virtual std::string memory() const { return {}; }
 };
 
 // Where a scoring pass spends its time, in seconds, for VES_SCORE_TIMING=1: one line per pass when it ends. Per thread: a pass runs on one.
@@ -274,7 +276,15 @@ public:
 		const size_t ds[3] = {(size_t)dis.stride[0], (size_t)dis.stride[1], (size_t)dis.stride[2]};
 		return gpu->add(rd, rs, dd, ds);
 	}
-	bool timing(double& copy, double& g, double& results) const override { gpu->timing(copy, g, results); return true; }
+	bool timing(double& copy, double& wait, double& g, double& results) const override { gpu->timing(copy, wait, g, results); return true; }
+	std::string memory() const override {
+		uint64_t device, host, per_frame;
+		int frames;
+		gpu->memory(device, host, per_frame, frames);
+		char b[160];
+		snprintf(b, sizeof b, "; GPU scorer memory %.0f MB device local, %.0f MB other, of which %d frames in flight %.1f MB each", device / 1048576.0, host / 1048576.0, frames, per_frame / 1048576.0);
+		return b;
+	}
 	bool finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<double>>& u, std::vector<std::vector<double>>& v) override {
 		std::vector<std::vector<std::map<std::string, double>>> fe;
 		if (!gpu->finish(scores, &fe)) return false;
@@ -418,19 +428,22 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 	if (ok && (shown((size_t)k, extra) || next_ref(r) == 1)) { fprintf(stderr, "encoded stream does not cover the reference frames\n"); ok = false; }
 	if (!ok) return false;
 	std::vector<std::vector<double>> all, cu, cv;
-	if (!scorer->finish(all, cu, cv) || all.empty()) { fprintf(stderr, "vmaf: the scorer could not finish\n"); return false; }
+	bool finished;
+	{ Timed t{score_clock.score}; finished = scorer->finish(all, cu, cv); } // the GPU scorer's last frames in flight
+	if (!finished || all.empty()) { fprintf(stderr, "vmaf: the scorer could not finish\n"); return false; }
 	if (const char* e = getenv("VES_SCORE_TIMING"); e && atoi(e) > 0 && k > 0) {
 		const ScoreClock& c = score_clock;
-		double copy, gpu, results;
-		const bool split = scorer->timing(copy, gpu, results);
+		double copy, wait, gpu, results;
+		const bool split = scorer->timing(copy, wait, gpu, results);
 		const double all_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - c.began).count(), per = 1000.0 / (double)m;
 		char b[512];
-		if (split) snprintf(b, sizeof b, " (copy in %.2f, GPU %.2f, results %.2f)", copy * per, gpu * per, results * per);
+		// score = copy in + waiting (+ a little); GPU and results run alongside, several frames at once, and only show in score through the waiting
+		if (split) snprintf(b, sizeof b, " (copy in %.2f, waiting for frames in flight %.2f; alongside: GPU %.2f, results %.2f)", copy * per, wait * per, gpu * per, results * per);
 		else b[0] = 0;
 		std::string sc = b;
-		fprintf(stderr, "vmaf timing, %s %dx%d %d-bit %d, %lld frames, %.1f fps: ms per frame: decode %.2f, waiting for packets %.2f, reference %.2f, convert %.2f, score %.2f%s, rest %.2f\n",
+		fprintf(stderr, "vmaf timing, %s %dx%d %d-bit %d, %lld frames, %.1f fps: ms per frame: decode %.2f, waiting for packets %.2f, reference %.2f, convert %.2f, score %.2f%s, rest %.2f%s\n",
 		        rp ? "true score" : "distorted score", ref.width, ref.height, score_fmt.depth, score_fmt.chroma, m, m / all_s, c.decode * per, c.packets * per, c.reference * per, c.convert * per, c.score * per, sc.c_str(),
-		        (all_s - c.decode - c.packets - c.reference - c.convert - c.score) * per);
+		        (all_s - c.decode - c.packets - c.reference - c.convert - c.score) * per, scorer->memory().c_str());
 	}
 	// One value per original frame: a frame the encode dropped repeats the score of the frame on screen.
 	auto expand = [&](std::vector<double>& v) {

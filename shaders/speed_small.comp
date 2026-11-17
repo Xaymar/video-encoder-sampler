@@ -1,0 +1,275 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 64) in;
+#include "speed_common.glsl"
+// One workgroup per plane: what est_params() does with the 25x25 covariance matrix. Its eigenvalues (Householder tridiagonalisation, then implicit
+// QR steps: compute_eigenvalues()) and its QR decomposition (matrix_qr_decomposition(), for solve_linear_system()); the work on whole matrices is
+// spread over the invocations element by element (each element's sum still in order), the steps that go one after another are done by invocation 0.
+shared float C[N * N];  // the covariance matrix (A_immutable)
+shared float A[N * N];  // tridiagonalisation's copy; later the Householder matrix of the QR decomposition (tmp_q)
+shared float Z[N * N];  // tmp_z
+shared float Q[N * N];
+shared float v[N], x[N], d[N], sd[N], eig[N];
+shared float sh_tau, sh_s, sh_beta, sh_alpha;
+shared bool sh_div;
+
+const double EPS = 1e-6LF;
+
+void chop(int a, int n) {
+	for (int i = 0; i < n - 1; i++) {
+		precise float s = abs(d[a + i]) + abs(d[a + i + 1]);
+		if (double(abs(sd[a + i])) < EPS * double(s)) sd[a + i] = 0.0;
+	}
+}
+
+float trailing(int a, int n) {
+	const float ta = d[a + n - 2], tb = d[a + n - 1], tab = sd[a + n - 2];
+	precise float diff = ta - tb;
+	const float dt = rf(double(diff) * 0.5LF);
+	precise float r;
+	if (dt > 0.0) {
+		precise float den = dt + pyth(dt, tab);
+		r = tb - tab * fdiv(tab, den);
+	} else if (dt == 0.0) {
+		r = tb - abs(tab);
+	} else {
+		precise float den = -dt + pyth(dt, tab);
+		r = tb + tab * fdiv(tab, den);
+	}
+	return r;
+}
+
+void givens(float a, float b, out float c, out float s) {
+	if (b == 0.0) { c = 1.0; s = 0.0; }
+	else if (abs(b) > abs(a)) {
+		const float t = fdiv(-a, b);
+		precise float q = 1.0 + t * t;
+		const float s1 = rf(ddiv(1.0LF, dsqrt(double(q))));
+		s = s1;
+		precise float cc = s1 * t;
+		c = cc;
+	} else {
+		const float t = fdiv(-b, a);
+		precise float q = 1.0 + t * t;
+		const float c1 = rf(ddiv(1.0LF, dsqrt(double(q))));
+		c = c1;
+		precise float ss = c1 * t;
+		s = ss;
+	}
+}
+
+void qr_step(int a, int n) {
+	float mu = trailing(a, n);
+	precise float lim = abs(d[a]) + abs(sd[a]);
+	if (EPS * double(abs(mu)) > double(lim)) mu = 0.0;
+	precise float xx = d[a] - mu;
+	float z = sd[a];
+	float ak = 0.0, bk = 0.0, zk = 0.0;
+	float ap = d[a], bp = sd[a], aq = d[a + 1];
+	if (n == 2) {
+		float c, s;
+		givens(xx, z, c, s);
+		precise float ap1 = c * (c * ap - s * bp) + s * (s * aq - c * bp);
+		precise float bp1 = c * (s * ap + c * bp) - s * (s * bp + c * aq);
+		precise float aq1 = s * (s * ap + c * bp) + c * (s * bp + c * aq);
+		d[a] = ap1;
+		sd[a] = bp1;
+		d[a + 1] = aq1;
+		return;
+	}
+	float bq = sd[a + 1];
+	float x_ = xx;
+	for (int k = 0; k < n - 1; k++) {
+		float c, s;
+		givens(x_, z, c, s);
+		precise float bk1 = c * bk - s * zk;
+		precise float ap1 = c * (c * ap - s * bp) + s * (s * aq - c * bp);
+		precise float bp1 = c * (s * ap + c * bp) - s * (s * bp + c * aq);
+		precise float zp1 = -s * bq;
+		precise float aq1 = s * (s * ap + c * bp) + c * (s * bp + c * aq);
+		precise float bq1 = c * bq;
+		ak = ap1; bk = bp1; zk = zp1;
+		ap = aq1; bp = bq1;
+		if (k < n - 2) aq = d[a + k + 2];
+		if (k < n - 3) bq = sd[a + k + 2];
+		d[a + k] = ak;
+		if (k > 0) sd[a + k - 1] = bk1;
+		if (k < n - 2) sd[a + k + 1] = bp;
+		x_ = bk;
+		z = zk;
+	}
+	d[a + n - 1] = ap;
+	sd[a + n - 2] = bk;
+}
+
+float vnorm() { // vector_norm(v)
+	precise float s = 0.0;
+	for (int i = 0; i < N; i++) s += v[i] * v[i];
+	return dsqrt_f(s);
+}
+
+// dst = X * Y (matrix_mul: each element a sum over k in order, from 0), for the elements of this invocation; written after a barrier, so dst may be Y.
+void matmul_into_Z(uint t) { // Z = A * Z
+	float r[10];
+	int n = 0;
+	for (uint e = t; e < N * N; e += 64) {
+		const int i = int(e) / N, j = int(e) % N;
+		precise float acc = 0.0;
+		for (int k = 0; k < N; k++) acc += A[i * N + k] * Z[k * N + j];
+		r[n++] = acc;
+	}
+	barrier();
+	n = 0;
+	for (uint e = t; e < N * N; e += 64) Z[e] = r[n++];
+	barrier();
+}
+void matmul_into_Q(uint t) { // Q = A * Q
+	float r[10];
+	int n = 0;
+	for (uint e = t; e < N * N; e += 64) {
+		const int i = int(e) / N, j = int(e) % N;
+		precise float acc = 0.0;
+		for (int k = 0; k < N; k++) acc += A[i * N + k] * Q[k * N + j];
+		r[n++] = acc;
+	}
+	barrier();
+	n = 0;
+	for (uint e = t; e < N * N; e += 64) Q[e] = r[n++];
+	barrier();
+}
+
+void main() {
+	const uint t = gl_LocalInvocationID.x;
+	const int p = int(gl_WorkGroupID.y), out0 = p * SMALL;
+	for (uint e = t; e < N * N; e += 64) { C[e] = covm[p * N * N + e]; A[e] = C[e]; }
+	barrier();
+
+	// convert_to_tridiagonal()
+	for (int i = 0; i < N - 2; i++) {
+		const int start = i + 1;
+		if (t == 0) { // compute_householder_transform(A, i, start, N)
+			float tau = 0.0, s = 0.0, beta = 0.0;
+			bool dv = false;
+			if (N - start != 1) {
+				precise float nn = 0.0;
+				for (int r = start + 1; r < N; r++) nn += A[r * N + i] * A[r * N + i];
+				const float xnorm = dsqrt_f(nn);
+				if (xnorm != 0.0) {
+					const float alpha = A[start * N + i];
+					precise float b = float(-sgn(alpha)) * pyth(alpha, xnorm);
+					beta = b;
+					precise float num = beta - alpha;
+					tau = fdiv(num, beta);
+					precise float ss = alpha - beta;
+					s = ss;
+					dv = s != 0.0;
+				}
+			}
+			sh_tau = tau; sh_s = s; sh_beta = beta; sh_div = dv;
+		}
+		barrier();
+		const float tau = sh_tau;
+		if (sh_div) {
+			for (int r = start + int(t); r < N; r += 64) A[r * N + i] = fdiv(A[r * N + i], sh_s);
+			barrier();
+			if (t == 0) A[start * N + i] = sh_beta;
+			barrier();
+		}
+		for (int j = start + int(t); j < N; j += 64) v[j] = A[j * N + i];
+		barrier();
+		if (tau != 0.0) {
+			if (t == 0) { A[(i + 1) * N + i] = v[i + 1]; v[i + 1] = 1.0; }
+			barrier();
+			for (int r = start + int(t); r < N; r += 64) { // tridiagonal_multiply()
+				precise float acc = 0.0;
+				for (int j = start; j < N; j++) acc += tau * A[r * N + j] * v[j];
+				x[r] = acc;
+			}
+			barrier();
+			if (t == 0) {
+				precise float xv = 0.0;
+				for (int r = start; r < N; r++) xv += x[r] * v[r];
+				sh_alpha = rf(-0.5LF * double(tau) * double(xv));
+			}
+			barrier();
+			const float alpha = sh_alpha;
+			for (int r = start + int(t); r < N; r += 64) { precise float xr = x[r] + alpha * v[r]; x[r] = xr; }
+			barrier();
+			const int m = N - start;
+			for (int e = int(t); e < m * m; e += 64) { // tridiagonal_syr2()
+				const int r = start + e / m, c = start + e % m;
+				precise float upd = A[r * N + c] - (x[r] * v[c] + v[r] * x[c]);
+				A[r * N + c] = upd;
+			}
+			barrier();
+		}
+	}
+	if (t == 0) {
+		for (int i = 0; i < N; i++) d[i] = A[i * N + i];
+		for (int i = 0; i < N - 1; i++) sd[i] = A[(i + 1) * N + i];
+		// compute_eigenvalues_tridiagonal()
+		chop(0, N);
+		int b = N - 1, iter = 0;
+		while (b > 0 && iter < 500) {
+			if (sd[b - 1] == 0.0) { b--; continue; }
+			int a = b - 1;
+			while (a > 0) {
+				if (sd[a - 1] == 0.0) break;
+				a--;
+			}
+			const int nb = b - a + 1;
+			qr_step(a, nb);
+			chop(a, nb);
+			iter++;
+		}
+		for (int i = 0; i < N; i++) eig[i] = d[i];
+	}
+	barrier();
+
+	// matrix_qr_decomposition(C): Z = C, Q = I, then one Householder reflection per column
+	for (uint e = t; e < N * N; e += 64) { Z[e] = C[e]; Q[e] = (int(e) / N == int(e) % N) ? 1.0 : 0.0; }
+	barrier();
+	for (int k = 0; k < N - 1; k++) {
+		for (uint e = t; e < N * N; e += 64) { // matrix_minor(Z, k)
+			const int i = int(e) / N, j = int(e) % N;
+			if (i < k || j < k) Z[e] = i == j ? 1.0 : 0.0;
+		}
+		barrier();
+		if (t == 0) {
+			for (int i = 0; i < N; i++) v[i] = Z[i * N + k];
+			const float norm = vnorm();
+			precise float vk = v[k] + float(sgn(C[k * N + k])) * norm;
+			v[k] = vk;
+			const float n2 = vnorm();
+			for (int i = 0; i < N; i++) v[i] = fdiv(v[i], n2);
+		}
+		barrier();
+		for (uint e = t; e < N * N; e += 64) { // matrix_identity_minus_v_vt()
+			const int i = int(e) / N, j = int(e) % N;
+			precise float q = -2.0 * v[i] * v[j];
+			if (i == j) q = q + 1.0;
+			A[e] = q;
+		}
+		barrier();
+		matmul_into_Z(t);
+		matmul_into_Q(t);
+	}
+	// R = Q C; the system is then solved with Q (transposed twice); and whether it can be: all eigenvalues at least EPS (is_matrix_regular()), no
+	// diagonal element of R below EPS (solve_triangular_system())
+	for (uint e = t; e < N * N; e += 64) {
+		const int i = int(e) / N, j = int(e) % N;
+		precise float acc = 0.0;
+		for (int k = 0; k < N; k++) acc += Q[i * N + k] * C[k * N + j];
+		small[out0 + N * N + int(e)] = acc;
+		small[out0 + int(e)] = Q[e];
+	}
+	if (t < N) small[out0 + 2 * N * N + int(t)] = eig[t];
+	memoryBarrierBuffer();
+	barrier();
+	if (t == 0) {
+		bool bad = false;
+		for (int i = 0; i < N; i++) if (double(eig[i]) < EPS) bad = true;
+		if (!bad) for (int i = N - 1; i >= 0; i--) if (double(abs(small[out0 + N * N + i * N + i])) < EPS) { bad = true; break; }
+		small[out0 + 2 * N * N + N] = bad ? 1.0 : 0.0;
+	}
+}

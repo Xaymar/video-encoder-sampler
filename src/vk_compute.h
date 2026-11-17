@@ -49,21 +49,34 @@ public:
 	// Whether device `device` (an index into devices()) can run the scorer; `why` says what is missing when it cannot.
 	static bool available(int device, std::string& why);
 
-	explicit Vk(int device); // throws std::runtime_error if the device cannot be had
+	// `slots`: how many command buffers can be recorded and in flight at once, each with its own fence (throws std::runtime_error if the device cannot be had).
+	explicit Vk(int device, int slots = 1);
 	~Vk();
 	Vk(const Vk&) = delete;
 	Vk& operator=(const Vk&) = delete;
 
-	// kind 0: host visible, device local where there is a window for it (written by the CPU straight into VRAM); 1: device local; 2: host cached (read back by the CPU)
+	// kind 0: host visible, device local where there is a window for it (written by the CPU straight into VRAM); 1: device local; 2: host cached (read back
+	// by the CPU); 3: host visible in system memory where there is such (written by the CPU, copied by the GPU). A kind that has run out of its first choice
+	// of memory gets its next one.
 	Buf buffer(VkDeviceSize size, int kind);
 	// A compute pipeline from the embedded SPIR-V `name` (shared by all users), with a descriptor set of its own that points at `bindings` (binding i -> bindings[i]).
 	Pipe pipeline(const char* name, const std::vector<Buf*>& bindings);
-	void begin();
+	// Recording into the command buffer of a slot (whose earlier work must be done: wait()), then submitting it. Submissions to a device run in order
+	// of submission on its one queue; a barrier() also orders the commands after it against everything submitted before (other slots, other users).
+	void begin(int slot = 0);
 	void bind(const Pipe& p);
 	void push(const void* data, uint32_t size);
 	void dispatch(uint32_t x, uint32_t y = 1);
+	void copy(const Buf& src, const Buf& dst, VkDeviceSize size = 0); // size 0: the smaller of the two buffers
 	void barrier();
-	void submit_wait();
+	void stamp(int slot, int which); // timestamp 0 (start) or 1 (end) of the slot's work, see gpu_seconds()
+	void submit(int slot = 0);
+	void wait(int slot = 0); // until the slot's last submission is done
+	// GPU time between the slot's two stamps in its last finished submission; -1 if the device has no timestamps. Safe to call from another thread
+	// than the one that records, for a slot that is not being recorded.
+	double gpu_seconds(int slot);
+	// Bytes of the buffers made so far, in device-local memory (VRAM, or what an integrated GPU sets aside) and in other memory.
+	void memory(uint64_t& device_local, uint64_t& host) const;
 
 private:
 	void release();

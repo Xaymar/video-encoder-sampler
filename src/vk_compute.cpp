@@ -26,7 +26,8 @@
 	X(vkCreatePipelineLayout) X(vkCreateComputePipelines) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) \
 	X(vkUpdateDescriptorSets) X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
 	X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdPipelineBarrier) \
-	X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences)
+	X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
+	X(vkCmdCopyBuffer) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 #define X(n) static PFN_##n n;
 VK_FUNCS(X)
@@ -59,6 +60,7 @@ struct Shared {
 	VkQueue queue{};
 	uint32_t family = 0;
 	VkPhysicalDeviceMemoryProperties mem{};
+	double timestamp_ns = 0; // nanoseconds per timestamp tick; 0 if the compute queue has no timestamps
 	VkDescriptorSetLayout dsl{};
 	VkPipelineLayout layout{};
 	std::mutex queue_lock, pipe_lock;
@@ -157,6 +159,11 @@ Shared* bring_up(int index, std::string& why) {
 		bool found = false;
 		for (uint32_t i = 0; i < qn; i++) if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { s.family = i; found = true; break; }
 		if (!found) throw std::runtime_error("no compute queue");
+		{
+			VkPhysicalDeviceProperties props;
+			vkGetPhysicalDeviceProperties(s.phys, &props);
+			if (qf[s.family].timestampValidBits && props.limits.timestampPeriod > 0) s.timestamp_ns = props.limits.timestampPeriod;
+		}
 		float prio = 1.0f;
 		VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
 		qci.queueFamilyIndex = s.family;
@@ -198,10 +205,16 @@ Shared* bring_up(int index, std::string& why) {
 struct Vk::Impl {
 	Shared* s = nullptr;
 	VkCommandPool pool{};
-	VkCommandBuffer cmd{};
-	VkFence fence{};
+	struct Slot {
+		VkCommandBuffer cmd{};
+		VkFence fence{};
+		VkQueryPool stamps{}; // two timestamps: the work began, the work ended
+	};
+	std::vector<Slot> slots;
+	VkCommandBuffer cmd{}; // the one being recorded
 	VkDescriptorPool dpool{};
 	std::vector<std::pair<VkBuffer, VkDeviceMemory>> owned;
+	uint64_t device_bytes = 0, host_bytes = 0;
 };
 
 std::vector<VkDeviceInfo> Vk::devices(std::string& why) {
@@ -212,7 +225,7 @@ std::vector<VkDeviceInfo> Vk::devices(std::string& why) {
 
 bool Vk::available(int device, std::string& why) { return bring_up(device, why) != nullptr; }
 
-Vk::Vk(int device) : impl(new Impl) {
+Vk::Vk(int device, int slots) : impl(new Impl) {
 	std::string why;
 	impl->s = bring_up(device, why);
 	if (!impl->s) { delete impl; impl = nullptr; throw std::runtime_error("Vulkan: " + why); }
@@ -228,13 +241,22 @@ Vk::Vk(int device) : impl(new Impl) {
 		cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 		cpi.queueFamilyIndex = s.family;
 		chk(vkCreateCommandPool(s.dev, &cpi, nullptr, &impl->pool), "command pool");
-		VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-		cai.commandPool = impl->pool;
-		cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-		cai.commandBufferCount = 1;
-		chk(vkAllocateCommandBuffers(s.dev, &cai, &impl->cmd), "command buffer");
-		VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
-		chk(vkCreateFence(s.dev, &fi, nullptr, &impl->fence), "fence");
+		impl->slots.resize(std::max(1, slots));
+		for (auto& sl : impl->slots) {
+			VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+			cai.commandPool = impl->pool;
+			cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+			cai.commandBufferCount = 1;
+			chk(vkAllocateCommandBuffers(s.dev, &cai, &sl.cmd), "command buffer");
+			VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+			chk(vkCreateFence(s.dev, &fi, nullptr, &sl.fence), "fence");
+			if (s.timestamp_ns > 0) {
+				VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+				qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
+				qi.queryCount = 2;
+				chk(vkCreateQueryPool(s.dev, &qi, nullptr, &sl.stamps), "query pool");
+			}
+		}
 	} catch (...) {
 		release();
 		throw;
@@ -246,7 +268,10 @@ Vk::~Vk() { release(); }
 void Vk::release() {
 	if (!impl) return;
 	Shared& s = *impl->s;
-	if (impl->fence) vkDestroyFence(s.dev, impl->fence, nullptr);
+	for (auto& sl : impl->slots) {
+		if (sl.fence) vkDestroyFence(s.dev, sl.fence, nullptr);
+		if (sl.stamps) vkDestroyQueryPool(s.dev, sl.stamps, nullptr);
+	}
 	if (impl->pool) vkDestroyCommandPool(s.dev, impl->pool, nullptr);
 	if (impl->dpool) vkDestroyDescriptorPool(s.dev, impl->dpool, nullptr);
 	for (auto& [b, m] : impl->owned) { vkDestroyBuffer(s.dev, b, nullptr); vkFreeMemory(s.dev, m, nullptr); }
@@ -265,18 +290,36 @@ Buf Vk::buffer(VkDeviceSize size, int kind) {
 	VkMemoryRequirements mr;
 	vkGetBufferMemoryRequirements(s.dev, b.buf, &mr);
 	const VkMemoryPropertyFlags hv = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, dl = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, hc = VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
-	const VkMemoryPropertyFlags want[3][3] = {{hv | dl, hv, 0}, {dl, 0, 0}, {hv | hc, hv, 0}};
-	int found = -1;
-	for (int w = 0; w < 3 && found < 0; w++)
+	// kind 3: host visible and not device local where there is such memory (system memory the GPU copies from), else like kind 0
+	const VkMemoryPropertyFlags want[4][3] = {{hv | dl, hv, 0}, {dl, 0, 0}, {hv | hc, hv, 0}, {hv, hv, 0}};
+	const VkMemoryPropertyFlags avoid[4][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}, {dl, 0, 0}};
+	// The memory types in order of preference; when one is out of memory (a small window of device-local host-visible memory without resizable BAR),
+	// the next one is tried.
+	std::vector<uint32_t> types;
+	for (int w = 0; w < 3; w++)
 		for (uint32_t i = 0; i < s.mem.memoryTypeCount; i++)
-			if ((mr.memoryTypeBits & (1u << i)) && (s.mem.memoryTypes[i].propertyFlags & want[kind][w]) == want[kind][w] && (want[kind][w] || w == 2)) { found = (int)i; break; }
-	if (found < 0) { vkDestroyBuffer(s.dev, b.buf, nullptr); throw std::runtime_error("Vulkan: no suitable memory type"); }
-	VkMemoryAllocateInfo mi{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-	mi.allocationSize = mr.size;
-	mi.memoryTypeIndex = found;
-	VkResult r = vkAllocateMemory(s.dev, &mi, nullptr, &b.mem);
-	if (r != VK_SUCCESS) { vkDestroyBuffer(s.dev, b.buf, nullptr); chk(r, "vkAllocateMemory"); }
+			if ((mr.memoryTypeBits & (1u << i)) && (s.mem.memoryTypes[i].propertyFlags & want[kind][w]) == want[kind][w] && !(s.mem.memoryTypes[i].propertyFlags & avoid[kind][w]) &&
+			    (want[kind][w] || w == 2) && std::find(types.begin(), types.end(), i) == types.end())
+				types.push_back(i);
+	if (types.empty()) { vkDestroyBuffer(s.dev, b.buf, nullptr); throw std::runtime_error("Vulkan: no suitable memory type"); }
+	int found = -1;
+	VkResult r = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+	for (uint32_t t : types) {
+		VkMemoryAllocateInfo mi{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+		mi.allocationSize = mr.size;
+		mi.memoryTypeIndex = t;
+		r = vkAllocateMemory(s.dev, &mi, nullptr, &b.mem);
+		if (r == VK_SUCCESS) { found = (int)t; break; }
+		if (r != VK_ERROR_OUT_OF_DEVICE_MEMORY && r != VK_ERROR_OUT_OF_HOST_MEMORY) break;
+	}
+	if (found < 0) { vkDestroyBuffer(s.dev, b.buf, nullptr); chk(r, "vkAllocateMemory"); }
+	if (kind != 1 && !(s.mem.memoryTypes[found].propertyFlags & hv)) {
+		vkFreeMemory(s.dev, b.mem, nullptr);
+		vkDestroyBuffer(s.dev, b.buf, nullptr);
+		throw std::runtime_error("Vulkan: out of host visible memory");
+	}
 	impl->owned.emplace_back(b.buf, b.mem);
+	(s.mem.memoryTypes[found].propertyFlags & dl ? impl->device_bytes : impl->host_bytes) += mr.size;
 	chk(vkBindBufferMemory(s.dev, b.buf, b.mem, 0), "vkBindBufferMemory");
 	// Host visible memory is taken coherent here; the memory types picked above are on every desktop GPU.
 	if (s.mem.memoryTypes[found].propertyFlags & hv) {
@@ -332,11 +375,25 @@ Pipe Vk::pipeline(const char* name, const std::vector<Buf*>& bindings) {
 	return p;
 }
 
-void Vk::begin() {
+void Vk::begin(int slot) {
+	Impl::Slot& sl = impl->slots.at(slot);
+	impl->cmd = sl.cmd;
 	vkResetCommandBuffer(impl->cmd, 0);
 	VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	chk(vkBeginCommandBuffer(impl->cmd, &bi), "begin");
+	if (sl.stamps) vkCmdResetQueryPool(impl->cmd, sl.stamps, 0, 2);
+}
+
+void Vk::stamp(int slot, int which) {
+	Impl::Slot& sl = impl->slots.at(slot);
+	// bottom of pipe: written once every command before it, in this submission and the ones before on the queue, is done
+	if (sl.stamps) vkCmdWriteTimestamp(impl->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.stamps, (uint32_t)which);
+}
+
+void Vk::copy(const Buf& src, const Buf& dst, VkDeviceSize size) {
+	VkBufferCopy c{0, 0, size ? size : std::min(src.size, dst.size)};
+	vkCmdCopyBuffer(impl->cmd, src.buf, dst.buf, 1, &c);
 }
 
 void Vk::bind(const Pipe& p) {
@@ -356,17 +413,27 @@ void Vk::barrier() {
 	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
 }
 
-void Vk::submit_wait() {
+void Vk::submit(int slot) {
 	Shared& s = *impl->s;
-	chk(vkEndCommandBuffer(impl->cmd), "end");
+	Impl::Slot& sl = impl->slots.at(slot);
+	chk(vkEndCommandBuffer(sl.cmd), "end");
 	VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
 	si.commandBufferCount = 1;
-	si.pCommandBuffers = &impl->cmd;
-	vkResetFences(s.dev, 1, &impl->fence);
-	{
-		std::lock_guard lock(s.queue_lock);
-		chk(vkQueueSubmit(s.queue, 1, &si, impl->fence), "submit");
-	}
-	chk(vkWaitForFences(s.dev, 1, &impl->fence, VK_TRUE, ~0ull), "wait");
+	si.pCommandBuffers = &sl.cmd;
+	vkResetFences(s.dev, 1, &sl.fence);
+	std::lock_guard lock(s.queue_lock);
+	chk(vkQueueSubmit(s.queue, 1, &si, sl.fence), "submit");
+}
+
+void Vk::memory(uint64_t& device_local, uint64_t& host) const { device_local = impl->device_bytes; host = impl->host_bytes; }
+
+void Vk::wait(int slot) { chk(vkWaitForFences(impl->s->dev, 1, &impl->slots.at(slot).fence, VK_TRUE, ~0ull), "wait"); }
+
+double Vk::gpu_seconds(int slot) {
+	Impl::Slot& sl = impl->slots.at(slot);
+	if (!sl.stamps) return -1;
+	uint64_t t[2] = {0, 0};
+	if (vkGetQueryPoolResults(impl->s->dev, sl.stamps, 0, 2, sizeof t, t, sizeof t[0], VK_QUERY_RESULT_64_BIT) != VK_SUCCESS || t[1] < t[0]) return -1;
+	return (double)(t[1] - t[0]) * impl->s->timestamp_ns * 1e-9;
 }
 #endif
