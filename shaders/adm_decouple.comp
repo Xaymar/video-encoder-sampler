@@ -25,7 +25,7 @@ float to_float(int64_t v) {
 // The products here are taken as unsigned magnitudes and their sign: on AMD's RDNA 3 Windows driver (LLPC, 26.10.1) the signed 64-bit product of
 // two negative values in the scale 0 path came out wrong (k 0 where the reference and distorted values were both negative), which put ADM's
 // scale 0 numerator 1.4-3.9% low. A negative product gives k <= 0, clamped to 0, so only positive products need the division.
-int restore(int o, int t, bool angle_flag) {
+int restore(int o, int t, bool angle_flag, out int k_out, out int rst0) {
 	int64_t k;
 	if (o == 0) {
 		k = 32768l;
@@ -50,6 +50,7 @@ int restore(int o, int t, bool angle_flag) {
 	const uint64_t ko = uint64_t(k) * uint64_t(uint(abs(o)));
 	int rst = o >= 0 ? int((ko + 16384ul) >> 15) : -int((ko + 16383ul) >> 15);
 	if (pc.scale == 0) rst = sext16(rst);
+	k_out = int(k); rst0 = rst;
 	const float rst_f = (float(k) / 32768.0) * (float(o) / 64.0);
 	if (angle_flag && rst_f != 0.0) {
 		// C: MIN (or MAX) of the double rst * limit and t, converted back when assigned; with a whole limit that is exact in integers.
@@ -89,9 +90,11 @@ void main() {
 			angle_flag = dp * dp >= rhs;
 		}
 	}
-	const int rh = restore(oh, th, angle_flag), rv = restore(ov, tv, angle_flag), rd = restore(od, td, angle_flag);
+	int kh, kv, kd, r0h, r0v, r0d;
+	const int rh = restore(oh, th, angle_flag, kh, r0h), rv = restore(ov, tv, angle_flag, kv, r0v), rd = restore(od, td, angle_flag, kd, r0d);
 	cur[XH * N + o] = rh; cur[XV * N + o] = rv; cur[XD * N + o] = rd;
 	int ah = th - rh, av = tv - rv, ad = td - rd;
 	if (pc.scale == 0) { ah = sext16(ah); av = sext16(av); ad = sext16(ad); }
 	cur[AH * N + o] = ah; cur[AV * N + o] = av; cur[AD * N + o] = ad;
+	if (pc.dbg != 0) { cur[AH * N + o] = kh; cur[AV * N + o] = angle_flag ? 1 : 0; cur[AD * N + o] = r0h; }
 }

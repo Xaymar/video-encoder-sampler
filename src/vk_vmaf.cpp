@@ -405,6 +405,7 @@ struct AdmPC {
 	int bpc;
 	int aim;
 	int egl_int;
+	int dbg;
 };
 struct CambiPC { int W, H, OW, OH, bpc, anti_dither, mask_index, pad, nd, vlt_luma, band_base, band_size; };
 struct SpeedPC { int W, H, SW, SH, DW, DH, bpc, fw, scaled, out_off; float scaler; };
@@ -781,6 +782,7 @@ private:
 						vk.dispatch(cx, cy); vk.barrier();
 					}
 					AdmPC pu = a.apc[s];
+					pu.dbg = !adm_dump.empty() && index == 1 && u == 0 && s == 0 ? 1 : 0; // the dump's frame: decouple's inner values into AH, AV, AD
 					vk.push(&pu, sizeof pu);
 					vk.bind(a.dec[s]); vk.dispatch(g.first, g.second); vk.barrier();
 					vk.bind(a.csf[s]); vk.dispatch(g.first, g.second); vk.barrier();
@@ -1034,7 +1036,8 @@ private:
 	int sw[4], sh[4], bw[4], bh[4];
 	std::vector<AdmUnit> au;
 	Buf acur[4], acopy[4], aden[4], atmp, adiv;
-	// VES_ADM_DUMP=<file>: frame 1's ADM bands and sums of scale 0 (acur[0], unit 0's cm, aden) written to that file, for comparing GPUs
+	// VES_ADM_DUMP=<file>: frame 1's ADM bands and sums of scale 0 (acur[0], unit 0's cm, aden) written to that file, for comparing GPUs; in that
+	// frame AH, AV, AD hold decouple's k, angle flag and restored value before the gain limit (of the h band), so its scores are wrong
 	std::string adm_dump;
 	Buf adump; // acopy: the bands the units after the first work on, one after another
 	Pipe adwt_v[4], adwt_h[4], aden_p[4];
