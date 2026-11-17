@@ -42,6 +42,9 @@ public:
 	// them (`ves --list-options` shows them as the defaults). Empty when the encoder cannot tell.
 	virtual std::vector<std::pair<std::string, std::string>> settings() { return {}; }
 	Stats stats;
+	// open() failed because the GPU had no encode session left (NVENC's per-GPU limit, which sessions of other processes count against, also ones stuck
+	// in the driver): not the run's fault, so it is run again later instead of counting as failed.
+	bool no_session = false;
 };
 
 // The native backends, selected by the names "nvenc", "amf", "qsv", "x264", "x265" and "svtav1".

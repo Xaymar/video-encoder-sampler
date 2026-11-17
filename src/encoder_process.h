@@ -28,6 +28,9 @@ bool isolated_caps(const std::string& encoder, const std::string& codec, int gpu
 // encoder_defaults() in the process of the GPU: `base` as "key=value" lines; `answer` the settings the same way, or "!" and why it could not open the encoder.
 bool isolated_defaults(const std::string& encoder, const std::string& codec, int gpu, const std::string& base, std::string& answer);
 
+// How many encoder processes did not end even when killed (stuck in a driver). They keep what they hold, NVENC sessions among it, until they end or the machine restarts.
+size_t abandoned_encoder_processes();
+
 // Ends the processes (at the end of a sweep); they also end by themselves when this process does.
 void stop_encoder_processes();
 
