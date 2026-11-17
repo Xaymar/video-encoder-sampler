@@ -7,9 +7,10 @@
 //   [PA] amf/doc/AMF_Video_PreAnalysis_API.md
 // Option names are AMF's property names in snake_case without the codec prefix (HevcEnableVBAQ is enable_vbaq; the pre-analysis ones keep "pa_"); ves
 // lists them with `ves --list-options amf/h264`. ves opens the encoder with usage transcoding and CBR, peak bitrate = target bitrate.
-// Rate control: CBR is the base; rate_control_method switches to peak constrained VBR (capped at the target, as ves sets the peak to it) or to the
-// high quality modes, which need pre-analysis [E]. Pre-analysis and pre-encode work with every rate control [E] (the header's "only works in peak
-// constrained VBR" [H] is older than the API reference) and can help a lot, so they and their options are all here.
+// Rate control: CBR is the base; rate_control "vbr" is peak constrained VBR, capped at the target as ves sets the peak to it. Pre-analysis and
+// pre-encode work with every rate control [E] (the header's "only works in peak constrained VBR" [H] is older than the API reference) and can help a
+// lot, so they and their options are all here. The high quality modes (hqvbr, hqcbr) need pre-analysis [E] and seem to be gone on RDNA GPUs, where
+// the high_quality preset may stand in for them (untested): they are commented out.
 // Every list is cut to a spread of its range: ves numbers the combinations with one 64-bit number, so all value lists multiplied (rules aside) must stay
 // below 9.2e18. Pruning tries the middle values only where the ends differ, so the ends of each range matter most.
 // Features this GPU's encoder lacks (B-frames, reference frame counts) are left to the capability check: those runs are ignored, not failed.
@@ -29,8 +30,9 @@
 			"codec": "h264",
 			"options": {
 				"preset": ["speed", "balanced", "quality", "high_quality"],
-				"profile": ["", "baseline", "main", "high"],   // "": what the picture needs
-				"rate_control_method": ["", 2, 5, 6],   // "": CBR (ves); 2 peak constrained VBR, 5 high quality VBR, 6 high quality CBR (H.264 numbering: CBR is 1, latency constrained VBR 3)
+				"profile": ["high"],   // the older profiles are no use any more
+				"rate_control": ["", "vbr"],   // "": CBR; also lcvbr, qvbr, hqvbr, hqcbr (ves turns the names into AMF's numbers per codec)
+				// "rate_control": ["", "vbr", "hqvbr", "hqcbr"],   // to test whether this GPU still has the high quality modes
 				"pre_encode": ["", 1],   // pre-encode assisted rate control, off in the transcoding usage [E]
 				"max_b_frames": [0, 1, 2, 3],   // BPicturesPattern, 0..3 [E]
 				"adaptive_mini_gop": ["", 1],   // adaptive B-frames; needs pre-analysis with a lookahead of 1 or more [E]
@@ -39,10 +41,10 @@
 				"max_ref_frames": [1, 2, 4, 8],   // MaxNumRefFrames, 0..16 [E]
 				"enable_vbaq": ["", 0, 1],
 				"high_motion_quality_boost_enable": ["", 0, 1],
-				"cabac_enable": ["", 0, 1],
+				// "cabac_enable": [...],   // every decoder has CABAC and it is clearly better
 				"de_blocking_filter": ["", 0, 1],
 				"rate_control_skip_frame_enable": ["", 0, 1],   // lets the rate control drop frames
-				"low_latency_internal": ["", 0, 1],
+				// "low_latency_internal": [...],   // AMD's own setting, not one to choose
 				"enforce_hrd": ["", 0, 1],
 				// "filler_data_enable": [0, 1],   // pads the stream to the bitrate: the picture stays the same
 				// "vbv_buffer_size": [...],   // bits, so the same value means a different buffer at every bitrate
@@ -71,15 +73,6 @@
 				"pre_filter_sensitivity": ["", 0, 4, 10],   // 0..10, lower keeps more detail
 			},
 			"rules": [
-				// Baseline has no B-frames and no CABAC.
-				{
-					"if": { "op": "==", "left": { "option": "profile" }, "right": "baseline" },
-					"require": [
-						{ "op": "==", "left": { "option": "max_b_frames" }, "right": 0 },
-						{ "op": "not", "value": { "set": "adaptive_mini_gop" } },
-						{ "op": "not", "value": { "set": "cabac_enable" } },
-					],
-				},
 				// Adaptive mini-GOP takes priority over the B-frame count [E]: it runs with one count, 3, the one AMD recommends with it [E].
 				{
 					"if": { "set": "adaptive_mini_gop" },
@@ -95,9 +88,9 @@
 					],
 					"else_require": { "op": "not", "value": { "set": "b_reference_mode" } },
 				},
-				// High quality VBR and CBR "require Pre-Analysis to be enabled" [E]; QVBR (4) aims at a quality level instead of the bitrate and is left out.
+				// High quality VBR and CBR "require Pre-Analysis to be enabled" [E]; QVBR aims at a quality level instead of the bitrate and is left out.
 				{
-					"if": { "op": "in", "left": { "option": "rate_control_method" }, "right": [5, 6] },
+					"if": { "op": "in", "left": { "option": "rate_control" }, "right": ["hqvbr", "hqcbr"] },
 					"require": [
 						{ "op": "==", "left": { "option": "enable_pre_analysis" }, "right": 1 },
 					],

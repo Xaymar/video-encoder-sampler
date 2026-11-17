@@ -43,7 +43,7 @@ const std::vector<Common>& commons() {
 		{"lookahead_frames", "0..", "frames of lookahead for rate control (0 = off)", {"8"}},
 		{"max_ref_frames", "1..", "most reference frames", {"2"}},
 		{"b_reference_mode", nullptr, "B-frames as references", {"none", "middle", "each"}},
-		{"rate_control", nullptr, "rate control mode at the target bitrate", {"cbr", "vbr"}},
+		{"rate_control", nullptr, "rate control mode at the target bitrate", {"cbr", "vbr", "lcvbr", "qvbr", "hqvbr", "hqcbr"}},
 	};
 	return t;
 }
@@ -96,6 +96,14 @@ bool translate(const std::string& enc, const std::string& codec, const std::stri
 			out.push_back({"b_reference_enable", value == "none" ? "0" : "1"});
 		} else return no();
 	} else if (key == "rate_control") {
+		if (enc == "amf") { // AMF's modes by name; H.264 numbers them differently from HEVC and AV1 (RATE_CONTROL_METHOD_ENUM)
+			static const std::map<std::string, std::pair<int, int>> modes = {
+				{"cbr", {1, 3}}, {"vbr", {2, 2}}, {"lcvbr", {3, 1}}, {"qvbr", {4, 4}}, {"hqvbr", {5, 5}}, {"hqcbr", {6, 6}}};
+			auto m = modes.find(value);
+			if (m == modes.end()) { error = "bad value '" + value + "' for 'rate_control' (amf: cbr, vbr, lcvbr, qvbr, hqvbr or hqcbr)"; return false; }
+			out.push_back({"rate_control_method", std::to_string(codec == "h264" ? m->second.first : m->second.second)});
+			return true;
+		}
 		if (value != "cbr" && value != "vbr") return bad();
 		if (enc == "svtav1") { // CBR needs the low-delay prediction structure and VBR the random-access one
 			out.push_back({"rc", value == "cbr" ? "2" : "1"});

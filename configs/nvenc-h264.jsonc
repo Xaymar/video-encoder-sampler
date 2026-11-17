@@ -28,25 +28,25 @@
 			"options": {
 				"preset": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
 				"tune": ["hq", "ll", "ull"],   // "lossless" needs constant QP 0 [H enableLossless], "uhq" is HEVC and AV1 only [H NV_ENC_TUNING_INFO]
-				"profile": ["", "main", "high", "baseline", "constrained_high"],   // "": the encoder picks; high10 (10-bit, Blackwell and newer [G 8.6]) and high444 (4:4:4) follow from the scenario
+				"profile": ["", "high"],   // high for 8-bit 4:2:0 (the older profiles are no use any more); "": the encoder picks high10 (Blackwell and newer [G 8.6]) or high444 for the others
 				// "level": ["auto"],   // a level only caps the DPB and the bitrate; auto picks one that fits
 				// "rate_control": ["cbr"],   // the default; "vbr" at the same average and peak bitrate is CBR with a looser buffer
 				"max_b_frames": [0, 1, 2, 3, 4],   // the GPU's NUM_MAX_BFRAMES caps it
-				"lookahead_frames": [0, 4, 8, 16, 27],   // 0 off; at most 31 minus the B-frames [H lookaheadDepth]
-				"lookahead_level": [0, 1, 2, 3],   // 15 = auto; needs lookahead (NVIDIA's library aborts the process otherwise [T])
+				"lookahead_frames": [0, 4, 8, 16, 32, 54],   // 0 off; [H lookaheadDepth] says 31 minus the B-frames, but the driver takes more and silently cuts it to what its surfaces allow (64 became 54 [T])
+				"lookahead_level": [0, 1, 2, 3, 15],   // 15 = auto; needs lookahead (NVIDIA's library aborts the process otherwise [T])
 				"disable_iadapt": [0, 1],   // adaptive I-frames at scene cuts: lookahead only [H][G 8.2]
 				"disable_badapt": [0, 1],   // adaptive B-frame count: lookahead and B-frames only [H][G 8.2]
 				"multi_pass": [0, 1, 2],   // 0 off, 1 two passes with a quarter resolution first pass, 2 two full passes [G 3.8.4]
-				"spatial_aq": [0, "auto", 1, 4, 8, 12, 15],   // 0 off, auto: driver picks the strength, 1..15 [H aqStrength][G 8.5.1]
+				"spatial_aq": [0, "auto"],   // 0 off, auto: the driver picks the strength per frame; a fixed strength 1..15 [H aqStrength] is always worse (user's tests)
 				"temporal_aq": [0, 1],
 				"strict_gop_target": [0, 1],
 				"zero_reorder_delay": [0, 1],   // no reordering: no B-frames, no temporal filter [H]
 				"enable_non_ref_p": [0, 1],
 				"enable_weighted_prediction": [0, 1],   // not with B-frames [H][G 8.7]
-				"low_delay_key_frame_scale": ["", 1, 2, 4],   // I- to P-frame bits with CBR and a single-frame VBV, which only ll and ull use [H]
+				"low_delay_key_frame_scale": ["", 1, 2, 4, 8, 16],   // I- to P-frame bits with CBR and a single-frame VBV, which only ll and ull use; 2 for ll and 1 for ull by default, no range given [H]
 				"mv_precision": [0, 1, 2, 3],   // 0 default (quarter pel), 1 full, 2 half, 3 quarter
 				"b_reference_mode": ["none", "middle", "each", "hierarchical"],
-				"hierarchical_b_frames": [0, 1],
+				// "hierarchical_b_frames": [0, 1],   // H.264's older flag for what b_reference_mode "hierarchical" does (same requirements [T])
 				"hierarchical_p_frames": [0, 1],
 				"bdirect_mode": [0, 1, 2, 3],   // 0 auto, 1 off, 2 temporal, 3 spatial: B-frames only
 				"max_ref_frames": ["", 1, 2, 3, 4, 6, 8, 16],   // "": the driver's DPB size
@@ -54,7 +54,7 @@
 				"max_ref_frames_l1": [0, 1, 2, 3],   // 0 auto, 1..7: the backward list, B-frames only
 				"num_ltr_frames": [0, 1, 2, 4],   // long-term references (trust mode): not with B-frames [H enableLTR][G 8.8]
 				"tf_level": [0, 4],   // temporal filter: 4 or more B-frames, no zero reorder delay [H tfLevel]
-				"entropy_coding_mode": [0, 1, 2],   // 0 auto, 1 CABAC, 2 CAVLC
+				// "entropy_coding_mode": [0, 1, 2],   // 0 auto, 1 CABAC, 2 CAVLC: every decoder has CABAC and it is clearly better
 				"adaptive_transform_mode": [0, 1, 2],   // 8x8 transform: 0 auto, 1 off, 2 on
 				"disable_deblocking_filter_idc": [0, 1, 2],   // [H] range 0..2, as in H.264 7.4.3
 				"cb_qp_index_offset": [-6, -3, 0, 3],   // chroma_qp_index_offset, -12..12 (H.264 7.4.2.2); lower gives chroma more bits
@@ -67,30 +67,17 @@
 				// "const_qp": [...],   // constant QP rate control only
 			},
 			"rules": [
-				// Profiles [H.264 A.2]: baseline has no B-frames, CABAC or 8x8 transform; main no 8x8 transform; constrained high no B-frames.
-				// The 8-bit 4:2:0 profiles need an 8-bit 4:2:0 picture: high10 and high444 are the encoder's own pick ("") for the others.
+				// High is 8-bit 4:2:0: it runs for those pictures, and the encoder's own pick ("") for 10-bit and 4:4:4.
 				{
-					"if": { "op": "in", "left": { "option": "profile" }, "right": ["baseline", "constrained_high"] },
-					"require": { "op": "==", "left": { "option": "max_b_frames" }, "right": 0 },
-				},
-				{
-					"if": { "op": "==", "left": { "option": "profile" }, "right": "baseline" },
-					"require": { "op": "!=", "left": { "option": "entropy_coding_mode" }, "right": 1 },
-				},
-				{
-					"if": { "op": "in", "left": { "option": "profile" }, "right": ["baseline", "main"] },
-					"require": { "op": "!=", "left": { "option": "adaptive_transform_mode" }, "right": 2 },
-				},
-				{
-					"if": { "set": "profile" },
-					"require": [
-						{ "op": "!=", "left": { "option": "bitdepth" }, "right": 10 },
-						{ "op": "!=", "left": { "option": "chroma" }, "right": 444 },
-					],
+					"if": { "op": "or", "args": [
+						{ "op": "==", "left": { "option": "bitdepth" }, "right": 10 },
+						{ "op": "==", "left": { "option": "chroma" }, "right": 444 },
+					] },
+					"require": { "op": "not", "value": { "set": "profile" } },
+					"else_require": { "set": "profile" },
 				},
 
-				// Lookahead: its level needs it on (the library aborts otherwise [T]); adaptive I/B decisions only exist with it [H disableIadapt][G 8.2];
-				// its depth is at most 31 minus the B-frames [H lookaheadDepth].
+				// Lookahead: its level needs it on (the library aborts otherwise [T]); adaptive I/B decisions only exist with it [H disableIadapt][G 8.2].
 				// (Hierarchical B-frames want both flags set even then, see below.)
 				{
 					"if": { "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
@@ -100,14 +87,12 @@
 					"if": { "op": "and", "args": [
 						{ "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
 						{ "op": "!=", "left": { "option": "b_reference_mode" }, "right": "hierarchical" },
-						{ "op": "!=", "left": { "option": "hierarchical_b_frames" }, "right": 1 },
 					] },
 					"require": [
 						{ "op": "==", "left": { "option": "disable_iadapt" }, "right": 0 },
 						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 0 },
 					],
 				},
-				{ "op": "<=", "left": { "op": "+", "left": { "option": "lookahead_frames" }, "right": { "option": "max_b_frames" } }, "right": 31 },
 
 				// Without B-frames: non-reference P-frames, weighted prediction [H][G 8.7], long-term references [H][G 8.8], zero reorder delay and
 				// uni-directional B (which "is ignored when regular B frames are used" [H]). With B-frames: adaptive B, B-frames as references,
@@ -124,7 +109,6 @@
 					"else_require": [
 						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 0 },
 						{ "op": "==", "left": { "option": "b_reference_mode" }, "right": "none" },
-						{ "op": "==", "left": { "option": "hierarchical_b_frames" }, "right": 0 },
 						{ "op": "==", "left": { "option": "bdirect_mode" }, "right": 0 },
 						{ "op": "==", "left": { "option": "max_ref_frames_l1" }, "right": 0 },
 					],
@@ -141,17 +125,13 @@
 				},
 
 				// B-frames as references: "each" needs 2 or more B-frames in a row [T]; "hierarchical" [H NV_ENC_BFRAME_REF_MODE_HIERARCHICAL] needs
-				// B-frames + 1 a power of 2 up to 32, lookahead off or at level 0, one pass, adaptive I and B off. The H.264-only hierarchical_b_frames
-				// flag has the same requirements [T] (user's tested rules).
+				// B-frames + 1 a power of 2 up to 32, lookahead off or at level 0, one pass, adaptive I and B off.
 				{
 					"if": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "each" },
 					"require": { "op": ">", "left": { "option": "max_b_frames" }, "right": 1 },
 				},
 				{
-					"if": { "op": "or", "args": [
-						{ "op": "==", "left": { "option": "b_reference_mode" }, "right": "hierarchical" },
-						{ "op": "==", "left": { "option": "hierarchical_b_frames" }, "right": 1 },
-					] },
+					"if": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "hierarchical" },
 					"require": [
 						{ "op": "in", "left": { "op": "+", "left": { "option": "max_b_frames" }, "right": 1 }, "right": [2, 4, 8, 16, 32] },
 						{ "op": "or", "args": [

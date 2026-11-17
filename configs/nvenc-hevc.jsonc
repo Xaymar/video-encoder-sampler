@@ -28,22 +28,22 @@
 			"options": {
 				"preset": ["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
 				"tune": ["hq", "uhq", "ll", "ull"],   // uhq: ultra high quality, Turing and newer [H NV_ENC_TUNING_INFO]; "lossless" needs constant QP 0
-				"profile": ["", "main", "main10"],   // "": the encoder picks (rext for 4:4:4); main is 8-bit 4:2:0, main10 4:2:0 up to 10 bits
+				// "profile": [...],   // the encoder picks main, main10 or rext from the picture
 				// "level": ["auto"],   // a level only caps the DPB and the bitrate; auto picks one that fits
 				// "rate_control": ["cbr"],   // the default; "vbr" at the same average and peak bitrate is CBR with a looser buffer
 				"max_b_frames": [0, 1, 2, 3, 4],   // the GPU's NUM_MAX_BFRAMES caps it
-				"lookahead_frames": [0, 4, 8, 16, 27],   // 0 off; at most 31 minus the B-frames [H lookaheadDepth]
-				"lookahead_level": [0, 1, 2, 3],   // 15 = auto; needs lookahead (NVIDIA's library aborts the process otherwise [T])
+				"lookahead_frames": [0, 4, 8, 16, 32, 54],   // 0 off; [H lookaheadDepth] says 31 minus the B-frames, but the driver takes more and silently cuts it to what its surfaces allow (64 became 54 [T])
+				"lookahead_level": [0, 1, 2, 3, 15],   // 15 = auto; needs lookahead (NVIDIA's library aborts the process otherwise [T])
 				"disable_iadapt": [0, 1],   // adaptive I-frames at scene cuts: lookahead only [H][G 8.2]
 				"disable_badapt": [0, 1],   // adaptive B-frame count: lookahead and B-frames only [H][G 8.2]
 				"multi_pass": [0, 1, 2],   // 0 off, 1 two passes with a quarter resolution first pass, 2 two full passes [G 3.8.4]
-				"spatial_aq": [0, "auto", 1, 4, 8, 12, 15],   // 0 off, auto: driver picks the strength, 1..15 [H aqStrength][G 8.5.1]
+				"spatial_aq": [0, "auto"],   // 0 off, auto: the driver picks the strength per frame; a fixed strength 1..15 [H aqStrength] is always worse (user's tests)
 				"temporal_aq": [0, 1],
 				"strict_gop_target": [0, 1],
 				"zero_reorder_delay": [0, 1],   // no reordering: no B-frames, no temporal filter [H]
 				"enable_non_ref_p": [0, 1],
 				"enable_weighted_prediction": [0, 1],   // not with B-frames [H][G 8.7]
-				"low_delay_key_frame_scale": ["", 1, 2, 4],   // I- to P-frame bits with CBR and a single-frame VBV, which only ll and ull use [H]
+				"low_delay_key_frame_scale": ["", 1, 2, 4, 8, 16],   // I- to P-frame bits with CBR and a single-frame VBV, which only ll and ull use; 2 for ll and 1 for ull by default, no range given [H]
 				"mv_precision": [0, 1, 2, 3],   // 0 default (quarter pel), 1 full, 2 half, 3 quarter
 				"b_reference_mode": ["none", "middle", "each", "hierarchical"],
 				"max_ref_frames": ["", 1, 2, 3, 4, 6, 8, 16],   // "": the driver's DPB size
@@ -54,7 +54,7 @@
 				"min_cu_size": [0, 1, 2, 3],   // 0 auto, 1 8x8, 2 16x16, 3 32x32
 				// "max_cu_size": [3],   // "Currently NVENC SDK only supports maxCUSize equal to NV_ENC_HEVC_CUSIZE_32x32" [H]
 				// "tier": ["main", "high"],   // only raises the level's bitrate limits; with level auto it changes nothing at these bitrates
-				"split_encode_mode": [0, 1, 2, 3, 4, 15],   // 0 auto, 1 forced (driver picks strips), 2..4 strips, 15 off; needs 2+ NVENCs, else one strip [H][G 8.14]
+				"split_encode_mode": [15],   // off: splitting a frame across NVENCs only buys speed and costs quality; auto (0) may split high resolutions [H][G 8.14]
 				"disable_deblocking_filter_idc": [0, 1, 2],   // [H] range 0..2, pps_deblocking_filter_disabled_flag (H.265 7.4.3.3)
 				"cb_qp_index_offset": [-6, -3, 0, 3],   // pps_cb_qp_offset, -12..12 (H.265 7.4.3.3); lower gives chroma more bits
 				"cr_qp_index_offset": [-6, -3, 0, 3],   // pps_cr_qp_offset, -12..12
@@ -66,18 +66,7 @@
 				// "const_qp": [...],   // constant QP rate control only
 			},
 			"rules": [
-				// Profiles [H.265 A.3]: main is 8-bit 4:2:0, main10 4:2:0 at 8 or 10 bits; 4:4:4 needs rext, which the encoder picks itself ("").
-				{
-					"if": { "set": "profile" },
-					"require": { "op": "!=", "left": { "option": "chroma" }, "right": 444 },
-				},
-				{
-					"if": { "op": "==", "left": { "option": "profile" }, "right": "main" },
-					"require": { "op": "!=", "left": { "option": "bitdepth" }, "right": 10 },
-				},
-
-				// Lookahead: its level needs it on (the library aborts otherwise [T]); adaptive I/B decisions only exist with it [H disableIadapt][G 8.2];
-				// its depth is at most 31 minus the B-frames [H lookaheadDepth].
+				// Lookahead: its level needs it on (the library aborts otherwise [T]); adaptive I/B decisions only exist with it [H disableIadapt][G 8.2].
 				// (Hierarchical B-frames want both flags set even then, see below.)
 				{
 					"if": { "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
@@ -93,7 +82,6 @@
 						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 0 },
 					],
 				},
-				{ "op": "<=", "left": { "op": "+", "left": { "option": "lookahead_frames" }, "right": { "option": "max_b_frames" } }, "right": 31 },
 
 				// Without B-frames: non-reference P-frames, weighted prediction [H][G 8.7], long-term references [H][G 8.8], zero reorder delay and
 				// uni-directional B (which "is ignored when regular B frames are used" [H]). With B-frames: adaptive B, B-frames as references
@@ -125,7 +113,7 @@
 				},
 
 				// B-frames as references: "each" needs 2 or more B-frames in a row [T]; "hierarchical" [H NV_ENC_BFRAME_REF_MODE_HIERARCHICAL] needs
-				// B-frames + 1 a power of 2 up to 32, lookahead off or at level 0, one pass, adaptive I and B off, split encoding auto or off.
+				// B-frames + 1 a power of 2 up to 32, lookahead off or at level 0, one pass, adaptive I and B off.
 				{
 					"if": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "each" },
 					"require": { "op": ">", "left": { "option": "max_b_frames" }, "right": 1 },
@@ -141,7 +129,6 @@
 						{ "op": "==", "left": { "option": "multi_pass" }, "right": 0 },
 						{ "op": "==", "left": { "option": "disable_iadapt" }, "right": 1 },
 						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 1 },
-						{ "op": "in", "left": { "option": "split_encode_mode" }, "right": [0, 15] },
 					],
 				},
 				// The DPB holds at least one frame more than there are B-frames in a row, and 3 with B-frames as references [T]; a reference list
@@ -157,12 +144,6 @@
 						{ "op": "<=", "left": { "option": "max_ref_frames_l0" }, "right": { "option": "max_ref_frames" } },
 						{ "op": "<=", "left": { "option": "max_ref_frames_l1" }, "right": { "option": "max_ref_frames" } },
 					],
-				},
-
-				// Split encoding is always off with weighted prediction [G 8.14][H splitEncodeMode]: a forced mode would be the same run as off.
-				{
-					"if": { "op": "==", "left": { "option": "enable_weighted_prediction" }, "right": 1 },
-					"require": { "op": "in", "left": { "option": "split_encode_mode" }, "right": [0, 15] },
 				},
 
 				// Temporal filter: frameIntervalP >= 5 (4 B-frames in a row), not with zero reorder delay [H tfLevel].
