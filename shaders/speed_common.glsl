@@ -1,4 +1,4 @@
-// SpEED's statistics on the GPU (speed_blur_v/h, speed_cov, speed_small, speed_blocks, speed_score): libvmaf 3.2.1 speed.c's est_params() and
+// SpEED's statistics on the GPU (speed_blur_v/h, speed_mean, speed_center, speed_cov, speed_small, speed_blocks, speed_score): libvmaf 3.2.1 speed.c's est_params() and
 // get_speed_score() after the decimation by 16 (speed_dec), for the 4 decimated planes of one SpEED unit (0, 1: the reference's U and V; 2, 3: the
 // decoded U and V). They redo the C code's float and double operations one by one, in its order: `precise` keeps the compiler from fusing a multiply
 // and an add (that rounds once instead of twice), division and square root go through double (Vulkan does not round float division correctly; a
@@ -7,10 +7,11 @@ layout(std430, binding = 0) readonly buffer Dec { float dec[]; };         // spe
 layout(std430, binding = 1) buffer Tmp { float tmpv[]; };                 // the 3x3 blur's vertical pass
 layout(std430, binding = 2) buffer Prep { float prep[]; };                // plane minus its blur: what the statistics are taken of
 layout(std430, binding = 3) readonly buffer Filt { float filt[]; };       // the blur's taps
-layout(std430, binding = 4) buffer Cov { float covm[]; };                 // per plane: the 25x25 covariance matrix
+layout(std430, binding = 4) buffer Cov { float covm[]; };                 // per plane: the 25x25 covariance matrix; after the 4 planes', their 25 means
 layout(std430, binding = 5) buffer Small { float small[]; };              // per plane (SMALL floats): Q (625), R (625), eigenvalues (25), cannot invert (1)
 layout(std430, binding = 6) buffer Blocks { float blk[]; };               // per plane: entropies (nb), then variances (nb)
 layout(std430, binding = 7) buffer Final { float fin[]; };                // per chroma plane (U, V): score, failed (1: a matrix could not be inverted)
+layout(std430, binding = 8) buffer Cen { double cen[]; };                 // per plane, per element of a block: the submatrix's samples minus their mean
 layout(push_constant) uniform PC {
 	int DW, DH;          // the decimated plane
 	int fw;              // blur taps

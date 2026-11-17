@@ -37,6 +37,8 @@ public:
 	// the background, alongside: the GPU's work on the frames (from GPU timestamps; without them, from handing over to done), and working out their
 	// results on the CPU.
 	void timing(double& copy, double& wait, double& gpu, double& results) const;
+	// Seconds of the GPU's work that went to SpEED: blur and covariances, eigenvalues and QR, blocks and score (all 0 without SpEED or timestamps).
+	void speed_timing(double parts[3]) const;
 	// Bytes of memory the scorer holds: device local (VRAM), other (system memory), and how much of those is per frame in flight (`frames` of them).
 	void memory(uint64_t& device_local, uint64_t& host, uint64_t& per_frame, int& frames) const;
 

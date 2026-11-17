@@ -1,0 +1,16 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 64) in;
+#include "speed_common.glsl"
+// One invocation per sample of the submatrix: for each of the 25 elements of a block, the sample at that offset minus its mean, in double, as the
+// CPU works out each covariance's terms (speed_cov then only multiplies and adds).
+void main() {
+	const int s = int(gl_GlobalInvocationID.x), p = int(gl_WorkGroupID.y), S = pc.subw * pc.subh;
+	if (s >= S) return;
+	const int i = s / pc.subw, j = s % pc.subw, base = p * pc.DW * pc.DH;
+	for (int x = 0; x < N; x++) {
+		const double m = double(covm[4 * N * N + p * N + x]);
+		precise double d = double(prep[base + (i + x / 5) * pc.DW + j + x % 5]) - m;
+		cen[(p * N + x) * S + s] = d;
+	}
+}

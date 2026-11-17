@@ -69,12 +69,13 @@ public:
 	void dispatch(uint32_t x, uint32_t y = 1);
 	void copy(const Buf& src, const Buf& dst, VkDeviceSize size = 0); // size 0: the smaller of the two buffers
 	void barrier();
-	void stamp(int slot, int which); // timestamp 0 (start) or 1 (end) of the slot's work, see gpu_seconds()
+	static constexpr int kStamps = 8;
+	void stamp(int slot, int which); // timestamp `which` (0: start, 1: end of the slot's work; up to kStamps - 1 for parts of it), see gpu_seconds()
 	void submit(int slot = 0);
 	void wait(int slot = 0); // until the slot's last submission is done
-	// GPU time between the slot's two stamps in its last finished submission; -1 if the device has no timestamps. Safe to call from another thread
-	// than the one that records, for a slot that is not being recorded.
-	double gpu_seconds(int slot);
+	// GPU time between two of the slot's stamps (by default start and end) in its last finished submission; -1 if the device has no timestamps or
+	// the submission did not write both. Safe to call from another thread than the one that records, for a slot that is not being recorded.
+	double gpu_seconds(int slot, int from = 0, int to = 1);
 	// Bytes of the buffers made so far, in device-local memory (VRAM, or what an integrated GPU sets aside) and in other memory.
 	void memory(uint64_t& device_local, uint64_t& host) const;
 

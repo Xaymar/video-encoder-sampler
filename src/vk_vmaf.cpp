@@ -553,6 +553,7 @@ bool models_compatible(const std::vector<Model>& ms, std::string& why) {
 // in a slot of its own (the frames going in, the sums coming back, a command buffer and a fence). The GPU still works on one frame after the other: the
 // buffers in between are shared by the slots.
 constexpr int kSlots = 4;
+constexpr int N_SPEED_PAIRS = 25 * 26 / 2; // covariances per SpEED plane (the matrix is symmetric)
 
 class VkVmaf {
 	struct Slot; // below
@@ -658,6 +659,10 @@ public:
 	void timing(double& copy, double& wait, double& gpu, double& results) {
 		std::lock_guard lock(mutex);
 		copy = t_copy; wait = t_wait; gpu = t_gpu; results = t_results;
+	}
+	void speed_timing(double parts[3]) {
+		std::lock_guard lock(mutex);
+		for (int i = 0; i < 3; i++) parts[i] = t_speed[i];
 	}
 	// Memory: device local and other in all, and what each slot adds of that (frames in, sums out).
 	uint64_t mem_device = 0, mem_host = 0, mem_slot = 0;
@@ -774,12 +779,23 @@ private:
 			};
 			auto pixels = [](const SpeedUnit& u) { return (uint32_t)((u.stpc.DW * u.stpc.DH + 63) / 64); };
 			auto one = [](const SpeedUnit&) { return 1u; };
+			// timestamps for VES_SCORE_TIMING's SpEED split: 2 before, 3 after the covariances, 4 after eigenvalues and QR, 5 after the rest
+			vk.barrier();
+			vk.stamp(slot, 2);
 			step(&SpeedUnit::sblur_v, pixels, 4);
 			step(&SpeedUnit::sblur_h, pixels, 4);
-			step(&SpeedUnit::scov, one, 4);
+			step(&SpeedUnit::smean, one, 4);
+			step(&SpeedUnit::scenter, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.subw * u.stpc.subh + 63) / 64); }, 4);
+			step(&SpeedUnit::scov, [](const SpeedUnit&) { return (uint32_t)((N_SPEED_PAIRS + 31) / 32); }, 4);
+			vk.barrier();
+			vk.stamp(slot, 3);
 			step(&SpeedUnit::ssmall_p, one, 4);
+			vk.barrier();
+			vk.stamp(slot, 4);
 			step(&SpeedUnit::sblocks, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.nb + 63) / 64); }, 4);
 			step(&SpeedUnit::sscore, one, 2);
+			vk.barrier();
+			vk.stamp(slot, 5);
 		}
 		// the sums the shaders wrote, into the slot's own buffers (CAMBI's are written there directly)
 		vk.barrier();
@@ -889,8 +905,8 @@ private:
 		int sfw3 = 0;
 		// the statistics (speed_common.glsl): blur, the plane minus its blur, covariance matrices, their eigenvalues and QR, per block results, scores
 		SpeedStatPC stpc{};
-		Buf stmp, sprep, sfilt3, scovm, ssmall, sblk, sfin;
-		Pipe sblur_v, sblur_h, scov, ssmall_p, sblocks, sscore;
+		Buf stmp, sprep, sfilt3, scovm, ssmall, sblk, sfin, scen;
+		Pipe sblur_v, sblur_h, smean, scenter, scov, ssmall_p, sblocks, sscore;
 	};
 	// One frame in flight: its frames going in (system memory the GPU copies from), the sums coming back (host cached memory the GPU copies them to,
 	// or CAMBI's c values, which its last shader writes there directly), and the thread that waits for the GPU and works out its results.
@@ -916,6 +932,7 @@ private:
 	bool stop = false;
 	std::vector<std::vector<Features>> feats; // collected, in frame order
 	double t_gpu = 0, t_results = 0;
+	double t_speed[3] = {0, 0, 0}; // SpEED's GPU time: blur and covariances, eigenvalues and QR, blocks and score
 	// VES_SPEED_CHECK=1: SpEED is also worked out on the CPU (from the GPU's decimated planes, as before it all moved to the GPU) and compared
 	bool speed_check = false;
 	mutable std::mutex check_lock;
@@ -982,13 +999,14 @@ private:
 			}
 			std::vector<Features> f;
 			std::string error;
-			double gpu = 0, res = 0;
+			double gpu = 0, res = 0, sp[3] = {-1, -1, -1};
 			try {
 				const auto t0 = clock::now();
 				vk.wait(k);
 				const auto t1 = clock::now();
 				gpu = vk.gpu_seconds(k);
 				if (gpu < 0) gpu = std::chrono::duration<double>(t1 - t0).count(); // no timestamps: how long it was waited for
+				for (int i = 0; i < 3; i++) sp[i] = vk.gpu_seconds(k, 2 + i, 3 + i); // SpEED's parts (-1 without SpEED or timestamps)
 				f = results(sl);
 				res = std::chrono::duration<double>(clock::now() - t1).count();
 			} catch (const std::exception& e) {
@@ -998,6 +1016,8 @@ private:
 			{
 				std::lock_guard lock(mutex);
 				t_gpu += gpu; t_results += res;
+				if (sp[0] >= 0 && sp[1] >= 0 && sp[2] >= 0)
+					for (int i = 0; i < 3; i++) t_speed[i] += sp[i];
 				sl.feats = std::move(f);
 				sl.error = std::move(error);
 				sl.state = Slot::Done;
@@ -1449,13 +1469,16 @@ private:
 			u.sprep = vk.buffer(4 * n * 4 + 16, 1);
 			u.sfilt3 = vk.buffer(128 * 4, 0);
 			memcpy(u.sfilt3.map, u.sfilter3.data(), 128 * 4);
-			u.scovm = vk.buffer(4 * 625 * 4 + 16, 1);
+			u.scovm = vk.buffer((4 * 625 + 4 * 25) * 4 + 16, 1); // the 4 planes' covariance matrices, then their means
+			u.scen = vk.buffer((size_t)4 * 25 * st.subw * st.subh * 8 + 16, 1); // centred samples in double, per plane and element of a block
 			u.ssmall = vk.buffer(4 * 1280 * 4 + 16, 1);
 			u.sblk = vk.buffer((size_t)4 * 2 * st.nb * 4 + 16, 1);
 			u.sfin = vk.buffer(4 * 4 + 16, 1);
-			const std::vector<Buf*> sb{&u.sout, &u.stmp, &u.sprep, &u.sfilt3, &u.scovm, &u.ssmall, &u.sblk, &u.sfin};
+			const std::vector<Buf*> sb{&u.sout, &u.stmp, &u.sprep, &u.sfilt3, &u.scovm, &u.ssmall, &u.sblk, &u.sfin, &u.scen};
 			u.sblur_v = vk.pipeline("speed_blur_v", sb);
 			u.sblur_h = vk.pipeline("speed_blur_h", sb);
+			u.smean = vk.pipeline("speed_mean", sb);
+			u.scenter = vk.pipeline("speed_center", sb);
 			u.scov = vk.pipeline("speed_cov", sb);
 			u.ssmall_p = vk.pipeline("speed_small", sb);
 			u.sblocks = vk.pipeline("speed_blocks", sb);
@@ -1563,6 +1586,11 @@ void GpuVmaf::timing(double& copy, double& wait, double& gpu, double& results) c
 	if (impl->gpu) impl->gpu->timing(copy, wait, gpu, results);
 }
 
+void GpuVmaf::speed_timing(double parts[3]) const {
+	parts[0] = parts[1] = parts[2] = 0;
+	if (impl->gpu) impl->gpu->speed_timing(parts);
+}
+
 void GpuVmaf::memory(uint64_t& device_local, uint64_t& host, uint64_t& per_frame, int& frames) const {
 	device_local = impl->gpu->mem_device; host = impl->gpu->mem_host; per_frame = impl->gpu->mem_slot; frames = kSlots;
 }
@@ -1645,6 +1673,7 @@ std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::vector<std::string>&, int, c
 bool GpuVmaf::add(const uint8_t* const[3], const size_t[3], const uint8_t* const[3], const size_t[3]) { return false; }
 bool GpuVmaf::finish(std::vector<std::vector<double>>&, std::vector<std::vector<std::map<std::string, double>>>*) { return false; }
 void GpuVmaf::timing(double& copy, double& wait, double& gpu, double& results) const { copy = wait = gpu = results = 0; }
+void GpuVmaf::speed_timing(double parts[3]) const { parts[0] = parts[1] = parts[2] = 0; }
 void GpuVmaf::memory(uint64_t& device_local, uint64_t& host, uint64_t& per_frame, int& frames) const { device_local = host = per_frame = 0; frames = 0; }
 
 #endif

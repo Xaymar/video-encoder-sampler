@@ -1,0 +1,15 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+layout(local_size_x = 32) in;
+#include "speed_common.glsl"
+// One workgroup per plane: the 25 means of compute_covariance_matrix() with the scalar kernel (float sums in row order, one chain each, as on the
+// CPU), after the 4 planes' covariance matrices.
+void main() {
+	const int t = int(gl_LocalInvocationID.x), p = int(gl_WorkGroupID.y), base = p * pc.DW * pc.DH;
+	if (t >= N) return;
+	const int r = t / 5, c = t % 5;
+	precise float s = 0.0;
+	for (int i = 0; i < pc.subh; i++)
+		for (int j = 0; j < pc.subw; j++) s += prep[base + (i + r) * pc.DW + j + c];
+	covm[4 * N * N + p * N + t] = fdiv(s, float(pc.subw * pc.subh));
+}
