@@ -28,12 +28,17 @@ public:
 	static std::unique_ptr<GpuVmaf> create(const std::vector<std::string>& model_paths, int device, const GpuVmafFrame& f, std::string& why);
 	~GpuVmaf();
 	// The next pair of original and decoded frames: planes Y, U, V (samples of 1 byte, or 2 bytes above 8 bit; rows `stride` bytes apart). The chroma
-	// planes are only read when the model has a chroma feature.
+	// planes are only read when the model has a chroma feature. The planes are copied before it returns; the scoring goes on in the background, several
+	// frames at once, and add() waits only when all of them are still busy. False if the frame (or one before it) could not be scored.
 	bool add(const uint8_t* const ref[3], const size_t ref_stride[3], const uint8_t* const dis[3], const size_t dis_stride[3]);
 	// For each model (in the order given), the VMAF score of every pair added; and, if asked for, every frame's features as libvmaf names them.
 	bool finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<std::map<std::string, double>>>* features = nullptr);
-	// Seconds spent so far copying frames in, waiting for the GPU (submit to done, including other scorers' work queued ahead), and summing the results.
-	void timing(double& copy, double& gpu, double& results) const;
+	// Seconds spent so far, in add() and finish(): copying frames in and handing them to the GPU, and waiting for a frame in flight to be done; and in
+	// the background, alongside: the GPU's work on the frames (from GPU timestamps; without them, from handing over to done), and working out their
+	// results on the CPU.
+	void timing(double& copy, double& wait, double& gpu, double& results) const;
+	// Bytes of memory the scorer holds: device local (VRAM), other (system memory), and how much of those is per frame in flight (`frames` of them).
+	void memory(uint64_t& device_local, uint64_t& host, uint64_t& per_frame, int& frames) const;
 
 private:
 	GpuVmaf();
