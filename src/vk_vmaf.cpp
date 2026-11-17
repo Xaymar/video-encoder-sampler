@@ -643,6 +643,13 @@ public:
 			put(sl.in_chroma[2].map, dis[1], dis_stride[1], cw, ch);
 			put(sl.in_chroma[3].map, dis[2], dis_stride[2], cw, ch);
 		}
+		if (vk.async_upload()) {
+			vk.upload_begin(k);
+			vk.upload_copy(sl.in_ref, sl.dev_ref);
+			vk.upload_copy(sl.in_dis, sl.dev_dis);
+			if (!su.empty()) for (int p = 0; p < 4; p++) vk.upload_copy(sl.in_chroma[p], sl.dev_chroma[p]);
+			vk.upload_submit(k);
+		}
 		record(k, index);
 		{
 			std::lock_guard lock(mutex);
@@ -693,11 +700,19 @@ private:
 		};
 		const int cur = (int)(index % 3);
 		const bool motion = need_stride[0] || need_stride[1];
-		vk.copy(sl.in_ref, raw_ref);
-		vk.copy(sl.in_dis, raw_dis);
-		if (motion) vk.copy(sl.in_ref, mfr[cur]);
-		if (!su.empty()) for (int p = 0; p < 4; p++) vk.copy(sl.in_chroma[p], sraw[p]);
-		vk.barrier();
+		if (vk.async_upload()) { // already in VRAM (copied on the second queue, which submit() waits for)
+			vk.copy(sl.dev_ref, raw_ref);
+			vk.copy(sl.dev_dis, raw_dis);
+			if (motion) vk.copy(sl.dev_ref, mfr[cur]);
+			if (!su.empty()) for (int p = 0; p < 4; p++) vk.copy(sl.dev_chroma[p], sraw[p]);
+			vk.barrier();
+		} else { // from system memory, once each: motion's copy of the reference comes from VRAM
+			vk.copy(sl.in_ref, raw_ref);
+			vk.copy(sl.in_dis, raw_dis);
+			if (!su.empty()) for (int p = 0; p < 4; p++) vk.copy(sl.in_chroma[p], sraw[p]);
+			vk.barrier();
+			if (motion) { vk.copy(raw_ref, mfr[cur]); vk.barrier(); }
+		}
 		part_done(0);
 		bool* with_motion = sl.with_motion;
 		with_motion[0] = with_motion[1] = false;
@@ -935,6 +950,9 @@ private:
 		size_t index = 0;
 		bool with_motion[2] = {false, false};
 		Buf in_ref, in_dis, in_chroma[4];
+		// With a second queue (Vk::async_upload()): the frame copied into VRAM there, while the compute queue works on other frames; the compute
+		// work then starts with fast copies from these into the shared buffers.
+		Buf dev_ref, dev_dis, dev_chroma[4];
 		Buf mpart[2], aden[4];
 		std::vector<std::array<Buf, 4>> vpart, cm, aimb; // per VIF unit, per ADM unit (aimb: units with AIM)
 		std::vector<Buf> sfin, sout;                    // per SpEED unit: its scores; its decimated planes (only for VES_SPEED_CHECK)
@@ -1063,6 +1081,11 @@ private:
 			sl.in_ref = vk.buffer(raw_size, 3);
 			sl.in_dis = vk.buffer(raw_size, 3);
 			if (!su.empty()) for (int p = 0; p < 4; p++) sl.in_chroma[p] = vk.buffer(sraw[p].size, 3);
+			if (vk.async_upload()) {
+				sl.dev_ref = vk.buffer(raw_size, 1);
+				sl.dev_dis = vk.buffer(raw_size, 1);
+				if (!su.empty()) for (int p = 0; p < 4; p++) sl.dev_chroma[p] = vk.buffer(sraw[p].size, 1);
+			}
 			auto mirror = [&](const Buf& from) { Buf to = vk.buffer(from.size, 2); sl.out.emplace_back(&from, to); return to; };
 			for (int k = 0; k < 2; k++) if (need_stride[k]) sl.mpart[k] = mirror(mpart[k]);
 			sl.vpart.resize(vpart.size());

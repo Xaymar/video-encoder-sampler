@@ -4,6 +4,7 @@
 #ifndef VES_NO_VULKAN
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -27,7 +28,7 @@
 	X(vkUpdateDescriptorSets) X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
 	X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdPipelineBarrier) \
 	X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
-	X(vkCmdCopyBuffer) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+	X(vkCmdCopyBuffer) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 #define X(n) static PFN_##n n;
 VK_FUNCS(X)
@@ -59,11 +60,16 @@ struct Shared {
 	VkDevice dev{};
 	VkQueue queue{};
 	uint32_t family = 0;
+	// A second queue for copying frames in while the compute queue works on others (a transfer-only family, the DMA engine, where there is one; else a
+	// second queue of the compute family); none if the device has neither, or VES_VMAF_NO_ASYNC_UPLOAD is set.
+	VkQueue xqueue{};
+	uint32_t xfamily = 0;
+	bool has_x = false;
 	VkPhysicalDeviceMemoryProperties mem{};
 	double timestamp_ns = 0; // nanoseconds per timestamp tick; 0 if the compute queue has no timestamps
 	VkDescriptorSetLayout dsl{};
 	VkPipelineLayout layout{};
-	std::mutex queue_lock, pipe_lock;
+	std::mutex queue_lock, xqueue_lock, pipe_lock;
 	std::map<std::string, VkPipeline> pipelines;
 };
 
@@ -164,20 +170,37 @@ Shared* bring_up(int index, std::string& why) {
 			vkGetPhysicalDeviceProperties(s.phys, &props);
 			if (qf[s.family].timestampValidBits && props.limits.timestampPeriod > 0) s.timestamp_ns = props.limits.timestampPeriod;
 		}
-		float prio = 1.0f;
-		VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
-		qci.queueFamilyIndex = s.family;
-		qci.queueCount = 1;
-		qci.pQueuePriorities = &prio;
+		const char* no_async = getenv("VES_VMAF_NO_ASYNC_UPLOAD");
+		if (!(no_async && atoi(no_async) > 0)) {
+			for (uint32_t i = 0; i < qn && !s.has_x; i++)
+				if ((qf[i].queueFlags & VK_QUEUE_TRANSFER_BIT) && !(qf[i].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) && qf[i].queueCount > 0) {
+					s.xfamily = i;
+					s.has_x = true;
+				}
+			if (!s.has_x && qf[s.family].queueCount >= 2) { s.xfamily = s.family; s.has_x = true; }
+		}
+		float prio[2] = {1.0f, 1.0f};
+		VkDeviceQueueCreateInfo qcis[2]{{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
+		uint32_t qcount = 1;
+		qcis[0].queueFamilyIndex = s.family;
+		qcis[0].queueCount = s.has_x && s.xfamily == s.family ? 2 : 1;
+		qcis[0].pQueuePriorities = prio;
+		if (s.has_x && s.xfamily != s.family) {
+			qcis[1].queueFamilyIndex = s.xfamily;
+			qcis[1].queueCount = 1;
+			qcis[1].pQueuePriorities = prio;
+			qcount = 2;
+		}
 		VkPhysicalDeviceFeatures feats{};
 		feats.shaderInt64 = VK_TRUE;
 		feats.shaderFloat64 = VK_TRUE;
 		VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-		dci.queueCreateInfoCount = 1;
-		dci.pQueueCreateInfos = &qci;
+		dci.queueCreateInfoCount = qcount;
+		dci.pQueueCreateInfos = qcis;
 		dci.pEnabledFeatures = &feats;
 		chk(vkCreateDevice(s.phys, &dci, nullptr, &s.dev), "vkCreateDevice");
 		vkGetDeviceQueue(s.dev, s.family, 0, &s.queue);
+		if (s.has_x) vkGetDeviceQueue(s.dev, s.xfamily, s.xfamily == s.family ? 1 : 0, &s.xqueue);
 		VkDescriptorSetLayoutBinding b[kBindings];
 		for (int i = 0; i < kBindings; i++) b[i] = {(uint32_t)i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 		VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -209,9 +232,14 @@ struct Vk::Impl {
 		VkCommandBuffer cmd{};
 		VkFence fence{};
 		VkQueryPool stamps{}; // kStamps timestamps: 0 the work began, 1 it ended, the rest for parts of it
+		VkCommandBuffer xcmd{}; // copies on the second queue (upload_begin()), which the slot's next submit() waits for through xsem
+		VkSemaphore xsem{};
+		bool xpending = false;
 	};
+	VkCommandPool xpool{};
 	std::vector<Slot> slots;
-	VkCommandBuffer cmd{}; // the one being recorded
+	VkCommandBuffer cmd{}; // the one being recorded (compute queue)
+	VkCommandBuffer xrec{}; // the one being recorded (second queue)
 	VkDescriptorPool dpool{};
 	std::vector<std::pair<VkBuffer, VkDeviceMemory>> owned;
 	uint64_t device_bytes = 0, host_bytes = 0;
@@ -241,6 +269,12 @@ Vk::Vk(int device, int slots) : impl(new Impl) {
 		cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 		cpi.queueFamilyIndex = s.family;
 		chk(vkCreateCommandPool(s.dev, &cpi, nullptr, &impl->pool), "command pool");
+		if (s.has_x) {
+			VkCommandPoolCreateInfo xpi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+			xpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+			xpi.queueFamilyIndex = s.xfamily;
+			chk(vkCreateCommandPool(s.dev, &xpi, nullptr, &impl->xpool), "command pool (copies)");
+		}
 		impl->slots.resize(std::max(1, slots));
 		for (auto& sl : impl->slots) {
 			VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
@@ -250,6 +284,15 @@ Vk::Vk(int device, int slots) : impl(new Impl) {
 			chk(vkAllocateCommandBuffers(s.dev, &cai, &sl.cmd), "command buffer");
 			VkFenceCreateInfo fi{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
 			chk(vkCreateFence(s.dev, &fi, nullptr, &sl.fence), "fence");
+			if (s.has_x) {
+				VkCommandBufferAllocateInfo xai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+				xai.commandPool = impl->xpool;
+				xai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+				xai.commandBufferCount = 1;
+				chk(vkAllocateCommandBuffers(s.dev, &xai, &sl.xcmd), "command buffer (copies)");
+				VkSemaphoreCreateInfo smi{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+				chk(vkCreateSemaphore(s.dev, &smi, nullptr, &sl.xsem), "semaphore");
+			}
 			if (s.timestamp_ns > 0) {
 				VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
 				qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
@@ -271,8 +314,10 @@ void Vk::release() {
 	for (auto& sl : impl->slots) {
 		if (sl.fence) vkDestroyFence(s.dev, sl.fence, nullptr);
 		if (sl.stamps) vkDestroyQueryPool(s.dev, sl.stamps, nullptr);
+		if (sl.xsem) vkDestroySemaphore(s.dev, sl.xsem, nullptr);
 	}
 	if (impl->pool) vkDestroyCommandPool(s.dev, impl->pool, nullptr);
+	if (impl->xpool) vkDestroyCommandPool(s.dev, impl->xpool, nullptr);
 	if (impl->dpool) vkDestroyDescriptorPool(s.dev, impl->dpool, nullptr);
 	for (auto& [b, m] : impl->owned) { vkDestroyBuffer(s.dev, b, nullptr); vkFreeMemory(s.dev, m, nullptr); }
 	delete impl;
@@ -286,6 +331,13 @@ Buf Vk::buffer(VkDeviceSize size, int kind) {
 	VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
 	bi.size = size;
 	bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	// With a second queue of another family, every buffer may be used by both (the copies in and the compute work), without ownership transfers.
+	const uint32_t families[2] = {s.family, s.xfamily};
+	if (s.has_x && s.xfamily != s.family) {
+		bi.sharingMode = VK_SHARING_MODE_CONCURRENT;
+		bi.queueFamilyIndexCount = 2;
+		bi.pQueueFamilyIndices = families;
+	}
 	chk(vkCreateBuffer(s.dev, &bi, nullptr, &b.buf), "vkCreateBuffer");
 	VkMemoryRequirements mr;
 	vkGetBufferMemoryRequirements(s.dev, b.buf, &mr);
@@ -413,6 +465,38 @@ void Vk::barrier() {
 	                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
 }
 
+bool Vk::async_upload() const { return impl->s->has_x; }
+
+void Vk::upload_begin(int slot) {
+	Impl::Slot& sl = impl->slots.at(slot);
+	impl->xrec = sl.xcmd;
+	vkResetCommandBuffer(impl->xrec, 0);
+	VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	chk(vkBeginCommandBuffer(impl->xrec, &bi), "begin (copies)");
+}
+
+void Vk::upload_copy(const Buf& src, const Buf& dst, VkDeviceSize size) {
+	VkBufferCopy c{0, 0, size ? size : std::min(src.size, dst.size)};
+	vkCmdCopyBuffer(impl->xrec, src.buf, dst.buf, 1, &c);
+}
+
+void Vk::upload_submit(int slot) {
+	Shared& s = *impl->s;
+	Impl::Slot& sl = impl->slots.at(slot);
+	chk(vkEndCommandBuffer(sl.xcmd), "end (copies)");
+	VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+	si.commandBufferCount = 1;
+	si.pCommandBuffers = &sl.xcmd;
+	si.signalSemaphoreCount = 1;
+	si.pSignalSemaphores = &sl.xsem;
+	{
+		std::lock_guard lock(s.xqueue_lock);
+		chk(vkQueueSubmit(s.xqueue, 1, &si, VK_NULL_HANDLE), "submit (copies)");
+	}
+	sl.xpending = true;
+}
+
 void Vk::submit(int slot) {
 	Shared& s = *impl->s;
 	Impl::Slot& sl = impl->slots.at(slot);
@@ -420,6 +504,14 @@ void Vk::submit(int slot) {
 	VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
 	si.commandBufferCount = 1;
 	si.pCommandBuffers = &sl.cmd;
+	// the copies of upload_submit() are done before this work starts; the slot's fence then also means they are done
+	const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+	if (sl.xpending) {
+		si.waitSemaphoreCount = 1;
+		si.pWaitSemaphores = &sl.xsem;
+		si.pWaitDstStageMask = &wait_stage;
+		sl.xpending = false;
+	}
 	vkResetFences(s.dev, 1, &sl.fence);
 	std::lock_guard lock(s.queue_lock);
 	chk(vkQueueSubmit(s.queue, 1, &si, sl.fence), "submit");

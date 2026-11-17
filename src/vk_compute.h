@@ -71,6 +71,12 @@ public:
 	void barrier();
 	static constexpr int kStamps = 12;
 	void stamp(int slot, int which); // timestamp `which` (0: start, 1: end of the slot's work; up to kStamps - 1 for parts of it), see gpu_seconds()
+	// Copies on a second queue (async_upload(): the device has one), so that copying a frame in overlaps the compute work on frames before it:
+	// upload_begin() records into the slot's own command buffer for it, upload_submit() submits it, and the slot's next submit() waits for it.
+	bool async_upload() const;
+	void upload_begin(int slot);
+	void upload_copy(const Buf& src, const Buf& dst, VkDeviceSize size = 0);
+	void upload_submit(int slot);
 	void submit(int slot = 0);
 	void wait(int slot = 0); // until the slot's last submission is done
 	// GPU time between two of the slot's stamps (by default start and end) in its last finished submission; -1 if the device has no timestamps or
