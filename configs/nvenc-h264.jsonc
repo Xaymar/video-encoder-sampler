@@ -158,12 +158,13 @@
 					],
 				},
 
-				// Temporal filter: frameIntervalP >= 5 (4 B-frames in a row), not with zero reorder delay [H tfLevel].
+				// Temporal filter: frameIntervalP >= 5 (4 B-frames in a row), not with zero reorder delay [H tfLevel], not with hierarchical P-frames [T].
 				{
 					"if": { "op": "==", "left": { "option": "tf_level" }, "right": 4 },
 					"require": [
 						{ "op": ">=", "left": { "option": "max_b_frames" }, "right": 4 },
 						{ "op": "==", "left": { "option": "zero_reorder_delay" }, "right": 0 },
+						{ "op": "==", "left": { "option": "hierarchical_p_frames" }, "right": 0 },   // initialize fails with status 8 (invalid parameter) [T 2026-11-17, RTX 4080 SUPER]
 					],
 				},
 			],
