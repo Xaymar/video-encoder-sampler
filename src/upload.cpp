@@ -380,7 +380,7 @@ std::map<std::string, std::string> Uploader::known(const std::vector<std::string
 	if (!impl->ready || impl->no_known) return out;
 	size_t batch = 5000;
 	for (size_t at = 0; at < keys.size();) {
-		const size_t n = std::min(batch, keys.size() - at);
+		const size_t n = std::min<size_t>(batch, keys.size() - at); // with the type: Windows headers define a min() macro
 		std::string body = "{\"keys\":[";
 		for (size_t i = 0; i < n; i++) body += (i ? ",\"" : "\"") + keys[at + i] + "\"";
 		body += "]}";
