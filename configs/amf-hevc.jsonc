@@ -1,0 +1,144 @@
+// AMF HEVC: the options that change the picture at a fixed bitrate, with the values AMF accepts, and rules that leave out the combinations AMF
+// refuses or ignores (the same stream twice). Run it as is (ves --config configs/amf-hevc.jsonc) or copy the entry into your own config.
+//
+// Sources, cited as [H], [E] and [PA] below (AMF 1.4.3x, https://github.com/GPUOpen-LibrariesAndSDKs/AMF):
+//   [H]  amf/public/include/components/VideoEncoderHEVC.h and PreAnalysis.h, the property comments
+//   [E]  amf/doc/AMF_Video_Encode_HEVC_API.md, the property reference ("available only when ...", "requires ...")
+//   [PA] amf/doc/AMF_Video_PreAnalysis_API.md
+// Option names are AMF's property names in snake_case without the codec prefix (HevcEnableVBAQ is enable_vbaq; the pre-analysis ones keep "pa_"); ves
+// lists them with `ves --list-options amf/hevc`. ves opens the encoder with usage transcoding and CBR, peak bitrate = target bitrate.
+// Rate control: CBR is the base; rate_control_method switches to peak constrained VBR (capped at the target, as ves sets the peak to it) or to the
+// high quality modes, which need pre-analysis [E]. Pre-analysis and pre-encode work with every rate control [E] (the header's "only works in peak
+// constrained VBR" [H] is older than the API reference) and can help a lot, so they and their options are all here.
+// Every list is cut to a spread of its range: ves numbers the combinations with one 64-bit number, so all value lists multiplied (rules aside) must stay
+// below 9.2e18. Pruning tries the middle values only where the ends differ, so the ends of each range matter most.
+// Features this GPU's encoder lacks (B-frames, reference frame counts) are left to the capability check: those runs are ignored, not failed.
+{
+	"output": "output",
+	"scenarios": [
+		{ "name": "sample", "bitrates": [6000], "resolutions": ["1920x1080"], "framerates": [60] },
+	],
+	"kfintervals": [2.0],
+	"vmaf": { "model": ["path=models/vmaf_v1.0.16_1d5h_2160.json", "path=models/vmaf_v1.0.16_3d0h.json", "path=models/vmaf_v1.0.16_5d0h.json", "path=models/vmaf_v1.0.16_3d0h_2160.json"], "over_penalty": 0.025 },
+	"settings": { "cache": "cache", "prune": true },
+
+	"encoders": [
+		{
+			"enabled": true,
+			"encoder": "amf",
+			"codec": "hevc",
+			"options": {
+				"preset": ["speed", "balanced", "quality", "high_quality"],
+				"profile": ["", "main", "main10"],   // "": what the picture needs
+				"tier": ["", "high"],   // main by default; only the level's bitrate limits differ
+				"rate_control_method": ["", 2, 5, 6],   // "": CBR (ves); 2 peak constrained VBR, 5 high quality VBR, 6 high quality CBR (HEVC numbering: CBR is 3, latency constrained VBR 1)
+				"pre_encode": ["", 0, 1],   // pre-encode assisted rate control; default depends on the usage [H]
+				"max_ref_frames": ["", 1, 2, 4, 8, 16],   // HevcMaxNumRefFrames, 0..16, default 1 [E]
+				"enable_vbaq": ["", 0, 1],
+				"high_motion_quality_boost_enable": ["", 0, 1],
+				"de_blocking_filter": ["", 0, 1],   // HevcDeBlockingFilter
+				"rate_control_skip_frame_enable": ["", 0, 1],   // lets the rate control drop frames
+				"low_latency_internal": ["", 0, 1],
+				"enforce_hrd": ["", 0, 1],
+				// AMF's HEVC encoder has no B-frames.
+				// "filler_data_enable": [0, 1],   // pads the stream to the bitrate: the picture stays the same
+				// "vbv_buffer_size": [...],   // bits, so the same value means a different buffer at every bitrate
+				// "min_qp_i": [...], "max_qp_i": [...], "min_qp_p": [...], "max_qp_p": [...],   // QP limits only take quality away from the rate control
+
+				// Pre-analysis [PA]: its pa_* properties only exist once enable_pre_analysis is on (ves sets that first).
+				"enable_pre_analysis": ["", 1],   // off in the transcoding usage [E]
+				"pa_look_ahead_buffer_depth": ["", 0, 1, 21, 41],   // 11 in the transcoding usage; AMD suggests 1, 11, 21 or 41 [PA]
+				"pa_perceptual_aq_mode": ["", 1],   // 1 CAQ; replaces VBAQ [PA]
+				"pacaq_strength": ["", 0, 2],   // CAQ strength: 0 low, 1 medium (default), 2 high
+				"pa_temporal_aq_mode": ["", 1, 2],   // 1 for video, 2 for games (DX11 only, which ves uses); replaces VBAQ, needs lookahead [PA]
+				"pa_high_motion_quality_boost_mode": ["", 1],   // 1 auto; needs lookahead [PA]
+				"pa_scene_change_detection_enable": ["", 0],   // on by default
+				"pa_scene_change_detection_sensitivity": ["", 0, 2],   // 0 low, 1 medium (default), 2 high; only with lookahead 0 [PA]
+				"pa_static_scene_detection_enable": ["", 1],   // codes static frames as skip frames; needs lookahead [PA]
+				"pa_static_scene_detection_sensitivity": ["", 0, 1],   // 0 low, 1 medium, 2 high (default)
+				"pa_max_qp_before_force_skip": ["", 20, 51],   // 0..51, default 35: static frames are skipped only below this QP [PA]
+				"pa_activity_type": ["", 1],   // 0 luma (default), 1 luma and chroma
+				"pa_frame_sad_enable": ["", 0],   // on by default
+				"pa_long_term_reference_enable": ["", 1],   // automatic long-term references
+				// "pa_initial_qp_after_scene_change": [...],   // 0..51: a fixed QP after cuts only takes the choice from the rate control
+
+				// The pre-encode filter in front of the encoder (ves's own; see config.all-options.jsonc).
+				"pre_filter": ["", 1],
+				"pre_filter_strength": ["", 0, 4, 10],   // 0..10
+				"pre_filter_sensitivity": ["", 0, 4, 10],   // 0..10, lower keeps more detail
+			},
+			"rules": [
+				// Main is 8-bit.
+				{
+					"if": { "op": "==", "left": { "option": "profile" }, "right": "main" },
+					"require": { "op": "!=", "left": { "option": "bitdepth" }, "right": 10 },
+				},
+				// High quality VBR and CBR "require Pre-Analysis to be enabled" and are 8-bit only [E]; QVBR (4) aims at a quality level instead of the bitrate and is left out.
+				{
+					"if": { "op": "in", "left": { "option": "rate_control_method" }, "right": [5, 6] },
+					"require": [
+						{ "op": "==", "left": { "option": "enable_pre_analysis" }, "right": 1 },
+						{ "op": "!=", "left": { "option": "bitdepth" }, "right": 10 },   // "only for 8-bit color bit depth" [E]
+					],
+				},
+				// Pre-analysis options need pre-analysis [PA].
+				{
+					"if": { "op": "or", "args": [{ "op": "not", "value": { "set": "enable_pre_analysis" } }, { "op": "==", "left": { "option": "enable_pre_analysis" }, "right": 0 }] },
+					"require": [
+						{ "op": "not", "value": { "set": "pa_look_ahead_buffer_depth" } },
+						{ "op": "not", "value": { "set": "pa_perceptual_aq_mode" } },
+						{ "op": "not", "value": { "set": "pacaq_strength" } },
+						{ "op": "not", "value": { "set": "pa_temporal_aq_mode" } },
+						{ "op": "not", "value": { "set": "pa_high_motion_quality_boost_mode" } },
+						{ "op": "not", "value": { "set": "pa_scene_change_detection_enable" } },
+						{ "op": "not", "value": { "set": "pa_scene_change_detection_sensitivity" } },
+						{ "op": "not", "value": { "set": "pa_static_scene_detection_enable" } },
+						{ "op": "not", "value": { "set": "pa_static_scene_detection_sensitivity" } },
+						{ "op": "not", "value": { "set": "pa_max_qp_before_force_skip" } },
+						{ "op": "not", "value": { "set": "pa_activity_type" } },
+						{ "op": "not", "value": { "set": "pa_frame_sad_enable" } },
+						{ "op": "not", "value": { "set": "pa_long_term_reference_enable" } },
+					],
+				},
+				// TAQ, PA high motion boost, static scene detection need a lookahead of at least 1 [PA][E]; the scene change sensitivity only applies without one [PA].
+				{
+					"if": { "op": "and", "args": [{ "set": "pa_look_ahead_buffer_depth" }, { "op": "==", "left": { "option": "pa_look_ahead_buffer_depth" }, "right": 0 }] },
+					"require": [
+						{ "op": "not", "value": { "set": "pa_temporal_aq_mode" } },
+						{ "op": "not", "value": { "set": "pa_high_motion_quality_boost_mode" } },
+						{ "op": "not", "value": { "set": "pa_static_scene_detection_enable" } },
+					],
+					"else_require": { "op": "not", "value": { "set": "pa_scene_change_detection_sensitivity" } },
+				},
+				{
+					"if": { "op": "==", "left": { "option": "pa_scene_change_detection_enable" }, "right": 0 },
+					"require": { "op": "not", "value": { "set": "pa_scene_change_detection_sensitivity" } },
+				},
+				{
+					"if": { "op": "not", "value": { "set": "pa_static_scene_detection_enable" } },
+					"require": [
+						{ "op": "not", "value": { "set": "pa_static_scene_detection_sensitivity" } },
+						{ "op": "not", "value": { "set": "pa_max_qp_before_force_skip" } },
+					],
+				},
+				// The CAQ strength is the perceptual AQ's; with perceptual or temporal AQ the encoder's own VBAQ is ignored [PA].
+				{
+					"if": { "op": "not", "value": { "set": "pa_perceptual_aq_mode" } },
+					"require": { "op": "not", "value": { "set": "pacaq_strength" } },
+				},
+				{
+					"if": { "op": "or", "args": [{ "set": "pa_perceptual_aq_mode" }, { "set": "pa_temporal_aq_mode" }] },
+					"require": { "op": "not", "value": { "set": "enable_vbaq" } },
+				},
+				// The pre-filter settings need the pre-filter.
+				{
+					"if": { "op": "not", "value": { "set": "pre_filter" } },
+					"require": [
+						{ "op": "not", "value": { "set": "pre_filter_strength" } },
+						{ "op": "not", "value": { "set": "pre_filter_sensitivity" } },
+					],
+				},
+			],
+		},
+	],
+}

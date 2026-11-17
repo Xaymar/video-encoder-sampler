@@ -1,0 +1,161 @@
+// x265: the options that change the picture at a fixed bitrate, with the values x265 accepts, and rules that leave out the combinations x265
+// refuses (the run fails) or silently changes into another one (the same stream twice). Run it as is (ves --config configs/x265.jsonc) or copy
+// the entry into your own config.
+//
+// Sources, cited as [C], [E] and [D] below (x265 master, https://bitbucket.org/multicoreware/x265_git):
+//   [C] source/common/param.cpp, x265_check_params(): a failed check makes encoder_open fail
+//   [E] source/encoder/encoder.cpp, Encoder::configure(): settings it overrides with a warning
+//   [D] doc/reST/cli.rst, the option reference ("only has effect when ...")
+// Option names are x265's command line names with _ for - (ves passes them to x265_param_parse), so any other x265 option works too.
+// ves runs x265 as single pass ABR at the scenario's bitrate; the explicit options here are applied after the preset and tune, so they win over both.
+// Every list is cut to a spread of its range: ves numbers the combinations with one 64-bit number, so all value lists multiplied (rules aside) must stay
+// below 9.2e18. Pruning tries the middle values only where the ends differ, so the ends of each range matter most. The options commented out
+// below are valid too and their rules are already in place: swap them in for others (the warnings about rules reading unlisted options are expected).
+{
+	"output": "output",
+	"scenarios": [
+		{ "name": "sample", "bitrates": [6000], "resolutions": ["1920x1080"], "framerates": [60] },
+	],
+	"kfintervals": [2.0],
+	"vmaf": { "model": ["path=models/vmaf_v1.0.16_1d5h_2160.json", "path=models/vmaf_v1.0.16_3d0h.json", "path=models/vmaf_v1.0.16_5d0h.json", "path=models/vmaf_v1.0.16_3d0h_2160.json"], "over_penalty": 0.025 },
+	"settings": { "cache": "cache", "prune": true },
+
+	"encoders": [
+		{
+			"enabled": true,
+			"encoder": "x265",
+			"options": {
+				"preset": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"],
+				"tune": ["", "psnr", "ssim", "grain", "animation", "fastdecode", "zerolatency"],
+				"profile": ["", "main", "main10"],   // "": what the picture needs (main, main10, or a main444 / main422 one)
+				"max_b_frames": [0, 2, 4, 8, 16],   // bframes, 0..16
+				"b_adapt": ["", 0, 1, 2],
+				"b_reference_mode": ["", "none", "middle"],   // b-pyramid
+				"weightb": ["", 0, 1],
+				// "b_intra": ["", 0, 1],
+				"lookahead_frames": [0, 10, 20, 40, 60],   // rc-lookahead, up to 250; more than the B-frames [C]
+				"cutree": ["", 0, 1],
+				"qcomp": ["", 0.5, 0.6, 0.8],   // 0.5..1.0 [C]
+				"max_ref_frames": [1, 2, 3, 4, 6],   // ref, 1..16 [C]
+				// "limit_refs": ["", 0, 1, 2, 3],   // 0..3 [C]
+				"rd": [1, 2, 3, 4, 5, 6],
+				"rdoq_level": ["", 0, 1, 2],
+				"psy_rd": ["", 0.0, 1.0, 2.0, 4.0],   // 0..5 [C]; needs rd 3 or more [D]
+				"psy_rdoq": ["", 0.0, 1.0, 4.0],   // 0..50 [C]; needs rdoq_level 1 or 2 [D]
+				// "ssim_rd": ["", 0, 1],   // needs rd 3 or more [D]
+				// "rd_refine": ["", 0, 1],   // needs rd 5 or 6 [D]
+				"subme": [0, 2, 3, 5, 7],   // 0..7
+				"me": ["dia", "hex", "umh", "star", "sea", "full"],
+				"merange": ["", 16, 92],
+				"aq_mode": [0, 1, 2, 3, 4],   // 0 off .. 4 edge [C]
+				"aq_strength": ["", 0.5, 1.0, 1.5, 2.0],   // 0..3 [C]
+				"ctu": [16, 32, 64],
+				"min_cu_size": [8, 16, 32],   // not above ctu [C]
+				// "max_tu_size": ["", 8, 16, 32],   // above ctu it is cut to ctu [E]
+				// "tu_intra_depth": [1, 2, 3, 4],
+				// "tu_inter_depth": [1, 2, 3, 4],
+				// "limit_tu": ["", 0, 1, 2, 3, 4],   // needs tu_inter_depth 2 or more [E]
+				"rect": ["", 0, 1],
+				"amp": ["", 0, 1],   // no effect without rect [D]
+				// "limit_modes": ["", 0, 1],   // only matters with rect or amp [D]
+				"max_merge": [1, 3, 5],   // 1..5 [C]
+				// "early_skip": ["", 0, 1],
+				// "rskip": ["", 0, 1, 2],
+				// "tskip": ["", 0, 1],
+				"weightp": ["", 0, 1],
+				"sao": ["", 0, 1],
+				// "sao_non_deblock": ["", 0, 1],   // SAO only
+				"deblock": ["", "-2:-2", "0:0", "1:1"],   // tC:beta, each -6..6 [C]
+				// "strong_intra_smoothing": ["", 0, 1],
+				"cbqpoffs": ["", -6, -3, 0],   // -12..12 [C]
+				"crqpoffs": ["", -6, -3, 0],
+				// "scenecut": ["", 0, 40],
+				// "open_gop": ["", 0, 1],
+				// "frame_threads": [...], "wpp": [...],   // threading: small side effects on the stream only
+				// "mcstf": [1],   // temporal filter: needs 5 or more B-frames and lookahead beyond them [E][C]
+				// "tier": ["main", "auto"],   // only matters for the level's bitrate limits
+				// "vbv_maxrate": [...], "vbv_bufsize": [...],   // kbit/s and kbit, so the same value means a different buffer at every bitrate
+			},
+			"rules": [
+				// Profiles: main is 8-bit 4:2:0 and main10 is 4:2:0 [x265 param_apply_profile]; the others follow from the picture ("").
+				{
+					"if": { "set": "profile" },
+					"require": { "op": "==", "left": { "option": "chroma" }, "right": 420 },
+				},
+				{
+					"if": { "op": "==", "left": { "option": "profile" }, "right": "main" },
+					"require": { "op": "!=", "left": { "option": "bitdepth" }, "right": 10 },
+				},
+
+				// "Lookahead depth must be greater than the max consecutive bframe count" [C] (encoder_open fails).
+				{
+					"if": { "op": ">", "left": { "option": "max_b_frames" }, "right": 0 },
+					"require": { "op": ">", "left": { "option": "lookahead_frames" }, "right": { "option": "max_b_frames" } },
+				},
+				// "cuTree disabled, requires lookahead to be enabled" [E].
+				{
+					"if": { "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
+					"require": { "op": "not", "value": { "set": "cutree" } },
+				},
+				// Without B-frames, the B-frame options do nothing; B-pyramid needs 2 or more.
+				{
+					"if": { "op": "==", "left": { "option": "max_b_frames" }, "right": 0 },
+					"require": [
+						{ "op": "not", "value": { "set": "b_adapt" } },
+						{ "op": "not", "value": { "set": "weightb" } },
+						{ "op": "not", "value": { "set": "b_intra" } },
+						{ "op": "not", "value": { "set": "b_reference_mode" } },
+					],
+				},
+
+				// RD-dependent options [D]: psy-rd and ssim-rd from rd 3, rd-refine at 5 and 6, psy-rdoq with rdoq-level 1 or 2.
+				{
+					"if": { "op": "<", "left": { "option": "rd" }, "right": 3 },
+					"require": [
+						{ "op": "not", "value": { "set": "psy_rd" } },
+						{ "op": "not", "value": { "set": "ssim_rd" } },
+					],
+				},
+				{
+					"if": { "op": "<", "left": { "option": "rd" }, "right": 5 },
+					"require": { "op": "not", "value": { "set": "rd_refine" } },
+				},
+				{
+					"if": { "op": "==", "left": { "option": "rdoq_level" }, "right": 0 },
+					"require": { "op": "not", "value": { "set": "psy_rdoq" } },
+				},
+
+				// AQ strength means nothing with AQ off.
+				{
+					"if": { "op": "==", "left": { "option": "aq_mode" }, "right": 0 },
+					"require": { "op": "not", "value": { "set": "aq_strength" } },
+				},
+
+				// Block sizes: the smallest CU is not above the CTU [C]; a larger TU is cut to the CTU [E]; limit-tu needs tu-inter-depth 2+ [E].
+				{ "op": "<=", "left": { "option": "min_cu_size" }, "right": { "option": "ctu" } },
+				{
+					"if": { "set": "max_tu_size" },
+					"require": { "op": "<=", "left": { "option": "max_tu_size" }, "right": { "option": "ctu" } },
+				},
+				{
+					"if": { "op": "<", "left": { "option": "tu_inter_depth" }, "right": 2 },
+					"require": { "op": "not", "value": { "set": "limit_tu" } },
+				},
+
+				// AMP "has no effect if rectangular partitions are disabled" [D]; limit-modes works on rect and amp [D].
+				{
+					"if": { "op": "==", "left": { "option": "rect" }, "right": 0 },
+					"require": [
+						{ "op": "not", "value": { "set": "amp" } },
+						{ "op": "not", "value": { "set": "limit_modes" } },
+					],
+				},
+				// SAO options need SAO.
+				{
+					"if": { "op": "==", "left": { "option": "sao" }, "right": 0 },
+					"require": { "op": "not", "value": { "set": "sao_non_deblock" } },
+				},
+			],
+		},
+	],
+}

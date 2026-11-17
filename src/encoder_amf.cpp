@@ -229,7 +229,8 @@ class Amf : public Encoder {
 			std::string native, bare;
 			for (const wchar_t* w = pi->name; *w; w++) native += (char)*w;
 			bare = native;
-			if (native.find("HalfPixel") != std::string::npos || native.find("QuarterPixel") != std::string::npos || native == "AdaptiveMiniGOP") continue; // GCN4 and older only, which AMD no longer supports
+			if (native.find("HalfPixel") != std::string::npos || native.find("QuarterPixel") != std::string::npos) continue; // GCN4 and older only, which AMD no longer supports
+			// (AdaptiveMiniGOP is current: AMF_Video_Encode_API.md lists it, adaptive B-frames that need pre-analysis with a lookahead of at least 1)
 			// Rate control settings are scoped per temporal layer and quality layer ("TL0.QL0.EnforceHRD"); ves uses the base layer only.
 			if (native.compare(0, 8, "TL0.QL0.") == 0) bare = native.substr(8);
 			else if (native.compare(0, 2, "TL") == 0 && native.find(".QL") != std::string::npos) continue;
@@ -240,7 +241,7 @@ class Amf : public Encoder {
 			std::string name = snake_case(bare);
 			if (name == "quality_preset") name = "preset"; // AMF's QualityPreset, HevcQualityPreset and Av1QualityPreset
 			if (name == "profile_level") name = "level";  // ProfileLevel and HevcProfileLevel; the AV1 one is Av1Level already
-			if (name == "rate_control_preanalysis_enable" || name == "rate_control_pre_analysis_enable") name = "pre_encode"; // pre-encode assisted rate control
+			if (name == "rate_control_preanalysis_enable" || name == "rate_control_pre_analysis_enable" || name == "rate_control_pre_encode") name = "pre_encode"; // pre-encode assisted rate control (AV1: Av1RateControlPreEncode)
 			names.emplace(name, native);
 		}
 	}

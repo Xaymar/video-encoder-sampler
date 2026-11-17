@@ -237,13 +237,14 @@ static std::string caps_refusal(const std::string& encoder, const std::string& c
 		first(needs("enable_uni_directional_b", "SUPPORT_UNIDIRECTIONAL_B"));
 		first(needs("tf_level", "SUPPORT_TEMPORAL_FILTER"));
 		first(at_most("num_ltr_frames", "NUM_MAX_LTR_FRAMES"));
-		// NV_ENC_CAPS_SUPPORT_BFRAME_REF_MODE: bit 0 each, bit 1 middle
-		if (opt("b_reference_mode", v) && (v == "each" || v == "middle") && cap("SUPPORT_BFRAME_REF_MODE", c) && !(c & (v == "each" ? 1 : 2)))
+		// NV_ENC_CAPS_SUPPORT_BFRAME_REF_MODE: bit 0 each, bit 1 middle, bit 2 hierarchical (the NV_ENC_BFRAME_REF_MODE values)
+		if (opt("b_reference_mode", v) && (v == "each" || v == "middle" || v == "hierarchical") && cap("SUPPORT_BFRAME_REF_MODE", c) &&
+		    !(c & (v == "each" ? 1 : v == "middle" ? 2 : 4)))
 			first("b_reference_mode=" + v + " is not in this GPU's SUPPORT_BFRAME_REF_MODE (" + std::to_string(c) + ")");
 	} else if (encoder == "amf") {
 		const bool h264 = codec == "h264", hevc = codec == "hevc", av1 = codec == "av1";
 		const char* bframes = h264 ? "BFrames" : av1 ? "AV1BFrames" : nullptr;
-		if (bframes) for (const char* key : {"max_b_frames", "b_pictures_pattern", "max_consecutive_bpictures"}) first(needs(key, bframes));
+		if (bframes) for (const char* key : {"max_b_frames", "b_pictures_pattern", "max_consecutive_b_pictures", "adaptive_mini_gop"}) first(needs(key, bframes));
 		const char* lo = h264 ? "MinReferenceFrames" : hevc ? "HevcMinReferenceFrames" : nullptr;
 		const char* hi = h264 ? "MaxReferenceFrames" : hevc ? "HevcMaxReferenceFrames" : nullptr;
 		if (lo) for (const char* key : {"max_ref_frames", "max_num_ref_frames"}) first(in_range(key, lo, hi));
