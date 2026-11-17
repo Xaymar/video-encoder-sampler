@@ -30,7 +30,9 @@
 #define NOMINMAX
 #include <windows.h>
 #include <io.h>
+#include <tlhelp32.h>
 #else
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/mman.h>
@@ -383,6 +385,7 @@ struct Device {
 	std::thread reader, errors;
 	std::atomic<int64_t> last_heard{0};
 	bool given_up = false; // by the watchdog: ended, its runs failed; the threads end when the process is gone
+	int64_t killed_at = 0;  // when it was killed (clock_ms), 0 if not
 	std::string given_up_why;
 	// The last lines the process printed, numbered, so that a wave can tell which came while it ran: they are why its runs failed.
 	std::mutex lines_m;
@@ -497,6 +500,7 @@ struct Device {
 		std::string what = "The encoder process for " + name + " (pid " + std::to_string(proc.pid) + ") " + why + ": ended";
 		if (runs) what += "; the " + std::to_string(runs) + (runs == 1 ? " run" : " runs") + " in it failed";
 		ui::log(what + "; the next run starts a new one");
+		killed_at = clock_ms();
 		proc.kill();
 	}
 
@@ -509,10 +513,15 @@ struct Device {
 		bool done;
 		{
 			std::unique_lock lock(m);
-			if (!ended_cv.wait_for(lock, std::chrono::seconds(5), [&] { return ended; })) proc.kill();
+			if (!ended_cv.wait_for(lock, std::chrono::seconds(5), [&] { return ended; })) { killed_at = clock_ms(); proc.kill(); }
 			done = ended_cv.wait_for(lock, std::chrono::seconds(5), [&] { return ended; });
 		}
-		if (done) reap(); else abandon();
+		if (done) reap();
+		else {
+			ui::log("The encoder process for " + name + " (pid " + std::to_string(proc.pid) + ") does not end even when killed: it is stuck in the driver, and keeps what it holds of the GPU "
+			        "(encode sessions, memory) until it ends; often only a restart of the computer ends it");
+			abandon();
+		}
 	}
 
 	// A process that ended is cleaned up before it is replaced.
@@ -560,8 +569,138 @@ void start_watchdog() {
 	});
 }
 
-// The process of a GPU (or CPU encoder), started when it is not running.
-std::shared_ptr<Device> device_for(const std::string& encoder, int gpu) {
+// How many processes of one GPU may be stuck (killed and still there) before no new one is started for it: each holds its encode sessions and burns a core, and
+// a new one most likely gets stuck the same way.
+constexpr int kMaxStuck = 3;
+constexpr int64_t kStuckAfterMs = 15000; // a killed process still there after this long is stuck
+
+std::map<std::string, std::vector<std::shared_ptr<Device>>> stuck_by_key; // under devices_m
+
+// Encoder processes of this program, of any run of it (an earlier sweep, another worker job), that are stuck: one thread left and older than a minute. A live
+// encoder process always has more (its heartbeat), and one that was killed but sits in a driver call keeps the one thread that is in there (seen on Windows with
+// NVIDIA's driver: hundreds of them, each holding its NVENC sessions and burning a core, until every new session was refused).
+struct StuckProcess {
+	long pid = 0;
+	std::string key; // "nvenc:0", or empty when its command line could not be read
+};
+#ifdef _WIN32
+std::string encoder_key_of_command_line(const std::wstring& cmd) {
+	std::vector<std::string> words;
+	std::string cur;
+	bool quoted = false;
+	for (wchar_t c : cmd) {
+		if (c == L'"') { quoted = !quoted; continue; }
+		if (!quoted && (c == L' ' || c == L'\t')) { if (!cur.empty()) words.push_back(cur); cur.clear(); continue; }
+		cur += c < 128 ? (char)c : '?';
+	}
+	if (!cur.empty()) words.push_back(cur);
+	for (size_t i = 0; i + 2 < words.size(); i++) if (words[i] == "--encoder-process") return words[i + 1] + ":" + words[i + 2];
+	return std::string();
+}
+std::vector<StuckProcess> stuck_encoder_processes() {
+	std::vector<StuckProcess> out;
+	std::wstring self;
+	{
+		wchar_t b[32768];
+		const DWORD n = GetModuleFileNameW(nullptr, b, 32768);
+		self.assign(b, n);
+		const size_t slash = self.find_last_of(L"\\/");
+		if (slash != std::wstring::npos) self.erase(0, slash + 1);
+	}
+	using QueryFn = LONG(WINAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+	static const auto query = (QueryFn)(void*)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess");
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (snap == INVALID_HANDLE_VALUE) return out;
+	PROCESSENTRY32W pe{};
+	pe.dwSize = sizeof pe;
+	FILETIME now_ft;
+	GetSystemTimeAsFileTime(&now_ft);
+	const ULONGLONG now = ((ULONGLONG)now_ft.dwHighDateTime << 32) | now_ft.dwLowDateTime;
+	for (BOOL more = Process32FirstW(snap, &pe); more; more = Process32NextW(snap, &pe)) {
+		if (pe.th32ProcessID == GetCurrentProcessId() || pe.cntThreads != 1 || _wcsicmp(pe.szExeFile, self.c_str()) != 0) continue;
+		HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+		if (!h) continue;
+		FILETIME created, ended, kernel, user;
+		bool old = false;
+		if (GetProcessTimes(h, &created, &ended, &kernel, &user)) old = now - (((ULONGLONG)created.dwHighDateTime << 32) | created.dwLowDateTime) > 60ULL * 10000000ULL;
+		StuckProcess sp;
+		sp.pid = (long)pe.th32ProcessID;
+		bool encoder_process = true; // unknown counts: a stuck process with an unreadable command line is most likely one
+		if (old && query) { // ProcessCommandLineInformation (60): a UNICODE_STRING followed by its text
+			std::vector<unsigned char> buf(65536);
+			ULONG got = 0;
+			if (query(h, 60, buf.data(), (ULONG)buf.size(), &got) >= 0) {
+				struct US { USHORT len, max; PWSTR text; };
+				const US* us = (const US*)buf.data();
+				if (us->text && us->len) {
+					sp.key = encoder_key_of_command_line(std::wstring(us->text, us->len / sizeof(wchar_t)));
+					encoder_process = !sp.key.empty();
+				}
+			}
+		}
+		CloseHandle(h);
+		if (old && encoder_process) out.push_back(sp);
+	}
+	CloseHandle(snap);
+	return out;
+}
+#else
+std::vector<StuckProcess> stuck_encoder_processes() {
+	std::vector<StuckProcess> out;
+	char self[4096];
+	const ssize_t sn = readlink("/proc/self/exe", self, sizeof self - 1);
+	if (sn <= 0) return out;
+	self[sn] = 0;
+	double uptime = 0;
+	if (FILE* f = fopen("/proc/uptime", "r")) { if (fscanf(f, "%lf", &uptime) != 1) uptime = 0; fclose(f); }
+	const long ticks = sysconf(_SC_CLK_TCK);
+	DIR* dir = opendir("/proc");
+	if (!dir) return out;
+	auto read_file = [](const std::string& path) {
+		std::string t;
+		if (FILE* f = fopen(path.c_str(), "rb")) { char b[4096]; size_t n; while ((n = fread(b, 1, sizeof b, f)) > 0) t.append(b, n); fclose(f); }
+		return t;
+	};
+	while (dirent* e = readdir(dir)) {
+		const long pid = atol(e->d_name);
+		if (pid <= 0 || pid == (long)getpid()) continue;
+		const std::string base = std::string("/proc/") + e->d_name;
+		char exe[4096];
+		const ssize_t n = readlink((base + "/exe").c_str(), exe, sizeof exe - 1);
+		if (n <= 0) continue;
+		exe[n] = 0;
+		if (strcmp(exe, self) != 0) continue;
+		const std::string status = read_file(base + "/status");
+		const size_t at = status.find("Threads:");
+		if (at == std::string::npos || atoi(status.c_str() + at + 8) != 1) continue;
+		if (status.find("State:\tZ") != std::string::npos) continue; // a zombie holds nothing; its parent reaps it
+		const std::string stat = read_file(base + "/stat");
+		const size_t close = stat.rfind(')');
+		if (close == std::string::npos || ticks <= 0) continue;
+		std::vector<std::string> fields; // from field 3 (state) on
+		{
+			std::string cur;
+			for (size_t i = close + 2; i < stat.size(); i++) { if (stat[i] == ' ') { fields.push_back(cur); cur.clear(); } else cur += stat[i]; }
+			fields.push_back(cur);
+		}
+		if (fields.size() < 20 || uptime - atof(fields[19].c_str()) / (double)ticks <= 60) continue; // field 22: start time
+		const std::string cmd = read_file(base + "/cmdline");
+		std::vector<std::string> words;
+		for (size_t i = 0; i < cmd.size();) { const size_t z = cmd.find('\0', i); words.push_back(cmd.substr(i, z == std::string::npos ? std::string::npos : z - i)); i = z == std::string::npos ? cmd.size() : z + 1; }
+		StuckProcess sp;
+		sp.pid = pid;
+		bool encoder_process = cmd.empty();
+		for (size_t i = 0; i + 2 < words.size(); i++) if (words[i] == "--encoder-process") { sp.key = words[i + 1] + ":" + words[i + 2]; encoder_process = true; }
+		if (encoder_process) out.push_back(sp);
+	}
+	closedir(dir);
+	return out;
+}
+#endif
+
+// The process of a GPU (or CPU encoder), started when it is not running. Null when it cannot be started; `refused` then says why, if it is because earlier
+// processes of that GPU are stuck.
+std::shared_ptr<Device> device_for(const std::string& encoder, int gpu, std::string* refused = nullptr) {
 	const bool on_gpu = is_gpu_encoder(encoder);
 	const std::string key = on_gpu ? encoder + ":" + std::to_string(gpu) : "cpu"; // the CPU encoders share one process, and with it one decode of the input
 	std::lock_guard lock(devices_m);
@@ -577,6 +716,34 @@ std::shared_ptr<Device> device_for(const std::string& encoder, int gpu) {
 		d->abandon();
 		std::lock_guard al(abandoned_m);
 		abandoned->push_back(d);
+		stuck_by_key[key].push_back(d);
+	}
+	d = nullptr;
+	if (on_gpu) {
+		// Those this process killed, and those anyone left behind (this process's own show up there too once they are a minute old).
+		auto& stuck = stuck_by_key[key];
+		const int64_t now = clock_ms();
+		std::vector<long> pids;
+		for (auto it = stuck.begin(); it != stuck.end();) {
+			std::lock_guard dl((*it)->m);
+			if ((*it)->ended) { it = stuck.erase(it); continue; } // it did end after all
+			if (now - (*it)->killed_at >= kStuckAfterMs) pids.push_back((*it)->proc.pid);
+			++it;
+		}
+		for (const StuckProcess& sp : stuck_encoder_processes())
+			if ((sp.key.empty() || sp.key == key) && std::find(pids.begin(), pids.end(), sp.pid) == pids.end()) pids.push_back(sp.pid);
+		const int count = (int)pids.size();
+		std::string pid_list;
+		for (size_t i = 0; i < pids.size() && i < 10; i++) pid_list += (i ? ", " : "") + std::to_string(pids[i]);
+		if (pids.size() > 10) pid_list += ", ...";
+		if (count >= kMaxStuck) {
+			const std::string why = std::to_string(count) + " earlier encoder processes for " + encoder + " GPU " + std::to_string(gpu) + " (pid " + pid_list +
+			                        ") are stuck (killed or done, one thread left, in the driver); no new one is started for it until they end, often only a restart of the computer ends them";
+			static std::map<std::string, int> told; // once per count, not once per run
+			if (told[key] != count) { told[key] = count; ui::log("Not starting an encoder process for " + encoder + " GPU " + std::to_string(gpu) + ": " + why); }
+			if (refused) *refused = why;
+			return nullptr;
+		}
 	}
 	auto fresh = std::make_shared<Device>();
 	fresh->encoder = on_gpu ? encoder : "cpu";
@@ -585,7 +752,6 @@ std::shared_ptr<Device> device_for(const std::string& encoder, int gpu) {
 	start_watchdog();
 	if (!fresh->start()) {
 		ui::log("cannot start the encoder process for " + fresh->name);
-		d = nullptr;
 		return nullptr;
 	}
 	d = fresh;
@@ -896,6 +1062,7 @@ bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vect
 			std::string s = dev ? dev->lines_since(first_line) : std::string();
 			return s.empty() ? fallback : s;
 		};
+		std::string refused; // why no process was started for it
 		auto fail_all = [&](bool crashed) {
 			std::string error = why(!dev ? "its encoder process did not start" : crashed ? "its encoder process ended" : "its encoder process sent a garbled answer");
 			if (dev && crashed) { // the watchdog's reason first, then what the process said last
@@ -914,7 +1081,21 @@ bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vect
 			std::lock_guard lock(m);
 			all_ok = false;
 		};
-		dev = device_for(where.first, where.second);
+		// While earlier processes of the GPU are stuck, its part waits for them to end rather than fail run after run (a new process would only get stuck too, or
+		// find no free encode session). Said once a minute, which also keeps a worker's job alive.
+		for (int64_t waiting_since = 0, said = 0;;) {
+			refused.clear();
+			dev = device_for(where.first, where.second, &refused);
+			if (dev || refused.empty()) break;
+			const int64_t now = clock_ms();
+			if (!waiting_since) waiting_since = said = now;
+			else if (now - said >= 60000) {
+				said = now;
+				ui::log("Still waiting for the stuck encoder processes of " + where.first + " GPU " + std::to_string(where.second) + " to end (" + std::to_string((now - waiting_since) / 60000) +
+				        " min): " + refused);
+			}
+			std::this_thread::sleep_for(std::chrono::seconds(10));
+		}
 		if (!dev) { fail_all(false); return; }
 		first_line = dev->lines_so_far();
 		Writer w;
