@@ -84,7 +84,7 @@ public:
 
 	// One request. `body` is sent as a POST body when `post` is set. The timeout is generous because the last chunk of a video is answered only
 	// after the server has hashed the whole file.
-	Reply request(bool post, const std::string& path, const char* content_type, const char* data, size_t size, long timeout, Transfer* progress = nullptr, const char* method = nullptr) const {
+	Reply request(bool post, const std::string& path, const char* content_type, const char* data, size_t size, long timeout, Transfer* progress = nullptr, const char* method = nullptr, bool parse = true) const {
 		Reply r;
 		CURL* c = curl_easy_init();
 		if (!c) { r.error = "cannot start libcurl"; return r; }
@@ -98,6 +98,7 @@ public:
 		curl_easy_setopt(c, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
 		curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, on_body);
 		curl_easy_setopt(c, CURLOPT_WRITEDATA, &r.body);
+		curl_easy_setopt(c, CURLOPT_ACCEPT_ENCODING, ""); // result files come gzipped from the site
 		if (progress) {
 			curl_easy_setopt(c, CURLOPT_NOPROGRESS, 0L);
 			curl_easy_setopt(c, CURLOPT_XFERINFOFUNCTION, on_transfer);
@@ -114,7 +115,7 @@ public:
 		else curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &r.status);
 		curl_slist_free_all(headers);
 		curl_easy_cleanup(c);
-		try { r.json = Json::parse(r.body); } catch (const std::exception&) {}
+		if (parse || r.status != 200) try { r.json = Json::parse(r.body); } catch (const std::exception&) {}
 		return r;
 	}
 
@@ -207,6 +208,8 @@ struct Uploader::Impl {
 
 	// What /me said, once it has been asked.
 	bool ready = false, may_scores = false, may_videos = false;
+	bool signed_in = false; // connect() is through, whatever came of it (for known(), which waits for it)
+	std::atomic<bool> no_known{false}; // the site cannot say which runs it has (an older site): not asked again
 	uint64_t chunk = 0;
 	std::unique_ptr<Site> site;
 	std::map<std::string, int> declined; // what the site said no to, and how often, for the summary at the end
@@ -344,6 +347,8 @@ struct Uploader::Impl {
 	void run() {
 		// Signs in right away, so a wrong key or an unreachable site shows when the sweep starts, not when its first run is through.
 		if (!connect()) disabled = true;
+		{ std::lock_guard lock(m); signed_in = true; }
+		cv.notify_all();
 		for (;;) {
 			UploadItem item;
 			{
@@ -367,6 +372,58 @@ Uploader::Uploader(const UploadOptions& options, std::function<void(const std::s
 }
 
 Uploader::~Uploader() { finish(); }
+
+std::map<std::string, std::string> Uploader::known(const std::vector<std::string>& keys) {
+	std::map<std::string, std::string> out;
+	if (keys.empty()) return out;
+	{ std::unique_lock lock(impl->m); impl->cv.wait(lock, [&] { return impl->signed_in; }); }
+	if (!impl->ready || impl->no_known) return out;
+	size_t batch = 5000;
+	for (size_t at = 0; at < keys.size();) {
+		const size_t n = std::min(batch, keys.size() - at);
+		std::string body = "{\"keys\":[";
+		for (size_t i = 0; i < n; i++) body += (i ? ",\"" : "\"") + keys[at + i] + "\"";
+		body += "]}";
+		Reply r;
+		for (int attempt = 0; attempt < 3; attempt++) {
+			r = impl->site->request(true, "/api/v1/known", "application/json", body.data(), body.size(), 300);
+			if (r.status != 0 && r.status < 500) break;
+		}
+		if (r.status == 413 && batch > 100) { // the site takes fewer at once: as many as it says
+			const size_t most = (size_t)strtoull(text_of(r.json, "max_keys").c_str(), nullptr, 10);
+			batch = most > 0 && most < batch ? most : batch / 2;
+			continue;
+		}
+		if (r.status == 404) { impl->no_known = true; impl->log("Upload: the site cannot say which runs it has (an older site); every run is done here"); return out; }
+		const Json* k = r.status == 200 ? r.json.find("known") : nullptr;
+		if (!k || k->type != Json::Obj) { impl->log("Upload: asking the site which runs it has failed (" + (r.status == 200 ? "the answer is not what this version expects: " + Site::snippet(r.body) : Site::why(r)) + "); those runs are done here"); return out; }
+		for (auto& [key, v] : k->o) if (v.type == Json::Str) out[key] = v.s;
+		at += n;
+	}
+	return out;
+}
+
+bool Uploader::fetch_result(const std::string& uuid, const std::string& file, std::string& why) {
+	if (!impl->ready) { why = "not signed in"; return false; }
+	Reply r;
+	for (int attempt = 0; attempt < 3; attempt++) {
+		r = impl->site->request(false, "/api/v1/run/" + uuid + "/result", nullptr, nullptr, 0, 300, nullptr, nullptr, false);
+		if (r.status != 0 && r.status < 500) break;
+	}
+	if (r.status != 200 || r.body.empty()) { why = Site::why(r); return false; }
+	std::error_code ec;
+	fs::create_directories(fs::path(file).parent_path(), ec);
+	fs::path tmp = file;
+	tmp += ".site";
+	{
+		std::ofstream f(tmp, std::ios::binary);
+		f.write(r.body.data(), (std::streamsize)r.body.size());
+		if (!f) { why = "cannot write " + tmp.string(); f.close(); fs::remove(tmp, ec); return false; }
+	}
+	fs::rename(tmp, file, ec);
+	if (ec) { why = "cannot write " + file + " (" + ec.message() + ")"; fs::remove(tmp, ec); return false; }
+	return true;
+}
 
 void Uploader::add(UploadItem item) {
 	ui::uploads(impl->handled, ++impl->added);

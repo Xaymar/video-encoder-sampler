@@ -35,6 +35,8 @@ ves --help
 
 Make an API key on the website (*Account → API key*), then set `"upload": {"url": "https://...", "key": "ves_..."}` in the config (or `--upload <url>` and the `VES_API_KEY` environment variable). Each run is uploaded right after it is scored, with its video where the site allows it; runs the site already has are skipped, and a failed upload never fails the sweep. The sweep says at its start whether uploading is on and whether the site took the key, and prints one `Upload <run>: ...` line per result with what the site did with it (or why it was not sent).
 
+Before its runs, a sweep asks the site which of them it has already (`POST /api/v1/known`, a batch of keys at a time) and downloads their result files into the output folder instead of running them, so machines that sweep on their own share their work through the site. A run counts as known only under its exact key: the same input, encoder and options, GPU and driver, library versions and scoring models. Downloaded runs rank and prune like the sweep's own; with `"videos": "best"` a winner among them is encoded again for its stream. `"upload": {"skip_known": false}` or `--no-skip-known` turns it off.
+
 ## Building
 
 Windows: CMake 3.20+, Ninja and clang. The libraries come from MSYS2 packages (staged by [`scripts/stage-msys2.sh`](scripts/stage-msys2.sh)) and a shared FFmpeg development build in `third-party/ffmpeg-dev`; libcurl is a git submodule (`git submodule update --init`). [`.github/workflows/build.yml`](.github/workflows/build.yml) shows every step (job `windows-x64`).
