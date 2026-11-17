@@ -384,6 +384,7 @@ struct Device {
 	uint32_t next_id = 1;
 	std::thread reader, errors;
 	std::atomic<int64_t> last_heard{0};
+	bool abandoned = false; // left to itself, see abandon()
 	bool given_up = false; // by the watchdog: ended, its runs failed; the threads end when the process is gone
 	int64_t killed_at = 0;  // when it was killed (clock_ms), 0 if not
 	std::string given_up_why;
@@ -535,7 +536,10 @@ struct Device {
 
 std::mutex abandoned_m;
 std::vector<std::shared_ptr<Device>>* abandoned = new std::vector<std::shared_ptr<Device>>; // never freed: their threads may still use them
+std::atomic<size_t> abandoned_count{0};
+size_t abandoned_encoder_processes() { return abandoned_count.load(); }
 void Device::abandon() {
+	if (!abandoned) { abandoned = true; abandoned_count++; }
 	if (reader.joinable()) reader.detach();
 	if (errors.joinable()) errors.detach();
 }
@@ -1023,7 +1027,7 @@ void run_wave_here(uint32_t id, const std::string& body) {
 	w.num((uint8_t)fr.ok).num(fr.frames).num((int64_t)feed_rp.blocked_ms).str(si.decoder);
 	for (auto& run : runs) {
 		const EncodeJob& ej = run.enc;
-		w.num((uint8_t)ej.ok).num(ej.kbps).num(ej.output.count).num(ej.output.bytes).num(ej.output.hash);
+		w.num((uint8_t)(ej.ok ? 1 : ej.no_session ? 2 : 0)).num(ej.kbps).num(ej.output.count).num(ej.output.bytes).num(ej.output.hash);
 		w.num((int64_t)ej.rp->busy_ms).num((int64_t)ej.rp->starved_ms).num((uint8_t)run.score_ok).num((int64_t)run.score_rp->starved_ms);
 		put_list(w, run.scores);
 		put(w, run.detail);
@@ -1137,7 +1141,9 @@ bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vect
 		const std::string decoder = r.str();
 		for (WaveRun* run : part) {
 			EncodeJob& ej = run->enc;
-			ej.ok = r.num<uint8_t>() != 0;
+			const uint8_t enc_state = r.num<uint8_t>(); // 1 ok, 2 no encode session left, 0 failed
+			ej.ok = enc_state == 1;
+			ej.no_session = enc_state == 2;
 			ej.kbps = r.num<double>();
 			ej.output.count = r.num<long long>();
 			ej.output.bytes = r.num<long long>();

@@ -345,7 +345,16 @@ public:
 		os.deviceType = NV_ENC_DEVICE_TYPE_CUDA;
 		os.device = ctx;
 		os.apiVersion = NVENCAPI_VERSION;
-		if ((st = f.nvEncOpenEncodeSessionEx(&os, &enc))) { enc = nullptr; return fail(st, "open session"); }
+		if ((st = f.nvEncOpenEncodeSessionEx(&os, &enc))) {
+			enc = nullptr;
+			// The driver's answer when every session of the GPU is taken: INCOMPATIBLE_CLIENT_KEY on GeForce cards (their session limit), OUT_OF_MEMORY on others.
+			if (st == NV_ENC_ERR_INCOMPATIBLE_CLIENT_KEY || st == NV_ENC_ERR_OUT_OF_MEMORY) {
+				no_session = true;
+				fprintf(stderr, "nvenc: no free encode session on gpu %d (status %d): the GPU's session limit is used up, by this sweep or another process\n", gpu, (int)st);
+				return false;
+			}
+			return fail(st, "open session");
+		}
 
 		bool known;
 		GUID codec = codec_guid(p.codec, known);

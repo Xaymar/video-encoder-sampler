@@ -1224,6 +1224,7 @@ static int run(int argc, char** argv) {
 		int parallel = 1;
 		int limit = 0;     // the lowest "parallel" an encoder entry asked for; it beats the defaults of the other entries in the pool
 		int fallback = 1;  // the highest default of the entries that asked for nothing
+		int no_session_waits = 0; // waves in a row in which none of its runs got an encode session from the GPU
 		std::string name;
 	};
 	std::deque<Task> tasks; // a deque: runs are made between rounds, and pointers to tasks stay valid
@@ -2146,6 +2147,18 @@ static int run(int argc, char** argv) {
 		// crashes alone is the one that does.
 		std::deque<Task*> alone;
 		for (;;) {
+			// A pool whose GPU had no encode session left for any run of its last wave waits before it tries again, longer each time (see Pool::no_session_waits).
+			for (auto& [pool, list] : by_pool) {
+				Pool& p = pools[pool];
+				if (!p.no_session_waits || list.empty()) continue;
+				const int wait_s = std::min(60, 10 << std::min(p.no_session_waits - 1, 3));
+				const size_t stuck = abandoned_encoder_processes();
+				ui::log("Pool " + pool + ": the GPU has no free encode session (" + std::to_string(p.no_session_waits) + (p.no_session_waits == 1 ? " try" : " tries") +
+				        "); waiting " + std::to_string(wait_s) + " s before trying again. Sessions are held by other programs or by processes stuck in the driver" +
+				        (stuck ? " (" + std::to_string(stuck) + " encoder " + (stuck == 1 ? "process" : "processes") + " of this sweep could not be ended)" : std::string()) +
+				        "; nvidia-smi shows who holds them, a restart frees them.");
+				std::this_thread::sleep_for(std::chrono::seconds(wait_s));
+			}
 			std::vector<Task*> wave;
 			if (!alone.empty()) { wave.push_back(alone.front()); alone.pop_front(); }
 			else for (auto& [pool, list] : by_pool) {
@@ -2206,6 +2219,7 @@ static int run(int argc, char** argv) {
 			if (feed_handle >= 0) ui::detach(feed_handle);
 			for (int h : handles) ui::detach(h);
 			const size_t crashed_runs = (size_t)std::count_if(wr.begin(), wr.end(), [](const WaveRun& w) { return w.enc.crashed; });
+			std::vector<Task*> no_session_again;
 			for (size_t i = 0; i < wave.size(); i++) {
 				Task& t = *wave[i];
 				Run& r = t.r;
@@ -2222,6 +2236,12 @@ static int run(int argc, char** argv) {
 				}
 				if (!t.ok) r.reason = wr[i].enc.error;
 				std::error_code ec;
+				if (!t.ok && wr[i].enc.no_session) { // not the run's fault: it is made again once the GPU has a session for it
+					fs::remove(wr[i].enc.file, ec);
+					r.reason.clear();
+					no_session_again.push_back(&t);
+					continue;
+				}
 				if (!t.ok && wr[i].enc.crashed && !t.retried && crashed_runs > 1) { // others were in the process with it
 					t.retried = true;
 					fs::remove(wr[i].enc.file, ec);
@@ -2248,6 +2268,25 @@ static int run(int argc, char** argv) {
 				if (r.video_file.empty() || cfg.best_videos) fs::remove(wr[i].enc.file, ec); // a temporary file; with "best" the winner is encoded again when its input is done
 				if (cfg.best_videos) r.video.clear();
 				finish(t);
+			}
+			// Runs that found no encode session go back to the front of their pool. A pool that got sessions for some of its runs only runs that many at once
+			// from now on (the rest are taken elsewhere, maybe for good); one that got none waits before its next wave.
+			std::map<std::string, std::pair<int, int>> pool_wave; // runs of the wave, how many of them had no session
+			for (Task* t : wave) pool_wave[t->pool].first++;
+			for (Task* t : no_session_again) pool_wave[t->pool].second++;
+			for (auto it = no_session_again.rbegin(); it != no_session_again.rend(); ++it) by_pool[(*it)->pool].push_front(*it);
+			for (auto& [pool, counts] : pool_wave) {
+				Pool& p = pools[pool];
+				const auto [ran, lost] = counts;
+				if (lost == 0) { p.no_session_waits = 0; continue; }
+				if (lost < ran) {
+					p.no_session_waits = 0;
+					if (ran - lost < p.parallel) {
+						p.parallel = ran - lost;
+						ui::log("Pool " + pool + ": the GPU had encode sessions for only " + std::to_string(p.parallel) + " of " + std::to_string(ran) + " runs; it runs " +
+						        std::to_string(p.parallel) + " at once from now on");
+					}
+				} else p.no_session_waits++;
 			}
 		}
 	}

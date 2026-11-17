@@ -268,7 +268,7 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q, Holding* holdi
 		job.output.add(d, n);
 		if (job.tee) job.tee(d, n);
 		if (!job.file.empty() && !mp4.add(d, n, pts, key, dts)) write_failed = true;
-	})) { q.cancel(); ended(); return; }
+	})) { job.no_session = codec && codec->no_session; q.cancel(); ended(); return; }
 	if (!job.file.empty() && !mp4.open(job.file, job.id, pl.enc, job.color, codec->reorder_delay())) { fprintf(stderr, "cannot write %s\n", job.file.c_str()); q.cancel(); ended(); return; }
 	bool ok = true;
 	if (job.rp) job.rp->waits_excluded = false; // its work goes on while it waits (see RunProgress::waits_excluded)
