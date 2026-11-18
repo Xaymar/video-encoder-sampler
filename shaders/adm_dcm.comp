@@ -93,7 +93,7 @@ void main() {
 		if (lx < 3 && i < pc.erow) {
 			int64_t sum = 0l;
 			for (int k = 0; k < T; k++) sum += sRed[lx][ly][k];
-			const int idx = (((set * rows + (i - pc.srow)) * tx + int(gl_WorkGroupID.x)) * 3 + lx) * 2;
+			const int idx = pc.dbg + (((set * rows + (i - pc.srow)) * tx + int(gl_WorkGroupID.x)) * 3 + lx) * 2; // pc.dbg: this unit's part of tmp
 			tmp[idx] = int(uint(uint64_t(sum)));
 			tmp[idx + 1] = int(uint(uint64_t(sum) >> 32));
 		}
