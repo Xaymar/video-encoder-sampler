@@ -3,6 +3,7 @@
 #include "vk_vmaf.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdlib>
 #include <map>
@@ -66,6 +67,10 @@ bool gpu_of_vulkan_device(int index, unsigned& vendor, int& n) {
 	return false;
 }
 
+static std::atomic<int> g_home{-1};
+void set_home_vulkan_device(int index) { g_home = index; }
+int home_vulkan_device() { return g_home; }
+
 // The fastest device the scorer can use, -1 if there is none.
 static int fastest_usable() {
 	for (auto& d : vulkan_devices_fastest_first()) if (d.usable) return d.index;
@@ -81,7 +86,9 @@ int GpuVmaf::pick_device(const std::string& spec, unsigned encoder_vendor, int e
 		return s;
 	};
 	if (spec.empty() || spec == "auto") {
-		// The fastest GPU, whichever GPU encodes: scoring does not need the encoder's GPU, and an integrated one is far too slow for it.
+		// The home GPU, where the reference and the scored streams are decoded and converted: their frames are scored where they are. Without
+		// one, the fastest GPU, whichever GPU encodes: scoring does not need the encoder's GPU, and an integrated one is far too slow for it.
+		if (const int h = home_vulkan_device(); h >= 0 && h < (int)all.size() && all[h].usable) return h;
 		const int d = fastest_usable();
 		if (d < 0) why = "no Vulkan GPU with 64 bit integer and float support (Vulkan devices: " + list() + "; vmaf.gpu picks one)";
 		return d;

@@ -4,6 +4,7 @@
 #include "source.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -328,21 +329,49 @@ std::vector<HwChoice> hw_choices(AVCodecID id, const std::string& want) {
 		for (const char* suffix : {"_cuvid", "_qsv", "_amf"}) for (auto& d : dedicated_decoders(id, suffix)) out.push_back({d, ""});
 		return out;
 	}
-	// One GPU (an encoder process): every type is pointed at that GPU, and types that cannot be pointed at it are left out, so the frames are decoded where
-	// they are encoded and scored. DXVA2 numbers adapters its own way, and FFmpeg's AMF device takes no adapter; both are left out.
-	struct Where { int cuda, dxgi, vk; std::string node; };
-	static const Where where{g_vendor == VENDOR_NVIDIA ? nvenc_cuda_ordinal(g_index) : -1, dxgi_adapter_index(g_vendor, g_index), vulkan_device_of_gpu(g_vendor, g_index), render_node(g_vendor, g_index)}; // asked once: the GPU does not change
-	const int cuda = where.cuda, dxgi = where.dxgi, vk = where.vk;
-	const std::string& node = where.node;
-	auto add = [&](const std::string& type, const std::string& device) { if (want == "auto" || want == type) out.push_back({type, device}); };
-	if (cuda >= 0) add("cuda", std::to_string(cuda));
-	if (dxgi >= 0) { add("d3d11va", std::to_string(dxgi)); add("d3d12va", std::to_string(dxgi)); }
-	if (g_vendor == VENDOR_INTEL && g_index == 0) add("qsv", "");
-	if (!node.empty()) add("vaapi", node);
-	if (vk >= 0) add("vulkan", std::to_string(vk));
-	if (cuda >= 0) for (auto& d : dedicated_decoders(id, "_cuvid")) add(d, std::to_string(cuda));
-	if (g_index == 0 && g_vendor == VENDOR_INTEL) for (auto& d : dedicated_decoders(id, "_qsv")) add(d, "");
-	if (g_index == 0 && g_vendor == VENDOR_AMD) for (auto& d : dedicated_decoders(id, "_amf")) add(d, "");
+	// A home GPU (an encoder process): every type is pointed at that GPU first, and types that cannot be pointed at it are left out, so the frames are
+	// decoded where they are converted and scored. Then the same for the other GPUs, fastest first, for kinds of streams the home GPU decodes wrongly
+	// (their frames come back to memory). DXVA2 numbers adapters its own way, and FFmpeg's AMF device takes no adapter; both are left out.
+	struct Gpu { unsigned vendor; int index; };
+	std::vector<Gpu> gpus{{g_vendor, g_index}};
+	for (auto& d : vulkan_devices_fastest_first()) {
+		unsigned v = 0;
+		int n = 0;
+		if (gpu_of_vulkan_device(d.index, v, n) && !(v == g_vendor && n == g_index)) gpus.push_back({v, n});
+	}
+	for (size_t rank = 0; rank < gpus.size(); rank++) {
+		const auto [vendor, index] = gpus[rank];
+		struct Where { int cuda, dxgi, vk; std::string node, gpu; };
+		static std::mutex where_mutex;
+		static std::map<std::pair<unsigned, int>, Where> where_of; // asked once per GPU: they do not change
+		Where where;
+		{
+			std::lock_guard lock(where_mutex);
+			auto it = where_of.find({vendor, index});
+			if (it == where_of.end())
+				it = where_of.emplace(std::make_pair(vendor, index), Where{vendor == VENDOR_NVIDIA ? nvenc_cuda_ordinal(index) : -1, dxgi_adapter_index(vendor, index),
+				                                                           vulkan_device_of_gpu(vendor, index), render_node(vendor, index), gpu_description(vendor, index)}).first;
+			where = it->second;
+		}
+		// Test: VES_HW_DECODE_DISTRUST=<name> treats the GPUs whose name has it (any case) as liars for every kind, to see the next GPU take over.
+		if (const char* e = getenv("VES_HW_DECODE_DISTRUST"); e && *e) {
+			auto lower = [](std::string t) { for (auto& c : t) c = (char)std::tolower((unsigned char)c); return t; };
+			if (lower(where.gpu).find(lower(e)) != std::string::npos) continue;
+		}
+		const int cuda = where.cuda, dxgi = where.dxgi, vk = where.vk;
+		const std::string& node = where.node;
+		std::vector<HwChoice> mine;
+		auto add = [&](const std::string& type, const std::string& device) { if (want == "auto" || want == type) mine.push_back({type, device, where.gpu, (int)rank}); };
+		if (cuda >= 0) add("cuda", std::to_string(cuda));
+		if (dxgi >= 0) { add("d3d11va", std::to_string(dxgi)); add("d3d12va", std::to_string(dxgi)); }
+		if (vendor == VENDOR_INTEL && index == 0) add("qsv", "");
+		if (!node.empty()) add("vaapi", node);
+		if (vk >= 0) add("vulkan", std::to_string(vk));
+		if (cuda >= 0) for (auto& d : dedicated_decoders(id, "_cuvid")) add(d, std::to_string(cuda));
+		if (index == 0 && vendor == VENDOR_INTEL) for (auto& d : dedicated_decoders(id, "_qsv")) add(d, "");
+		if (index == 0 && vendor == VENDOR_AMD) for (auto& d : dedicated_decoders(id, "_amf")) add(d, "");
+		out.insert(out.end(), mine.begin(), mine.end());
+	}
 	return out;
 }
 
@@ -434,8 +463,8 @@ std::vector<HwChoice> hw_decode_choices(AVCodecID id) {
 	if (want.empty()) return {};
 	std::vector<HwChoice> out;
 	for (auto& c : hw_choices(id, want)) if (av_hwdevice_find_type_by_name(c.type.c_str()) != AV_HWDEVICE_TYPE_NONE) out.push_back(c); // device types only (see ff_decode.cpp)
-	// Vulkan first: its frames can be scored on the GPU where they are, the others' have to come back to memory.
-	std::stable_partition(out.begin(), out.end(), [](const HwChoice& c) { return c.type == "vulkan"; });
+	// Vulkan first on the home GPU: its frames can be scored where they are, the others' have to come back to memory. The other GPUs come after it.
+	std::stable_sort(out.begin(), out.end(), [](const HwChoice& a, const HwChoice& b) { return a.rank != b.rank ? a.rank < b.rank : (a.type == "vulkan" && b.type != "vulkan"); });
 	return out;
 }
 
@@ -642,9 +671,12 @@ std::unique_ptr<Source> open_source(const std::string& path) {
 		// Vulkan first where its frames can stay on the GPU: the converter works on them there (on the same device), and only what the encoders need
 		// is read back.
 		if (converter_shares_ffmpeg_vulkan() && !getenv("VES_HW_DECODE_TO_MEMORY"))
-			std::stable_partition(choices.begin(), choices.end(), [](const HwChoice& c) { return c.type == "vulkan" && !c.device.empty(); });
+			std::stable_sort(choices.begin(), choices.end(), [](const HwChoice& a, const HwChoice& b) {
+				auto vk = [](const HwChoice& c) { return c.type == "vulkan" && !c.device.empty(); };
+				return a.rank != b.rank ? a.rank < b.rank : (vk(a) && !vk(b));
+			});
 #endif
-		for (const auto& [type, device] : choices) {
+		for (const auto& [type, device, gpu, rank] : choices) {
 			const std::string key = path + "|" + type + "|" + device;
 			bool known = false, good = false;
 			{
@@ -654,14 +686,15 @@ std::unique_ptr<Source> open_source(const std::string& path) {
 			if (known && !good) continue;
 			if (!known) {
 				good = verify_hardware(path, type, device);
-				if (good) fprintf(stderr, "hardware decoding (%s%s) matched software on the first %d frames of '%s'\n", type.c_str(), device.empty() ? "" : (", device " + device).c_str(), VERIFY_FRAMES, path.c_str());
+				if (good) fprintf(stderr, "hardware decoding (%s%s%s) matched software on the first %d frames of '%s'\n", type.c_str(), device.empty() ? "" : (", device " + device).c_str(),
+				                  rank ? (" on " + gpu + ", not the home GPU").c_str() : "", VERIFY_FRAMES, path.c_str());
 				std::lock_guard lock(g_mutex);
 				g_verdict[key] = good;
 				if (!good) continue;
 			}
 			auto s = std::make_unique<FfSource>();
 #ifndef VES_NO_VULKAN
-			if (type == "vulkan") source_on_gpu(*s, path, device);
+			if (type == "vulkan" && rank == 0) source_on_gpu(*s, path, device); // (on another GPU, the frames come back to memory for the home GPU's converter)
 #endif
 			if (s->open(path, type, true, device)) return s;
 		}

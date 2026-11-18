@@ -911,8 +911,9 @@ int vulkan_device_of_spec(const std::string& spec, std::string& why) {
 	return -1;
 }
 
-// The GPU this process decodes on: the one --decode-gpu names, else the fastest one that hardware decoding can be pointed at (it does not have to be the GPU that
-// encodes: the frames come back to memory either way). Hardware decoding still checks its first frames against software and decodes in software where it cannot.
+// The GPU this process decodes on, its home GPU: the one --decode-gpu names, else the fastest one that hardware decoding can be pointed at (it does not have to be
+// the GPU that encodes: only the frames the encoders get go there). Hardware decoding still checks its frames against software; a kind of stream this GPU decodes
+// wrongly goes to the next GPU that decodes it right (see hw_choices() in ff_source.cpp), and to software last.
 void pick_decode_gpu() {
 	std::string why;
 	int want = vulkan_device_of_spec(decode_gpu_spec, why);
@@ -925,13 +926,15 @@ void pick_decode_gpu() {
 		int n = 0;
 		if (!gpu_of_vulkan_device(index, vendor, n)) continue;
 		set_hw_decode_gpu(vendor, n);
-		fprintf(stderr, "decoding on %s\n", gpu_description(vendor, n).c_str());
+		set_home_vulkan_device(index); // converting and scoring follow it (unless --scaling-gpu or vmaf.gpu say otherwise)
+		fprintf(stderr, "decoding on %s (home GPU: converting and scoring there as well)\n", gpu_description(vendor, n).c_str());
 		return;
 	}
 	if (process_vendor) set_hw_decode_gpu(process_vendor, process_gpu); // no Vulkan to tell the GPUs apart: as before, on this process's GPU
 }
 
-// The Vulkan device this process converts frames on: the one --scaling-gpu names, else the fastest one, when a test picture comes back right from it; else the next one that
+// The Vulkan device this process converts frames on: the one --scaling-gpu names, else the home GPU (where the frames were decoded), else the fastest one, when a test
+// picture comes back right from it; else the next one that
 // gets it right. Some drivers convert to nothing but zeros without an error: the Vega iGPU of an AMD laptop gave all-green videos. Found once per process.
 std::string scaling_device() {
 	static std::once_flag once;
@@ -941,9 +944,11 @@ std::string scaling_device() {
 		const int want = vulkan_device_of_spec(scaling_gpu_spec, why);
 		if (!why.empty()) fprintf(stderr, "scaling gpu: %s, scaling on the fastest GPU instead\n", why.c_str());
 		const auto fastest = vulkan_devices_fastest_first();
+		const int home = home_vulkan_device();
 		std::vector<const VkDeviceInfo*> order;
 		for (auto& d : fastest) if (d.index == want) order.push_back(&d);
-		for (auto& d : fastest) if (d.index != want) order.push_back(&d);
+		for (auto& d : fastest) if (d.index == home && home != want) order.push_back(&d);
+		for (auto& d : fastest) if (d.index != want && d.index != home) order.push_back(&d);
 		for (const VkDeviceInfo* d : order) {
 			ScaleOptions test;
 			test.device = d->name;

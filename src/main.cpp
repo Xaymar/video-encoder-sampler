@@ -692,9 +692,11 @@ Paths
                             Vulkan is tried first: its frames stay on the GPU, where the converter and the scorer use them on FFmpeg's own device
                             (VES_SHARED_VULKAN=0: they make their own devices; VES_HW_DECODE_TO_MEMORY=1: frames are read back as they are decoded).
                             Vulkan decodes only H.264, HEVC, AV1 and VP9 (the video engine), not FFmpeg's compute shader decoders (FFV1, ...).
-        --decode-gpu <auto|own|n|name>  the GPU the sources are decoded on (default: auto, the fastest GPU: discrete first, then the most VRAM); own: the GPU
-                            that encodes the run; n: Vulkan device n; name: the first device whose name contains it (--vmaf-gpu list shows them)
-        --scaling-gpu <auto|own|n|name>  the GPU frames are scaled and converted on, the same way (default: auto). Beats "scaling": {"gpu"} of the
+        --decode-gpu <auto|own|n|name>  the home GPU, which decodes the sources and the scored streams (default: auto, the fastest GPU: discrete first,
+                            then the most VRAM); own: the GPU that encodes the run; n: Vulkan device n; name: the first device whose name contains it
+                            (--vmaf-gpu list shows them). Converting and scoring follow it. A kind of stream it decodes wrongly goes to the next GPU
+                            that decodes it right, and to software last
+        --scaling-gpu <auto|own|n|name>  the GPU frames are scaled and converted on, the same way (default: auto, the home GPU). Beats "scaling": {"gpu"} of the
                             config; unlike that one it is this machine's choice and does not change which runs count as done
         --priority <low|normal>  low (default): idle CPU priority and the lowest disk priority, so ves never gets in the way of other programs; normal: the system default
         --decode-threads <n> threads per decoder (default: all cores; 4 with --low-memory)
@@ -713,7 +715,7 @@ Scoring
         --vmaf-threads <n>
         --vmaf-device <cpu|gpu|auto>  where VMAF is computed (default: cpu). gpu: on the GPU with Vulkan compute (8 and 10 bit input; v0 and v1 models; scores within 1e-9 of libvmaf's);
                             auto: the GPU where it can be used (8 or 10 bit YUV, a model file, a Vulkan GPU), else the CPU. These scores are kept apart from libvmaf's in the cache
-        --vmaf-gpu <auto|n|name>  the Vulkan device that scores (default: auto, the fastest GPU: discrete first, then the most VRAM); own: the GPU that encodes the run; n: Vulkan device n;
+        --vmaf-gpu <auto|n|name>  the Vulkan device that scores (default: auto, the home GPU, else the fastest: discrete first, then the most VRAM); own: the GPU that encodes the run; n: Vulkan device n;
                             name: the first device whose name contains it. --vmaf-gpu list shows the Vulkan devices
         --over-penalty <p>  VMAF points deducted per percent for a run just over the target bitrate (default: 0.025); it grows exponentially, like the website's
 
@@ -813,6 +815,10 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	std::optional<double> check;
 	std::optional<double> penalty;
 	std::optional<std::string> vmaf_device, vmaf_gpu;
+	// Flags for what the config's "settings" also has: kept until the config is read, so that the flag wins (a worker passes its own on as flags).
+	std::optional<std::string> hw_decode, decode_gpu, scaling_gpu, priority;
+	std::optional<int> decode_threads;
+	bool low_memory = false, in_process = false;
 	bool videos = true, all_videos = false, upload_videos = true, skip_known = true, quick = false, upscale = false;
 	std::set<std::string> only_lines; // --only-runs
 	bool short_names = false;
@@ -846,8 +852,8 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		}
 		else if (a == "--plain") cfg.plain = true;
 		else if (a == "--log") log_path = value();
-		else if (a == "--low-memory") cfg.low_memory = true;
-		else if (a == "--in-process") cfg.in_process = true;
+		else if (a == "--low-memory") low_memory = true;
+		else if (a == "--in-process") in_process = true;
 		else if (a == "--host") cfg.host_port = atoi(value().c_str());
 		else if (a == "--progress") ui::set_progress_stdout(true);
 		else if (a == "--trust-downloads") set_trust_downloads(true);
@@ -855,11 +861,11 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--only-runs") { std::ifstream f(value()); for (std::string l; std::getline(f, l);) { if (!l.empty() && l.back() == '\r') l.pop_back(); only_lines.insert(l); } only_set = true; }
 		else if (a == "--token") cfg.token = value();
 		else if (a == "--min-workers") cfg.min_workers = std::max(1, atoi(value().c_str()));
-		else if (a == "--decode-threads") cfg.decode_threads = atoi(value().c_str());
-		else if (a == "--hw-decode") cfg.hw_decode = value();
-		else if (a == "--decode-gpu") cfg.decode_gpu = value();
-		else if (a == "--scaling-gpu") cfg.scaling_gpu = value();
-		else if (a == "--priority") cfg.priority = value();
+		else if (a == "--decode-threads") decode_threads = atoi(value().c_str());
+		else if (a == "--hw-decode") hw_decode = value();
+		else if (a == "--decode-gpu") decode_gpu = value();
+		else if (a == "--scaling-gpu") scaling_gpu = value();
+		else if (a == "--priority") priority = value();
 		else if (a == "-c" || a == "--cache") cache = value();
 		else if (a == "--vmaf-model") model = value();
 		else if (a == "--vmaf-threads") threads = atoi(value().c_str());
@@ -911,6 +917,13 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 			if (!job.pool.empty()) j.pool = job.pool;
 		}
 	}
+	if (hw_decode) cfg.hw_decode = *hw_decode;
+	if (decode_gpu) cfg.decode_gpu = *decode_gpu;
+	if (scaling_gpu) cfg.scaling_gpu = *scaling_gpu;
+	if (priority) cfg.priority = *priority;
+	if (decode_threads) cfg.decode_threads = *decode_threads;
+	if (low_memory) cfg.low_memory = true;
+	if (in_process) cfg.in_process = true;
 	if (!inputs.empty()) { cfg.inputs.clear(); for (auto& i : inputs) add_inputs(cfg, i); }
 	if (output) cfg.output_dir = *output == "off" ? "" : *output;
 	cfg.save_videos = cfg.save_videos && videos;
