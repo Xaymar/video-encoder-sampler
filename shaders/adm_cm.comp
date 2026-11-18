@@ -3,10 +3,27 @@
 #extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 256) in;
 #include "adm_common.glsl"
-// Contrast masking: one workgroup per row; writes the row's three inner sums (h, v, d). DLM: the restored part above the masking threshold of the
+// Contrast masking (with the csf of adm_csf.comp worked out on the way): one workgroup per row; writes the row's three inner sums (h, v, d). DLM: the restored part above the masking threshold of the
 // additive impairment; AIM (pc.aim): the additive impairment above the threshold of the restored part.
 
 shared int64_t sh[3][256];
+
+// adm_csf's two values for band theta at q, worked out here instead of read back (so the csf needs no pass of its own): its contrast sensitivity
+// weighting, and the filtered absolute value of that.
+int csf_dst(int theta, int q, int N) {
+	const int src = cur[((pc.aim != 0 ? XH : AH) + theta) * N + q];
+	const int rf = theta == 0 ? pc.rf0 : theta == 1 ? pc.rf1 : pc.rf2;
+	if (pc.scale == 0) {
+		const int shifts = theta == 2 ? 17 : 15;
+		const int adds = theta == 2 ? 65535 : 16384;
+		return sext16((rf * src + adds) >> shifts);
+	}
+	return int(((int64_t(uint(rf)) * int64_t(src)) + 134217728l) >> 28);
+}
+int csf_flt(int dst) {
+	if (pc.scale == 0) return sext16((4369 * abs(dst) + 2048) >> 12);
+	return int(((143165577l * int64_t(abs(dst))) - 2147483648l) >> 32); // -2^31: see adm_csf.comp
+}
 
 void main() {
 	const int row = pc.srow + int(gl_WorkGroupID.y);
@@ -21,11 +38,12 @@ void main() {
 			for (int di = -1; di <= 1; di++) {
 				for (int dj = -1; dj <= 1; dj++) {
 					const int q = (row + di) * pc.BW + j + dj;
+					const int dst = csf_dst(theta, q, N);
 					if (di == 0 && dj == 0) {
-						const int c = abs(cur[(CAH + theta) * N + q]);
+						const int c = abs(dst);
 						sum += pc.scale == 0 ? sext16((8738 * c + 2048) >> 12) : int(((286331153l * int64_t(c)) - 2147483648l) >> 32); // -2^31: see adm_csf.comp
 					} else {
-						sum += cur[(CFH + theta) * N + q];
+						sum += csf_flt(dst);
 					}
 				}
 			}

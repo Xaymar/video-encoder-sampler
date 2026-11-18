@@ -791,14 +791,15 @@ private:
 					pu.dbg = !adm_dump.empty() && index == 1 && u == 0 && s == 0 ? 1 : 0; // the dump's frame: decouple's inner values into AH, AV, AD
 					vk.push(&pu, sizeof pu);
 					vk.bind(a.dec[s]); vk.dispatch(g.first, g.second); vk.barrier();
-					vk.bind(a.csf[s]); vk.dispatch(g.first, g.second); vk.barrier();
+					// adm_cm works the csf out itself; its own pass only fills CAH..CFD for VES_ADM_DUMP
+					if (!adm_dump.empty()) { vk.bind(a.csf[s]); vk.dispatch(g.first, g.second); vk.barrier(); }
 					vk.bind(a.cm_p[s]); vk.dispatch(1, pu.erow - pu.srow);
 					vk.barrier();
 					if (a.aim) { // the csf and the masking again, the other way round, into buffers of their own
 						AdmPC pa = pu;
 						pa.aim = 1;
 						vk.push(&pa, sizeof pa);
-						vk.bind(a.aimcsf[s]); vk.dispatch(g.first, g.second); vk.barrier();
+						if (!adm_dump.empty()) { vk.bind(a.aimcsf[s]); vk.dispatch(g.first, g.second); vk.barrier(); }
 						vk.bind(a.aimcm[s]); vk.dispatch(1, pu.erow - pu.srow);
 						vk.barrier();
 					}
