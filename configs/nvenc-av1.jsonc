@@ -32,7 +32,7 @@
 				// "level": ["auto"],   // a level only caps the frame size, rate and tiles; auto picks one that fits
 				// "rate_control": ["cbr"],   // the default; "vbr" at the same average and peak bitrate is CBR with a looser buffer
 				"max_b_frames": [0, 1, 2, 3, 4],   // the GPU's NUM_MAX_BFRAMES caps it
-				"lookahead_frames": [0, 4, 8, 16, 24, 28, 32],   // 0 off; deeper than 32 minus the B-frames changes nothing on H.264, see the rule [T 2026-11-18]
+				"lookahead_frames": [0, 4, 8, 16, 24, 28, 30, 32],   // 0 off; 54 matched 32 without B-frames, 31 and up matched 30 with 4, see the rule [T 2026-11-18]
 				"lookahead_level": [0, 1, 2, 3],   // needs lookahead (NVIDIA's library aborts the process otherwise [T]); 15 = auto matched 3 on H.264 [T 2026-11-18]
 				"disable_iadapt": [0, 1],   // adaptive I-frames at scene cuts: lookahead only [H][G 8.2]
 				"disable_badapt": [0, 1],   // adaptive B-frame count: lookahead and B-frames only [H][G 8.2]
@@ -40,8 +40,8 @@
 				"spatial_aq": [0, "auto"],   // 0 off, auto: the driver picks the strength per frame; a fixed strength 1..15 [H aqStrength] is always worse (user's tests)
 				"temporal_aq": [0, 1],
 				"strict_gop_target": [0, 1],
-				"zero_reorder_delay": [0, 1],   // no reordering: no B-frames, no temporal filter [H]
-				"enable_non_ref_p": [0, 1],
+				"zero_reorder_delay": [0],   // only allowed without B-frames, and there it changed nothing [T 2026-11-18, RTX 4080 SUPER]
+				"enable_non_ref_p": [0],   // only allowed without B-frames, and there it changed nothing [T 2026-11-18, RTX 4080 SUPER]
 				"enable_weighted_prediction": [0, 1],   // not with B-frames [H][G 8.7]
 				"low_delay_key_frame_scale": ["", 1, 2, 4, 8, 16],   // I- to P-frame bits with CBR and a single-frame VBV, which only ll and ull use; 2 for ll and 1 for ull by default, no range given [H]
 				"mv_precision": [0, 1, 2],   // 0 default (quarter pel), 1 full, 2 half, 3 quarter: 3 matched 0 on H.264 [T 2026-11-18]
@@ -167,11 +167,27 @@
 						{ "op": "==", "left": { "option": "zero_reorder_delay" }, "right": 0 },
 					],
 				},
-				// Lookahead deeper than 32 minus the B-frames made the same stream as that depth on H.264 [T 2026-11-18, RTX 4080 SUPER, driver 621.24];
-				// assumed the same here until configs/check confirms it.
+				// Lookahead deeper than 32 made the same stream as 32 without B-frames, and deeper than 30 the same as 30 with 4 B-frames
+				// [T 2026-11-18, RTX 4080 SUPER, driver 621.24]; H.264 stops at 32 minus the B-frames instead. 1 to 3 B-frames are untested and keep 32.
 				{
-					"if": { "op": ">", "left": { "option": "lookahead_frames" }, "right": 0 },
-					"require": { "op": "<=", "left": { "option": "lookahead_frames" }, "right": { "op": "-", "left": 32, "right": { "option": "max_b_frames" } } },
+					"if": { "op": ">=", "left": { "option": "max_b_frames" }, "right": 4 },
+					"require": { "op": "<=", "left": { "option": "lookahead_frames" }, "right": 30 },
+				},
+				// With B-frames, forward 4 or backward 3 alone made the same stream as auto in every case tested; both together only changed
+				// the stream with the middle or hierarchical B-frame as a reference and 3 or more B-frames [T 2026-11-18, RTX 4080 SUPER].
+				// Only the ends (0, 4 and 0, 3) were tested.
+				{
+					"if": { "op": "and", "args": [
+						{ "op": ">", "left": { "option": "max_b_frames" }, "right": 0 },
+						{ "op": "or", "args": [
+							{ "op": "<", "left": { "option": "max_b_frames" }, "right": 3 },
+							{ "op": "not in", "left": { "option": "b_reference_mode" }, "right": ["middle", "hierarchical"] },
+						] },
+					] },
+					"require": [
+						{ "op": "==", "left": { "option": "max_ref_frames_forward" }, "right": 0 },
+						{ "op": "==", "left": { "option": "max_ref_frames_backward" }, "right": 0 },
+					],
 				},
 				// With lookahead level 1 to 3, adaptive I/B decisions and temporal AQ made the same stream on or off on H.264 [T 2026-11-18, RTX 4080 SUPER];
 				// assumed the same here until configs/check confirms it.
