@@ -14,8 +14,11 @@ layout(std430, binding = 4) writeonly buffer Part { double part[]; }; // per wor
 
 const int MAXD = 8; // nd <= 8 (max_log_contrast <= 3)
 const int TILE = 16;
-const int MAXPAD = 16;
-shared int tile[(TILE + 2 * MAXPAD) * (TILE + 2 * MAXPAD)];
+const int MAXPAD = 32; // windows up to 65: every scale of 4K (a 65 window) works from shared memory
+// The tile and its border as the histograms see them, 16 bits each, two to a word (under 16 KiB with the sums below): a counted sample's value less
+// the band's base, else NOT_IN_TILE (above every value, so k is past the span whatever the pixel's value).
+shared uint tile[((TILE + 2 * MAXPAD) * (TILE + 2 * MAXPAD) + 1) / 2];
+const uint NOT_IN_TILE = 65535u;
 shared double ssum[256];
 shared uint scnt[256];
 
@@ -56,7 +59,15 @@ void main() {
 	const int tw = TILE + 2 * pad;
 	if (tiled) {
 		const int r0 = int(gl_WorkGroupID.y) * TILE - pad, c0 = int(gl_WorkGroupID.x) * TILE - pad;
-		for (int k = int(gl_LocalInvocationIndex); k < tw * tw; k += 256) tile[k] = counted(r0 + k / tw, c0 + k % tw);
+		for (int k2 = int(gl_LocalInvocationIndex); 2 * k2 < tw * tw; k2 += 256) {
+			uint w = 0u;
+			for (int h = 0; h < 2; h++) {
+				const int k = 2 * k2 + h;
+				const int v = k < tw * tw ? counted(r0 + k / tw, c0 + k % tw) : NOT_COUNTED;
+				w |= (v == NOT_COUNTED ? NOT_IN_TILE : uint(v - pc.band_base)) << (16 * h);
+			}
+			tile[k2] = w;
+		}
 		barrier();
 	}
 	float c_value = 0.0;
@@ -70,10 +81,12 @@ void main() {
 			const uint span = uint(2 * nd), off = uint(nd - v);
 			if (tiled) {
 				const int base = int(gl_LocalInvocationID.y) * tw + int(gl_LocalInvocationID.x);
+				const uint offc = uint(nd - compact); // k = value - v + nd, from the tile's value less the band's base
 				for (int dr = 0; dr <= 2 * pad; dr++) {
 					const int row = base + dr * tw;
 					for (int dc = 0; dc <= 2 * pad; dc++) {
-						const uint k = uint(tile[row + dc]) + off;
+						const int q = row + dc;
+						const uint k = ((tile[q >> 1] >> (16u * uint(q & 1))) & 65535u) + offc;
 						if (k <= span) count(cnt, k);
 					}
 				}
