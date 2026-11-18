@@ -63,11 +63,11 @@
 				"pa_scene_change_detection_enable": ["", 0],   // both
 				"pa_scene_change_detection_sensitivity": ["", 0, 2],   // every value
 				// Static scene detection codes static frames as skip frames and needs a lookahead [PA]. On the 9800X3D iGPU (RDNA 2, AMF 1.4.37) with the check clip's
-				// still segment it worked, but only with sensitivity 0 or 1: unset (2, high) made the same stream as off, and the max QP before force skip changed
+				// still segment it worked (on the 780M too, RDNA 3, AMF 1.5.3), but only with sensitivity 0 or 1: unset (2, high) made the same stream as off, and the max QP before force skip changed
 				// nothing [T on H.264 and HEVC].
 				"pa_static_scene_detection_enable": [""],   // fixed for this slice
 				"pa_static_scene_detection_sensitivity": [""],   // fixed for this slice
-				// "pa_max_qp_before_force_skip": ["", 20, 51],   // 0..51, default 35: static frames are skipped only below this QP [PA]; changed nothing [T]
+				// "pa_max_qp_before_force_skip": ["", 20, 51],   // 0..51, default 35: static frames are skipped only below this QP [PA]; changed nothing on RDNA 2 [T], and 20 bluescreened the 780M (RDNA 3, 0x119 in amdkmdag.sys) [T]: do not set it
 				"pa_activity_type": ["", 1],   // both
 				"pa_frame_sad_enable": ["", 0],   // both
 				"pa_long_term_reference_enable": ["", 1],   // both
