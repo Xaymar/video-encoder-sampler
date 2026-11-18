@@ -1,4 +1,4 @@
-// --check slice of amf-h264.jsonc: pre-analysis: scene change and static scene detection, activity, SAD, long-term references
+// --check slice of amf-h264.jsonc: pre-analysis: scene change, activity, SAD, long-term references
 // Run: ves --config configs/check/amf-h264-pa-scene.jsonc --check -i <file>. The other options are fixed; the rules still apply.
 // AMF H.264: the options that change the picture at a fixed bitrate, with the values AMF accepts, and rules that leave out the combinations AMF
 // refuses or ignores (the same stream twice). Run it as is (ves --config configs/amf-h264.jsonc) or copy the entry into your own config.
@@ -62,9 +62,11 @@
 				"pa_high_motion_quality_boost_mode": [""],   // fixed for this slice
 				"pa_scene_change_detection_enable": ["", 0],   // both
 				"pa_scene_change_detection_sensitivity": ["", 0, 2],   // every value
-				"pa_static_scene_detection_enable": ["", 1],   // both
-				"pa_static_scene_detection_sensitivity": ["", 0, 1],   // every value
-				"pa_max_qp_before_force_skip": ["", 20, 51],   // every value
+				// Static scene detection codes static frames as skip frames and needs a lookahead [PA]. It is RDNA 4 only as far as we know, and it changed nothing on
+				// RDNA 2 and 3 [T] (the test clip has no static parts either), so it is left out. On RDNA 4, use these lines instead:
+				// "pa_static_scene_detection_enable": ["", 1],
+				// "pa_static_scene_detection_sensitivity": ["", 0, 1],   // 0 low, 1 medium, 2 high (default)
+				// "pa_max_qp_before_force_skip": ["", 20, 51],   // 0..51, default 35: static frames are skipped only below this QP [PA]
 				"pa_activity_type": ["", 1],   // both
 				"pa_frame_sad_enable": ["", 0],   // both
 				"pa_long_term_reference_enable": ["", 1],   // both
