@@ -468,6 +468,11 @@ std::vector<HwChoice> hw_decode_choices(AVCodecID id) {
 	return out;
 }
 
+bool hw_decode_on() {
+	std::lock_guard lock(g_mutex);
+	return !g_hw.empty();
+}
+
 void set_hw_decode_gpu(unsigned vendor, int index) {
 	std::lock_guard lock(g_mutex);
 	g_vendor = vendor;

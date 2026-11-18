@@ -39,6 +39,8 @@ std::unique_ptr<Source> open_source(const std::string& path); // nullptr if it c
 // exactly; otherwise it is decoded in software. The encoded streams that are scored follow the same setting, checked against software frame by
 // frame as they are decoded (see ff_decode.cpp).
 void set_hw_decode(const std::string& type);
+// Whether hardware decoding is on (set_hw_decode()).
+bool hw_decode_on();
 // Hardware decoding on the n-th GPU of a vendor only (as gpu.h lists them): set in the process of that GPU, so that its frames never cross to another device.
 void set_hw_decode_gpu(unsigned vendor, int index);
 
