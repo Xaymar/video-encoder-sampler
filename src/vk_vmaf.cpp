@@ -409,7 +409,7 @@ struct AdmPC {
 	int egl_int;
 	int dbg;
 };
-struct CambiPC { int W, H, OW, OH, bpc, anti_dither, mask_index, pad, nd, vlt_luma, band_base, band_size; };
+struct CambiPC { int W, H, OW, OH, bpc, anti_dither, mask_index, pad, nd, vlt_luma, band_base, band_size, lanes; };
 struct SpeedPC { int W, H, SW, SH, DW, DH, bpc, fw, scaled, out_off; float scaler; };
 struct SpeedStatPC { int DW, DH, fw, subw, subh, nbh, nbv, nb, mode; float sigma_nn, nn_floor, base_entropy, one; double log2_2pie; }; // speed_common.glsl
 
@@ -573,7 +573,7 @@ class VkVmaf {
 	struct Slot; // below
 
 public:
-	VkVmaf(int device, const std::vector<Model>& models, const GpuVmafFrame& f) : vk(device, kSlots), ms(models), W(f.w), H(f.h), bpc(f.depth), bps(f.depth > 8 ? 2 : 1) {
+	VkVmaf(int device, const std::vector<Model>& models, const GpuVmafFrame& f) : vk(device, kSlots), device_index(device), ms(models), W(f.w), H(f.h), bpc(f.depth), bps(f.depth > 8 ? 2 : 1) {
 		ysize = (size_t)W * H;
 		plane_bytes = ysize * bps;
 		if (const char* e = getenv("VES_SPEED_CHECK"); e && atoi(e) > 0) speed_check = true;
@@ -1004,6 +1004,7 @@ private:
 		std::thread worker;
 	};
 	Vk vk; // first: it releases the buffers and sets below when it goes away
+	int device_index; // in the loader's order
 	std::array<Slot, kSlots> slots;
 	std::mutex mutex;
 	std::condition_variable changed;
@@ -1433,6 +1434,13 @@ private:
 			for (int d = 0; d < nd; d++) { t[d] = tvi_for_diff(d + 1, o.tvi, 10, lr, pq) + nd; t[32 + d] = contrast_weights[d]; }
 			memcpy(t + 64, vmaf_tables::reciprocal_lut, CAMBI_RECIPROCAL_LUT_SIZE * 4);
 			cpc.nd = nd;
+			{ // cambi_cvalue's 8 bit row counts: 25% faster on an RTX 4070 Laptop, 12% slower on a Radeon 780M (2026-11-18). Not on AMD, unless
+			  // VES_CAMBI_LANES says
+				uint32_t vendor = 0;
+				for (auto& d : vulkan_devices_fastest_first()) if (d.index == device_index) vendor = d.vendor_id;
+				cpc.lanes = vendor != 0x1002;
+				if (const char* e = getenv("VES_CAMBI_LANES"); e && *e) cpc.lanes = atoi(e) > 0;
+			}
 			cpc.vlt_luma = vlt_luma(o.vlt, lr, pq);
 			const int v_lo = cpc.vlt_luma - 3 * nd + 1;
 			cpc.band_base = v_lo > 0 ? v_lo : 0;

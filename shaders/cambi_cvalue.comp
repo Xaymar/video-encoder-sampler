@@ -82,6 +82,34 @@ void window_direct(inout Counts cnt, int i, int j, int pad, uint off, uint span,
 	}
 }
 
+void count(inout Counts c, uint k, const bool small) { // one sample straight into the 16 bit counts (pc.lanes == 0)
+	const uint64_t inc = 1ul << (16u * (k & 3u));
+	const uint wi = k >> 2u;
+	c.w0 += wi == 0u ? inc : 0ul;
+	c.w1 += wi == 1u ? inc : 0ul;
+	c.w2 += wi == 2u ? inc : 0ul;
+	if (!small) {
+		c.w3 += wi == 3u ? inc : 0ul;
+		c.w4 += wi == 4u ? inc : 0ul;
+	}
+}
+void window_tiled_plain(inout Counts cnt, int base, int tw, int pad, uint off, uint span, const bool small) {
+	for (int dr = 0; dr <= 2 * pad; dr++) {
+		const int row = base + dr * tw;
+		for (int dc = 0; dc <= 2 * pad; dc++) {
+			const uint k = uint(tile[row + dc]) + off;
+			if (k <= span) count(cnt, k, small);
+		}
+	}
+}
+void window_direct_plain(inout Counts cnt, int i, int j, int pad, uint off, uint span, const bool small) {
+	for (int dr = -pad; dr <= pad; dr++)
+		for (int dc = -pad; dc <= pad; dc++) {
+			const uint k = uint(counted(i + dr, j + dc)) + off;
+			if (k <= span) count(cnt, k, small);
+		}
+}
+
 int get_count(Counts c, int k) {
 	const int wi = k >> 2;
 	const uint64_t w = wi == 0 ? c.w0 : wi == 1 ? c.w1 : wi == 2 ? c.w2 : wi == 3 ? c.w3 : c.w4;
@@ -110,11 +138,19 @@ void main() {
 			const uint span = uint(2 * nd), off = uint(nd - v);
 			if (tiled) {
 				const int base = int(gl_LocalInvocationID.y) * tw + int(gl_LocalInvocationID.x);
-				if (nd <= 4) window_tiled(cnt, base, tw, pad, off, span, true);
-				else window_tiled(cnt, base, tw, pad, off, span, false);
-			} else {
+				if (pc.lanes != 0) {
+					if (nd <= 4) window_tiled(cnt, base, tw, pad, off, span, true);
+					else window_tiled(cnt, base, tw, pad, off, span, false);
+				} else {
+					if (nd <= 4) window_tiled_plain(cnt, base, tw, pad, off, span, true);
+					else window_tiled_plain(cnt, base, tw, pad, off, span, false);
+				}
+			} else if (pc.lanes != 0) {
 				if (nd <= 4) window_direct(cnt, i, j, pad, off, span, true);
 				else window_direct(cnt, i, j, pad, off, span, false);
+			} else {
+				if (nd <= 4) window_direct_plain(cnt, i, j, pad, off, span, true);
+				else window_direct_plain(cnt, i, j, pad, off, span, false);
 			}
 			const int p0 = get_count(cnt, nd);
 			const int value = v + nd; // as cambi.c has it: tvi[] is in the same offset space
