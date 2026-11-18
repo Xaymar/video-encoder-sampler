@@ -502,6 +502,14 @@ public:
 		names_all = names;
 		for (auto& [k, v] : native_opts) if (k != "enable_pre_analysis" && !apply(k, v)) return false;
 
+		// What this encoder is about to run with, before the driver gets it: when an option takes the whole system down (static scene detection
+		// bluescreened the 780M), this is the last line in the log and names the culprit.
+		{
+			std::string line;
+			for (auto& [k, v] : native_opts) line += " " + k + "=" + v;
+			for (auto& [k, v] : filter_opts) line += " " + k + "=" + v;
+			fprintf(stderr, "amf: opening %s %dx%d with%s\n", p.codec.c_str(), w, h, line.empty() ? " defaults" : line.c_str());
+		}
 		const auto surface = depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12;
 		bool inited = false;
 		if (p.codec == "av1" && std::none_of(native_opts.begin(), native_opts.end(), [](const auto& kv) { return kv.first == "alignment_mode"; })) {
