@@ -9,8 +9,8 @@
 // lists them with `ves --list-options amf/h264`. ves opens the encoder with usage transcoding and CBR, peak bitrate = target bitrate.
 // Rate control: CBR is the base; rate_control "vbr" is peak constrained VBR, capped at the target as ves sets the peak to it. Pre-analysis and
 // pre-encode work with every rate control [E] (the header's "only works in peak constrained VBR" [H] is older than the API reference) and can help a
-// lot, so they and their options are all here. The high quality modes (hqvbr, hqcbr) need pre-analysis [E] and seem to be gone on RDNA GPUs, where
-// the high_quality preset may stand in for them (untested): they are commented out.
+// lot, so they and their options are all here. The high quality modes (hqvbr, hqcbr) need pre-analysis [E] and aim at a
+// quality level (qvbr_quality_level, default QP 23) before the bitrate, so that level is swept with them.
 // Every list is cut to a spread of its range: ves numbers the combinations with one 64-bit number, so all value lists multiplied (rules aside) must stay
 // below 9.2e18. Pruning tries the middle values only where the ends differ, so the ends of each range matter most.
 // Features this GPU's encoder lacks (B-frames, reference frame counts) are left to the capability check: those runs are ignored, not failed.
@@ -31,8 +31,10 @@
 			"options": {
 				"preset": ["speed", "balanced", "quality"],   // high_quality made the same stream as quality in every test on both GPUs [T]; ["speed", "balanced", "quality", "high_quality"] to retest
 				"profile": ["high"],   // the older profiles are no use any more
-				"rate_control": [""],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T]; also lcvbr, qvbr, hqvbr, hqcbr
-				// "rate_control": ["", "vbr", "hqvbr", "hqcbr"],   // to test whether this GPU still has the high quality modes
+				"rate_control": ["", "hqvbr", "hqcbr"],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T]; also lcvbr, qvbr
+				// The high quality modes aim at a quality level, QvbrQualityLevel, and only then at the bitrate. Its default of 23 [H] is a far better picture than
+				// most footage gets at these bitrates, which is why they scored far below high_quality on RDNA 2 [T]: they only make sense with it swept.
+				"qvbr_quality_level": ["", 13, 28, 33, 38, 43, 51],   // 1..51, default 23 (""); lower is a better picture [H]; only with qvbr, hqvbr, hqcbr (rule below)
 				"pre_encode": ["", 1],   // pre-encode assisted rate control, off in the transcoding usage [E]
 				"max_b_frames": [0],   // BPicturesPattern, 0..3 [E]. 1 to 3 made the same stream as 0 on RDNA 2 and RDNA 3 (the caps did not refuse them) [T]
 				// "max_b_frames": [0, 1, 2, 3],   // for GPUs that really have H.264 B-frames (RDNA 4?)
@@ -45,7 +47,7 @@
 				// "cabac_enable": [...],   // every decoder has CABAC and it is clearly better
 				"de_blocking_filter": ["", 0, 1],
 				"rate_control_skip_frame_enable": [""],   // lets the rate control drop frames; on or off made the same stream at CBR and VBR [T] Was ["", 0, 1]
-				// "low_latency_internal": [...],   // AMD's own setting, not one to choose
+				"low_latency_internal": ["", 1],   // AMF_VIDEO_ENCODER_LOWLATENCY_MODE (LowLatencyInternal), default off: "enables low latency mode and POC mode 2 in the encoder" [H]
 				"enforce_hrd": [""],   // on or off made the same stream at CBR and VBR [T] Was ["", 0, 1]
 				// "filler_data_enable": [0, 1],   // pads the stream to the bitrate: the picture stays the same
 				// "vbv_buffer_size": [...],   // bits, so the same value means a different buffer at every bitrate
@@ -95,7 +97,23 @@
 					],
 					"else_require": { "op": "not", "value": { "set": "b_reference_mode" } },
 				},
-				// High quality VBR and CBR "require Pre-Analysis to be enabled" [E]; QVBR aims at a quality level instead of the bitrate and is left out.
+				// The quality level is read by the quality based modes only (QVBR per [H]; hqvbr and hqcbr aim at it too); with the others it would only repeat a stream.
+				{
+					"if": { "set": "qvbr_quality_level" },
+					"require": [
+						{ "set": "rate_control" },   // unset is CBR, as ves opens the encoder
+						{ "op": "in", "left": { "option": "rate_control" }, "right": ["qvbr", "hqvbr", "hqcbr"] },
+					],
+				},
+				// POC mode 2 (picture order = decode order) leaves no room for B-frames.
+				{
+					"if": { "op": "==", "left": { "option": "low_latency_internal" }, "right": 1 },
+					"require": [
+						{ "op": "==", "left": { "option": "max_b_frames" }, "right": 0 },
+						{ "op": "not", "value": { "set": "adaptive_mini_gop" } },
+					],
+				},
+				// High quality VBR and CBR "require Pre-Analysis to be enabled" [E]; QVBR aims at its quality level with the bitrate only as the peak and is left out.
 				{
 					"if": { "op": "in", "left": { "option": "rate_control" }, "right": ["hqvbr", "hqcbr"] },
 					"require": [
