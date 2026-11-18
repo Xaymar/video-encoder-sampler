@@ -169,7 +169,7 @@
 				},
 
 				// Lookahead deeper than 32 minus the B-frames made the same stream as that depth: B=0: 31 = 32 (and 54 = 32); B=4: 28 = 30 = 31 = 32,
-				// while 27 still differed [T 2026-11-18, RTX 4080 SUPER, 19 s of mixed footage]. ([H lookaheadDepth] says 31 minus the B-frames.)
+				// while 27 still differed [T 2026-11-18, RTX 4080 SUPER, driver 621.24, 19 s of mixed footage]. ([H lookaheadDepth] says 31 minus the B-frames.)
 				{
 					"if": { "op": ">", "left": { "option": "lookahead_frames" }, "right": 0 },
 					"require": { "op": "<=", "left": { "option": "lookahead_frames" }, "right": { "op": "-", "left": 32, "right": { "option": "max_b_frames" } } },
