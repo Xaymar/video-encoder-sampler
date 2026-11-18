@@ -34,8 +34,8 @@
 				// "level": ["auto"],   // a level only caps the DPB and the bitrate; auto picks one that fits
 				// "rate_control": ["cbr"],   // the default; "vbr" at the same average and peak bitrate is CBR with a looser buffer
 				"max_b_frames": [0, 1, 2, 3, 4],   // the GPU's NUM_MAX_BFRAMES caps it
-				"lookahead_frames": [0, 54],   // the ends of [0, 4, 8, 16, 32, 54] for this slice
-				"lookahead_level": [0, 1, 2, 3, 15],   // 15 = auto; needs lookahead (NVIDIA's library aborts the process otherwise [T])
+				"lookahead_frames": [0, 32],   // the ends of [0, 4, 8, 16, 32] for this slice
+				"lookahead_level": [0, 1, 2, 3],   // needs lookahead (NVIDIA's library aborts the process otherwise [T]); 15 = auto made the same stream as 3 every time [T 2026-11-18, RTX 4080 SUPER]
 				"disable_iadapt": [0, 1],   // adaptive I-frames at scene cuts: lookahead only [H][G 8.2]
 				"disable_badapt": [0, 1],   // adaptive B-frame count: lookahead and B-frames only [H][G 8.2]
 				"multi_pass": [0, 1, 2],   // 0 off, 1 two passes with a quarter resolution first pass, 2 two full passes [G 3.8.4]
