@@ -327,6 +327,11 @@ AVBufferRef* shared_hw_device(const std::string& type, const std::string& device
 	return shared ? av_buffer_ref(shared) : nullptr;
 }
 
+std::string hw_decode_gpu_identity() {
+	std::lock_guard lock(g_mutex);
+	return g_vendor ? gpu_description(g_vendor, g_index) : std::string("the default GPU");
+}
+
 std::vector<HwChoice> hw_decode_choices(AVCodecID id) {
 	std::string want;
 	{

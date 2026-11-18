@@ -53,5 +53,7 @@ void describe_difference(const Picture& a, const Picture& b, int frame);
 // device in that type's terms, as --hw-decode and the decode GPU (set_hw_decode(), set_hw_decode_gpu()) say. Empty: software only.
 struct HwChoice { std::string type, device; };
 std::vector<HwChoice> hw_decode_choices(AVCodecID id);
+// The decode GPU with its driver ("<name> (driver <version>)"), for keys of what was found out about it.
+std::string hw_decode_gpu_identity();
 // The hardware device of a type, made once per run and shared by every decoder; nullptr if it cannot be made. The caller gets a reference of its own.
 AVBufferRef* shared_hw_device(const std::string& type, const std::string& device);

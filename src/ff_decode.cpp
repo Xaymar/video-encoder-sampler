@@ -1,11 +1,11 @@
 // Decoder on top of libavcodec, for the encoded streams that are scored.
 //
-// The software decoder is the truth. With hardware decoding on (--hw-decode, on the GPU --decode-gpu picks), a stream is decoded by the GPU as well,
-// and both run side by side on its first frames: as long as they are compared, the software decode's frames are the ones handed out, and once a
-// frame differs (or the GPU cannot decode the stream, gives fewer frames, a format we cannot use, ...) the hardware decoder is dropped and software
-// carries on from there, so the scores are those of a software decode either way. After the check the software decoder is dropped instead.
-// The first stream of a kind (codec, bit depth, chroma, size, device) in a process is checked all the way through, later ones on their first
-// frames (VES_HW_DECODE_VERIFY=<frames> or "all"). A device that once differed for a kind is not used for it again.
+// The software decoder is the truth, but it is only used until a GPU has shown that it decodes a kind of stream (codec, size, bit depth, chroma) exactly
+// the same. With hardware decoding on (--hw-decode, on the GPU --decode-gpu picks), a stream of a kind that is not known yet is decoded by the GPU and
+// in software side by side, all the way through, and the software frames are the ones handed out. When every frame matched, the GPU is truthful for
+// that kind: this is kept on disk (see save_verdict()), and from then on streams of that kind decode on the GPU alone, with no software decoder at all.
+// A difference (or the GPU giving fewer frames, a format we cannot use, an error) drops the GPU decoder and software carries on; that kind then stays
+// in software on that GPU. VES_HW_DECODE_VERIFY=<frames>|all compares known kinds as well, to look at a machine again.
 // Only FFmpeg's own decoders on a hardware device (hwaccel) are used, not the dedicated ones (h264_cuvid, ...): they parse, reorder and crop
 // the stream with the same code as the software decoder, and only the reconstruction runs on the GPU. (AV1 is the exception: software is libdav1d,
 // the GPU gets FFmpeg's own AV1 decoder, which has no software path of its own; the check covers that as well.)
@@ -15,6 +15,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -29,17 +32,64 @@ extern "C" {
 
 namespace {
 
-constexpr long long VERIFY_FRAMES = 30; // checked on each later stream of a kind
-
+// VES_HW_DECODE_VERIFY=<frames>|all: compare every stream that much even when the device is known to be truthful for its kind. 0 (unset): rely on the verdicts.
 long long verify_frames() {
 	if (const char* e = getenv("VES_HW_DECODE_VERIFY")) return strcmp(e, "all") == 0 ? -1 : atoll(e);
-	return VERIFY_FRAMES;
+	return 0;
 }
 
 std::mutex g_mutex;
-std::set<std::string> g_bad;          // kind|type|device that differed from software or could not decode
-std::set<std::string> g_checked_all;  // kinds whose first stream is (being) checked all the way
+std::set<std::string> g_bad;          // kind|type|device that differed from software or could not decode in this process
 std::set<std::string> g_told;         // messages said once
+
+// Verdicts that outlive the process: "good" once a whole stream of a kind decoded exactly like software on a device, "bad" once it did not. The key
+// holds the GPU and its driver and the libavcodec version, so an update of either checks again. One line per verdict, appended, in the user's cache
+// folder (VES_HW_DECODE_VERDICTS=<file> to put it elsewhere, "off" for none).
+std::map<std::string, bool> g_verdicts;
+bool g_verdicts_loaded = false;
+
+std::string verdict_file() {
+	if (const char* e = getenv("VES_HW_DECODE_VERDICTS")) return strcmp(e, "off") == 0 ? std::string() : std::string(e);
+	std::error_code ec;
+	std::filesystem::path dir;
+#ifdef _WIN32
+	if (const char* a = getenv("LOCALAPPDATA")) dir = std::filesystem::path(a) / "ves";
+#else
+	if (const char* x = getenv("XDG_CACHE_HOME"); x && *x) dir = std::filesystem::path(x) / "ves";
+	else if (const char* h = getenv("HOME")) dir = std::filesystem::path(h) / ".cache" / "ves";
+#endif
+	if (dir.empty()) return {};
+	std::filesystem::create_directories(dir, ec);
+	return (dir / "hw-decode-verdicts.txt").string();
+}
+
+// With g_mutex held.
+void load_verdicts() {
+	if (g_verdicts_loaded) return;
+	g_verdicts_loaded = true;
+	const std::string file = verdict_file();
+	if (file.empty()) return;
+	std::ifstream in(file);
+	for (std::string line; std::getline(in, line);) {
+		const size_t tab = line.find('\t');
+		if (tab == std::string::npos) continue;
+		const std::string what = line.substr(0, tab), key = line.substr(tab + 1);
+		if (what == "good" || what == "bad") g_verdicts[key] = what == "good"; // the last line for a key wins
+	}
+}
+
+// With g_mutex held.
+void save_verdict(const std::string& key, bool good) {
+	load_verdicts();
+	if (auto it = g_verdicts.find(key); it != g_verdicts.end() && it->second == good) return;
+	g_verdicts[key] = good;
+	const std::string file = verdict_file();
+	if (file.empty()) return;
+	if (FILE* f = fopen(file.c_str(), "ab")) { // one short line per write: processes that append at the same time do not mix their lines
+		fprintf(f, "%s\t%s\n", good ? "good" : "bad", key.c_str());
+		fclose(f);
+	}
+}
 
 void tell_once(const std::string& key, const std::string& msg) {
 	{
@@ -152,23 +202,28 @@ struct Dec {
 class FfDecoder : public Decoder {
 	AVPacket* pkt = av_packet_alloc();
 	std::unique_ptr<Dec> sw, hw;
-	std::string kind, hw_key, hw_name; // the stream's kind, kind|type|device of the hardware decoder, and what to call it
+	std::string kind, hw_key, hw_name; // the stream's kind, the hardware decoder's verdict key, and what to call it
 	long long check = 0;               // frames still to compare; -1: all of them
 	long long compared = 0;
-	bool full_check = false;
 
 	void drop_hw(const std::string& why) {
 		{
 			std::lock_guard lock(g_mutex);
 			g_bad.insert(hw_key);
+			save_verdict(hw_key, false);
 		}
 		tell_once("drop|" + hw_key, "scored streams: hardware decoding (" + hw_name + ") is not used for " + kind + ": " + why + "; decoding in software");
 		hw.reset();
 	}
 
-	void drop_sw() {
-		tell_once("ok|" + hw_key + (full_check ? "|all" : ""), "scored streams: hardware decoding (" + hw_name + ") matched software on " +
-		          (full_check ? "all " + std::to_string(compared) + " frames of the first " + kind + " stream" : "the first " + std::to_string(compared) + " frames of a " + kind + " stream"));
+	// The comparison ends with every frame the same; `whole`: it covered the whole stream, which makes the device truthful for this kind.
+	void drop_sw(bool whole) {
+		if (whole) {
+			std::lock_guard lock(g_mutex);
+			save_verdict(hw_key, true);
+		}
+		tell_once("ok|" + hw_key + (whole ? "|all" : ""), "scored streams: hardware decoding (" + hw_name + ") matched software on " +
+		          (whole ? "all " + std::to_string(compared) + " frames of a " + kind + " stream; streams of this kind now decode on the GPU alone" : "the first " + std::to_string(compared) + " frames of a " + kind + " stream"));
 		sw.reset();
 	}
 
@@ -177,40 +232,53 @@ public:
 
 	bool open(Codec codec, const std::vector<uint8_t>& extradata, const Shape* enc) override {
 		const AVCodecID id = codec == Codec::H264 ? AV_CODEC_ID_H264 : codec == Codec::HEVC ? AV_CODEC_ID_HEVC : codec == Codec::AV1 ? AV_CODEC_ID_AV1 : AV_CODEC_ID_NONE;
-		sw = std::make_unique<Dec>();
-		if (id == AV_CODEC_ID_NONE || !sw->open(id, extradata, "", "")) { fprintf(stderr, "no decoder for encoded stream\n"); return false; }
-		if (!enc) return true; // no kind to keep verdicts for: software only
+		if (id == AV_CODEC_ID_NONE) { fprintf(stderr, "no decoder for encoded stream\n"); return false; }
+		auto open_sw = [&] {
+			sw = std::make_unique<Dec>();
+			if (sw->open(id, extradata, "", "")) return true;
+			fprintf(stderr, "no decoder for encoded stream\n");
+			return false;
+		};
+		if (!enc) return open_sw(); // no kind to keep verdicts for: software only
 		kind = std::string(avcodec_get_name(id)) + " " + std::to_string(enc->w) + "x" + std::to_string(enc->h) + " " + std::to_string(enc->pix.depth) + "-bit " +
 		       (enc->pix.chroma == 420 ? "4:2:0" : enc->pix.chroma == 422 ? "4:2:2" : "4:4:4");
 		// The first hardware decoder that opens and is not known to be bad for this kind of stream.
 		std::vector<HwChoice> choices = hw_decode_choices(id);
 		if (getenv("VES_HW_DECODE_TEST")) choices = {{"test", ""}};
+		const std::string where = "|" + hw_decode_gpu_identity() + "|lavc " + std::to_string(avcodec_version());
+		bool good = false;
 		for (const HwChoice& c : choices) {
-			const std::string key = kind + "|" + c.type + "|" + c.device;
+			const std::string key = kind + "|" + c.type + "|" + c.device + where;
 			{
 				std::lock_guard lock(g_mutex);
+				load_verdicts();
 				if (g_bad.count(key)) continue;
+				if (auto it = g_verdicts.find(key); it != g_verdicts.end() && !it->second) continue;
 			}
 			auto d = std::make_unique<Dec>();
-			hw_key = key;
-			hw_name = c.type + (c.device.empty() ? "" : ", device " + c.device);
 			if (!d->open(id, extradata, c.type, c.device)) { // no such device here, or it cannot decode the codec
 				std::lock_guard lock(g_mutex);
 				g_bad.insert(key);
 				continue;
 			}
 			hw = std::move(d);
+			hw_key = key;
+			hw_name = c.type + (c.device.empty() ? "" : ", device " + c.device);
+			std::lock_guard lock(g_mutex);
+			if (auto it = g_verdicts.find(key); it != g_verdicts.end()) good = it->second;
 			break;
 		}
 		if (!hw) {
 			if (!choices.empty()) tell_once("none|" + kind, "scored streams: no hardware decoder can be used for " + kind + " streams: decoding in software");
+			return open_sw();
+		}
+		check = verify_frames();
+		if (good && check == 0) { // truthful for this kind already: the GPU alone
+			tell_once("gpu|" + hw_key, "scored streams: " + kind + " streams decode on the GPU (" + hw_name + "), which matched software on a whole stream of this kind before");
 			return true;
 		}
-		std::lock_guard lock(g_mutex);
-		check = verify_frames();
-		if (check == 0) check = 1; // the first frame at least: it tells whether the GPU decodes the stream at all
-		if (g_checked_all.insert(hw_key).second) { full_check = true; check = -1; }
-		return true;
+		if (!good) check = -1; // not known yet: this stream is compared all the way through
+		return open_sw();
 	}
 
 	bool send(const uint8_t* data, size_t size) override {
@@ -243,6 +311,9 @@ public:
 				if (!sw) { // past the check: there is no software decode to fall back on
 					if (why.rfind("reading", 0) == 0) gpu_lost(why);
 					fprintf(stderr, "scored streams: hardware decoding (%s) failed after %lld frames: %s\n", hw_name.c_str(), hw->got, why.c_str());
+					std::lock_guard lock(g_mutex);
+					g_bad.insert(hw_key);
+					save_verdict(hw_key, false); // the run fails; when it is tried again, it decodes in software
 					return -1;
 				}
 				drop_hw(why);
@@ -263,14 +334,14 @@ public:
 					fprintf(stderr, "scored streams: hardware decoding (%s) differs from software at frame %lld of a %s stream\n", hw_name.c_str(), compared, kind.c_str());
 					describe_difference(a, b, (int)compared);
 					drop_hw("its frames differ from software");
-				} else if (++compared == check) drop_sw();
+				} else if (++compared == check) drop_sw(false);
 				out = std::move(a);
 				return 1;
 			}
 			if (hw->eof && hw->ready.empty() && !sw->ready.empty()) { drop_hw("it gave fewer frames than software"); continue; }
 			if (sw->eof && sw->ready.empty() && !hw->ready.empty()) { drop_hw("it gave more frames than software"); continue; }
 			if (sw->eof && hw->eof) { // the whole stream was compared
-				if (full_check && compared > 0) drop_sw();
+				if (compared > 0) drop_sw(true);
 				else hw.reset();
 				continue;
 			}
