@@ -903,7 +903,7 @@ private:
 		}
 		part_done(0);
 		// waves: the features' passes interleaved, stage by stage (not with VES_SCORE_TIMING, whose stamps time the parts one after another, nor
-		// VES_ADM_DUMP; VES_VMAF_WAVES=0: one feature after another, as before)
+		// VES_ADM_DUMP). Off by default: slower on an RTX 4080 SUPER (the features' passes compete for its caches), VES_VMAF_WAVES=1
 		const bool waves = use_waves && !part_timing && !vk.pass_timing() && adm_dump.empty();
 		Rec r_mo(vk, waves), r_vif(vk, waves), r_adm(vk, waves), r_cambi(vk, waves), r_speed(vk, waves);
 		Rec* R = &r_mo;
@@ -1254,7 +1254,7 @@ private:
 	uint32_t gx = 0, gy = 0;
 	Buf mfr[3], mtmp, mpart[2];
 	Pipe my[2][3][3], mx[2][3][3], mxy[2][3][3];
-	bool use_waves = true; // see record(): VES_VMAF_WAVES=0 turns it off
+	bool use_waves = false; // see record(): VES_VMAF_WAVES=1 turns it on (2026-11-18, RTX 4080 SUPER: 13-18% slower at 4K, no gain at 1080p)
 	bool motion_fused = true; // motion_xy: both convolutions in one pass (up to 15 bits; VES_MOTION_SPLIT=1: motion_y and motion_x)
 	// vif: the subsampled planes once, the statistics for each enhancement gain limit
 	std::vector<double> vif_egl;
