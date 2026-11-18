@@ -55,7 +55,7 @@
 				// "max_cu_size": [3],   // "Currently NVENC SDK only supports maxCUSize equal to NV_ENC_HEVC_CUSIZE_32x32" [H]
 				// "tier": ["main", "high"],   // only raises the level's bitrate limits; with level auto it changes nothing at these bitrates
 				"split_encode_mode": [15],   // off: splitting a frame across NVENCs only buys speed and costs quality; auto (0) may split high resolutions [H][G 8.14]
-				"disable_deblocking_filter_idc": [0, 1, 2],   // [H] range 0..2, pps_deblocking_filter_disabled_flag (H.265 7.4.3.3)
+				"disable_deblocking_filter_idc": [0],   // [H] range 0..2, but 1 and 2 made the same stream as 0 in every case tested (p1/p7, AQ, MV precision, chroma QP offsets) [T 2026-11-18, RTX 4080 SUPER, driver 621.24]
 				"cb_qp_index_offset": [-6, -3, 0, 3],   // pps_cb_qp_offset, -12..12 (H.265 7.4.3.3); lower gives chroma more bits
 				"cr_qp_index_offset": [-6, -3, 0, 3],   // pps_cr_qp_offset, -12..12
 				"enable_uni_directional_b": [0, 1],   // B-frames with both references in the past, for ll and ull; ignored with regular B-frames [H]
