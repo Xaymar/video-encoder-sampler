@@ -227,7 +227,9 @@ public:
 		return true;
 	}
 
-	bool add(const Picture& ref, const Picture& dis) override {
+	bool add(const Picture& ref, const Picture& dis_in) override {
+		Picture dis = dis_in;
+		if (!picture_to_memory(dis)) return false;
 		VmafPicture rp{}, dp{};
 		if (!to_picture(ref, rp)) return false;
 		if (!to_picture(dis, dp)) { vmaf_picture_unref(&rp); return false; }
@@ -267,13 +269,28 @@ class GpuScorer : public Scorer {
 	int w, h;
 
 public:
+	long long in_place = 0; // frames scored where the GPU decoded them
+	bool told_refused = false;
 	GpuScorer(std::unique_ptr<GpuVmaf> g, int w, int h) : gpu(std::move(g)), w(w), h(h) {}
-	bool add(const Picture& ref, const Picture& dis) override {
-		if (ref.width != w || ref.height != h || dis.width != w || dis.height != h) { fprintf(stderr, "vmaf: the frames are not %dx%d\n", w, h); return false; }
-		if (ref.fmt != dis.fmt || !ref.fmt.planar || ref.fmt.rgb) { fprintf(stderr, "vmaf: the frames are not in the same planar YUV format\n"); return false; }
+	bool add(const Picture& ref, const Picture& dis_in) override {
+		if (ref.width != w || ref.height != h || dis_in.width != w || dis_in.height != h) { fprintf(stderr, "vmaf: the frames are not %dx%d\n", w, h); return false; }
+		if (ref.fmt != dis_in.fmt || !ref.fmt.planar || ref.fmt.rgb) { fprintf(stderr, "vmaf: the frames are not in the same planar YUV format\n"); return false; }
 		const uint8_t* rd[3] = {ref.data[0], ref.data[1], ref.data[2]};
-		const uint8_t* dd[3] = {dis.data[0], dis.data[1], dis.data[2]};
 		const size_t rs[3] = {(size_t)ref.stride[0], (size_t)ref.stride[1], (size_t)ref.stride[2]};
+		if (dis_in.gpu) { // decoded on the GPU: scored where it is when it is on this device
+			bool refused = false;
+			if (gpu->add_gpu(rd, rs, dis_in.gpu.get(), refused)) {
+				static std::atomic<bool> told{false};
+				if (!told.exchange(true)) fprintf(stderr, "vmaf: frames decoded on the GPU are scored there, without reading them back\n");
+				in_place++;
+				return true;
+			}
+			if (!refused) return false;
+			if (!told_refused) { told_refused = true; fprintf(stderr, "vmaf: frames decoded on the GPU are read back to memory to be scored (another device, or a layout the scorer cannot read)\n"); }
+		}
+		Picture dis = dis_in;
+		if (!picture_to_memory(dis)) return false;
+		const uint8_t* dd[3] = {dis.data[0], dis.data[1], dis.data[2]};
 		const size_t ds[3] = {(size_t)dis.stride[0], (size_t)dis.stride[1], (size_t)dis.stride[2]};
 		return gpu->add(rd, rs, dd, ds);
 	}
@@ -417,6 +434,7 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 		d.color = decoded_color;
 		if (!convert_dis) show(d, m);
 		else {
+			if (!picture_to_memory(d)) { ok = false; break; } // libplacebo gets frames in memory (for now)
 			d.pts = m;
 			d.duration = 1; // libplacebo needs it to know when the last frame ends; the packets carry none
 			if (m == 0 && !up->open(d, enc.fps.inverse(), ref.width, ref.height, score_fmt, scale, ref.score_range)) { fprintf(stderr, "vmaf: cannot scale the encoded frames back to %dx%d\n", ref.width, ref.height); ok = false; break; }

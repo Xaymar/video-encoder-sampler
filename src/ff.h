@@ -53,5 +53,25 @@ void describe_difference(const Picture& a, const Picture& b, int frame);
 // device in that type's terms, as --hw-decode and the decode GPU (set_hw_decode(), set_hw_decode_gpu()) say. Empty: software only.
 struct HwChoice { std::string type, device; };
 std::vector<HwChoice> hw_decode_choices(AVCodecID id);
+// The decode GPU with its driver ("<name> (driver <version>)"), for keys of what was found out about it.
+std::string hw_decode_gpu_identity();
 // The hardware device of a type, made once per run and shared by every decoder; nullptr if it cannot be made. The caller gets a reference of its own.
 AVBufferRef* shared_hw_device(const std::string& type, const std::string& device);
+
+#ifndef VES_NO_VULKAN
+#include "vk_compute.h"
+// An FFmpeg Vulkan frame, decoded on Vulkan device `device` (FFmpeg's device that the scorer shares), described for reading it in place; false if it
+// cannot be (another device, a queue family the scorer does not use, a layout it does not know).
+bool vulkan_frame(const AVFrame* f, int device, VkDecodedFrame& out);
+// A Vulkan frame of FFmpeg's device `device` as a Picture that stays on the GPU (Picture::gpu, which holds the frame): its size, format (the planar
+// twin of the frame's own) and color, no samples. for_scorer: false unless the scorer can read it in place (vulkan_frame()); otherwise it can still be
+// converted in place (pl_convert.cpp) or read back (picture_to_memory()).
+bool vulkan_picture(const AVFrame* f, int device, bool for_scorer, Picture& out);
+// The FFmpeg frame behind a picture that is on the GPU, nullptr for one in memory.
+const AVFrame* gpu_avframe(const Picture& p);
+// FFmpeg's Vulkan device `index` (as Vk::devices() numbers them) if it is the GPU with these PCI ids, else nullptr; the caller gets a reference of its own.
+AVBufferRef* ffmpeg_vulkan_device(int index, uint32_t vendor_id, uint32_t device_id);
+// For tests without a GPU decoder: a copy of software frame `f` (yuv420p or yuv420p10) in a new Vulkan frame on FFmpeg's device `device`, interleaved
+// to NV12/P010 if `nv12`. `frames` is the frames context made on the first call (the caller unrefs it). nullptr if it cannot be made.
+AVFrame* vulkan_upload(const AVFrame* f, int device, bool nv12, AVBufferRef*& frames);
+#endif

@@ -1,13 +1,20 @@
 // Converter on libplacebo's own API (Vulkan). Reads frames in whatever sample layout the source has (planar, NV12/P010, packed RGB,
 // ...), scales them and converts them to planar YUV.
 #include "convert.h"
+#include "decode.h"
 #include "gpu.h"
+#ifndef VES_NO_VULKAN
+#include "ff.h"
+#include "vk_compute.h"
+#endif
 
 #include <chrono>
 #include <cmath>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -25,11 +32,33 @@ extern "C" {
 #include <libplacebo/utils/upload.h>
 #include <libplacebo/vulkan.h>
 }
+#ifndef VES_NO_VULKAN
+extern "C" {
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_vulkan.h>
+}
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+#define PL_LIBAV_IMPLEMENTATION 0 // the functions are compiled in pl_libav.c
+#include <libplacebo/utils/libav.h>
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+#endif
 
 namespace {
 
 void log_cb(void*, enum pl_log_level level, const char* msg) {
-	if (level <= PL_LOG_WARN) fprintf(stderr, "libplacebo: %s\n", msg);
+	static const int show = getenv("VES_PLACEBO_LOG") ? atoi(getenv("VES_PLACEBO_LOG")) : PL_LOG_WARN;
+	if ((int)level <= show) fprintf(stderr, "libplacebo: %s\n", msg);
 }
 
 // Plane sizes of a frame in a chroma layout.
@@ -100,12 +129,90 @@ struct SharedVulkan {
 		return r;
 	}
 	void give_back(const std::string& shape, pl_renderer r) { idle[shape].push_back(r); } // with `use` held
+	void* ffmpeg = nullptr; // the AVBufferRef of FFmpeg's Vulkan device when it is that one (import_ffmpeg())
 	~SharedVulkan() {
 		for (auto& [shape, list] : idle) for (auto& r : list) pl_renderer_destroy(&r);
 		pl_vulkan_destroy(&vk);
 		pl_log_destroy(&log);
+#ifndef VES_NO_VULKAN
+		AVBufferRef* ref = (AVBufferRef*)ffmpeg;
+		av_buffer_unref(&ref);
+#endif
 	}
 };
+
+std::atomic<bool> g_ffmpeg_vulkan{false};
+
+#ifndef VES_NO_VULKAN
+// The flags FFmpeg made its queues with (AVVulkanDeviceContext::queue_flags, newer FFmpeg; VK_KHR_internally_synchronized_queues sets one): 0 where
+// the field does not exist yet.
+template <typename T> auto ffmpeg_queue_flags(const T& h, int) -> decltype((uint32_t)h.queue_flags) { return (uint32_t)h.queue_flags; }
+template <typename T> uint32_t ffmpeg_queue_flags(const T&, long) { return 0; }
+// libplacebo takes the queues' flags (pl_vulkan_queue::flags) in newer versions; an older one can only use queues made without any.
+template <typename Q> auto set_queue_flags(Q& q, uint32_t f, int) -> decltype(q.flags = 0, true) { q.flags = (VkDeviceQueueCreateFlags)f; return true; }
+template <typename Q> bool set_queue_flags(Q&, uint32_t f, long) { return f == 0; }
+// lock_queue/unlock_queue are deprecated in favour of VK_KHR_internally_synchronized_queues (drivers that have it, NVIDIA's for one, make them no-ops); they still work.
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+// libplacebo on FFmpeg's Vulkan device of the GPU named `name`: the device its decoders (and the scorer) use, so that the frames they make there can be
+// converted where they are. Null if FFmpeg has no device for it; `s->ffmpeg` keeps the device.
+pl_vulkan import_ffmpeg(SharedVulkan* s, const std::string& name) {
+	if (name.empty()) return nullptr;
+	for (auto& d : vulkan_devices_fastest_first()) {
+		if (d.name != name) continue;
+		AVBufferRef* ref = ffmpeg_vulkan_device(d.index, d.vendor_id, d.device_id);
+		if (!ref) return nullptr;
+		AVHWDeviceContext* hw = (AVHWDeviceContext*)ref->data;
+		const AVVulkanDeviceContext* hv = (const AVVulkanDeviceContext*)hw->hwctx;
+		struct pl_vulkan_import_params ip = {};
+		ip.instance = hv->inst;
+		ip.get_proc_addr = hv->get_proc_addr;
+		ip.phys_device = hv->phys_dev;
+		ip.device = hv->act_dev;
+		ip.extensions = hv->enabled_dev_extensions;
+		ip.num_extensions = hv->nb_enabled_dev_extensions;
+		ip.features = &hv->device_features;
+		ip.lock_queue = [](void* c, uint32_t qf, uint32_t qi) { auto* h = (AVHWDeviceContext*)c; ((AVVulkanDeviceContext*)h->hwctx)->lock_queue(h, qf, qi); };
+		ip.unlock_queue = [](void* c, uint32_t qf, uint32_t qi) { auto* h = (AVHWDeviceContext*)c; ((AVVulkanDeviceContext*)h->hwctx)->unlock_queue(h, qf, qi); };
+		ip.queue_ctx = hw;
+		// The first family of each kind, a dedicated one for compute and transfers where there is one (as libplacebo picks for a device of its own).
+		ip.queue_graphics = ip.queue_compute = ip.queue_transfer = {VK_QUEUE_FAMILY_IGNORED, 0};
+		for (int i = 0; i < hv->nb_qf; i++) {
+			const AVVulkanDeviceQueueFamily& q = hv->qf[i];
+			if (q.num <= 0) continue;
+			const pl_vulkan_queue here = {(uint32_t)q.idx, (uint32_t)q.num};
+			if ((q.flags & VK_QUEUE_GRAPHICS_BIT) && !ip.queue_graphics.count) ip.queue_graphics = here;
+			if ((q.flags & VK_QUEUE_COMPUTE_BIT) && !(q.flags & VK_QUEUE_GRAPHICS_BIT) && !ip.queue_compute.count) ip.queue_compute = here;
+			if ((q.flags & VK_QUEUE_TRANSFER_BIT) && !(q.flags & (VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT)) && !ip.queue_transfer.count) ip.queue_transfer = here;
+		}
+		if (!ip.queue_graphics.count) { av_buffer_unref(&ref); return nullptr; }
+		if (!ip.queue_compute.count) ip.queue_compute = ip.queue_graphics;
+		if (!ip.queue_transfer.count) ip.queue_transfer = ip.queue_graphics;
+		const uint32_t qflags = ffmpeg_queue_flags(*hv, 0);
+		if (!set_queue_flags(ip.queue_graphics, qflags, 0) || !set_queue_flags(ip.queue_compute, qflags, 0) || !set_queue_flags(ip.queue_transfer, qflags, 0)) {
+			fprintf(stderr, "libplacebo: this libplacebo cannot use FFmpeg's Vulkan queues (made with flags 0x%x): converting on a device of its own, through memory\n", qflags);
+			av_buffer_unref(&ref);
+			return nullptr;
+		}
+		pl_vulkan vk = pl_vulkan_import(s->log, &ip);
+		if (!vk) { av_buffer_unref(&ref); return nullptr; }
+		s->ffmpeg = ref;
+		fprintf(stderr, "libplacebo: converting on FFmpeg's Vulkan device %d (%s), where its decoder's frames are\n", d.index, name.c_str());
+		return vk;
+	}
+	return nullptr;
+}
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+#endif
 
 std::shared_ptr<SharedVulkan> shared_vulkan(const std::string& device) {
 	static std::mutex m;
@@ -117,11 +224,14 @@ std::shared_ptr<SharedVulkan> shared_vulkan(const std::string& device) {
 	auto s = std::make_shared<SharedVulkan>();
 	struct pl_log_params lp = {};
 	lp.log_cb = log_cb;
-	lp.log_level = PL_LOG_WARN;
+	lp.log_level = getenv("VES_PLACEBO_LOG") ? (enum pl_log_level)atoi(getenv("VES_PLACEBO_LOG")) : PL_LOG_WARN; // VES_PLACEBO_LOG=<libplacebo log level>: 5 debug, 6 trace
 	s->log = pl_log_create(PL_API_VER, &lp);
+#ifndef VES_NO_VULKAN
+	if (g_ffmpeg_vulkan) s->vk = import_ffmpeg(s.get(), device);
+#endif
 	struct pl_vulkan_params vp = pl_vulkan_default_params;
 	if (!device.empty()) vp.device_name = device.c_str();
-	s->vk = pl_vulkan_create(s->log, &vp);
+	if (!s->vk) s->vk = pl_vulkan_create(s->log, &vp);
 	if (!s->vk) return nullptr;
 	slot = s;
 	return slot;
@@ -137,6 +247,7 @@ struct Planes { // the memory of an output picture
 constexpr int IN_FLIGHT = 3;
 struct Slot {
 	pl_buf up[3]{}, dl[3]{};
+	pl_buf gup[3]{}; // for a frame on the GPU: its planes copied there, cut to its size
 	bool pending = false;
 	int64_t pts = 0, duration = 1;
 	Color color;
@@ -210,7 +321,7 @@ public:
 			std::lock_guard lock(dev->use);
 			for (auto& t : in_tex) pl_tex_destroy(vk->gpu, &t);
 			for (auto& t : out_tex) pl_tex_destroy(vk->gpu, &t);
-			for (auto& s : slots) for (int i = 0; i < 3; i++) { pl_buf_destroy(vk->gpu, &s.up[i]); pl_buf_destroy(vk->gpu, &s.dl[i]); } // libplacebo frees them once the GPU is done
+			for (auto& s : slots) for (int i = 0; i < 3; i++) { pl_buf_destroy(vk->gpu, &s.up[i]); pl_buf_destroy(vk->gpu, &s.dl[i]); pl_buf_destroy(vk->gpu, &s.gup[i]); } // libplacebo frees them once the GPU is done
 		}
 	}
 
@@ -267,6 +378,57 @@ public:
 		return (size_t)(plane_rows(p, pn) - 1) * (size_t)p->stride[pn] + (size_t)w * (size_t)p->layout.step[pn];
 	}
 
+#ifndef VES_NO_VULKAN
+	// A frame decoded on this device: its planes are copied (on the GPU) into the slot's buffers, cut to the picture's size, so that from there on it
+	// takes the same path as planes from memory; `out` describes them (its own sample layout: NV12/P010 keep U and V together). The frame is
+	// released to libplacebo and taken back the way FFmpeg's own filters do (its semaphores, layouts and lock).
+	bool gpu_planes(const Picture& p, Slot& fs, Picture& out) {
+		const AVFrame* af = gpu_avframe(p);
+		const AVHWFramesContext* fc = (const AVHWFramesContext*)af->hw_frames_ctx->data;
+		const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(fc->sw_format);
+		out = p;
+		out.layout = layout_of(fc->sw_format);
+		if (!d || out.layout.planes == 0) { fprintf(stderr, "libplacebo: the GPU frame's format %s is not supported\n", av_get_pix_fmt_name(fc->sw_format)); return false; }
+		std::lock_guard lock(dev->use);
+		if (lost()) return false;
+		struct pl_frame src = {};
+		struct pl_avframe_params ap = {};
+		ap.frame = af;
+		if (!pl_map_avframe_ex(vk->gpu, &src, &ap)) { fprintf(stderr, "libplacebo: cannot map the GPU frame\n"); return false; }
+		bool ok = src.num_planes == out.layout.planes && (!src.acquire || src.acquire(vk->gpu, &src));
+		const bool acquired = ok;
+		for (int n = 0; ok && n < src.num_planes; n++) {
+			pl_tex t = src.planes[n].texture;
+			const bool chroma = n == 1 || n == 2;
+			const int w = chroma ? AV_CEIL_RSHIFT(p.width, d->log2_chroma_w) : p.width, h = chroma ? AV_CEIL_RSHIFT(p.height, d->log2_chroma_h) : p.height;
+			const size_t texel = t ? t->params.format->texel_size : 0;
+			if (!t || texel != (size_t)out.layout.step[n] || w > t->params.w || h > t->params.h) { ok = false; break; }
+			const size_t pitch = ((size_t)w * texel + 255) & ~(size_t)255;
+			if (!fs.gup[n] || fs.gup[n]->params.size < pitch * h) {
+				pl_buf_destroy(vk->gpu, &fs.gup[n]);
+				struct pl_buf_params bp = {};
+				bp.size = pitch * h;
+				bp.memory_type = PL_BUF_MEM_DEVICE;
+				if (!(fs.gup[n] = pl_buf_create(vk->gpu, &bp))) { ok = false; break; }
+			}
+			struct pl_tex_transfer_params tp = {};
+			tp.tex = t;
+			tp.rc = {0, 0, 0, w, h, 1};
+			tp.row_pitch = pitch;
+			tp.buf = fs.gup[n];
+			ok = pl_tex_download(vk->gpu, &tp);
+			out.stride[n] = (int)pitch;
+			out.data[n] = nullptr;
+		}
+		if (acquired && src.release) src.release(vk->gpu, &src);
+		pl_unmap_avframe(vk->gpu, &src);
+		if (!ok) { fprintf(stderr, "libplacebo: copying the GPU frame's planes failed\n"); lost(); }
+		static std::once_flag told;
+		if (ok) std::call_once(told, [&] { fprintf(stderr, "libplacebo: frames decoded on the GPU are converted there, without reading them back (%s)\n", av_get_pix_fmt_name(fc->sw_format)); });
+		return ok;
+	}
+#endif
+
 	bool push(const Picture* p) override {
 		if (!vk) return false;
 		if (!p) { // everything in flight comes out
@@ -274,13 +436,34 @@ public:
 			std::lock_guard lock(dev->use);
 			return !lost();
 		}
-		const Layout& L = p->layout;
-		if (L.planes == 0) return false;
+		Picture on_gpu; // a frame on the GPU, as its planes are once copied into the slot's GPU buffers
+		if (p->gpu) {
+#ifndef VES_NO_VULKAN
+			const AVFrame* af = gpu_avframe(*p);
+			const AVHWFramesContext* fc = af && af->hw_frames_ctx ? (const AVHWFramesContext*)af->hw_frames_ctx->data : nullptr;
+			const bool here = fc && af->format == AV_PIX_FMT_VULKAN && ((const AVVulkanDeviceContext*)fc->device_ctx->hwctx)->act_dev == vk->device;
+#else
+			const bool here = false;
+#endif
+			if (!here) { // on another device: through memory
+				Picture m = *p;
+				if (!picture_to_memory(m)) return false;
+				return push(&m);
+			}
+		}
 		if (slots[next_slot].pending && take_oldest(true) < 0) return false; // every slot is in flight: the oldest has to come out first
 		Slot& fs = slots[next_slot];
+#ifndef VES_NO_VULKAN
+		if (p->gpu) {
+			if (!gpu_planes(*p, fs, on_gpu)) return false;
+			p = &on_gpu;
+		}
+#endif
+		const Layout& L = p->layout;
+		if (L.planes == 0) return false;
 
 		// The planes go into the slot's mapped upload buffers without the lock (nothing on the GPU reads them: the slot's last frame is done).
-		bool via_buf = mapped_up;
+		bool via_buf = mapped_up && !p->gpu;
 		size_t need[3] = {};
 		for (int pn = 0; pn < L.planes && pn < 3 && via_buf; pn++) {
 			need[pn] = ((size_t)p->stride[pn] * (size_t)plane_rows(p, pn) + 3) & ~(size_t)3;
@@ -343,7 +526,8 @@ public:
 			if (!ok) { fprintf(stderr, "libplacebo: unsupported sample layout\n"); return false; }
 			d.pixel_stride = L.step[pn];
 			d.row_stride = p->stride[pn];
-			if (via_buf) { d.buf = fs.up[pn]; d.buf_offset = 0; }
+			if (p->gpu) { d.buf = fs.gup[pn]; d.buf_offset = 0; }
+			else if (via_buf) { d.buf = fs.up[pn]; d.buf_offset = 0; }
 			else d.pixels = p->data[pn];
 			d.swapped = L.big_endian;
 			if (!pl_upload_plane(vk->gpu, &image.planes[image.num_planes], &in_tex[image.num_planes], &d)) { fprintf(stderr, "libplacebo: upload failed\n"); lost(); return false; }
@@ -415,6 +599,12 @@ public:
 } // namespace
 
 std::unique_ptr<Converter> make_converter() { return std::make_unique<PlConverter>(); }
+
+void set_converter_ffmpeg_vulkan(bool on) {
+	const char* e = getenv("VES_SHARED_VULKAN");
+	g_ffmpeg_vulkan = on && !(e && atoi(e) == 0);
+}
+bool converter_shares_ffmpeg_vulkan() { return g_ffmpeg_vulkan; }
 
 bool converter_works(const ScaleOptions& opt, std::string& why) {
 	// 64x64 8-bit 4:4:4: luma rises from left to right, Cb from top to bottom, Cr is flat; it goes to 32x32 4:2:0, which takes the same path as a real frame (scale, subsample, download).

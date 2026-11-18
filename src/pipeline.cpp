@@ -17,6 +17,7 @@
 #include "formats.h"
 #include "gpu.h"
 #include "mux.h"
+#include "decode.h"
 #include "source.h"
 
 bool source_info(const std::string& path, SourceInfo& out) {
@@ -452,7 +453,10 @@ void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Pl
 		if (keep) {
 			frame.pts = kept++; // encoded frames are numbered consecutively, whatever the gaps in the source timing
 			frame.duration = 1; // one tick of the 1/enc.fps time base
-			if (!pl.rescale) hand_on(frame);
+			if (!pl.rescale) {
+				if (!picture_to_memory(frame)) { ok = false; break; } // decoded on the GPU, and the encoders take frames from memory
+				hand_on(frame);
+			}
 			else {
 				if (frame.pts == 0) ok = scaler->open(frame, e.fps.inverse(), e.w, e.h, e.pix, so, pl.range);
 				ok = ok && scaler->push(&frame);
@@ -497,7 +501,11 @@ void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, F
 		}
 		if (!out.read() || raw.next(reader, t, &rp) != 1) break; // the end, or every scorer of this format has ended
 		rp.step();
-		if (t.fmt == fmt) { out.push(t); continue; }
+		if (t.fmt == fmt) { // nothing to convert: the scorer takes the frame as it is, from memory
+			if (!picture_to_memory(t)) { ok = false; break; }
+			out.push(t);
+			continue;
+		}
 		t.duration = 1;
 		if (first) { ok = conv->open(t, si.framerate.inverse(), si.width, si.height, fmt, so); first = false; }
 		if (ok && !conv->push(&t)) ok = false;

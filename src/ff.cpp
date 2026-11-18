@@ -85,6 +85,10 @@ int decode_threads() {
 const AVCodec* hwaccel_decoder(AVCodecID id, const std::string& type) {
 	const AVHWDeviceType t = av_hwdevice_find_type_by_name(type.c_str());
 	if (t == AV_HWDEVICE_TYPE_NONE) return nullptr;
+	// On Vulkan only the codecs of the GPU's video engine. FFmpeg also decodes FFV1, ProRes and others "on Vulkan" with compute shaders, and those are
+	// not to be trusted: a second FFV1 decoder on a device that did other work after the first one was closed gives broken frames ("slices overread",
+	// FFmpeg 8.1 on lavapipe, with nothing but an FFmpeg upload in between), while the first decoder, the one that is checked against software, is fine.
+	if (t == AV_HWDEVICE_TYPE_VULKAN && id != AV_CODEC_ID_H264 && id != AV_CODEC_ID_HEVC && id != AV_CODEC_ID_AV1 && id != AV_CODEC_ID_VP9) return nullptr;
 	void* it = nullptr;
 	while (const AVCodec* c = av_codec_iterate(&it)) {
 		if (c->id != id || !av_codec_is_decoder(c) || (c->capabilities & AV_CODEC_CAP_HARDWARE)) continue;
