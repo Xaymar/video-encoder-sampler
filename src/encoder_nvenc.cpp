@@ -69,7 +69,8 @@ GUID codec_guid(const std::string& codec, bool& known) {
 
 const std::vector<std::pair<std::string, NV_ENC_TUNING_INFO>>& tunes() {
 	static const std::vector<std::pair<std::string, NV_ENC_TUNING_INFO>> t = {{"hq", NV_ENC_TUNING_INFO_HIGH_QUALITY}, {"ll", NV_ENC_TUNING_INFO_LOW_LATENCY},
-		{"ull", NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY}, {"lossless", NV_ENC_TUNING_INFO_LOSSLESS}};
+		{"ull", NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY}, {"lossless", NV_ENC_TUNING_INFO_LOSSLESS},
+		{"uhq", NV_ENC_TUNING_INFO_ULTRA_HIGH_QUALITY}}; // uhq: HEVC and AV1 only, Turing and newer (nvEncodeAPI.h, NV_ENC_TUNING_INFO)
 	return t;
 }
 
@@ -450,11 +451,16 @@ public:
 			}
 		}
 		if (take("temporal_aq", v)) rc.enableTemporalAQ = atoi(v.c_str()) != 0;
-		if (take("b_reference_mode", v)) {
-			NV_ENC_BFRAME_REF_MODE m = v == "each" ? NV_ENC_BFRAME_REF_MODE_EACH : v == "middle" ? NV_ENC_BFRAME_REF_MODE_MIDDLE : NV_ENC_BFRAME_REF_MODE_DISABLED;
+		if (take("b_reference_mode", v)) { // none | middle | each | hierarchical (NV_ENC_BFRAME_REF_MODE; hierarchical has requirements of its own, see config.all-options.jsonc)
+			NV_ENC_BFRAME_REF_MODE m;
+			if (v == "none") m = NV_ENC_BFRAME_REF_MODE_DISABLED;
+			else if (v == "middle") m = NV_ENC_BFRAME_REF_MODE_MIDDLE;
+			else if (v == "each") m = NV_ENC_BFRAME_REF_MODE_EACH;
+			else if (v == "hierarchical") m = NV_ENC_BFRAME_REF_MODE_HIERARCHICAL;
+			else { fprintf(stderr, "nvenc: bad b_reference_mode '%s' (none, middle, each or hierarchical)\n", v.c_str()); return false; }
 			if (codec == NV_ENC_CODEC_H264_GUID) cfg.encodeCodecConfig.h264Config.useBFramesAsRef = m;
 			else if (codec == NV_ENC_CODEC_HEVC_GUID) cfg.encodeCodecConfig.hevcConfig.useBFramesAsRef = m;
-			else { fprintf(stderr, "nvenc: b_ref_mode not supported for %s\n", p.codec.c_str()); return false; }
+			else cfg.encodeCodecConfig.av1Config.useBFramesAsRef = m;
 		}
 		if (take("max_ref_frames", v)) {
 			if (codec == NV_ENC_CODEC_H264_GUID) cfg.encodeCodecConfig.h264Config.maxNumRefFrames = atoi(v.c_str());
@@ -659,9 +665,11 @@ public:
 		add("lookahead_frames", std::to_string(rc.enableLookahead ? (int)rc.lookaheadDepth : 0));
 		add("spatial_aq", !rc.enableAQ ? "0" : rc.aqStrength == 0 ? "auto" : std::to_string((int)rc.aqStrength));
 		add("temporal_aq", std::to_string((int)rc.enableTemporalAQ));
-		if (h264 || hevc) {
-			const int m = h264 ? (int)cfg.encodeCodecConfig.h264Config.useBFramesAsRef : (int)cfg.encodeCodecConfig.hevcConfig.useBFramesAsRef;
-			add("b_reference_mode", m == NV_ENC_BFRAME_REF_MODE_EACH ? "each" : m == NV_ENC_BFRAME_REF_MODE_MIDDLE ? "middle" : m == NV_ENC_BFRAME_REF_MODE_DISABLED ? "none" : std::to_string(m));
+		{
+			const int m = h264 ? (int)cfg.encodeCodecConfig.h264Config.useBFramesAsRef : hevc ? (int)cfg.encodeCodecConfig.hevcConfig.useBFramesAsRef
+			                   : (int)cfg.encodeCodecConfig.av1Config.useBFramesAsRef;
+			add("b_reference_mode", m == NV_ENC_BFRAME_REF_MODE_EACH ? "each" : m == NV_ENC_BFRAME_REF_MODE_MIDDLE ? "middle" : m == NV_ENC_BFRAME_REF_MODE_HIERARCHICAL ? "hierarchical"
+			                        : m == NV_ENC_BFRAME_REF_MODE_DISABLED ? "none" : std::to_string(m));
 		}
 		add("max_ref_frames", std::to_string(h264 ? (int)cfg.encodeCodecConfig.h264Config.maxNumRefFrames : hevc ? (int)cfg.encodeCodecConfig.hevcConfig.maxNumRefFramesInDPB
 		                                           : (int)cfg.encodeCodecConfig.av1Config.maxNumRefFramesInDPB));
@@ -812,7 +820,7 @@ OptionList nvenc_options(const std::string& codec) {
 	};
 	for (auto& [name, t] : tunes()) out[1].values += (out[1].values.empty() ? "" : " | ") + name;
 	for (auto& [name, guid] : profiles(codec)) out[2].values += (out[2].values.empty() ? "" : " | ") + name;
-	if (codec != "av1") out.push_back({"b_reference_mode", "none | middle | each", "B-frames as references"});
+	out.push_back({"b_reference_mode", "none | middle | each | hierarchical", "B-frames as references"});
 	out.push_back({"max_ref_frames", "1..", "most reference frames"});
 	out.push_back({"num_ltr_frames", "0..", "long-term references: 0 off, above 0 on with that many frames"});
 	bool known;

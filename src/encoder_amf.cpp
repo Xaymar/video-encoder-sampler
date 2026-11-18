@@ -31,6 +31,7 @@
 #include "gpu.h"
 
 #include <components/PreProcessing.h>
+#include <algorithm>
 #include <components/VideoEncoderAV1.h>
 #include <components/VideoEncoderHEVC.h>
 #include <components/VideoEncoderVCE.h>
@@ -229,7 +230,8 @@ class Amf : public Encoder {
 			std::string native, bare;
 			for (const wchar_t* w = pi->name; *w; w++) native += (char)*w;
 			bare = native;
-			if (native.find("HalfPixel") != std::string::npos || native.find("QuarterPixel") != std::string::npos || native == "AdaptiveMiniGOP") continue; // GCN4 and older only, which AMD no longer supports
+			if (native.find("HalfPixel") != std::string::npos || native.find("QuarterPixel") != std::string::npos) continue; // GCN4 and older only, which AMD no longer supports
+			// (AdaptiveMiniGOP is current: AMF_Video_Encode_API.md lists it, adaptive B-frames that need pre-analysis with a lookahead of at least 1)
 			// Rate control settings are scoped per temporal layer and quality layer ("TL0.QL0.EnforceHRD"); ves uses the base layer only.
 			if (native.compare(0, 8, "TL0.QL0.") == 0) bare = native.substr(8);
 			else if (native.compare(0, 2, "TL") == 0 && native.find(".QL") != std::string::npos) continue;
@@ -240,7 +242,7 @@ class Amf : public Encoder {
 			std::string name = snake_case(bare);
 			if (name == "quality_preset") name = "preset"; // AMF's QualityPreset, HevcQualityPreset and Av1QualityPreset
 			if (name == "profile_level") name = "level";  // ProfileLevel and HevcProfileLevel; the AV1 one is Av1Level already
-			if (name == "rate_control_preanalysis_enable" || name == "rate_control_pre_analysis_enable") name = "pre_encode"; // pre-encode assisted rate control
+			if (name == "rate_control_preanalysis_enable" || name == "rate_control_pre_analysis_enable" || name == "rate_control_pre_encode") name = "pre_encode"; // pre-encode assisted rate control (AV1: Av1RateControlPreEncode)
 			names.emplace(name, native);
 		}
 	}
@@ -328,11 +330,13 @@ private:
 		if (!on) return true;
 		AMF_RESULT r = factory->CreateComponent(ctx, AMFPreProcessing, &filter_pp);
 		if (r != AMF_OK) return fail(r, "CreateComponent(PreProcessing)");
-		filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_ENABLE, true);
-		filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_STRENGTH, strength);
-		filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_SENSITIVITY, sensitivity);
-		filter_pp->SetProperty(AMF_PP_TARGET_BITRATE, (amf_int64)p.bitrate);
-		filter_pp->SetProperty(AMF_PP_FRAME_RATE, AMFConstructRate(p.framerate.num, p.framerate.den));
+		// --check found the strength and sensitivity changing nothing, so a property the component refuses is reported.
+		const auto refused = [](AMF_RESULT sr, const char* name) { if (sr != AMF_OK) fprintf(stderr, "amf: the pre-encode filter refused %s (result %d)\n", name, (int)sr); };
+		refused(filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_ENABLE, true), "PPAdaptiveFilterEnable");
+		refused(filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_STRENGTH, strength), "PPAdaptiveFilterStrength");
+		refused(filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_SENSITIVITY, sensitivity), "PPAdaptiveFilterSensitivity");
+		refused(filter_pp->SetProperty(AMF_PP_TARGET_BITRATE, (amf_int64)p.bitrate), "PPTargetBitrate");
+		refused(filter_pp->SetProperty(AMF_PP_FRAME_RATE, AMFConstructRate(p.framerate.num, p.framerate.den)), "PPFrameRate");
 		if ((r = filter_pp->Init(depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init(PreProcessing)");
 		return true;
 	}
@@ -498,7 +502,26 @@ public:
 		names_all = names;
 		for (auto& [k, v] : native_opts) if (k != "enable_pre_analysis" && !apply(k, v)) return false;
 
-		if ((r = enc->Init(depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init");
+		// What this encoder is about to run with, before the driver gets it: when an option takes the whole system down (static scene detection
+		// bluescreened the 780M), this is the last line in the log and names the culprit.
+		{
+			std::string line;
+			for (auto& [k, v] : native_opts) line += " " + k + "=" + v;
+			for (auto& [k, v] : filter_opts) line += " " + k + "=" + v;
+			fprintf(stderr, "amf: opening %s %dx%d with%s\n", p.codec.c_str(), w, h, line.empty() ? " defaults" : line.c_str());
+		}
+		const auto surface = depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12;
+		bool inited = false;
+		if (p.codec == "av1" && std::none_of(native_opts.begin(), native_opts.end(), [](const auto& kv) { return kv.first == "alignment_mode"; })) {
+			// AV1's alignment mode defaults to 64x16 only [H Av1AlignmentMode], which RDNA 3 refuses for 1080 lines with AMF_NOT_SUPPORTED. Try no
+			// restrictions first, then 8x2, then 1080p coded as 1082 lines (RDNA 3's own workaround), keeping the first one Init accepts.
+			for (amf_int64 mode : {(amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_NO_RESTRICTIONS, (amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_8X2_ONLY,
+					(amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_64X16_1080P_CODED_1082, (amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_64X16_ONLY}) {
+				if (enc->SetProperty(AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE, mode) != AMF_OK) break;   // an older runtime without the property
+				if ((r = enc->Init(surface, w, h)) == AMF_OK) { inited = true; break; }   // a failed Init leaves nothing to terminate
+			}
+			if (!inited && (r = enc->Init(surface, w, h)) != AMF_OK) return fail(r, "Init");
+		} else if ((r = enc->Init(surface, w, h)) != AMF_OK) return fail(r, "Init");
 		read_caps();
 		if (!filter_opts.empty() && !open_filter(filter_opts, p)) return false;
 		amf::AMFVariant bp;

@@ -129,7 +129,7 @@
 	//   ""    leaves the option at the encoder's default (it is not passed on), so ["", "film"] tests no tune and film; for x264 and x265 that is how to run without a tune
 	//   []    ignores the option (as if it were not there), handy for switching one off without deleting it
 	// Option names are snake_case. Some are common: the same name and meaning for every encoder that can do them (an encoder that cannot fails the
-	// run with a message): max_b_frames, lookahead_frames, max_ref_frames, b_reference_mode (none | middle | each) and rate_control (cbr | vbr).
+	// run with a message): max_b_frames, lookahead_frames, max_ref_frames, b_reference_mode (none | middle | each) and rate_control (cbr | vbr; AMF also lcvbr | qvbr | hqvbr | hqcbr).
 	// The rest are the encoder's own, written snake_case: x264, x265 and SVT-AV1 command line names (aq-mode is aq_mode), NVENC's structure fields
 	// (enable_ltr), AMF's property names without the codec prefix (QualityPreset is preset), QuickSync's field names (TargetUsage is preset, CodecProfile is profile).
 	// An unknown name fails the run. config.all-options.jsonc lists them all.

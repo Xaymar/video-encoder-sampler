@@ -1,0 +1,176 @@
+// --check slice of nvenc-h264.jsonc: AQ, motion vectors, transform, deblocking, chroma offsets
+// Run: ves --config configs/check/nvenc-h264-picture.jsonc --check (add -i <file>). The other options are fixed; the rules still apply.
+// NVENC H.264: every option ves can set that changes the picture at a fixed bitrate, with the values NVENC accepts, and rules that leave out the
+// combinations NVENC refuses or that encode the same stream as another combination. Run it as is (ves --config configs/nvenc-h264.jsonc) or copy
+// the entry into your own config and cut the value lists down.
+//
+// Sources, cited as [H] and [G] below:
+//   [H] nvEncodeAPI.h of Video Codec SDK 13.1 (third-party/nv-codec-headers), the comment on each field
+//   [G] NVENC Video Encoder API Programming Guide, SDK 13.0, https://docs.nvidia.com/video-technologies/video-codec-sdk/13.0/nvenc-video-encoder-api-prog-guide/
+//   [T] tested on NVIDIA hardware with ves (crashes or refusals seen in sweeps)
+// What a GPU lacks (10-bit or 4:4:4 encoding, B-frames, lookahead, temporal AQ, B-frames as references, temporal filter, weighted prediction, ...) is
+// not repeated here: ves asks the GPU's capabilities and ignores those runs (caps_refusal in main.cpp).
+//
+// The rate control is CBR at the scenario's bitrate. Options that only work with another rate control are listed commented out, with the reason.
+// Unlisted options run with the preset's value; a rule that reads one uses that value (ves reads the preset's defaults from the GPU).
+{
+	"output": "output",
+	"scenarios": [
+		{ "name": "sample", "bitrates": [6000], "resolutions": ["1920x1080"], "framerates": ["<=1000"], "chroma": [420], "range": ["limited"] },
+	],
+	"kfintervals": [2.0],
+	"vmaf": { "model": ["path=models/vmaf_v1.0.16_1d5h_2160.json", "path=models/vmaf_v1.0.16_3d0h.json", "path=models/vmaf_v1.0.16_5d0h.json", "path=models/vmaf_v1.0.16_3d0h_2160.json"], "over_penalty": 0.025 },
+	"settings": { "cache": "cache", "prune": true },
+
+	"encoders": [
+		{
+			"enabled": true,
+			"encoder": "nvenc",
+			"codec": "h264",
+			"options": {
+				"preset": ["p1", "p7"],   // the ends of ["p1", "p2", "p3", "p4", "p5", "p6", "p7"] for this slice
+				"tune": ["hq"],   // the slice sets everything tune would change, so ll and ull only repeat hq [T 2026-11-18]
+				"profile": [""],   // fixed for this slice
+				// "level": ["auto"],   // a level only caps the DPB and the bitrate; auto picks one that fits
+				// "rate_control": ["cbr"],   // the default; "vbr" at the same average and peak bitrate is CBR with a looser buffer
+				"max_b_frames": [0],   // fixed for this slice
+				"lookahead_frames": [0],   // fixed for this slice
+				"lookahead_level": [0],   // fixed for this slice
+				"disable_iadapt": [0],   // fixed for this slice
+				"disable_badapt": [0],   // fixed for this slice
+				"multi_pass": [0],   // fixed for this slice
+				"spatial_aq": [0, "auto"],   // 0 off, auto: the driver picks the strength per frame; a fixed strength 1..15 [H aqStrength] is always worse (user's tests)
+				"temporal_aq": [0, 1],
+				"strict_gop_target": [0],   // fixed for this slice
+				"zero_reorder_delay": [0],   // fixed for this slice
+				"enable_non_ref_p": [0],   // fixed for this slice
+				"enable_weighted_prediction": [0],   // fixed for this slice
+				"low_delay_key_frame_scale": [""],   // changed nothing in the first check [T 2026-11-17]
+				"mv_precision": [0, 1, 2],   // 3 matched 0 [T 2026-11-17]
+				"b_reference_mode": ["none"],   // fixed for this slice
+				// "hierarchical_b_frames": [0, 1],   // H.264's older flag for what b_reference_mode "hierarchical" does (same requirements [T])
+				"hierarchical_p_frames": [0],   // fixed for this slice
+				"bdirect_mode": [0],   // fixed for this slice
+				"max_ref_frames": [""],   // fixed for this slice
+				"max_ref_frames_l0": [0],   // fixed for this slice
+				"max_ref_frames_l1": [0],   // fixed for this slice
+				"num_ltr_frames": [0],   // fixed for this slice
+				"tf_level": [0],   // fixed for this slice
+				// "entropy_coding_mode": [0, 1, 2],   // 0 auto, 1 CABAC, 2 CAVLC: every decoder has CABAC and it is clearly better
+				"adaptive_transform_mode": [0, 1],   // 2 matched 0 [T 2026-11-17]
+				"disable_deblocking_filter_idc": [0, 1, 2],   // [H] range 0..2, as in H.264 7.4.3
+				"cb_qp_index_offset": [-6, 3],   // the ends of [-6, -3, 0, 3] for this slice
+				"cr_qp_index_offset": [-6, 3],   // the ends of [-6, -3, 0, 3] for this slice
+				"enable_uni_directional_b": [0],   // fixed for this slice
+				// "enable_filler_data_insertion": [0, 1],   // pads CBR up to the bitrate: the pictures stay the same [H]
+				// "vbv_buffer_size": [...], "vbv_initial_delay": [...],   // in bits, so the same value means a different buffer at every bitrate
+				// "min_qp": [...], "max_qp": [...], "initial_rc_qp": [...],   // QP limits only take quality away from CBR's own choice
+				// "target_quality": [...],   // constant quality: VBR only, and only useful with a peak bitrate and no target [G 3.8.3] (user: rarely helps)
+				// "const_qp": [...],   // constant QP rate control only
+			},
+			"rules": [
+				// High is 8-bit 4:2:0: it runs for those pictures, and the encoder's own pick ("") for 10-bit and 4:4:4.
+				{
+					"if": { "op": "or", "args": [
+						{ "op": "==", "left": { "option": "bitdepth" }, "right": 10 },
+						{ "op": "==", "left": { "option": "chroma" }, "right": 444 },
+					] },
+					"require": { "op": "not", "value": { "set": "profile" } },
+					"else_require": { "set": "profile" },
+				},
+
+				// Lookahead: its level needs it on (the library aborts otherwise [T]); adaptive I/B decisions only exist with it [H disableIadapt][G 8.2].
+				// (Hierarchical B-frames want both flags set even then, see below.)
+				{
+					"if": { "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
+					"require": { "op": "==", "left": { "option": "lookahead_level" }, "right": 0 },
+				},
+				{
+					"if": { "op": "and", "args": [
+						{ "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
+						{ "op": "!=", "left": { "option": "b_reference_mode" }, "right": "hierarchical" },
+					] },
+					"require": [
+						{ "op": "==", "left": { "option": "disable_iadapt" }, "right": 0 },
+						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 0 },
+					],
+				},
+
+				// Without B-frames: non-reference P-frames, weighted prediction [H][G 8.7], long-term references [H][G 8.8], zero reorder delay and
+				// uni-directional B (which "is ignored when regular B frames are used" [H]). With B-frames: adaptive B, B-frames as references,
+				// hierarchical B, direct mode and the backward reference list.
+				{
+					"if": { "op": ">", "left": { "option": "max_b_frames" }, "right": 0 },
+					"require": [
+						{ "op": "==", "left": { "option": "enable_non_ref_p" }, "right": 0 },
+						{ "op": "==", "left": { "option": "enable_weighted_prediction" }, "right": 0 },
+						{ "op": "==", "left": { "option": "num_ltr_frames" }, "right": 0 },
+						{ "op": "==", "left": { "option": "zero_reorder_delay" }, "right": 0 },
+						{ "op": "==", "left": { "option": "enable_uni_directional_b" }, "right": 0 },
+					],
+					"else_require": [
+						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 0 },
+						{ "op": "==", "left": { "option": "b_reference_mode" }, "right": "none" },
+						{ "op": "==", "left": { "option": "bdirect_mode" }, "right": 0 },
+						{ "op": "==", "left": { "option": "max_ref_frames_l1" }, "right": 0 },
+					],
+				},
+				// Uni-directional B is for the low-latency tunes [H enableUniDirectionalB].
+				{
+					"if": { "op": "==", "left": { "option": "enable_uni_directional_b" }, "right": 1 },
+					"require": { "op": "in", "left": { "option": "tune" }, "right": ["ll", "ull"] },
+				},
+				// The I/P bit ratio only applies to CBR with a single-frame VBV, which the low-latency tunes use [H lowDelayKeyFrameScale].
+				{
+					"if": { "set": "low_delay_key_frame_scale" },
+					"require": { "op": "in", "left": { "option": "tune" }, "right": ["ll", "ull"] },
+				},
+
+				// B-frames as references: "each" needs 2 or more B-frames in a row [T]; "hierarchical" [H NV_ENC_BFRAME_REF_MODE_HIERARCHICAL] needs
+				// B-frames + 1 a power of 2 up to 32, lookahead off or at level 0, one pass, adaptive I and B off.
+				{
+					"if": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "each" },
+					"require": { "op": ">", "left": { "option": "max_b_frames" }, "right": 1 },
+				},
+				{
+					"if": { "op": "==", "left": { "option": "b_reference_mode" }, "right": "hierarchical" },
+					"require": [
+						{ "op": "in", "left": { "op": "+", "left": { "option": "max_b_frames" }, "right": 1 }, "right": [2, 4, 8, 16, 32] },
+						{ "op": "or", "args": [
+							{ "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
+							{ "op": "==", "left": { "option": "lookahead_level" }, "right": 0 },
+						] },
+						{ "op": "==", "left": { "option": "multi_pass" }, "right": 0 },
+						{ "op": "==", "left": { "option": "disable_iadapt" }, "right": 1 },
+						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 1 },
+					],
+				},
+				// The DPB holds at least one frame more than there are B-frames in a row, and 3 with B-frames as references [T]; a reference list
+				// cannot hold more frames than the DPB keeps.
+				{
+					"if": { "set": "max_ref_frames" },
+					"require": [
+						{ "op": ">=", "left": { "option": "max_ref_frames" }, "right": { "op": "+", "left": { "option": "max_b_frames" }, "right": 1 } },
+						{
+							"if": { "op": "!=", "left": { "option": "b_reference_mode" }, "right": "none" },
+							"require": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": 3 },
+						},
+						{ "op": "<=", "left": { "option": "max_ref_frames_l0" }, "right": { "option": "max_ref_frames" } },
+						{ "op": "<=", "left": { "option": "max_ref_frames_l1" }, "right": { "option": "max_ref_frames" } },
+					],
+				},
+
+				// Temporal filter: frameIntervalP >= 5 (4 B-frames in a row), not with zero reorder delay [H tfLevel], not with hierarchical P-frames [T].
+				{
+					"if": { "op": "==", "left": { "option": "tf_level" }, "right": 4 },
+					"require": [
+						{ "op": ">=", "left": { "option": "max_b_frames" }, "right": 4 },
+						{ "op": "==", "left": { "option": "zero_reorder_delay" }, "right": 0 },
+						{ "op": "==", "left": { "option": "hierarchical_p_frames" }, "right": 0 },   // initialize fails with status 8 (invalid parameter) [T 2026-11-17, RTX 4080 SUPER]
+					],
+				},
+			],
+			"parallel": 6,
+		},
+	],
+}

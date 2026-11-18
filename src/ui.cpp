@@ -135,6 +135,13 @@ void to_log_file(const std::string& line) {
 	fputs(line.c_str(), log_file);
 	fputc('\n', log_file);
 	fflush(log_file);
+	// Onto the disk, not only into the system's cache: a driver crash that takes Windows down (a bluescreen) loses what is still cached, so the
+	// log would end before the line that tells what crashed. The log gets a few lines a second at most, so this costs nothing that shows.
+#ifdef _WIN32
+	_commit(_fileno(log_file));
+#else
+	fsync(fileno(log_file));
+#endif
 }
 
 std::string span(double sec) {
@@ -617,6 +624,8 @@ void log_plain(const std::string& line) {
 	std::lock_guard lock(m);
 	if (!is_live) emit(line + "\n");
 }
+
+void log_file_only(const std::string& line) { to_log_file(line); }
 
 bool open_log(const std::string& path, const std::string& first_line, std::string& err) {
 	FILE* f = fopen(path.c_str(), "ab"); // appended to: a restart keeps what came before

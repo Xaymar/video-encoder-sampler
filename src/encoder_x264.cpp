@@ -6,6 +6,7 @@
 #include "options.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -91,7 +92,31 @@ public:
 		if (!h || x264_encoder_headers(h, &nal, &n) < 0) return {};
 		for (int i = 0; i < n; i++) if (nal[i].i_type == NAL_SEI) {
 			auto s = settings_from_sei(nal[i].p_payload, (size_t)nal[i].i_payload);
-			if (!s.empty()) return s;
+			if (s.empty()) continue;
+			// The SEI spells some settings differently from the options that set them: they are added under the option's name, in its values, so
+			// that a listed value equal to the preset's is known as the default (and not run next to "").
+			std::vector<std::pair<std::string, std::string>> add;
+			auto pick = [](const std::string& v, std::initializer_list<const char*> names) -> std::string {
+				const int i = atoi(v.c_str());
+				return i >= 0 && (size_t)i < names.size() ? names.begin()[i] : v;
+			};
+			for (auto& [k, v] : s) {
+				if (k == "me_range") add.push_back({"merange", v});
+				else if (k == "mixed_ref") add.push_back({"mixed_refs", v});
+				else if (k == "decimate") add.push_back({"dct_decimate", v});
+				else if (k == "b_pyramid") v = pick(v, {"none", "strict", "normal"});
+				else if (k == "direct") v = pick(v, {"none", "spatial", "temporal", "auto"});
+				else if (k == "deblock") { // enabled:alpha:beta
+					const size_t c = v.find(':');
+					if (c != std::string::npos && v.compare(0, c, "1") == 0) add.push_back({"deblock", v.substr(c + 1)});
+				} else if (k == "aq") { // mode:strength
+					const size_t c = v.find(':');
+					add.push_back({"aq_mode", v.substr(0, c)});
+					if (c != std::string::npos) add.push_back({"aq_strength", v.substr(c + 1)});
+				}
+			}
+			s.insert(s.end(), add.begin(), add.end());
+			return s;
 		}
 		return {};
 	}

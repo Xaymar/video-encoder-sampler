@@ -1,0 +1,81 @@
+// QuickSync AV1: the options that change the picture at a fixed bitrate, with the values oneVPL accepts, and rules that leave out the combinations
+// the runtime ignores (the same stream twice). Run it as is (ves --config configs/qsv-av1.jsonc) or copy the entry into your own config.
+//
+// Sources, cited as [S] below: oneVPL api/vpl/mfxstructures.h (https://github.com/intel/libvpl), the field comments ("valid only ...", "ignored if ...").
+// Option names are the oneVPL field names of mfxInfoMFX, mfxExtCodingOption2 and mfxExtCodingOption3 in snake_case (TargetUsage is preset); ves lists
+// them with `ves --list-options qsv/av1`. On/off fields take "on" and "off". ves opens the encoder with CBR, MaxKbps = TargetKbps.
+// The runtime adjusts settings it cannot use instead of failing (ves prints "the runtime adjusted some parameters"), so a value this GPU lacks may run as
+// another one. rate_control "vbr" is VBR capped at the target (ves sets MaxKbps to it); the LA rate controls (la, la_hrd, la_icq) need the shader
+// encoder that Arc and later GPUs lack, so they are left out.
+// Every list is cut to a spread of its range: ves numbers the combinations with one 64-bit number, so all value lists multiplied (rules aside) must stay
+// below 9.2e18. Pruning tries the middle values only where the ends differ, so the ends of each range matter most.
+{
+	"output": "output",
+	"scenarios": [
+		{ "name": "sample", "bitrates": [6000], "resolutions": ["1920x1080"], "framerates": [60] },
+	],
+	"kfintervals": [2.0],
+	"vmaf": { "model": ["path=models/vmaf_v1.0.16_1d5h_2160.json", "path=models/vmaf_v1.0.16_3d0h.json", "path=models/vmaf_v1.0.16_5d0h.json", "path=models/vmaf_v1.0.16_3d0h_2160.json"], "over_penalty": 0.025 },
+	"settings": { "cache": "cache", "prune": true },
+
+	"encoders": [
+		{
+			"enabled": true,
+			"encoder": "qsv",
+			"codec": "av1",
+			"options": {
+				"preset": [1, 2, 4, 6, 7],   // TargetUsage: 1 best quality .. 7 best speed
+				"rate_control": ["", "vbr"],   // "": CBR
+				"low_delay_brc": ["", "on"],   // VBR only: keeps every frame near the average size [S]
+				"max_b_frames": [0, 1, 3, 7],   // GopRefDist - 1
+				"b_reference_mode": ["", "none", "middle"],   // BRefType: 1 off, 2 pyramid
+				"max_ref_frames": ["", 1, 2, 4, 8],   // NumRefFrame (DPB size for AVC and HEVC) [S]
+				"lookahead_frames": ["", 10, 40, 100],   // LookAheadDepth, 10..100 [S]; the low power encoder's lookahead on newer GPUs
+				"look_ahead_ds": ["", 1, 2, 3],   // lookahead down sampling: 1 off, 2 2x, 3 4x [S]
+				"gop_opt_flag": ["", 1, 2],   // 1 closed GOP, 2 strict (no adaptive I/B) [S]
+				"adaptive_i": ["", "on", "off"],   // may turn P and B into I; ignored with a strict GOP [S]
+				"adaptive_b": ["", "on", "off"],   // may turn B into P; ignored with a strict GOP [S]
+				"adaptive_ref": ["", "on", "off"],
+				"adaptive_ltr": ["", "on", "off"],
+				"adaptive_cqm": ["", "on", "off"],   // adaptive quantization matrices
+				"mbbrc": ["", "on", "off"],   // macroblock level rate control: "may have negative impact on ... objective visual quality metric" [S]
+				"ext_brc": ["", "on"],   // the runtime's software rate control
+				"scenario_info": ["", 3, 7],   // hint: 3 archive, 7 game streaming
+				// AV1 runs on the low power encoder only (ves sets it); its weighted prediction, GPB and trellis fields are AVC/HEVC ones.
+			},
+			"rules": [
+				// Without B-frames there is nothing to adapt or reference among B-frames; pyramids need 2 or more [S].
+				{
+					"if": { "op": "==", "left": { "option": "max_b_frames" }, "right": 0 },
+					"require": { "op": "not", "value": { "set": "adaptive_b" } },
+				},
+				{
+					"if": { "op": "<", "left": { "option": "max_b_frames" }, "right": 2 },
+					"require": { "op": "not", "value": { "set": "b_reference_mode" } },
+				},
+				// AdaptiveI and AdaptiveB are "ignored if GopOptFlag ... is equal to MFX_GOP_STRICT" [S].
+				{
+					"if": { "op": "==", "left": { "option": "gop_opt_flag" }, "right": 2 },
+					"require": [
+						{ "op": "not", "value": { "set": "adaptive_i" } },
+						{ "op": "not", "value": { "set": "adaptive_b" } },
+					],
+				},
+				// Lookahead down sampling only applies with lookahead [S]; LowDelayBRC only with VBR [S].
+				{
+					"if": { "op": "not", "value": { "set": "lookahead_frames" } },
+					"require": { "op": "not", "value": { "set": "look_ahead_ds" } },
+				},
+				{
+					"if": { "op": "not", "value": { "set": "rate_control" } },
+					"require": { "op": "not", "value": { "set": "low_delay_brc" } },
+				},
+				// The DPB holds at least the two references of a B-frame.
+				{
+					"if": { "op": "and", "args": [{ "set": "max_ref_frames" }, { "op": ">", "left": { "option": "max_b_frames" }, "right": 0 }] },
+					"require": { "op": ">=", "left": { "option": "max_ref_frames" }, "right": 2 },
+				},
+			],
+		},
+	],
+}

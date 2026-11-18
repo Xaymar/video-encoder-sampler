@@ -1,0 +1,145 @@
+// x264: the options that change the picture at a fixed bitrate, with the values x264 accepts, and rules that leave out the combinations x264
+// silently changes into another one (so they would encode the same stream twice). x264 almost never refuses a combination: it clamps and
+// overrides instead, in validate_parameters() and x264_param_apply_profile(). Run it as is (ves --config configs/x264.jsonc) or copy the entry.
+//
+// Sources, cited as [V], [P] and [X] below (x264 master, https://code.videolan.org/videolan/x264):
+//   [V] encoder/encoder.c, validate_parameters()
+//   [P] common/base.c, x264_param_apply_profile(), which ves calls after the options
+//   [X] x264.c, the --fullhelp text
+// Option names are x264's command line names with _ for - (ves passes them to x264_param_parse), so any other x264 option works too.
+// ves runs x264 as single pass ABR at the scenario's bitrate; the explicit options here are applied after the preset and tune, so they win over both.
+// Every list is cut to a spread of its range: ves numbers the combinations with one 64-bit number, so all value lists multiplied (rules aside) must stay
+// below 9.2e18. Pruning tries the middle values only where the ends differ, so the ends of each range matter most.
+{
+	"output": "output",
+	"scenarios": [
+		{ "name": "sample", "bitrates": [6000], "resolutions": ["1920x1080"], "framerates": [60] },
+	],
+	"kfintervals": [2.0],
+	"vmaf": { "model": ["path=models/vmaf_v1.0.16_1d5h_2160.json", "path=models/vmaf_v1.0.16_3d0h.json", "path=models/vmaf_v1.0.16_5d0h.json", "path=models/vmaf_v1.0.16_3d0h_2160.json"], "over_penalty": 0.025 },
+	"settings": { "cache": "cache", "prune": true },
+
+	"encoders": [
+		{
+			"enabled": true,
+			"encoder": "x264",
+			"options": {
+				"preset": ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow", "placebo"],
+				"tune": ["", "film", "animation", "grain", "stillimage"],   // psnr and ssim only game those metrics; fastdecode and zerolatency trade quality for speed and delay
+				"profile": ["", "high"],   // high for 8-bit 4:2:0 (the older profiles are no use any more); "": high10 / high422 / high444 for the others
+				"max_b_frames": [0, 1, 2, 3, 5, 8],   // bframes, 0..16
+				"b_adapt": ["", 0, 1, 2],   // 0 fixed, 1 fast, 2 trellis
+				"b_pyramid": ["", "none", "strict", "normal"],   // B-frames as references (the common b_reference_mode has none and middle = normal)
+				"weightb": ["", 0, 1],
+				"direct": ["", "none", "spatial", "temporal", "auto"],
+				// "open_gop": [...],   // needs a key frame range (min and max); ves sets a fixed key frame interval, which wants closed GOPs
+				"max_ref_frames": [1, 2, 4, 8, 16],   // ref, 1..16
+				"mixed_refs": ["", 0, 1],
+				"weightp": ["", 0, 1, 2],   // 0 off, 1 simple (blind), 2 smart
+				"lookahead_frames": [0, 10, 30, 60],   // rc-lookahead, 0..250; capped at the key frame interval when there is no VBV [V]
+				"mbtree": ["", 0, 1],
+				"qcomp": ["", 0.5, 0.8],   // 0..1; 1 turns mbtree off [V]
+				"aq_mode": [0, 1, 2, 3],   // 0 off, 1 variance, 2 auto-variance, 3 auto-variance biased to dark scenes
+				"aq_strength": ["", 0.5, 1.0, 1.5],   // 0..3; 0 turns AQ off [V]
+				"subme": [0, 2, 4, 6, 7, 9, 10, 11],   // 10 and 11 need trellis 2 and AQ, else 9 [V][X]
+				"me": ["dia", "hex", "umh", "esa", "tesa"],
+				"merange": ["", 16, 32, 64],   // 4..1024; dia and hex use at most 16 [V]
+				"partitions": ["", "none", "all"],   // i8x8 needs 8x8dct [X]
+				"8x8dct": ["", 0, 1],
+				"trellis": [0, 1, 2],   // 0 off, 1 final macroblock only, 2 every decision
+				"psy_rd": ["", "0.0:0.0", "1.0:0.0", "1.0:0.25"],   // psy-rd:psy-trellis; psy-rd needs subme 6+, psy-trellis needs trellis [V][X]
+				"cabac": ["", 0, 1],
+				"fast_pskip": ["", 0, 1],
+				"dct_decimate": ["", 0, 1],
+				"deblock": ["", "-2:-2", "0:0", "1:1"],   // alpha:beta, each -6..6 [V]
+				// "cqm": ["", "flat", "jvt"],   // quantization matrices, flat by default; main and baseline force flat [P] (left out to stay under the limit)
+				"chroma_qp_offset": ["", -6, -3, 0],   // -32..32 before x264's own psy and 4:4:4 adjustments [V]
+				"scenecut": ["", 0, 40],   // 0 off
+				"nr": ["", 0, 500],   // noise reduction, 0..65536
+				// "no_deblock": [1],   // turns the loop filter off
+				// "pbratio": [...], "ipratio": [...],   // pbratio has no effect with mbtree [X]
+				// "deadzone_inter": [...], "deadzone_intra": [...],   // 0..32 [V]
+				// "vbv_maxrate": [...], "vbv_bufsize": [...],   // kbit/s and kbit, so the same value means a different buffer at every bitrate
+				// "qpmin": [...], "qpmax": [...],   // QP limits only take quality away from the rate control's own choice
+			},
+			"rules": [
+				// High is 8-bit 4:2:0 [P]: it runs for those pictures, and the encoder's own pick ("") for the others.
+				{
+					"if": { "op": "or", "args": [
+						{ "op": "==", "left": { "option": "bitdepth" }, "right": 10 },
+						{ "op": "!=", "left": { "option": "chroma" }, "right": 420 },
+					] },
+					"require": { "op": "not", "value": { "set": "profile" } },
+					"else_require": { "set": "profile" },
+				},
+
+				// Without B-frames x264 turns off adaptive B, direct prediction, and weighted B [V]; B-pyramid needs 2 or more [V].
+				{
+					"if": { "op": "==", "left": { "option": "max_b_frames" }, "right": 0 },
+					"require": [
+						{ "op": "not", "value": { "set": "b_adapt" } },
+						{ "op": "not", "value": { "set": "direct" } },
+						{ "op": "not", "value": { "set": "weightb" } },
+					],
+				},
+				{
+					"if": { "op": "<", "left": { "option": "max_b_frames" }, "right": 2 },
+					"require": { "op": "not", "value": { "set": "b_pyramid" } },
+				},
+				// subme 0 with temporal direct becomes spatial [V].
+				{
+					"if": { "op": "==", "left": { "option": "subme" }, "right": 0 },
+					"require": { "op": "not in", "left": { "option": "direct" }, "right": ["temporal", "auto"] },
+				},
+
+				// Mixed references need more than one reference [V].
+				{
+					"if": { "op": "==", "left": { "option": "max_ref_frames" }, "right": 1 },
+					"require": { "op": "not", "value": { "set": "mixed_refs" } },
+				},
+
+				// mbtree is off without lookahead (with a key frame interval, no intra refresh) and with qcomp 1 [V].
+				{
+					"if": { "op": "==", "left": { "option": "lookahead_frames" }, "right": 0 },
+					"require": { "op": "not", "value": { "set": "mbtree" } },
+				},
+				// AQ strength means nothing with AQ off (mbtree switches AQ on at strength 0 then [V]).
+				{
+					"if": { "op": "==", "left": { "option": "aq_mode" }, "right": 0 },
+					"require": { "op": "not", "value": { "set": "aq_strength" } },
+				},
+
+				// subme 10 and 11 fall back to 9 without trellis 2 and AQ [V].
+				{
+					"if": { "op": ">=", "left": { "option": "subme" }, "right": 10 },
+					"require": [
+						{ "op": "==", "left": { "option": "trellis" }, "right": 2 },
+						{ "op": ">", "left": { "option": "aq_mode" }, "right": 0 },
+					],
+				},
+				// dia and hex search at most 16 pixels: a longer range is the same run [V]. tesa with subme 0 or 1 becomes esa [V].
+				{
+					"if": { "op": "in", "left": { "option": "me" }, "right": ["dia", "hex"] },
+					"require": { "op": "not", "value": { "set": "merange" } },
+				},
+				{
+					"if": { "op": "<=", "left": { "option": "subme" }, "right": 1 },
+					"require": { "op": "!=", "left": { "option": "me" }, "right": "tesa" },
+				},
+				// Psy-RD needs subme 6 or more and psy-trellis needs trellis [V]: with neither, every psy_rd value is the same run.
+				{
+					"if": { "op": "and", "args": [
+						{ "op": "<", "left": { "option": "subme" }, "right": 6 },
+						{ "op": "==", "left": { "option": "trellis" }, "right": 0 },
+					] },
+					"require": { "op": "not", "value": { "set": "psy_rd" } },
+				},
+				// i8x8 partitions need the 8x8 transform [X].
+				{
+					"if": { "op": "==", "left": { "option": "partitions" }, "right": "all" },
+					"require": { "op": "!=", "left": { "option": "8x8dct" }, "right": 0 },
+				},
+			],
+		},
+	],
+}

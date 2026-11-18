@@ -1,0 +1,132 @@
+// SVT-AV1: the options that change the picture at a fixed bitrate, with the values SVT-AV1 accepts, and rules that leave out the combinations it
+// refuses (the run fails) or that change nothing (the same stream twice). Written against SVT-AV1 v4.3.0; older versions lack some options, and an
+// unknown name fails the run with a message. Run it as is (ves --config configs/svtav1.jsonc) or copy the entry into your own config.
+//
+// Sources, cited as [S] and [P] below (https://gitlab.com/AOMediaCodec/SVT-AV1, tag v4.3.0):
+//   [S] Source/Lib/Globals/enc_settings.c, svt_av1_verify_settings(): a failed check makes set_parameter fail
+//   [P] Docs/Parameters.md, the option reference (ranges, "only applicable for ...")
+// Option names are SVT-AV1's command line names with _ for - (ves passes them to svt_av1_enc_parse_parameter), so any other option works too.
+// rate_control "cbr" (ves's default) runs CBR with the low-delay prediction structure, which CBR requires [S]; "vbr" runs VBR with random access.
+// VBR is listed because SVT-AV1's random-access structure (and the options that need it) can be worth its looser rate.
+// Every list is cut to a spread of its range: ves numbers the combinations with one 64-bit number, so all value lists multiplied (rules aside) must stay
+// below 9.2e18. Pruning tries the middle values only where the ends differ, so the ends of each range matter most. Not deterministic: results vary a little.
+{
+	"output": "output",
+	"scenarios": [
+		{ "name": "sample", "bitrates": [6000], "resolutions": ["1920x1080"], "framerates": [60] },
+	],
+	"kfintervals": [2.0],
+	"vmaf": { "model": ["path=models/vmaf_v1.0.16_1d5h_2160.json", "path=models/vmaf_v1.0.16_3d0h.json", "path=models/vmaf_v1.0.16_5d0h.json", "path=models/vmaf_v1.0.16_3d0h_2160.json"], "over_penalty": 0.025 },
+	"settings": { "cache": "cache", "prune": true },
+
+	"encoders": [
+		{
+			"enabled": true,
+			"encoder": "svtav1",
+			"options": {
+				"preset": [0, 2, 4, 6, 8, 10, 12, 13],   // 0 slowest .. 13 fastest (every second one, to stay under the limit)
+				"rate_control": ["cbr", "vbr"],
+				"tune": [0],   // visual quality; 1 PSNR and 5 VMAF only game those metrics; 2 SSIM, 3 IQ and 4 MS-SSIM need CRF [S]
+				"lookahead_frames": ["", 0, 16, 60, 120],   // lookahead, 0..120; "": auto [P]
+				"hierarchical_levels": ["", 2, 3, 4, 5],   // 0..5 [S]
+				"enable_dg": ["", 0, 1],   // dynamic mini-GOP
+				"startup_mg_size": ["", 0, 2, 3, 4],   // the first mini-GOP after a key frame [P]
+				"irefresh_type": ["", 1, 2],   // 1 forward key frames (open GOP), not with CBR [S]; 2 key frames (closed GOP)
+				"scd": [0, 1],   // scene change detection
+				"enable_tf": [0, 1, 2],   // temporally filtered alt-ref frames: 0 off, 1 on, 2 adaptive
+				"tf_strength": ["", 0, 2, 4],   // 0..4 [P]
+				"enable_kf_tf": ["", 0, 1],
+				"aq_mode": [1, 2],   // 0 (off) "can not be turned OFF when RC ON" [S]
+				"enable_variance_boost": [0, 1],
+				"variance_boost_strength": ["", 1, 2, 4],   // 1..4 [P]
+				"variance_octile": ["", 1, 5, 8],   // 1..8 [P]
+				"qp_scale_compress_strength": ["", 0, 1, 3],   // 0..3 [P]
+				"ac_bias": ["", 0.0, 2.0, 8.0],   // 0.0..8.0 [P]
+				"sharpness": ["", -7, 0, 7],   // -7..7 [P]
+				"luminance_qp_bias": ["", 0, 50, 100],   // 0..100 [P]
+				"enable_qm": [0, 1],
+				"qm_min": ["", 0, 8],   // 0..15, quant matrix flatness [P]
+				"qm_max": ["", 8, 15],
+				"enable_cdef": [0, 1],
+				"enable_restoration": [0, 1],
+				"enable_dlf": [0, 1, 2],   // deblocking: 2 is slower and more accurate
+				"enable_mfmv": ["", 0, 1],
+				"max_tx_size": ["", 32, 64],
+				// "scm": ["", 0, 1, 2, 3],   // screen content tools [P]
+				"film_grain": [0, 8, 25, 50],   // 0..50 [S]; synthesized grain rarely helps VMAF
+				"film_grain_denoise": ["", 0, 1],
+				"adaptive_film_grain": ["", 0, 1],
+				"fast_decode": [0, 1, 2],   // 3 needs a build with ENABLE_FAST_DECODE_3 [S]
+				"tile_rows": [0, 1, 2],   // log2, 0..6 [S]
+				"tile_columns": [0, 1, 2],   // log2, 0..4 [S]
+				// "recode_loop": ["", 0, 4],   // 0..4 [P]
+				"buf_sz": ["", 500, 1000, 2000],   // ms, CBR only [P]
+				// "overshoot_pct": ["", 0, 25, 100],   // 0..100 [S]
+				// "undershoot_pct": ["", 0, 25, 100],
+				// "gop_constraint_rc": ["", 0, 1],
+				// (scm, recode_loop, overshoot_pct, undershoot_pct and gop_constraint_rc are commented out to stay under the limit: swap them in for others.)
+				// "hbd_mds": ["", 0, 1, 2],   // high bit depth mode decisions: 1 and 2 only work with 10-bit input [P]
+				// "enable_overlays": [0, 1], "enable_intrabc": [0, 1], "rtc": [0, 1],
+				// "minsection_pct": [...], "maxsection_pct": [...],   // GOP bitrate bounds, VBR [P]
+				// "lp": [...],   // threads; 1 crashes SVT-AV1 4.x (repro/svtav1_lp1.cpp), ves refuses it
+			},
+			"rules": [
+				// CBR needs low delay [S] (ves pairs them); "Forward key frames (intra refresh type 1) are not supported with CBR" [S];
+				// (tune VMAF "only supports random access" [S], if you list it.) The buffer size is "only applicable for CBR" [P].
+				{
+					"if": { "op": "==", "left": { "option": "rate_control" }, "right": "cbr" },
+					"require": [
+						{ "op": "!=", "left": { "option": "irefresh_type" }, "right": 1 },
+					],
+					"else_require": { "op": "not", "value": { "set": "buf_sz" } },
+				},
+				// The startup mini-GOP and dynamic mini-GOPs belong to the random-access structure.
+				{
+					"if": { "op": "==", "left": { "option": "rate_control" }, "right": "cbr" },
+					"require": [
+						{ "op": "not", "value": { "set": "startup_mg_size" } },
+						{ "op": "not", "value": { "set": "enable_dg" } },
+					],
+				},
+
+				// Filter strengths need their filter.
+				{
+					"if": { "op": "==", "left": { "option": "enable_tf" }, "right": 0 },
+					"require": [
+						{ "op": "not", "value": { "set": "tf_strength" } },
+						{ "op": "not", "value": { "set": "enable_kf_tf" } },
+					],
+				},
+				{
+					"if": { "op": "==", "left": { "option": "enable_variance_boost" }, "right": 0 },
+					"require": [
+						{ "op": "not", "value": { "set": "variance_boost_strength" } },
+						{ "op": "not", "value": { "set": "variance_octile" } },
+					],
+				},
+				{
+					"if": { "op": "==", "left": { "option": "enable_qm" }, "right": 0 },
+					"require": [
+						{ "op": "not", "value": { "set": "qm_min" } },
+						{ "op": "not", "value": { "set": "qm_max" } },
+					],
+				},
+				{
+					"if": { "op": "and", "args": [{ "set": "qm_min" }, { "set": "qm_max" }] },
+					"require": { "op": "<=", "left": { "option": "qm_min" }, "right": { "option": "qm_max" } },
+				},
+				{
+					"if": { "op": "==", "left": { "option": "film_grain" }, "right": 0 },
+					"require": [
+						{ "op": "not", "value": { "set": "film_grain_denoise" } },
+						{ "op": "not", "value": { "set": "adaptive_film_grain" } },
+					],
+				},
+				// "MaxTiles is 128 and MaxTileCols is 16" [S]: never reached by these lists; listed for larger ones.
+				{ "op": "<=", "left": { "op": "+", "left": { "option": "tile_rows" }, "right": { "option": "tile_columns" } }, "right": 7 },
+				// Only 4:2:0 is supported [P EncoderColorFormat].
+				{ "op": "!=", "left": { "option": "chroma" }, "right": 444 },
+			],
+		},
+	],
+}

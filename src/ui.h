@@ -64,6 +64,7 @@ void detach(int handle);
 
 void log(const std::string& line);             // a permanent line
 void log_plain(const std::string& line);       // only in plain mode: detail the live area already shows
+void log_file_only(const std::string& line);    // a line only for the --log file (the report at the end, which goes to stdout itself)
 bool open_log(const std::string& path, const std::string& first_line, std::string& err); // --log: every line of log() and log_plain() also goes to this file (appended to), with the date and time
 void overall(int done, int total);             // runs finished out of all of them
 void uploads(int sent, int queued);            // uploads handled out of all queued so far

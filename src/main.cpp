@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -237,13 +238,14 @@ static std::string caps_refusal(const std::string& encoder, const std::string& c
 		first(needs("enable_uni_directional_b", "SUPPORT_UNIDIRECTIONAL_B"));
 		first(needs("tf_level", "SUPPORT_TEMPORAL_FILTER"));
 		first(at_most("num_ltr_frames", "NUM_MAX_LTR_FRAMES"));
-		// NV_ENC_CAPS_SUPPORT_BFRAME_REF_MODE: bit 0 each, bit 1 middle
-		if (opt("b_reference_mode", v) && (v == "each" || v == "middle") && cap("SUPPORT_BFRAME_REF_MODE", c) && !(c & (v == "each" ? 1 : 2)))
+		// NV_ENC_CAPS_SUPPORT_BFRAME_REF_MODE: bit 0 each, bit 1 middle, bit 2 hierarchical (the NV_ENC_BFRAME_REF_MODE values)
+		if (opt("b_reference_mode", v) && (v == "each" || v == "middle" || v == "hierarchical") && cap("SUPPORT_BFRAME_REF_MODE", c) &&
+		    !(c & (v == "each" ? 1 : v == "middle" ? 2 : 4)))
 			first("b_reference_mode=" + v + " is not in this GPU's SUPPORT_BFRAME_REF_MODE (" + std::to_string(c) + ")");
 	} else if (encoder == "amf") {
 		const bool h264 = codec == "h264", hevc = codec == "hevc", av1 = codec == "av1";
 		const char* bframes = h264 ? "BFrames" : av1 ? "AV1BFrames" : nullptr;
-		if (bframes) for (const char* key : {"max_b_frames", "b_pictures_pattern", "max_consecutive_bpictures"}) first(needs(key, bframes));
+		if (bframes) for (const char* key : {"max_b_frames", "b_pictures_pattern", "max_consecutive_b_pictures", "adaptive_mini_gop"}) first(needs(key, bframes));
 		const char* lo = h264 ? "MinReferenceFrames" : hevc ? "HevcMinReferenceFrames" : nullptr;
 		const char* hi = h264 ? "MaxReferenceFrames" : hevc ? "HevcMaxReferenceFrames" : nullptr;
 		if (lo) for (const char* key : {"max_ref_frames", "max_num_ref_frames"}) first(in_range(key, lo, hi));
@@ -731,6 +733,9 @@ Quick run (replaces the encoders and scenarios of the config file)
                             and every combination is tested
         --fixed <key[,..]>  options that are never pruned
         --no-prune          run every combination even when an option shows no effect
+        --check[=seconds]   only check the config: encode the first second (or that many seconds) of each input with every run and score nothing.
+                            Lists the runs that failed and the runs whose streams are identical to another run's (an option that changed nothing,
+                            so a rule is missing). Every combination runs (no pruning), nothing is cached, written to the output folder or uploaded
         --upscale           allow encoding above the source's resolution, chroma layout and bit depth
         --pool <name>  --parallel <n>   (with a config file, these apply to every encoder entry of it)
 
@@ -797,6 +802,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	std::vector<std::string> inputs, bitrates, res, fps, kfs;
 	std::optional<std::string> output, cache, log_path, model, upload_url, upload_key;
 	std::optional<int> threads;
+	std::optional<double> check;
 	std::optional<double> penalty;
 	std::optional<std::string> vmaf_device, vmaf_gpu;
 	bool videos = true, all_videos = false, upload_videos = true, skip_known = true, quick = false, upscale = false;
@@ -826,6 +832,10 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--upload-key") upload_key = value();
 		else if (a == "--no-upload-videos") upload_videos = false;
 		else if (a == "--no-skip-known") skip_known = false;
+		else if (a == "--check") {
+			check = inline_value ? atof(v.c_str()) : 1.0;
+			if (!(*check > 0)) throw std::runtime_error("--check takes a number of seconds above 0 (--check=2)");
+		}
 		else if (a == "--plain") cfg.plain = true;
 		else if (a == "--log") log_path = value();
 		else if (a == "--low-memory") cfg.low_memory = true;
@@ -907,6 +917,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	if (only_set) { cfg.only_runs_set = true; cfg.only_runs = only_lines; }
 	if (short_names) cfg.short_names = true;
 	if (threads) cfg.vo.threads = *threads;
+	if (check) cfg.vo.check_seconds = *check;
 	if (vmaf_device) cfg.vo.device = *vmaf_device;
 	if (vmaf_gpu) cfg.vo.gpu = *vmaf_gpu;
 	if (penalty) over_penalty = *penalty;
@@ -1186,8 +1197,18 @@ static int run(int argc, char** argv) {
 		if (cfg.output_dir.empty() && cfg.cache_dir.empty()) { fprintf(stderr, "error: --host needs an output or a cache folder to keep the workers' results in\n"); return 1; }
 		if (cfg.token.empty()) if (const char* t = getenv("VES_TOKEN")) cfg.token = t;
 	}
+	const bool check = cfg.vo.check_seconds > 0;
+	if (check) { // --check: encode the start of each input with every run, score nothing, keep nothing
+		if (cfg.host_port) { fprintf(stderr, "error: --check runs everything on this machine; it does not work with --host\n"); return 1; }
+		cfg.cache_dir.clear();
+		cfg.output_dir.clear();
+		cfg.upload.url.clear();
+		cfg.save_videos = cfg.best_videos = false;
+		for (auto& j : cfg.jobs) j.prune = false;
+		printf("Checking the config: %g s of each input per run, nothing scored, cached, written or uploaded\n", cfg.vo.check_seconds);
+	}
 	if (cfg.low_memory && cfg.vo.threads <= 0) cfg.vo.threads = 2;
-	{ // a model libvmaf cannot use would fail every run
+	if (!check) { // a model libvmaf cannot use would fail every run
 		std::string why;
 		int depth = 8;
 		for (auto& m : vmaf_models(cfg.vo)) {
@@ -1806,6 +1827,11 @@ static int run(int argc, char** argv) {
 			ui::log(std::string(line) + (r.reason.empty() ? "" : ": " + r.reason));
 			return;
 		}
+		if (check) {
+			snprintf(line, sizeof line, "%s ok  %s  (%s, %lld kbps: %.0f kbps)", r.tag.c_str(), r.label.c_str(), r.input.c_str(), (long long)r.bitrate, r.kbps);
+			ui::log(line);
+			return;
+		}
 		r.penalty = over_penalty_points(r.kbps, (double)r.bitrate);
 		const FrameStats fs_ = frame_stats(r.scores);
 		r.rwm = fs_.rwm - r.penalty;
@@ -2302,16 +2328,17 @@ static int run(int argc, char** argv) {
 				t.r.score_progress = std::make_shared<RunProgress>();
 				ej.encoder = t.job->encoder; ej.codec = t.job->codec; ej.plan = &t.plan;
 				ej.bitrate = t.r.bitrate * 1000; ej.kf = t.r.kf; ej.rp = t.r.progress.get();
-				ej.file = !t.r.video_file.empty() && (reencode || !cfg.best_videos) ? t.r.video_file : (spool_dir / ("run" + std::to_string(t.index) + ".mp4")).string();
+				ej.file = check ? std::string() // only counted and hashed
+				        : !t.r.video_file.empty() && (reencode || !cfg.best_videos) ? t.r.video_file : (spool_dir / ("run" + std::to_string(t.index) + ".mp4")).string();
 				ej.id = t.id; ej.color = t.plan.color;
 				run.codec = t.id; run.score_rp = t.r.score_progress.get();
 				ptrs.push_back(&run);
-				ui::log_plain(t.r.tag + (reencode ? " encoding the best of its group again  " : " encoding and scoring  ") + t.r.label + "  (" + file_name(input) + ", " + std::to_string(t.r.bitrate) + " kbps, pool " + t.pool + ")");
+				ui::log_plain(t.r.tag + (reencode ? " encoding the best of its group again  " : check ? " encoding  " : " encoding and scoring  ") + t.r.label + "  (" + file_name(input) + ", " + std::to_string(t.r.bitrate) + " kbps, pool " + t.pool + ")");
 				run.label = t.r.label;
 				run.pool = t.pool;
 				if (cfg.in_process) { // otherwise the processes show these rows
 					handles.push_back(ui::attach(t.r.progress.get(), t.r.label, t.pool));
-					handles.push_back(ui::attach(t.r.score_progress.get(), t.r.label, t.pool));
+					if (!check) handles.push_back(ui::attach(t.r.score_progress.get(), t.r.label, t.pool));
 				}
 			}
 			RunProgress feed_rp;
@@ -2341,7 +2368,13 @@ static int run(int argc, char** argv) {
 				r.enc_starved_s = r.progress->starved_ms / 1000.0;
 				r.decode_blocked_s = feed_rp.blocked_ms / 1000.0;
 				r.score_starved_s = r.score_progress->starved_ms / 1000.0;
-				if (wr[i].enc.ok && wr[i].score_ok) {
+				if (check && wr[i].enc.ok) { // the stream's hash says whether another run made the same one
+					char h[24];
+					snprintf(h, sizeof h, "%016llx", (unsigned long long)wr[i].enc.output.pictures);
+					r.kbps = wr[i].enc.kbps;
+					r.video_sha256 = h;
+					t.ok = true;
+				} else if (wr[i].enc.ok && wr[i].score_ok) {
 					r.kbps = wr[i].enc.kbps;
 					r.scores = std::move(wr[i].scores);
 					r.detail = std::move(wr[i].detail);
@@ -2377,7 +2410,7 @@ static int run(int argc, char** argv) {
 					r.video_file.clear();
 					continue;
 				}
-				if (t.ok) r.video_sha256 = sha256_file(wr[i].enc.file);
+				if (t.ok && !check) r.video_sha256 = sha256_file(wr[i].enc.file);
 				if (r.video_file.empty() || cfg.best_videos) fs::remove(wr[i].enc.file, ec); // a temporary file; with "best" the winner is encoded again when its input is done
 				if (cfg.best_videos) r.video.clear();
 				finish(t);
@@ -2499,6 +2532,7 @@ static int run(int argc, char** argv) {
 	std::map<std::string, std::vector<std::string>> failed_runs, ignored_runs, pruned_runs, group_json; // by input
 	int ignored = 0, pruned = 0;
 	std::map<std::string, int> ignored_why; // reason -> how many runs
+	std::map<std::string, std::vector<std::string>> failed_why; // --check: the failed runs with their reasons, by input
 	std::map<std::string, size_t> first_with; // group and stream hash -> the run that has it
 	int identical = 0;
 	for (auto& t : tasks) {
@@ -2513,7 +2547,47 @@ static int run(int argc, char** argv) {
 		}
 		else if (t.r.pruned) { pruned++; pruned_runs[t.r.input].push_back("{\"label\":" + jq(t.r.label) + ",\"reason\":" + jq(t.r.reason) + "}"); }
 		else if (t.r.ignored) { ignored++; ignored_why[t.r.reason]++; ignored_runs[t.r.input].push_back("{\"label\":" + jq(t.r.label) + ",\"reason\":" + jq(t.r.reason) + "}"); }
-		else { failed++; failed_runs[t.r.input].push_back(t.r.label); }
+		else { failed++; failed_runs[t.r.input].push_back(t.r.label); if (check) failed_why[t.r.input].push_back(t.r.label + (t.r.reason.empty() ? std::string() : ": " + t.r.reason)); }
+	}
+	if (check) { // the report of --check: what failed, and which runs made the same stream (an option that changed nothing)
+		// To stdout, and to the --log file too: a console keeps only so many lines, and this report is often longer.
+		auto say = [](const char* fmt, ...) {
+			char small[1024];
+			va_list ap, ap2;
+			va_start(ap, fmt);
+			va_copy(ap2, ap);
+			const int n = vsnprintf(small, sizeof small, fmt, ap);
+			va_end(ap);
+			std::string text;
+			if (n >= (int)sizeof small) { text.resize((size_t)n + 1); vsnprintf(text.data(), text.size(), fmt, ap2); text.resize((size_t)n); }
+			else if (n > 0) text.assign(small, (size_t)n);
+			va_end(ap2);
+			fputs(text.c_str(), stdout);
+			for (size_t at = 0; at < text.size();) {
+				size_t e = text.find('\n', at);
+				if (e == std::string::npos) e = text.size();
+				if (e > at) ui::log_file_only(text.substr(at, e - at));
+				at = e + 1;
+			}
+		};
+		size_t ran = runs.size() + (size_t)identical;
+		say("\nChecked %zu runs: %zu made a stream, %d failed, %d ignored\n", ran + (size_t)failed, ran, failed, ignored);
+		for (auto& [input, lines] : failed_why) {
+			say("\nFailed (%s):\n", file_name(input).c_str());
+			for (auto& l : lines) say("  %s\n", l.c_str());
+		}
+		bool header = false;
+		for (auto& r : runs) if (!r.identical.empty()) {
+			if (!header) { say("\nSame stream as another run (the options that differ changed nothing):\n"); header = true; }
+			say("  %s (%s, %lld kbps)\n", r.label.c_str(), file_name(r.input).c_str(), (long long)r.bitrate);
+			for (auto& l : r.identical) say("    = %s\n", l.c_str());
+		}
+		if (!header) say("\nNo two runs made the same stream.\n");
+		if (ignored) {
+			say("\nIgnored:\n");
+			for (auto& [why, n] : ignored_why) say("  %d: %s\n", n, why.c_str());
+		}
+		return failed ? 2 : 0;
 	}
 
 	if (identical) printf("\n%d runs produced exactly the same stream as another run of their group and are left out of the ranking (listed as identical_runs in the result files)\n", identical);
