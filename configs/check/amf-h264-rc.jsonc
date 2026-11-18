@@ -1,0 +1,163 @@
+// --check slice of amf-h264.jsonc: preset, rate control, pre-encode, HRD and frame skipping
+// Run: ves --config configs/check/amf-h264-rc.jsonc --check -i <file>. The other options are fixed; the rules still apply.
+// AMF H.264: the options that change the picture at a fixed bitrate, with the values AMF accepts, and rules that leave out the combinations AMF
+// refuses or ignores (the same stream twice). Run it as is (ves --config configs/amf-h264.jsonc) or copy the entry into your own config.
+//
+// Sources, cited as [H], [E] and [PA] below (AMF 1.4.3x, https://github.com/GPUOpen-LibrariesAndSDKs/AMF):
+//   [H]  amf/public/include/components/VideoEncoderVCE.h and PreAnalysis.h, the property comments
+//   [E]  amf/doc/AMF_Video_Encode_API.md, the property reference ("available only when ...", "requires ...")
+//   [PA] amf/doc/AMF_Video_PreAnalysis_API.md
+// Option names are AMF's property names in snake_case without the codec prefix (HevcEnableVBAQ is enable_vbaq; the pre-analysis ones keep "pa_"); ves
+// lists them with `ves --list-options amf/h264`. ves opens the encoder with usage transcoding and CBR, peak bitrate = target bitrate.
+// Rate control: CBR is the base; rate_control "vbr" is peak constrained VBR, capped at the target as ves sets the peak to it. Pre-analysis and
+// pre-encode work with every rate control [E] (the header's "only works in peak constrained VBR" [H] is older than the API reference) and can help a
+// lot, so they and their options are all here. The high quality modes (hqvbr, hqcbr) need pre-analysis [E] and seem to be gone on RDNA GPUs, where
+// the high_quality preset may stand in for them (untested): they are commented out.
+// Every list is cut to a spread of its range: ves numbers the combinations with one 64-bit number, so all value lists multiplied (rules aside) must stay
+// below 9.2e18. Pruning tries the middle values only where the ends differ, so the ends of each range matter most.
+// Features this GPU's encoder lacks (B-frames, reference frame counts) are left to the capability check: those runs are ignored, not failed.
+{
+	"output": "output",
+	"scenarios": [
+		{ "name": "sample", "bitrates": [6000], "resolutions": ["1920x1080"], "framerates": ["<=1000"], "chroma": [420], "range": ["limited"] },
+	],
+	"kfintervals": [2.0],
+	"vmaf": { "model": ["path=models/vmaf_v1.0.16_1d5h_2160.json", "path=models/vmaf_v1.0.16_3d0h.json", "path=models/vmaf_v1.0.16_5d0h.json", "path=models/vmaf_v1.0.16_3d0h_2160.json"], "over_penalty": 0.025 },
+	"settings": { "cache": "cache", "prune": true },
+
+	"encoders": [
+		{
+			"enabled": true,
+			"encoder": "amf",
+			"codec": "h264",
+			"options": {
+				"preset": ["speed", "balanced", "quality", "high_quality"],   // every value
+				"profile": ["high"],   // fixed for this slice
+				"rate_control": ["", "vbr"],   // both
+				// "rate_control": ["", "vbr", "hqvbr", "hqcbr"],   // to test whether this GPU still has the high quality modes
+				"pre_encode": ["", 1],   // both
+				"max_b_frames": [0],   // fixed for this slice
+				"adaptive_mini_gop": [""],   // fixed for this slice
+				// "max_consecutive_b_pictures": [...],   // 0..3; defaults to the B-frame count, or 3 with adaptive mini-GOP [E]
+				"b_reference_mode": [""],   // fixed for this slice
+				"max_ref_frames": [1],   // fixed for this slice
+				"enable_vbaq": [""],   // fixed for this slice
+				"high_motion_quality_boost_enable": [""],   // fixed for this slice
+				// "cabac_enable": [...],   // every decoder has CABAC and it is clearly better
+				"de_blocking_filter": [""],   // fixed for this slice
+				"rate_control_skip_frame_enable": ["", 0, 1],   // every value
+				// "low_latency_internal": [...],   // AMD's own setting, not one to choose
+				"enforce_hrd": ["", 0, 1],   // every value
+				// "filler_data_enable": [0, 1],   // pads the stream to the bitrate: the picture stays the same
+				// "vbv_buffer_size": [...],   // bits, so the same value means a different buffer at every bitrate
+				// "min_qp": [...], "max_qp": [...],   // QP limits only take quality away from the rate control's own choice
+
+				// Pre-analysis [PA]: its pa_* properties only exist once enable_pre_analysis is on (ves sets that first).
+				"enable_pre_analysis": [""],   // fixed for this slice
+				"pa_look_ahead_buffer_depth": [""],   // fixed for this slice
+				"pa_perceptual_aq_mode": [""],   // fixed for this slice
+				"pacaq_strength": [""],   // fixed for this slice
+				"pa_temporal_aq_mode": [""],   // fixed for this slice
+				"pa_high_motion_quality_boost_mode": [""],   // fixed for this slice
+				"pa_scene_change_detection_enable": [""],   // fixed for this slice
+				"pa_scene_change_detection_sensitivity": [""],   // fixed for this slice
+				"pa_static_scene_detection_enable": [""],   // fixed for this slice
+				"pa_static_scene_detection_sensitivity": [""],   // fixed for this slice
+				"pa_max_qp_before_force_skip": [""],   // fixed for this slice
+				"pa_activity_type": [""],   // fixed for this slice
+				"pa_frame_sad_enable": [""],   // fixed for this slice
+				"pa_long_term_reference_enable": [""],   // fixed for this slice
+				// "pa_initial_qp_after_scene_change": [...],   // 0..51: a fixed QP after cuts only takes the choice from the rate control
+
+				// The pre-encode filter in front of the encoder (ves's own; see config.all-options.jsonc).
+				"pre_filter": [""],   // fixed for this slice
+				"pre_filter_strength": [""],   // fixed for this slice
+				"pre_filter_sensitivity": [""],   // fixed for this slice
+			},
+			"rules": [
+				// Adaptive mini-GOP takes priority over the B-frame count [E]: it runs with one count, 3, the one AMD recommends with it [E].
+				{
+					"if": { "set": "adaptive_mini_gop" },
+					"require": { "op": "==", "left": { "option": "max_b_frames" }, "right": 3 },
+				},
+				// B-frame settings "are available only when MaxOfReferenceFrames is greater than 1" and LTR is not used [E]; "LTR and B-frames (including
+				// adaptive B-frames) cannot be used simultaneously" [E].
+				{
+					"if": { "op": "or", "args": [{ "op": ">", "left": { "option": "max_b_frames" }, "right": 0 }, { "set": "adaptive_mini_gop" }] },
+					"require": [
+						{ "op": ">", "left": { "option": "max_ref_frames" }, "right": 1 },
+						{ "op": "not", "value": { "set": "pa_long_term_reference_enable" } },
+					],
+					"else_require": { "op": "not", "value": { "set": "b_reference_mode" } },
+				},
+				// High quality VBR and CBR "require Pre-Analysis to be enabled" [E]; QVBR aims at a quality level instead of the bitrate and is left out.
+				{
+					"if": { "op": "in", "left": { "option": "rate_control" }, "right": ["hqvbr", "hqcbr"] },
+					"require": [
+						{ "op": "==", "left": { "option": "enable_pre_analysis" }, "right": 1 },
+					],
+				},
+				// Pre-analysis options need pre-analysis [PA].
+				{
+					"if": { "op": "or", "args": [{ "op": "not", "value": { "set": "enable_pre_analysis" } }, { "op": "==", "left": { "option": "enable_pre_analysis" }, "right": 0 }] },
+					"require": [
+						{ "op": "not", "value": { "set": "pa_look_ahead_buffer_depth" } },
+						{ "op": "not", "value": { "set": "pa_perceptual_aq_mode" } },
+						{ "op": "not", "value": { "set": "pacaq_strength" } },
+						{ "op": "not", "value": { "set": "pa_temporal_aq_mode" } },
+						{ "op": "not", "value": { "set": "pa_high_motion_quality_boost_mode" } },
+						{ "op": "not", "value": { "set": "pa_scene_change_detection_enable" } },
+						{ "op": "not", "value": { "set": "pa_scene_change_detection_sensitivity" } },
+						{ "op": "not", "value": { "set": "pa_static_scene_detection_enable" } },
+						{ "op": "not", "value": { "set": "pa_static_scene_detection_sensitivity" } },
+						{ "op": "not", "value": { "set": "pa_max_qp_before_force_skip" } },
+						{ "op": "not", "value": { "set": "pa_activity_type" } },
+						{ "op": "not", "value": { "set": "pa_frame_sad_enable" } },
+						{ "op": "not", "value": { "set": "pa_long_term_reference_enable" } },
+						{ "op": "not", "value": { "set": "adaptive_mini_gop" } },
+					],
+				},
+				// TAQ, PA high motion boost, static scene detection and adaptive mini-GOP need a lookahead of at least 1 [PA][E]; the scene change sensitivity only applies without one [PA].
+				{
+					"if": { "op": "and", "args": [{ "set": "pa_look_ahead_buffer_depth" }, { "op": "==", "left": { "option": "pa_look_ahead_buffer_depth" }, "right": 0 }] },
+					"require": [
+						{ "op": "not", "value": { "set": "pa_temporal_aq_mode" } },
+						{ "op": "not", "value": { "set": "pa_high_motion_quality_boost_mode" } },
+						{ "op": "not", "value": { "set": "pa_static_scene_detection_enable" } },
+						{ "op": "not", "value": { "set": "adaptive_mini_gop" } },
+					],
+					"else_require": { "op": "not", "value": { "set": "pa_scene_change_detection_sensitivity" } },
+				},
+				{
+					"if": { "op": "==", "left": { "option": "pa_scene_change_detection_enable" }, "right": 0 },
+					"require": { "op": "not", "value": { "set": "pa_scene_change_detection_sensitivity" } },
+				},
+				{
+					"if": { "op": "not", "value": { "set": "pa_static_scene_detection_enable" } },
+					"require": [
+						{ "op": "not", "value": { "set": "pa_static_scene_detection_sensitivity" } },
+						{ "op": "not", "value": { "set": "pa_max_qp_before_force_skip" } },
+					],
+				},
+				// The CAQ strength is the perceptual AQ's; with perceptual or temporal AQ the encoder's own VBAQ is ignored [PA].
+				{
+					"if": { "op": "not", "value": { "set": "pa_perceptual_aq_mode" } },
+					"require": { "op": "not", "value": { "set": "pacaq_strength" } },
+				},
+				{
+					"if": { "op": "or", "args": [{ "set": "pa_perceptual_aq_mode" }, { "set": "pa_temporal_aq_mode" }] },
+					"require": { "op": "not", "value": { "set": "enable_vbaq" } },
+				},
+				// The pre-filter settings need the pre-filter.
+				{
+					"if": { "op": "not", "value": { "set": "pre_filter" } },
+					"require": [
+						{ "op": "not", "value": { "set": "pre_filter_strength" } },
+						{ "op": "not", "value": { "set": "pre_filter_sensitivity" } },
+					],
+				},
+			],
+			"parallel": 2,
+		},
+	],
+}
