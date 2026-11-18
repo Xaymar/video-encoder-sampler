@@ -9,8 +9,8 @@
 // lists them with `ves --list-options amf/hevc`. ves opens the encoder with usage transcoding and CBR, peak bitrate = target bitrate.
 // Rate control: CBR is the base; rate_control "vbr" is peak constrained VBR, capped at the target as ves sets the peak to it. Pre-analysis and
 // pre-encode work with every rate control [E] (the header's "only works in peak constrained VBR" [H] is older than the API reference) and can help a
-// lot, so they and their options are all here. The high quality modes (hqvbr, hqcbr) need pre-analysis [E] and aim at a
-// quality level (qvbr_quality_level, default QP 23) before the bitrate, so that level is swept with them.
+// lot, so they and their options are all here. The high quality modes (hqvbr, hqcbr) need pre-analysis [E]; they are
+// left out (see rate_control).
 // Every list is cut to a spread of its range: ves numbers the combinations with one 64-bit number, so all value lists multiplied (rules aside) must stay
 // below 9.2e18. Pruning tries the middle values only where the ends differ, so the ends of each range matter most.
 // Features this GPU's encoder lacks (B-frames, reference frame counts) are left to the capability check: those runs are ignored, not failed.
@@ -31,11 +31,9 @@
 			"options": {
 				"preset": ["speed", "balanced", "quality", "high_quality"],   // high_quality = quality on RDNA 2 (Areldir, 1.4.37) but differs on RDNA 3 (780M, 1.5.3) [T], so both stay
 				// "profile": [...], "tier": [...],   // the encoder picks main or main10 from the picture; the tier only changes the level's bitrate limits
-				"rate_control": ["", "hqvbr"],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T]; hqcbr made the same stream as hqvbr on RDNA 2 [T]; also lcvbr, qvbr, hqcbr
-				// The high quality modes aim at a quality level, QvbrQualityLevel, and only then at the bitrate. Its default of 23 [H] is a far better picture than
-				// most footage gets at these bitrates, which may be why they scored far below high_quality on RDNA 2 (the level itself changed nothing there [T]).
-				"qvbr_quality_level": [""],   // 1..51, default 23 (""); lower is a better picture [H]; only with qvbr, hqvbr, hqcbr (rule below). 13, 33 and 51 made the same stream as unset under
-				// hqvbr and hqcbr on RDNA 2 (H.264, HEVC) [T], so it stays unset until RDNA 3 is checked (configs/check/amf-*-quality-level.jsonc). Was ["", 13, 28, 33, 38, 43, 51]
+				"rate_control": [""],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T]; also lcvbr, qvbr, hqvbr, hqcbr
+				// hqvbr, hqcbr and their quality level (qvbr_quality_level) are left out: the level changed nothing on RDNA 2 or RDNA 3, hqcbr made the same
+				// stream as hqvbr on RDNA 2, and on RDNA 3 both made a different stream on every run with the same options [T].
 				"pre_encode": ["", 0, 1],   // pre-encode assisted rate control; default depends on the usage [H]
 				"max_ref_frames": ["", 1, 2, 4, 8, 16],   // HevcMaxNumRefFrames, 0..16, default 1 [E]
 				"enable_vbaq": ["", 0, 1],
