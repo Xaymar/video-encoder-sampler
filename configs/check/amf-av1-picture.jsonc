@@ -142,6 +142,35 @@
 						{ "op": "not", "value": { "set": "pa_max_qp_before_force_skip" } },
 					],
 				},
+				// [T] below: configs/check/amf-{h264,hevc}-pa-scene, 2026-11-18, on Areldir (9800X3D iGPU, AMF 1.4.37) and Irkela (780M, AMF 1.5.3): 352 runs, 10 to 12 different streams. Assumed for AV1 (not tested yet).
+				// The activity type and frame SAD changed nothing without perceptual or temporal AQ [T].
+				{
+					"if": { "op": "and", "args": [{ "op": "not", "value": { "set": "pa_perceptual_aq_mode" } }, { "op": "not", "value": { "set": "pa_temporal_aq_mode" } }] },
+					"require": [
+						{ "op": "not", "value": { "set": "pa_activity_type" } },
+						{ "op": "not", "value": { "set": "pa_frame_sad_enable" } },
+					],
+				},
+				// With scene change detection off, the lookahead depth ("", 0, 21) changed nothing unless something else reads the lookahead [T].
+				{
+					"if": { "op": "and", "args": [
+						{ "op": "==", "left": { "option": "pa_scene_change_detection_enable" }, "right": 0 },
+						{ "op": "not", "value": { "set": "pa_temporal_aq_mode" } },
+						{ "op": "not", "value": { "set": "pa_high_motion_quality_boost_mode" } },
+						{ "op": "not", "value": { "set": "pa_static_scene_detection_enable" } },
+						{ "op": "not", "value": { "set": "pa_perceptual_aq_mode" } },
+					] },
+					"require": { "op": "not", "value": { "set": "pa_look_ahead_buffer_depth" } },
+				},
+				// Lookahead 0 with scene change detection on (and no long-term references) broke CBR: 7.4 to 11.4 Mbps for 6 Mbps [T], so those are left out.
+				{
+					"if": { "op": "and", "args": [
+						{ "set": "pa_look_ahead_buffer_depth" },
+						{ "op": "==", "left": { "option": "pa_look_ahead_buffer_depth" }, "right": 0 },
+						{ "op": "not", "value": { "set": "pa_long_term_reference_enable" } },
+					] },
+					"require": { "op": "==", "left": { "option": "pa_scene_change_detection_enable" }, "right": 0 },
+				},
 				// The CAQ strength is the perceptual AQ's; with perceptual or temporal AQ the encoder's own AQ mode is ignored [PA].
 				{
 					"if": { "op": "not", "value": { "set": "pa_perceptual_aq_mode" } },
