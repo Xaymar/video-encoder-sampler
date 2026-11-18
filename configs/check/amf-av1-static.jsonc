@@ -1,3 +1,4 @@
+// WARNING: bluescreened the 780M (RDNA 3) repeatedly. Do not run it on RDNA 3.
 // --check slice of amf-av1.jsonc: static scene detection (RDNA 4 only?); needs a clip with a still part, such as the check clip with its 2.0-2.4 s segment
 // Run: ves --config configs/check/amf-av1-static.jsonc --check=3 -i <file>. The other options are fixed; the rules still apply.
 // AMF AV1: the options that change the picture at a fixed bitrate, with the values AMF accepts, and rules that leave out the combinations AMF
