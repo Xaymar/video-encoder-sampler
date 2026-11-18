@@ -32,7 +32,7 @@
 				// "level": ["auto"],   // a level only caps the DPB and the bitrate; auto picks one that fits
 				// "rate_control": ["cbr"],   // the default; "vbr" at the same average and peak bitrate is CBR with a looser buffer
 				"max_b_frames": [0, 1, 2, 3, 4],   // the GPU's NUM_MAX_BFRAMES caps it
-				"lookahead_frames": [0, 4, 8, 16, 32, 54],   // 0 off; [H lookaheadDepth] says 31 minus the B-frames, but the driver takes more and silently cuts it to what its surfaces allow (64 became 54 [T])
+				"lookahead_frames": [0, 4, 8, 16, 32],   // 0 off; 32 and 54 made the same stream at every level, with and without B-frames [T 2026-11-18, RTX 4080 SUPER]; [H lookaheadDepth] says 31 minus the B-frames
 				"lookahead_level": [0, 1, 2, 3, 15],   // 15 = auto; needs lookahead (NVIDIA's library aborts the process otherwise [T])
 				"disable_iadapt": [0, 1],   // adaptive I-frames at scene cuts: lookahead only [H][G 8.2]
 				"disable_badapt": [0, 1],   // adaptive B-frame count: lookahead and B-frames only [H][G 8.2]

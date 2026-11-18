@@ -34,8 +34,8 @@
 				// "level": ["auto"],   // a level only caps the DPB and the bitrate; auto picks one that fits
 				// "rate_control": ["cbr"],   // the default; "vbr" at the same average and peak bitrate is CBR with a looser buffer
 				"max_b_frames": [0, 4],   // with and without B-frames
-				"lookahead_frames": [0, 4, 8, 16, 32, 54],   // every depth of the full config: where does more stop changing anything?
-				"lookahead_level": [0, 1, 2, 3, 15],   // 15 = auto
+				"lookahead_frames": [16, 24, 26, 27, 28, 30, 31, 32],   // where is the cap? 32 and 54 made the same stream at every level [T 2026-11-18]; [H lookaheadDepth] says 31 minus the B-frames
+				"lookahead_level": [0],   // the level did not move the cap [T 2026-11-18]
 				"disable_iadapt": [0],   // fixed for this slice
 				"disable_badapt": [0],   // fixed for this slice
 				"multi_pass": [0],   // fixed for this slice
