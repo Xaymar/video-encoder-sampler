@@ -1,0 +1,20 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 64) in;
+#include "adm_common.glsl"
+// The masking's row sums from adm_dcm.comp's tiles (pc.aim: the AIM's, else the DLM's), as adm_cm.comp writes them.
+
+void main() {
+	const int r = int(gl_GlobalInvocationID.x), rows = pc.erow - pc.srow;
+	if (r >= rows) return;
+	const int tx = (pc.ecol - pc.scol + 15) / 16, set = pc.aim != 0 ? 1 : 0;
+	for (int q = 0; q < 3; q++) {
+		int64_t sum = 0l;
+		for (int k = 0; k < tx; k++) {
+			const int idx = (((set * rows + r) * tx + k) * 3 + q) * 2;
+			sum += int64_t(uint64_t(uint(tmp[idx])) | (uint64_t(uint(tmp[idx + 1])) << 32));
+		}
+		cm_rows[r * 3 + q] = sum;
+	}
+}

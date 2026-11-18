@@ -579,7 +579,9 @@ public:
 		if (const char* e = getenv("VES_SPEED_CHECK"); e && atoi(e) > 0) speed_check = true;
 		if (const char* e = getenv("VES_SCORE_TIMING"); e && atoi(e) > 0) part_timing = true;
 		if (const char* e = getenv("VES_ADM_SPLIT_DWT"); e && atoi(e) > 0) adm_split_dwt = true;
+		if (const char* e = getenv("VES_ADM_SPLIT_CM"); e && atoi(e) > 0) adm_split_cm = true;
 		if (const char* e = getenv("VES_ADM_DUMP"); e && *e) adm_dump = e;
+		if (!adm_dump.empty()) adm_split_cm = true; // the dump holds the bands decouple and csf write
 		raw_size = (plane_bytes + 3) / 4 * 4 + 4;
 		raw_ref = vk.buffer(raw_size, 1);
 		raw_dis = vk.buffer(raw_size, 1);
@@ -778,7 +780,25 @@ private:
 				vk.push(&pd, sizeof pd);
 				vk.bind(aden_p[s]); vk.dispatch(1, pc.cb - pc.ct);
 				// then decouple, csf and masking with each set of options, unit 0 in place, the others on a copy of the bands
-				for (size_t u = 0; u < au.size(); u++) {
+				for (size_t u = 0; u < au.size() && !adm_split_cm; u++) { // adm_dcm: no copy of the bands, nothing written into them
+					AdmUnit& a = au[u];
+					AdmPC pu = a.apc[s];
+					pu.aim = a.aim ? 1 : 0;
+					vk.push(&pu, sizeof pu);
+					vk.bind(a.dcm[s]);
+					vk.dispatch((uint32_t)((pu.ecol - pu.scol + 15) / 16), (uint32_t)((pu.erow - pu.srow + 15) / 16)); vk.barrier();
+					const uint32_t rg = (uint32_t)((pu.erow - pu.srow + 63) / 64);
+					pu.aim = 0;
+					vk.push(&pu, sizeof pu);
+					vk.bind(a.cmsum[s]); vk.dispatch(rg, 1);
+					if (a.aim) {
+						pu.aim = 1;
+						vk.push(&pu, sizeof pu);
+						vk.bind(a.aimsum[s]); vk.dispatch(rg, 1);
+					}
+					vk.barrier(); // the next unit's tiles go into the same tmp
+				}
+				for (size_t u = 0; u < au.size() && adm_split_cm; u++) {
 					AdmUnit& a = au[u];
 					if (u > 0) {
 						const int n = 8 * bw[s] * bh[s];
@@ -966,6 +986,7 @@ private:
 		AdmHost ah[4];
 		Buf cur[4], cm[4], aimb[4];
 		Pipe copy[4], dec[4], csf[4], cm_p[4], aimcsf[4], aimcm[4];
+		Pipe dcm[4], cmsum[4], aimsum[4]; // decouple, csf and masking in one (adm_dcm), and its row sums
 	};
 	// SpEED with one set of the options the shaders use (the decimation by 16, after an optional prescale).
 	struct SpeedUnit {
@@ -1051,6 +1072,7 @@ private:
 	Buf adump; // acopy: the bands the units after the first work on, one after another
 	Pipe adwt[4], adwt_v[4], adwt_h[4], aden_p[4];
 	bool adm_split_dwt = false;
+	bool adm_split_cm = false; // VES_ADM_SPLIT_CM=1 (and VES_ADM_DUMP): decouple, csf and masking as passes of their own, as before
 	// cambi
 	bool cambi_on = false;
 	CambiOpts cambi_o;
@@ -1291,8 +1313,8 @@ private:
 				AdmUnit& a = au[u];
 				// The units are recorded one after another, each finished (barrier) before the next copies the bands, and only their sums (cm, aimb) are read
 				// afterwards: one copy of the bands serves every unit after the first. A copy of its own for each took 70 MB per unit at 2560x1440.
-				if (u == 1) acopy[s] = vk.buffer(20 * N * 4 + 16, 1);
-				a.cur[s] = u == 0 ? acur[s] : acopy[s];
+				if (u == 1 && adm_split_cm) acopy[s] = vk.buffer(20 * N * 4 + 16, 1); // adm_dcm needs no copy
+				a.cur[s] = u == 0 || !adm_split_cm ? acur[s] : acopy[s];
 				a.cm[s] = vk.buffer((size_t)bh[s] * 3 * 8 + 16, 1);
 				if (a.aim) a.aimb[s] = vk.buffer((size_t)bh[s] * 3 * 8 + 16, 1);
 			}
@@ -1313,11 +1335,18 @@ private:
 			aden_p[s] = vk.pipeline("adm_den", b);
 			for (size_t u = 0; u < au.size(); u++) {
 				AdmUnit& a = au[u];
-				if (u > 0) a.copy[s] = vk.pipeline("copy_u32", {&acur[s], &a.cur[s]});
+				if (u > 0 && adm_split_cm) a.copy[s] = vk.pipeline("copy_u32", {&acur[s], &a.cur[s]});
 				std::vector<Buf*> bu{&a.cur[s], prev, &raw_ref, &raw_dis, &atmp, &adiv, &a.cm[s], &aden[s]};
 				a.dec[s] = vk.pipeline("adm_decouple", bu);
 				a.csf[s] = vk.pipeline("adm_csf", bu);
 				a.cm_p[s] = vk.pipeline("adm_cm", bu);
+				std::vector<Buf*> bf{&acur[s], prev, &raw_ref, &raw_dis, &atmp, &adiv, &a.cm[s], &aden[s]}; // the bands of every unit: adm_dcm writes none
+				a.dcm[s] = vk.pipeline("adm_dcm", bf);
+				a.cmsum[s] = vk.pipeline("adm_cmsum", bf);
+				if (a.aim) {
+					bf[6] = &a.aimb[s];
+					a.aimsum[s] = vk.pipeline("adm_cmsum", bf);
+				}
 				if (a.aim) {
 					std::vector<Buf*> ba{&a.cur[s], prev, &raw_ref, &raw_dis, &atmp, &adiv, &a.aimb[s], &aden[s]};
 					a.aimcsf[s] = vk.pipeline("adm_csf", ba);
