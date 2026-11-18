@@ -33,8 +33,8 @@
 				// "profile": [...],   // the encoder picks main, main10 or rext from the picture
 				// "level": ["auto"],   // a level only caps the DPB and the bitrate; auto picks one that fits
 				// "rate_control": ["cbr"],   // the default; "vbr" at the same average and peak bitrate is CBR with a looser buffer
-				"max_b_frames": [0, 4],   // with and without
-				"lookahead_frames": [16, 24, 26, 27, 28, 30, 31, 32, 54],   // around the H.264 cap of 32 minus the B-frames
+				"max_b_frames": [1, 2, 3],   // 0 and 4 were run on 2026-11-18
+				"lookahead_frames": [28, 29, 30, 31, 32, 54],   // around the caps seen at 0 and 4 B-frames
 				"lookahead_level": [0],   // fixed for this slice
 				"disable_iadapt": [0],   // fixed for this slice
 				"disable_badapt": [0],   // fixed for this slice
