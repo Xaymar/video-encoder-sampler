@@ -22,7 +22,7 @@
 
 #define VK_FUNCS(X) \
 	X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) \
-	X(vkGetPhysicalDeviceFeatures) X(vkCreateDevice) X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
+	X(vkGetPhysicalDeviceFeatures) X(vkCreateDevice) X(vkGetDeviceQueue) X(vkGetDeviceQueue2) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
 	X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkCreateShaderModule) X(vkCreateDescriptorSetLayout) \
 	X(vkCreatePipelineLayout) X(vkCreateComputePipelines) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) \
 	X(vkUpdateDescriptorSets) X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
@@ -234,9 +234,21 @@ Shared* bring_up(int index, std::string& why) {
 			chk(vkCreateDevice(s.phys, &dci, nullptr, &s.dev), "vkCreateDevice");
 			s.xqueue_index = s.xfamily == s.family ? 1 : 0;
 		}
-		vkGetDeviceQueue(s.dev, s.family, s.queue_index, &s.queue);
-		if (s.has_x) vkGetDeviceQueue(s.dev, s.xfamily, s.xqueue_index, &s.xqueue);
-		if (s.has_c2) vkGetDeviceQueue(s.dev, s.family, used, &s.cqueue2);
+		// Queues made with flags (FFmpeg's, with VK_KHR_internally_synchronized_queues) can only be had with the same flags.
+		auto get_queue = [&](uint32_t family, uint32_t index, VkQueue& q) {
+			q = VK_NULL_HANDLE;
+			if (s.external && s.ext.queue_flags) {
+				VkDeviceQueueInfo2 qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2};
+				qi.flags = s.ext.queue_flags;
+				qi.queueFamilyIndex = family;
+				qi.queueIndex = index;
+				vkGetDeviceQueue2(s.dev, &qi, &q);
+			} else vkGetDeviceQueue(s.dev, family, index, &q);
+			if (!q) throw std::runtime_error("no queue " + std::to_string(index) + " of queue family " + std::to_string(family));
+		};
+		get_queue(s.family, s.queue_index, s.queue);
+		if (s.has_x) get_queue(s.xfamily, s.xqueue_index, s.xqueue);
+		if (s.has_c2) get_queue(s.family, used, s.cqueue2);
 		VkDescriptorSetLayoutBinding b[kBindings];
 		for (int i = 0; i < kBindings; i++) b[i] = {(uint32_t)i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 		VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};

@@ -39,6 +39,7 @@ struct VkExternal {
 	uint32_t compute_family = 0, compute_queues = 0;
 	bool has_transfer = false; // a transfer-only family (for copies beside the compute work)
 	uint32_t transfer_family = 0;
+	uint32_t queue_flags = 0; // VkDeviceQueueCreateFlags its queues were made with (then they are fetched with vkGetDeviceQueue2)
 	void (*lock)(void* ctx, uint32_t family, uint32_t index) = nullptr;
 	void (*unlock)(void* ctx, uint32_t family, uint32_t index) = nullptr;
 	void* ctx = nullptr;

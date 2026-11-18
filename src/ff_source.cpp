@@ -365,7 +365,11 @@ AVBufferRef* shared_hw_device(const std::string& type, const std::string& device
 std::mutex g_vk_mutex;
 std::map<int, uint32_t> g_vk_compute_family; // per Vulkan device given out: the family the scorer submits to
 
-// lock_queue/unlock_queue are deprecated in favour of VK_KHR_internally_synchronized_queues, which drivers do not have yet; FFmpeg itself still uses them.
+// The flags FFmpeg made its queues with (AVVulkanDeviceContext::queue_flags, newer FFmpeg; VK_KHR_internally_synchronized_queues sets one): 0 where
+// the field does not exist yet.
+template <typename T> auto ffmpeg_queue_flags(const T& h, int) -> decltype((uint32_t)h.queue_flags) { return (uint32_t)h.queue_flags; }
+template <typename T> uint32_t ffmpeg_queue_flags(const T&, long) { return 0; }
+// lock_queue/unlock_queue are deprecated in favour of VK_KHR_internally_synchronized_queues (drivers that have it, NVIDIA's for one, make them no-ops); they still work.
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -400,6 +404,7 @@ bool vulkan_provider(int index, uint32_t vendor_id, uint32_t device_id, VkExtern
 	if (!compute) return false;
 	out.phys = vk->phys_dev;
 	out.dev = vk->act_dev;
+	out.queue_flags = ffmpeg_queue_flags(*vk, 0);
 	out.ctx = hw;
 	out.lock = [](void* c, uint32_t fam, uint32_t i) { auto* h = (AVHWDeviceContext*)c; ((AVVulkanDeviceContext*)h->hwctx)->lock_queue(h, fam, i); };
 	out.unlock = [](void* c, uint32_t fam, uint32_t i) { auto* h = (AVHWDeviceContext*)c; ((AVVulkanDeviceContext*)h->hwctx)->unlock_queue(h, fam, i); };

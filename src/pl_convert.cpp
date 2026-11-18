@@ -144,7 +144,14 @@ struct SharedVulkan {
 std::atomic<bool> g_ffmpeg_vulkan{false};
 
 #ifndef VES_NO_VULKAN
-// lock_queue/unlock_queue are deprecated in favour of VK_KHR_internally_synchronized_queues, which drivers do not have yet; FFmpeg itself still uses them.
+// The flags FFmpeg made its queues with (AVVulkanDeviceContext::queue_flags, newer FFmpeg; VK_KHR_internally_synchronized_queues sets one): 0 where
+// the field does not exist yet.
+template <typename T> auto ffmpeg_queue_flags(const T& h, int) -> decltype((uint32_t)h.queue_flags) { return (uint32_t)h.queue_flags; }
+template <typename T> uint32_t ffmpeg_queue_flags(const T&, long) { return 0; }
+// libplacebo takes the queues' flags (pl_vulkan_queue::flags) in newer versions; an older one can only use queues made without any.
+template <typename Q> auto set_queue_flags(Q& q, uint32_t f, int) -> decltype(q.flags = 0, true) { q.flags = (VkDeviceQueueCreateFlags)f; return true; }
+template <typename Q> bool set_queue_flags(Q&, uint32_t f, long) { return f == 0; }
+// lock_queue/unlock_queue are deprecated in favour of VK_KHR_internally_synchronized_queues (drivers that have it, NVIDIA's for one, make them no-ops); they still work.
 #if defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
@@ -186,6 +193,12 @@ pl_vulkan import_ffmpeg(SharedVulkan* s, const std::string& name) {
 		if (!ip.queue_graphics.count) { av_buffer_unref(&ref); return nullptr; }
 		if (!ip.queue_compute.count) ip.queue_compute = ip.queue_graphics;
 		if (!ip.queue_transfer.count) ip.queue_transfer = ip.queue_graphics;
+		const uint32_t qflags = ffmpeg_queue_flags(*hv, 0);
+		if (!set_queue_flags(ip.queue_graphics, qflags, 0) || !set_queue_flags(ip.queue_compute, qflags, 0) || !set_queue_flags(ip.queue_transfer, qflags, 0)) {
+			fprintf(stderr, "libplacebo: this libplacebo cannot use FFmpeg's Vulkan queues (made with flags 0x%x): converting on a device of its own, through memory\n", qflags);
+			av_buffer_unref(&ref);
+			return nullptr;
+		}
 		pl_vulkan vk = pl_vulkan_import(s->log, &ip);
 		if (!vk) { av_buffer_unref(&ref); return nullptr; }
 		s->ffmpeg = ref;
