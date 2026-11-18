@@ -29,7 +29,7 @@
 			"encoder": "amf",
 			"codec": "hevc",
 			"options": {
-				"preset": ["speed", "balanced", "quality", "high_quality"],
+				"preset": ["speed", "balanced", "quality", "high_quality"],   // high_quality = quality on RDNA 2 (Areldir, 1.4.37) but differs on RDNA 3 (780M, 1.5.3) [T], so both stay
 				// "profile": [...], "tier": [...],   // the encoder picks main or main10 from the picture; the tier only changes the level's bitrate limits
 				"rate_control": [""],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T]; also lcvbr, qvbr, hqvbr, hqcbr
 				// "rate_control": ["", "vbr", "hqvbr", "hqcbr"],   // to test whether this GPU still has the high quality modes
