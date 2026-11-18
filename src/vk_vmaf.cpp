@@ -1491,8 +1491,11 @@ private:
 				for (auto& d : vulkan_devices_fastest_first()) if (d.index == device_index) vendor = d.vendor_id;
 				cpc.lanes = vendor != 0x1002;
 				if (const char* e = getenv("VES_CAMBI_LANES"); e && *e) cpc.lanes = atoi(e) > 0;
-				// cambi_cvalue's column counts for tiles whose values lie close together (VES_CAMBI_COLS=0: off)
-				if (const char* e = getenv("VES_CAMBI_COLS"); e && *e && atoi(e) == 0) cpc.lanes |= 2;
+				// cambi_cvalue's column counts for tiles whose values lie close together: CAMBI 30% cheaper on an RTX 4080 SUPER, but cvalue 1.9x
+				// slower on an RDNA 2 iGPU (2026-11-18). Not on AMD, unless VES_CAMBI_COLS says
+				bool cols = vendor != 0x1002;
+				if (const char* e = getenv("VES_CAMBI_COLS"); e && *e) cols = atoi(e) > 0;
+				if (!cols) cpc.lanes |= 2;
 			}
 			cpc.vlt_luma = vlt_luma(o.vlt, lr, pq);
 			const int v_lo = cpc.vlt_luma - 3 * nd + 1;
