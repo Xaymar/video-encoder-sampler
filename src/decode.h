@@ -18,3 +18,6 @@ public:
 };
 
 std::unique_ptr<Decoder> make_decoder(); // libavcodec
+
+// A picture that is still on the GPU (Picture::gpu) read back into memory, as decoding to memory would have given it; true if it is in memory now.
+bool picture_to_memory(Picture& p);

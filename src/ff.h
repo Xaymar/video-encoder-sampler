@@ -57,3 +57,10 @@ std::vector<HwChoice> hw_decode_choices(AVCodecID id);
 std::string hw_decode_gpu_identity();
 // The hardware device of a type, made once per run and shared by every decoder; nullptr if it cannot be made. The caller gets a reference of its own.
 AVBufferRef* shared_hw_device(const std::string& type, const std::string& device);
+
+#ifndef VES_NO_VULKAN
+#include "vk_compute.h"
+// An FFmpeg Vulkan frame, decoded on Vulkan device `device` (FFmpeg's device that the scorer shares), described for reading it in place; false if it
+// cannot be (another device, a queue family the scorer does not use, a layout it does not know).
+bool vulkan_frame(const AVFrame* f, int device, VkDecodedFrame& out);
+#endif

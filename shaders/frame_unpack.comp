@@ -1,0 +1,29 @@
+#version 450
+layout(local_size_x = 256) in;
+// A plane of a frame decoded on this GPU (copied out of its image as it is: NV12/P010 and the like) into a plane as the scorer takes it: samples one
+// after the other, 1 byte each up to 8 bits, 2 bytes (the value, little-endian) above. Each invocation writes one word of the output.
+//   mode 0: luma, sample k = source sample k;  mode 1 / 2: chroma of an interleaved plane, sample k = source sample 2k (U) / 2k + 1 (V)
+// Source samples are `sbps` bytes; `shift` moves them down (P010 keeps its 10 bits at the top of 16).
+layout(std430, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { uint dst[]; };
+layout(push_constant) uniform PC { int words; int samples; int mode; int sbps; int dbps; int shift; } pc;
+
+uint sample_at(int i) { // source sample i
+	if (pc.sbps == 1) return (src[i >> 2] >> ((i & 3) * 8)) & 0xffu;
+	return (src[i >> 1] >> ((i & 1) * 16)) & 0xffffu;
+}
+
+void main() {
+	const int k = int(gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u + gl_GlobalInvocationID.x);
+	if (k >= pc.words) return;
+	const int per = 4 / pc.dbps;
+	uint w = 0u;
+	for (int j = 0; j < per; j++) {
+		const int s = k * per + j;
+		if (s >= pc.samples) break;
+		const int from = pc.mode == 0 ? s : 2 * s + (pc.mode - 1);
+		const uint v = sample_at(from) >> uint(pc.shift);
+		w |= v << uint(j * 8 * pc.dbps);
+	}
+	dst[k] = w;
+}

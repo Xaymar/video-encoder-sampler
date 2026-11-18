@@ -687,6 +687,62 @@ public:
 		t_copy += std::chrono::duration<double>(clock::now() - t1).count();
 	}
 
+	// Whether frame `f`, decoded on the GPU, can be read in place: on this device (which must be its decoder's), in the layout the scorer takes.
+	bool takes(const VkDecodedFrame& f) const {
+		if (f.device != device_index || !vk.external() || speed2) return false;
+		if (f.nplanes < 2 || (f.bytes == 1) != (bps == 1) || (bps == 1 && f.shift != 0)) return false;
+		if (!f.interleaved && f.nplanes < 3) return false;
+		return f.planes[0].w == (uint32_t)W && f.planes[0].h == (uint32_t)H && (su.empty() || (f.planes[1].w == (uint32_t)cw && f.planes[1].h == (uint32_t)ch));
+	}
+
+	// submit() for a decoded frame on the GPU (takes(f)): its planes are copied out of its images at the start of the slot's work.
+	void submit_gpu(const uint8_t* const ref[3], const size_t ref_stride[3], const VkDecodedFrame& f, size_t index) {
+		using clock = std::chrono::steady_clock;
+		const int k = (int)(index % kSlots);
+		Slot& sl = slots[k];
+		const auto t0 = clock::now();
+		collect(k);
+		const auto t1 = clock::now();
+		t_wait += std::chrono::duration<double>(t1 - t0).count();
+		auto put = [&](void* dst, const uint8_t* src, size_t stride, int w, int h) {
+			const size_t row = (size_t)w * bps;
+			if (stride == row) memcpy(dst, src, row * h);
+			else for (int y = 0; y < h; y++) memcpy((uint8_t*)dst + (size_t)y * row, src + (size_t)y * stride, row);
+		};
+		put(sl.in_ref.map, ref[0], ref_stride[0], W, H);
+		if (!su.empty()) {
+			put(sl.in_chroma[0].map, ref[1], ref_stride[1], cw, ch);
+			put(sl.in_chroma[1].map, ref[2], ref_stride[2], cw, ch);
+		}
+		if (vk.async_upload()) {
+			vk.upload_begin(k);
+			vk.upload_copy(sl.in_ref, sl.dev_ref);
+			if (!su.empty()) for (int p = 0; p < 2; p++) vk.upload_copy(sl.in_chroma[p], sl.dev_chroma[p]);
+			vk.upload_submit(k, speed2);
+		}
+		sl.held = f.keep;
+		gpu_in = &f;
+		if (f.lock) f.lock(f.ctx);
+		try {
+			record(k, index);
+		} catch (...) {
+			gpu_in = nullptr;
+			if (f.unlock) f.unlock(f.ctx);
+			throw;
+		}
+		gpu_in = nullptr;
+		if (f.unlock) f.unlock(f.ctx);
+		{
+			std::lock_guard lock(mutex);
+			sl.index = index;
+			sl.state = Slot::Busy;
+		}
+		changed.notify_all();
+		t_copy += std::chrono::duration<double>(clock::now() - t1).count();
+	}
+
+	int device() const { return device_index; }
+
 	// Every frame's features (per frame, per model), in order, once the GPU and the results are done with all of them. Throws if one failed.
 	std::vector<std::vector<Features>> finish(size_t frames) {
 		using clock = std::chrono::steady_clock;
@@ -714,6 +770,61 @@ public:
 	uint64_t mem_device = 0, mem_host = 0, mem_slot = 0;
 
 private:
+	const VkDecodedFrame* gpu_in = nullptr; // submit_gpu(): the frame record() starts with
+
+	// The planes of a decoded frame out of its images, into the buffers that its upload would have filled (the slot's own in VRAM with the copies
+	// on their own queue, else the ones in system memory, which record() copies on from): exact, the samples are only moved (and shifted down).
+	void read_decoded(int slot, const VkDecodedFrame& f) {
+		Slot& sl = slots[slot];
+		const bool dev = vk.async_upload();
+		Buf& y_to = dev ? sl.dev_dis : sl.in_dis;
+		Buf* u_to = su.empty() ? nullptr : dev ? &sl.dev_chroma[2] : &sl.in_chroma[2];
+		Buf* v_to = su.empty() ? nullptr : dev ? &sl.dev_chroma[3] : &sl.in_chroma[3];
+		for (int i = 0; i < f.nimages; i++) {
+			vk.wait_timeline(slot, f.sem[i], *f.sem_value[i]);
+			vk.image_to_transfer(f.images[i], *f.layout[i], *f.access[i]);
+			*f.sem_value[i] += 1;
+			vk.signal_timeline(slot, f.sem[i], *f.sem_value[i]);
+		}
+		if (!sl.ftmp[0].buf) {
+			sl.ftmp[0] = vk.buffer(((size_t)W * H * f.bytes + 3) / 4 * 4 + 4, 1);
+			const size_t c = (size_t)f.planes[1].w * f.planes[1].h * f.bytes * (f.interleaved ? 2 : 1);
+			sl.ftmp[1] = vk.buffer((c + 3) / 4 * 4 + 4, 1);
+			sl.ftmp[2] = vk.buffer((c + 3) / 4 * 4 + 4, 1);
+			sl.fpipe[0] = vk.pipeline("frame_unpack", {&sl.ftmp[0], &y_to});
+			if (u_to) {
+				sl.fpipe[1] = vk.pipeline("frame_unpack", {&sl.ftmp[1], u_to});
+				sl.fpipe[2] = vk.pipeline("frame_unpack", {f.interleaved ? &sl.ftmp[1] : &sl.ftmp[2], v_to});
+			}
+		}
+		const bool y_direct = f.bytes == 1 && f.shift == 0; // NV12's luma is already what the scorer takes
+		vk.copy_image(f.planes[0], y_direct ? y_to : sl.ftmp[0]);
+		if (u_to) {
+			vk.copy_image(f.planes[1], sl.ftmp[1]);
+			if (!f.interleaved) vk.copy_image(f.planes[2], sl.ftmp[2]);
+		}
+		vk.barrier();
+		struct { int32_t words, samples, mode, sbps, dbps, shift; } pc;
+		auto unpack = [&](const Pipe& p, int samples, int mode) {
+			pc.samples = samples;
+			pc.words = (samples * bps + 3) / 4;
+			pc.mode = mode;
+			pc.sbps = f.bytes;
+			pc.dbps = bps;
+			pc.shift = f.shift;
+			vk.bind(p);
+			vk.push(&pc, sizeof pc);
+			const uint32_t groups = (uint32_t)((pc.words + 255) / 256);
+			vk.dispatch(std::min<uint32_t>(groups, 65535u), (groups + 65534u) / 65535u);
+		};
+		if (!y_direct) unpack(sl.fpipe[0], W * H, 0);
+		if (u_to) {
+			unpack(sl.fpipe[1], cw * ch, f.interleaved ? 1 : 0);
+			unpack(sl.fpipe[2], cw * ch, f.interleaved ? 2 : 0);
+		}
+		vk.barrier();
+	}
+
 	// The work of frame `index` into the command buffer of slot `slot`, submitted.
 	void record(int slot, size_t index) {
 		Slot& sl = slots[slot];
@@ -721,6 +832,7 @@ private:
 		// The frames before on the queue (this scorer's other slots) are done with the shared buffers before this one writes them.
 		vk.barrier();
 		vk.stamp(slot, 0);
+		if (gpu_in) read_decoded(slot, *gpu_in);
 		auto part_done = [&](int part) { // VES_SCORE_TIMING: the end of one part of the work
 			if (!part_timing) return;
 			vk.barrier();
@@ -1028,6 +1140,9 @@ private:
 		size_t index = 0;
 		bool with_motion[2] = {false, false};
 		Buf in_ref, in_dis, in_chroma[4];
+		Buf ftmp[3];                // a frame decoded on the GPU: its planes as copied out of its images (read_decoded())
+		Pipe fpipe[3];              // ... and the unpacking of each into the frame's buffers
+		std::shared_ptr<void> held; // ... and the frame itself, until the slot is used again
 		// With a second queue (Vk::async_upload()): the frame copied into VRAM there, while the compute queue works on other frames; the compute
 		// work then starts with fast copies from these into the shared buffers.
 		Buf dev_ref, dev_dis, dev_chroma[4];
@@ -1779,6 +1894,22 @@ bool GpuVmaf::add(const uint8_t* const ref[3], const size_t ref_stride[3], const
 	return true;
 }
 
+bool GpuVmaf::add_gpu(const uint8_t* const ref[3], const size_t ref_stride[3], const void* dis, bool& refused) {
+	const VkDecodedFrame& f = *(const VkDecodedFrame*)dis;
+	refused = !impl->gpu->takes(f);
+	if (refused) return false;
+	try {
+		impl->gpu->submit_gpu(ref, ref_stride, f, impl->frames);
+		impl->frames++;
+	} catch (const std::exception& e) {
+		fprintf(stderr, "vmaf (GPU): %s\n", e.what());
+		return false;
+	}
+	return true;
+}
+
+int GpuVmaf::device() const { return impl->gpu->device(); }
+
 void GpuVmaf::timing(double& copy, double& wait, double& gpu, double& results) const {
 	copy = wait = gpu = results = 0;
 	if (impl->gpu) impl->gpu->timing(copy, wait, gpu, results);
@@ -1869,6 +2000,8 @@ GpuVmaf::~GpuVmaf() {}
 bool GpuVmaf::supported(const std::vector<std::string>&, int, const GpuVmafFrame&, std::string& why) { why = "built without Vulkan"; return false; }
 std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::vector<std::string>&, int, const GpuVmafFrame&, std::string& why) { why = "built without Vulkan"; return nullptr; }
 bool GpuVmaf::add(const uint8_t* const[3], const size_t[3], const uint8_t* const[3], const size_t[3]) { return false; }
+bool GpuVmaf::add_gpu(const uint8_t* const[3], const size_t[3], const void*, bool& refused) { refused = true; return false; }
+int GpuVmaf::device() const { return -1; }
 bool GpuVmaf::finish(std::vector<std::vector<double>>&, std::vector<std::vector<std::map<std::string, double>>>*) { return false; }
 void GpuVmaf::timing(double& copy, double& wait, double& gpu, double& results) const { copy = wait = gpu = results = 0; }
 void GpuVmaf::gpu_parts(std::vector<std::pair<std::string, double>>& parts) const { parts.clear(); }

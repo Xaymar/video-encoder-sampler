@@ -52,6 +52,9 @@ struct Picture {
 	int64_t duration = 1;           // in the same units
 	Color color;
 	std::shared_ptr<void> owner;
+	// A frame that is still on the GPU that decoded it (a VkDecodedFrame of vk_compute.h; data[] is empty then): scored there where the scorer can,
+	// else brought to memory first (picture_to_memory(), decode.h).
+	std::shared_ptr<void> gpu;
 };
 
 // Output geometry of an encode; zero fields mean "as the source".

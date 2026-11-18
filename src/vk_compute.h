@@ -2,6 +2,7 @@
 // A minimal Vulkan compute layer for the GPU VMAF scorer (vk_vmaf.cpp). Each Vulkan device that is used is brought up once and shared by every
 // scorer in the process that uses it; each `Vk` object is one user of one device, with its own buffers, descriptor sets and command buffer, all released when it goes away.
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,52 @@ bool gpu_of_vulkan_device(int index, unsigned& vendor, int& n);
 #ifndef VES_NO_VULKAN
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
+
+// A Vulkan device made elsewhere for Vk to use instead of making its own: FFmpeg's, so that frames its decoder made on the GPU can be read where they
+// are (see ff_vulkan.cpp). It must have shaderInt64, shaderFloat64 and timeline semaphores on. `lock`/`unlock` guard a queue that its maker uses too.
+struct VkExternal {
+	VkPhysicalDevice phys = VK_NULL_HANDLE;
+	VkDevice dev = VK_NULL_HANDLE;
+	uint32_t compute_family = 0, compute_queues = 0;
+	bool has_transfer = false; // a transfer-only family (for copies beside the compute work)
+	uint32_t transfer_family = 0;
+	void (*lock)(void* ctx, uint32_t family, uint32_t index) = nullptr;
+	void (*unlock)(void* ctx, uint32_t family, uint32_t index) = nullptr;
+	void* ctx = nullptr;
+};
+// Where devices come from when one is first brought up: `provider(index, vendor, device, out)` fills `out` for Vulkan device `index` (as Vk::devices()
+// numbers it, with these PCI ids) and returns true, or returns false to have Vk make its own. Set before any device is brought up.
+void vk_set_external_provider(bool (*provider)(int index, uint32_t vendor_id, uint32_t device_id, VkExternal& out));
+
+// A plane of an image on the device (a frame decoded there) to be copied into a buffer: `aspect` is VK_IMAGE_ASPECT_PLANE_n_BIT of a multi-planar
+// image or VK_IMAGE_ASPECT_COLOR_BIT; w x h texels.
+struct VkImagePlane {
+	VkImage img = VK_NULL_HANDLE;
+	VkImageAspectFlags aspect = 0;
+	uint32_t w = 0, h = 0;
+};
+
+// A frame decoded on a device that Vk uses (an FFmpeg Vulkan frame, see ff_vulkan.cpp), described for reading it where it is. The planes are those
+// of the decoder's format: Y, then either one plane of interleaved U and V (NV12, P010) or U and V; samples `bytes` wide with the value `shift`
+// bits up. Images, their layouts and access, and the timeline semaphore of each are the frame's own: they are updated as it is read. `lock` and
+// `unlock` (with `ctx`) keep its decoder off it meanwhile; `keep` holds the frame until the GPU is done with it.
+struct VkDecodedFrame {
+	VkImagePlane planes[3];
+	int nplanes = 0;
+	bool interleaved = false;
+	int bytes = 1, shift = 0;
+	VkImage images[3]{};
+	int nimages = 0;
+	VkImageLayout* layout[3]{};
+	uint32_t* access[3]{};
+	VkSemaphore sem[3]{};
+	uint64_t* sem_value[3]{};
+	void (*lock)(void* ctx) = nullptr;
+	void (*unlock)(void* ctx) = nullptr;
+	void* ctx = nullptr;
+	int device = -1; // the Vulkan device (Vk::devices() index)
+	std::shared_ptr<void> keep;
+};
 
 struct Buf {
 	VkBuffer buf = VK_NULL_HANDLE;
@@ -76,6 +123,15 @@ public:
 	void copy(const Buf& src, const Buf& dst, VkDeviceSize size = 0); // size 0: the smaller of the two buffers
 	void copy_range(const Buf& src, VkDeviceSize src_off, const Buf& dst, VkDeviceSize dst_off, VkDeviceSize size);
 	void barrier();
+	// An image the device made (a decoded frame): moves it from `layout` (with writes `access` to finish first) to the layout copies read from,
+	// and updates `layout` and `access` to that. Then copy_image() copies one of its planes into a buffer, row after row with no gaps.
+	void image_to_transfer(VkImage img, VkImageLayout& layout, uint32_t& access);
+	void copy_image(const VkImagePlane& plane, const Buf& dst);
+	// The slot's next submit() waits for timeline semaphore `sem` to reach `value` first / sets it to `value` when done.
+	void wait_timeline(int slot, VkSemaphore sem, uint64_t value);
+	void signal_timeline(int slot, VkSemaphore sem, uint64_t value);
+	// Whether the device came from a VkExternal provider (and so has timeline semaphores and can read its maker's images).
+	bool external() const;
 	static constexpr int kStamps = 12;
 	void stamp(int slot, int which); // timestamp `which` (0: start, 1: end of the slot's work; up to kStamps - 1 for parts of it), see gpu_seconds()
 	// Copies on a second queue (async_upload(): the device has one), so that copying a frame in overlaps the compute work on frames before it:

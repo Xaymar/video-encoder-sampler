@@ -31,6 +31,10 @@ public:
 	// planes are only read when the model has a chroma feature. The planes are copied before it returns; the scoring goes on in the background, several
 	// frames at once, and add() waits only when all of them are still busy. False if the frame (or one before it) could not be scored.
 	bool add(const uint8_t* const ref[3], const size_t ref_stride[3], const uint8_t* const dis[3], const size_t dis_stride[3]);
+	// The same with a decoded frame that is still on the GPU (`dis`, opaque: a VkDecodedFrame of vk_compute.h), read where it is: false if it is on
+	// another device or in a form this cannot read (then download it and use add()). `refused` tells that apart from a failure of the scoring.
+	bool add_gpu(const uint8_t* const ref[3], const size_t ref_stride[3], const void* dis, bool& refused);
+	int device() const; // the Vulkan device it scores on
 	// For each model (in the order given), the VMAF score of every pair added; and, if asked for, every frame's features as libvmaf names them.
 	bool finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<std::map<std::string, double>>>* features = nullptr);
 	// Seconds spent so far, in add() and finish(): copying frames in and handing them to the GPU, and waiting for a frame in flight to be done; and in

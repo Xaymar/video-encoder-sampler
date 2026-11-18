@@ -11,6 +11,7 @@
 // the GPU gets FFmpeg's own AV1 decoder, which has no software path of its own; the check covers that as well.)
 #include "decode.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -109,6 +110,8 @@ struct Dec {
 	AVBufferRef* dev = nullptr;
 	std::deque<Picture> ready;
 	bool eof = false;
+	bool keep_on_gpu = false; // Vulkan frames stay where they are (Picture::gpu), for the scorer on the same device
+	int vk_device = -1;
 	long long got = 0; // frames received
 
 	~Dec() {
@@ -117,6 +120,9 @@ struct Dec {
 		av_frame_free(&planar);
 		avcodec_free_context(&ctx);
 		av_buffer_unref(&dev);
+#ifndef VES_NO_VULKAN
+		av_buffer_unref(&test_frames);
+#endif
 	}
 
 	static AVPixelFormat pick_format(AVCodecContext* c, const AVPixelFormat* fmts) {
@@ -154,6 +160,7 @@ struct Dec {
 			ctx->opaque = (void*)(intptr_t)hw_fmt;
 			ctx->get_format = &Dec::pick_format;
 			ctx->thread_count = 1; // the GPU does the work
+			ctx->extra_hw_frames = 8; // frames that stay on the GPU are held while the scorer has them in flight
 		}
 		if (!extradata.empty()) {
 			ctx->extradata = (uint8_t*)av_mallocz(extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE);
@@ -166,6 +173,82 @@ struct Dec {
 
 	bool send(const AVPacket* pkt) { return avcodec_send_packet(ctx, pkt) >= 0; }
 
+#ifndef VES_NO_VULKAN
+	bool test_upload = false;           // VES_HW_DECODE_TEST_UPLOAD: the "test" decoder's frames are uploaded to a Vulkan device, as if decoded there
+	AVBufferRef* test_frames = nullptr;
+
+	// A Vulkan frame as a picture that stays on the GPU (Picture::gpu); false if the scorer could not read it there.
+	bool gpu_picture(AVFrame* hwf) {
+		if (!hwf->hw_frames_ctx) return false;
+		auto vf = std::make_shared<VkDecodedFrame>();
+		const AVPixelFormat sw_fmt = ((AVHWFramesContext*)hwf->hw_frames_ctx->data)->sw_format;
+		const SemiPlanar* sp = semi_planar(sw_fmt);
+		const AVPixelFormat planar_fmt = sp ? sp->to : sw_fmt;
+		Fmt fmt;
+		if (!describe_native(planar_fmt, fmt) || !fmt.planar || !vulkan_frame(hwf, vk_device, *vf)) return false;
+		Picture p;
+		p.width = hwf->width; p.height = hwf->height;
+		p.fmt = fmt;
+		p.native = planar_fmt;
+		p.layout = layout_of(planar_fmt);
+		p.pts = hwf->pts;
+		p.duration = hwf->duration;
+		p.color = {(int)hwf->color_range, (int)hwf->colorspace, (int)hwf->color_primaries, (int)hwf->color_trc};
+		p.gpu = vf;
+		ready.push_back(std::move(p));
+		return true;
+	}
+
+	// For testing the GPU path without a GPU decoder: the frame, interleaved to NV12/P010 if VES_HW_DECODE_TEST_UPLOAD=nv12, uploaded to device vk_device.
+	bool upload_test(AVFrame* f) {
+		const bool nv = strcmp(getenv("VES_HW_DECODE_TEST_UPLOAD"), "nv12") == 0;
+		const bool high = f->format == AV_PIX_FMT_YUV420P10LE;
+		if (f->format != AV_PIX_FMT_YUV420P && !high) return false;
+		AVFrame* cpu = f;
+		AVFrame* inter = nullptr;
+		if (nv) {
+			inter = av_frame_alloc();
+			inter->format = high ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+			inter->width = f->width; inter->height = f->height;
+			if (av_frame_get_buffer(inter, 0) < 0) { av_frame_free(&inter); return false; }
+			av_frame_copy_props(inter, f);
+			const int cw = (f->width + 1) / 2, ch = (f->height + 1) / 2;
+			for (int y = 0; y < f->height; y++) {
+				if (!high) memcpy(inter->data[0] + (size_t)y * inter->linesize[0], f->data[0] + (size_t)y * f->linesize[0], (size_t)f->width);
+				else for (int x = 0; x < f->width; x++) ((uint16_t*)(inter->data[0] + (size_t)y * inter->linesize[0]))[x] = (uint16_t)(((const uint16_t*)(f->data[0] + (size_t)y * f->linesize[0]))[x] << 6);
+			}
+			for (int y = 0; y < ch; y++) for (int x = 0; x < cw; x++) {
+				if (!high) {
+					inter->data[1][(size_t)y * inter->linesize[1] + 2 * x] = f->data[1][(size_t)y * f->linesize[1] + x];
+					inter->data[1][(size_t)y * inter->linesize[1] + 2 * x + 1] = f->data[2][(size_t)y * f->linesize[2] + x];
+				} else {
+					uint16_t* d = (uint16_t*)(inter->data[1] + (size_t)y * inter->linesize[1]);
+					d[2 * x] = (uint16_t)(((const uint16_t*)(f->data[1] + (size_t)y * f->linesize[1]))[x] << 6);
+					d[2 * x + 1] = (uint16_t)(((const uint16_t*)(f->data[2] + (size_t)y * f->linesize[2]))[x] << 6);
+				}
+			}
+			cpu = inter;
+		}
+		if (!test_frames) {
+			AVBufferRef* devref = shared_hw_device("vulkan", std::to_string(vk_device));
+			if (!devref) { av_frame_free(&inter); return false; }
+			test_frames = av_hwframe_ctx_alloc(devref);
+			av_buffer_unref(&devref);
+			AVHWFramesContext* fc = (AVHWFramesContext*)test_frames->data;
+			fc->format = AV_PIX_FMT_VULKAN;
+			fc->sw_format = (AVPixelFormat)cpu->format;
+			fc->width = cpu->width; fc->height = cpu->height;
+			if (av_hwframe_ctx_init(test_frames) < 0) { av_buffer_unref(&test_frames); av_frame_free(&inter); return false; }
+		}
+		AVFrame* hwf = av_frame_alloc();
+		bool ok = av_hwframe_get_buffer(test_frames, hwf, 0) >= 0 && av_hwframe_transfer_data(hwf, cpu, 0) >= 0;
+		if (ok) { av_frame_copy_props(hwf, f); ok = gpu_picture(hwf); }
+		av_frame_free(&hwf);
+		av_frame_free(&inter);
+		return ok;
+	}
+#endif
+
 	// Moves every frame the decoder has into `ready`. <0: an error (`why` says which), else 0.
 	int pump(std::string& why) {
 		for (;;) {
@@ -175,8 +258,14 @@ struct Dec {
 			char b[AV_ERROR_MAX_STRING_SIZE];
 			if (r < 0) { why = std::string("decoding failed: ") + av_make_error_string(b, sizeof b, r); return r; }
 			AVFrame* f = frame;
+#ifndef VES_NO_VULKAN
+			if (keep_on_gpu && test_upload && upload_test(frame)) { av_frame_unref(frame); got++; continue; }
+#endif
 			if (hw_fmt != AV_PIX_FMT_NONE) {
 				if (frame->format != hw_fmt) { av_frame_unref(frame); why = "the GPU did not decode the frame"; return AVERROR(ENOSYS); }
+#ifndef VES_NO_VULKAN
+				if (keep_on_gpu && hw_fmt == AV_PIX_FMT_VULKAN && gpu_picture(frame)) { av_frame_unref(frame); got++; continue; }
+#endif
 				av_frame_unref(down);
 				if (const int t = av_hwframe_transfer_data(down, frame, 0); t < 0) {
 					av_frame_unref(frame);
@@ -264,6 +353,10 @@ public:
 			hw = std::move(d);
 			hw_key = key;
 			hw_name = c.type + (c.device.empty() ? "" : ", device " + c.device);
+			if (c.type == "vulkan" && !c.device.empty()) hw->vk_device = atoi(c.device.c_str());
+#ifndef VES_NO_VULKAN
+			if (c.type == "test" && getenv("VES_HW_DECODE_TEST_UPLOAD")) { hw->test_upload = true; hw->vk_device = 0; }
+#endif
 			std::lock_guard lock(g_mutex);
 			if (auto it = g_verdicts.find(key); it != g_verdicts.end()) good = it->second;
 			break;
@@ -273,7 +366,8 @@ public:
 			return open_sw();
 		}
 		check = verify_frames();
-		if (good && check == 0) { // truthful for this kind already: the GPU alone
+		if (good && check == 0) { // truthful for this kind already: the GPU alone, and Vulkan frames stay on it
+			hw->keep_on_gpu = hw->vk_device >= 0 && !getenv("VES_HW_DECODE_TO_MEMORY");
 			tell_once("gpu|" + hw_key, "scored streams: " + kind + " streams decode on the GPU (" + hw_name + "), which matched software on a whole stream of this kind before");
 			return true;
 		}
@@ -351,5 +445,35 @@ public:
 };
 
 } // namespace
+
+bool picture_to_memory(Picture& p) {
+	if (!p.gpu) return true;
+#ifndef VES_NO_VULKAN
+	const AVFrame* src = (const AVFrame*)((VkDecodedFrame*)p.gpu.get())->keep.get();
+	AVFrame* down = av_frame_alloc();
+	AVFrame* planar = av_frame_alloc();
+	bool ok = av_hwframe_transfer_data(down, src, 0) >= 0;
+	if (ok) {
+		av_frame_copy_props(down, src);
+		AVFrame* f = unpack_semi_planar(down, planar);
+		Fmt fmt;
+		ok = describe_native((AVPixelFormat)f->format, fmt);
+		if (ok) {
+			const int64_t pts = p.pts, duration = p.duration;
+			const Color color = p.color;
+			const int w = p.width, h = p.height; // cut down already where the coded size had padding (see vmaf.cpp)
+			p = picture_from_frame(f, fmt);
+			p.pts = pts; p.duration = duration; p.color = color;
+			p.width = std::min(p.width, w); p.height = std::min(p.height, h);
+		}
+	}
+	av_frame_free(&down);
+	av_frame_free(&planar);
+	if (!ok) fprintf(stderr, "reading a frame decoded on the GPU back failed\n");
+	return ok;
+#else
+	return false;
+#endif
+}
 
 std::unique_ptr<Decoder> make_decoder() { return std::make_unique<FfDecoder>(); }

@@ -19,6 +19,9 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
+#ifndef VES_NO_VULKAN
+#include <libavutil/hwcontext_vulkan.h>
+#endif
 }
 
 namespace {
@@ -327,6 +330,61 @@ AVBufferRef* shared_hw_device(const std::string& type, const std::string& device
 	return shared ? av_buffer_ref(shared) : nullptr;
 }
 
+#ifndef VES_NO_VULKAN
+// FFmpeg's Vulkan device of a GPU is also the scorer's (vk_compute.h, VkExternal), so that what its decoder makes is read on the GPU where it is.
+std::mutex g_vk_mutex;
+std::map<int, uint32_t> g_vk_compute_family; // per Vulkan device given out: the family the scorer submits to
+
+// lock_queue/unlock_queue are deprecated in favour of VK_KHR_internally_synchronized_queues, which drivers do not have yet; FFmpeg itself still uses them.
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+bool vulkan_provider(int index, uint32_t vendor_id, uint32_t device_id, VkExternal& out) {
+	AVBufferRef* ref = shared_hw_device("vulkan", std::to_string(index)); // kept for the whole run (the shared map holds it)
+	if (!ref) return false;
+	AVHWDeviceContext* hw = (AVHWDeviceContext*)ref->data;
+	AVVulkanDeviceContext* vk = (AVVulkanDeviceContext*)hw->hwctx;
+	av_buffer_unref(&ref);
+	auto props = (PFN_vkGetPhysicalDeviceProperties)vk->get_proc_addr(vk->inst, "vkGetPhysicalDeviceProperties");
+	if (!props) return false;
+	VkPhysicalDeviceProperties p;
+	props(vk->phys_dev, &p);
+	if (p.vendorID != vendor_id || p.deviceID != device_id) return false; // FFmpeg counted the devices differently
+	// The scorer needs 64 bit integers and floats; reading the decoder's frames needs timeline semaphores.
+	if (!vk->device_features.features.shaderInt64 || !vk->device_features.features.shaderFloat64) return false;
+	bool timeline = false;
+	for (auto* n = (const VkBaseInStructure*)vk->device_features.pNext; n; n = n->pNext)
+		if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES) timeline = ((const VkPhysicalDeviceVulkan12Features*)n)->timelineSemaphore;
+		else if (n->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES) timeline = timeline || ((const VkPhysicalDeviceTimelineSemaphoreFeatures*)n)->timelineSemaphore;
+	if (!timeline || !vk->lock_queue || !vk->unlock_queue) return false;
+	bool compute = false;
+	for (int i = 0; i < vk->nb_qf; i++) {
+		const AVVulkanDeviceQueueFamily& q = vk->qf[i];
+		if (!compute && (q.flags & VK_QUEUE_COMPUTE_BIT) && q.num > 0) { out.compute_family = (uint32_t)q.idx; out.compute_queues = (uint32_t)q.num; compute = true; }
+		if (!out.has_transfer && (q.flags & VK_QUEUE_TRANSFER_BIT) && !(q.flags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) && q.num > 0) { out.transfer_family = (uint32_t)q.idx; out.has_transfer = true; }
+	}
+	if (!compute) return false;
+	out.phys = vk->phys_dev;
+	out.dev = vk->act_dev;
+	out.ctx = hw;
+	out.lock = [](void* c, uint32_t fam, uint32_t i) { auto* h = (AVHWDeviceContext*)c; ((AVVulkanDeviceContext*)h->hwctx)->lock_queue(h, fam, i); };
+	out.unlock = [](void* c, uint32_t fam, uint32_t i) { auto* h = (AVHWDeviceContext*)c; ((AVVulkanDeviceContext*)h->hwctx)->unlock_queue(h, fam, i); };
+	std::lock_guard lock(g_vk_mutex);
+	g_vk_compute_family[index] = out.compute_family;
+	fprintf(stderr, "vulkan device %d (%s): shared by FFmpeg's decoder and the scorer\n", index, p.deviceName);
+	return true;
+}
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+#endif
+
 std::string hw_decode_gpu_identity() {
 	std::lock_guard lock(g_mutex);
 	return g_vendor ? gpu_description(g_vendor, g_index) : std::string("the default GPU");
@@ -341,6 +399,8 @@ std::vector<HwChoice> hw_decode_choices(AVCodecID id) {
 	if (want.empty()) return {};
 	std::vector<HwChoice> out;
 	for (auto& c : hw_choices(id, want)) if (av_hwdevice_find_type_by_name(c.type.c_str()) != AV_HWDEVICE_TYPE_NONE) out.push_back(c); // device types only (see ff_decode.cpp)
+	// Vulkan first: its frames can be scored on the GPU where they are, the others' have to come back to memory.
+	std::stable_partition(out.begin(), out.end(), [](const HwChoice& c) { return c.type == "vulkan"; });
 	return out;
 }
 
@@ -353,7 +413,64 @@ void set_hw_decode_gpu(unsigned vendor, int index) {
 void set_hw_decode(const std::string& type) {
 	std::lock_guard lock(g_mutex);
 	g_hw = type == "off" || type == "none" ? "" : type;
+#ifndef VES_NO_VULKAN
+	// Decoding on the GPU: the scorer uses FFmpeg's Vulkan device where it can, so that frames decoded there can be scored without leaving it.
+	if (!g_hw.empty() && (g_hw == "auto" || g_hw == "vulkan")) vk_set_external_provider(&vulkan_provider);
+#endif
 }
+
+#ifndef VES_NO_VULKAN
+bool vulkan_frame(const AVFrame* f, int device, VkDecodedFrame& out) {
+	if (!f || f->format != AV_PIX_FMT_VULKAN || !f->hw_frames_ctx) return false;
+	uint32_t family;
+	{
+		std::lock_guard lock(g_vk_mutex);
+		auto it = g_vk_compute_family.find(device);
+		if (it == g_vk_compute_family.end()) return false; // the scorer is not on FFmpeg's device
+		family = it->second;
+	}
+	AVHWFramesContext* fc = (AVHWFramesContext*)f->hw_frames_ctx->data;
+	AVVulkanFramesContext* vfc = (AVVulkanFramesContext*)fc->hwctx;
+	AVVkFrame* vf = (AVVkFrame*)f->data[0];
+	const AVPixFmtDescriptor* d = av_pix_fmt_desc_get(fc->sw_format);
+	if (!d || (d->flags & (AV_PIX_FMT_FLAG_RGB | AV_PIX_FMT_FLAG_BE)) || d->nb_components != 3 || !(d->flags & AV_PIX_FMT_FLAG_PLANAR)) return false;
+	const bool interleaved = d->comp[1].plane == d->comp[2].plane;
+	out.nplanes = interleaved ? 2 : 3;
+	out.interleaved = interleaved;
+	out.bytes = d->comp[0].step > 1 || d->comp[0].depth > 8 ? 2 : 1;
+	if (interleaved) out.bytes = d->comp[1].step / 2;
+	out.shift = d->comp[0].shift;
+	if (d->comp[1].shift != out.shift || d->comp[2].shift != out.shift) return false;
+	int nimg = 0;
+	while (nimg < AV_NUM_DATA_POINTERS && vf->img[nimg]) nimg++;
+	if (nimg != 1 && nimg != out.nplanes) return false;
+	for (int i = 0; i < nimg; i++) if (vf->queue_family[i] != VK_QUEUE_FAMILY_IGNORED && vf->queue_family[i] != family) return false;
+	const int cw = AV_CEIL_RSHIFT(f->width, d->log2_chroma_w), ch = AV_CEIL_RSHIFT(f->height, d->log2_chroma_h);
+	for (int p = 0; p < out.nplanes; p++) {
+		out.planes[p].img = vf->img[nimg == 1 ? 0 : p];
+		out.planes[p].aspect = nimg == 1 ? (p == 0 ? VK_IMAGE_ASPECT_PLANE_0_BIT : p == 1 ? VK_IMAGE_ASPECT_PLANE_1_BIT : VK_IMAGE_ASPECT_PLANE_2_BIT) : VK_IMAGE_ASPECT_COLOR_BIT;
+		out.planes[p].w = (uint32_t)(p ? cw : f->width);
+		out.planes[p].h = (uint32_t)(p ? ch : f->height);
+	}
+	out.nimages = nimg;
+	for (int i = 0; i < nimg; i++) {
+		out.images[i] = vf->img[i];
+		out.layout[i] = &vf->layout[i];
+		out.access[i] = (uint32_t*)&vf->access[i];
+		out.sem[i] = vf->sem[i];
+		out.sem_value[i] = &vf->sem_value[i];
+	}
+	struct Lock { AVHWFramesContext* fc; AVVulkanFramesContext* vfc; AVVkFrame* vf; };
+	auto* l = new Lock{fc, vfc, vf};
+	AVFrame* keep = av_frame_clone(f);
+	out.keep = std::shared_ptr<void>(keep, [l](void* p) { AVFrame* a = (AVFrame*)p; av_frame_free(&a); delete l; });
+	out.ctx = l;
+	out.lock = [](void* c) { auto* k = (Lock*)c; if (k->vfc->lock_frame) k->vfc->lock_frame(k->fc, k->vf); };
+	out.unlock = [](void* c) { auto* k = (Lock*)c; if (k->vfc->unlock_frame) k->vfc->unlock_frame(k->fc, k->vf); };
+	out.device = device;
+	return true;
+}
+#endif
 
 std::unique_ptr<Source> open_source(const std::string& path) {
 	av_log_set_level(AV_LOG_ERROR); // warnings such as "UDTA parsing failed" repeat for every run that opens the file
