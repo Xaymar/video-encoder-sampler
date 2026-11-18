@@ -77,14 +77,18 @@ void load_verdicts() {
 		const size_t tab = line.find('\t');
 		if (tab == std::string::npos) continue;
 		const std::string what = line.substr(0, tab), key = line.substr(tab + 1);
-		if (what == "good" || what == "bad") g_verdicts[key] = what == "good"; // the last line for a key wins
+		// "bad" wins over "good": a decoder that got one stream of a kind wrong is not trusted with it again, even when another stream of that kind
+		// that ran at the same time matched (some lie only now and then: d3d12va on an RDNA 2 iGPU did).
+		if (what == "bad") g_verdicts[key] = false;
+		else if (what == "good") g_verdicts.emplace(key, true);
 	}
 }
 
 // With g_mutex held.
 void save_verdict(const std::string& key, bool good) {
 	load_verdicts();
-	if (auto it = g_verdicts.find(key); it != g_verdicts.end() && it->second == good) return;
+	if (auto it = g_verdicts.find(key); it != g_verdicts.end() && (it->second == good || !it->second)) return; // the same, or bad already (bad stays)
+	if (good && g_bad.count(key)) return; // it differed on another stream in this process
 	g_verdicts[key] = good;
 	const std::string file = verdict_file();
 	if (file.empty()) return;
