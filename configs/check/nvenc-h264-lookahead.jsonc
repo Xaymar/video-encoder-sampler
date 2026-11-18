@@ -38,7 +38,7 @@
 				"lookahead_level": [0, 1, 2, 3],   // needs lookahead (NVIDIA's library aborts the process otherwise [T]); 15 = auto made the same stream as 3 every time [T 2026-11-18, RTX 4080 SUPER]
 				"disable_iadapt": [0, 1],   // adaptive I-frames at scene cuts: lookahead only [H][G 8.2]
 				"disable_badapt": [0, 1],   // adaptive B-frame count: lookahead and B-frames only [H][G 8.2]
-				"multi_pass": [0, 1, 2],   // 0 off, 1 two passes with a quarter resolution first pass, 2 two full passes [G 3.8.4]
+				"multi_pass": [0],   // its own slice (nvenc-h264-multipass.jsonc): it does not depend on lookahead
 				"spatial_aq": [0],   // fixed for this slice
 				"temporal_aq": [0, 1],
 				"strict_gop_target": [0, 1],
