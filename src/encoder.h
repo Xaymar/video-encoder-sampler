@@ -42,6 +42,10 @@ public:
 	// them (`ves --list-options` shows them as the defaults). Empty when the encoder cannot tell.
 	virtual std::vector<std::pair<std::string, std::string>> settings() { return {}; }
 	Stats stats;
+	// After open(): the size the encoder codes, when it is larger than Params::width x height because the encoder pads the picture at the right and bottom
+	// (AMF's AV1 codes in 64x16 blocks only). 0 when it codes the picture's own size. AV1 has no cropping of its own (its render size is a hint that
+	// decoders ignore), so the stream decodes this large: the MP4 carries the crop (a 'clap' box) and scoring cuts the padding off.
+	int coded_w = 0, coded_h = 0;
 	// open() failed because the GPU had no encode session left (NVENC's per-GPU limit, which sessions of other processes count against, also ones stuck
 	// in the driver): not the run's fault, so it is run again later instead of counting as failed.
 	bool no_session = false;

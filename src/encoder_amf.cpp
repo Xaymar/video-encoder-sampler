@@ -161,7 +161,8 @@ class Amf : public Encoder {
 	amf::AMFComponentPtr enc;
 	int depth = 8;
 	Sink sink;
-	int w = 0, h = 0;
+	int w = 0, h = 0;   // the picture
+	int cw = 0, ch = 0; // what is coded: the picture and the padding at the right and bottom (AV1: 64x16 blocks)
 	// Finished packets are collected on a thread of their own; AMF has no blocking read, so it polls.
 	std::thread rx;
 	std::atomic<bool> eof{false}, stop{false};
@@ -197,6 +198,10 @@ class Amf : public Encoder {
 		amf::AMFPlane *yp = surf->GetPlaneAt(0), *uvp = surf->GetPlaneAt(1);
 		pack_plane(*fr, 0, w, h, depth, (uint8_t*)yp->GetNative(), yp->GetHPitch());
 		pack_uv(*fr, w, h, depth, (uint8_t*)uvp->GetNative(), uvp->GetHPitch());
+		if (cw == w && ch == h) return;
+		const int bytes = depth > 8 ? 2 : 1;
+		pad_edges((uint8_t*)yp->GetNative(), yp->GetHPitch(), w, h, cw, ch, bytes);
+		pad_edges((uint8_t*)uvp->GetNative(), uvp->GetHPitch(), (w + 1) / 2, (h + 1) / 2, cw / 2, ch / 2, 2 * bytes);
 	}
 
 	// What the encoder says it can do: where it runs (dedicated hardware, GPU compute or software) and the capability values the SDK lists (maximum bit rate, B-frames,
@@ -337,7 +342,7 @@ private:
 		refused(filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_SENSITIVITY, sensitivity), "PPAdaptiveFilterSensitivity");
 		refused(filter_pp->SetProperty(AMF_PP_TARGET_BITRATE, (amf_int64)p.bitrate), "PPTargetBitrate");
 		refused(filter_pp->SetProperty(AMF_PP_FRAME_RATE, AMFConstructRate(p.framerate.num, p.framerate.den)), "PPFrameRate");
-		if ((r = filter_pp->Init(depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init(PreProcessing)");
+		if ((r = filter_pp->Init(depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, cw, ch)) != AMF_OK) return fail(r, "Init(PreProcessing)");
 		return true;
 	}
 
@@ -423,7 +428,7 @@ public:
 
 	bool open(const Params& p, Sink s) override {
 		sink = std::move(s);
-		w = p.width; h = p.height;
+		w = cw = p.width; h = ch = p.height;
 		const Fmt fmt = p.pix;
 		depth = fmt.depth;
 		if (fmt.chroma != 420 || depth > 10) { fprintf(stderr, "amf: cannot encode %d-bit %d\n", depth, fmt.chroma); return false; }
@@ -467,7 +472,6 @@ public:
 		enc->SetProperty(n->rc, n->rc_cbr);
 		enc->SetProperty(n->target, (amf_int64)p.bitrate);
 		enc->SetProperty(n->peak, (amf_int64)p.bitrate);
-		enc->SetProperty(n->size, AMFConstructSize(w, h));
 		enc->SetProperty(n->rate, AMFConstructRate(p.framerate.num, p.framerate.den));
 		enc->SetProperty(n->gop, (amf_int64)p.gop);
 		enc->SetProperty(n->bitdepth, (amf_int64)(depth > 8 ? 10 : 8));
@@ -475,6 +479,15 @@ public:
 		NativeOptions native_opts;
 		std::string why;
 		if (!resolve_options("amf", p.codec, o, [](const std::string& k) { return k; }, native_opts, why)) { fprintf(stderr, "amf: %s\n", why.c_str()); return false; }
+		if (p.codec == "av1" && std::none_of(native_opts.begin(), native_opts.end(), [](const auto& kv) { return kv.first == "alignment_mode"; })) {
+			// AV1 is coded in 64x16 blocks only [H Av1AlignmentMode, its default], which AMD recommends for quality over the modes that code other sizes
+			// (RDNA 3 refuses 1080 lines in this mode, so 1920x1080 is coded as 1920x1088). The picture is padded to that by repeating its edges, and
+			// the padding is cropped off in the container (coded_w/coded_h), since AV1 itself cannot crop.
+			cw = (w + 63) / 64 * 64; ch = (h + 15) / 16 * 16;
+			if (enc->SetProperty(AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE, (amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_64X16_ONLY) != AMF_OK) cw = w, ch = h; // a runtime without the property
+		}
+		if (cw != w || ch != h) { coded_w = cw; coded_h = ch; }
+		enc->SetProperty(n->size, AMFConstructSize(cw, ch));
 
 		// The pre-encode filter is a component of its own in front of the encoder; its options (pre_filter, pre_filter_strength, pre_filter_sensitivity) are not encoder properties.
 		std::map<std::string, std::string> filter_opts;
@@ -508,20 +521,11 @@ public:
 			std::string line;
 			for (auto& [k, v] : native_opts) line += " " + k + "=" + v;
 			for (auto& [k, v] : filter_opts) line += " " + k + "=" + v;
-			fprintf(stderr, "amf: opening %s %dx%d with%s\n", p.codec.c_str(), w, h, line.empty() ? " defaults" : line.c_str());
+			if (cw != w || ch != h) fprintf(stderr, "amf: opening %s %dx%d (coded %dx%d) with%s\n", p.codec.c_str(), w, h, cw, ch, line.empty() ? " defaults" : line.c_str());
+			else fprintf(stderr, "amf: opening %s %dx%d with%s\n", p.codec.c_str(), w, h, line.empty() ? " defaults" : line.c_str());
 		}
 		const auto surface = depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12;
-		bool inited = false;
-		if (p.codec == "av1" && std::none_of(native_opts.begin(), native_opts.end(), [](const auto& kv) { return kv.first == "alignment_mode"; })) {
-			// AV1's alignment mode defaults to 64x16 only [H Av1AlignmentMode], which RDNA 3 refuses for 1080 lines with AMF_NOT_SUPPORTED. Try no
-			// restrictions first, then 8x2, then 1080p coded as 1082 lines (RDNA 3's own workaround), keeping the first one Init accepts.
-			for (amf_int64 mode : {(amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_NO_RESTRICTIONS, (amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_8X2_ONLY,
-					(amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_64X16_1080P_CODED_1082, (amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_64X16_ONLY}) {
-				if (enc->SetProperty(AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE, mode) != AMF_OK) break;   // an older runtime without the property
-				if ((r = enc->Init(surface, w, h)) == AMF_OK) { inited = true; break; }   // a failed Init leaves nothing to terminate
-			}
-			if (!inited && (r = enc->Init(surface, w, h)) != AMF_OK) return fail(r, "Init");
-		} else if ((r = enc->Init(surface, w, h)) != AMF_OK) return fail(r, "Init");
+		if ((r = enc->Init(surface, cw, ch)) != AMF_OK) return fail(r, "Init");
 		read_caps();
 		if (!filter_opts.empty() && !open_filter(filter_opts, p)) return false;
 		amf::AMFVariant bp;
@@ -540,7 +544,7 @@ public:
 			return eof;
 		}
 		amf::AMFSurfacePtr surf;
-		if ((r = ctx->AllocSurface(amf::AMF_MEMORY_HOST, depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h, &surf)) != AMF_OK) return fail(r, "AllocSurface");
+		if ((r = ctx->AllocSurface(amf::AMF_MEMORY_HOST, depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, cw, ch, &surf)) != AMF_OK) return fail(r, "AllocSurface");
 		repack(fr, surf);
 		surf->SetPts(fr->pts);
 		if ((r = surf->Convert(amf::AMF_MEMORY_DX11)) != AMF_OK) return fail(r, "Convert");
