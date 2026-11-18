@@ -47,7 +47,7 @@
 				"enable_weighted_prediction": [0],   // fixed for this slice
 				"low_delay_key_frame_scale": [""],   // fixed for this slice
 				"mv_precision": [0],   // fixed for this slice
-				"b_reference_mode": ["none", "middle", "each", "hierarchical"],
+				"b_reference_mode": ["none", "hierarchical"],   // middle and each do not touch lookahead (B-frames slice); hierarchical needs lookahead off or level 0 and adaptive I/B off, so it is tested here
 				// "hierarchical_b_frames": [0, 1],   // H.264's older flag for what b_reference_mode "hierarchical" does (same requirements [T])
 				"hierarchical_p_frames": [0],   // fixed for this slice
 				"bdirect_mode": [0],   // fixed for this slice
