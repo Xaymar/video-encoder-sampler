@@ -29,7 +29,7 @@
 			"codec": "h264",
 			"options": {
 				"preset": ["p1", "p7"],   // the ends of ["p1", "p2", "p3", "p4", "p5", "p6", "p7"] for this slice
-				"tune": ["hq", "ll", "ull"],   // "lossless" needs constant QP 0 [H enableLossless], "uhq" is HEVC and AV1 only [H NV_ENC_TUNING_INFO]
+				"tune": ["hq"],   // the slice sets everything tune would change, so ll and ull only repeat hq [T 2026-11-18]
 				"profile": [""],   // fixed for this slice
 				// "level": ["auto"],   // a level only caps the DPB and the bitrate; auto picks one that fits
 				// "rate_control": ["cbr"],   // the default; "vbr" at the same average and peak bitrate is CBR with a looser buffer

@@ -168,6 +168,16 @@
 					],
 				},
 
+				// With lookahead level 1 to 3, adaptive I/B decisions and temporal AQ made the same stream on or off: the level's own analysis takes
+				// over [T 2026-11-18, RTX 4080 SUPER, driver 621.24, 19 s of mixed footage]. They only changed anything at level 0.
+				{
+					"if": { "op": ">", "left": { "option": "lookahead_level" }, "right": 0 },
+					"require": [
+						{ "op": "==", "left": { "option": "disable_iadapt" }, "right": 0 },
+						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 0 },
+						{ "op": "==", "left": { "option": "temporal_aq" }, "right": 0 },
+					],
+				},
 				// Lookahead deeper than 32 minus the B-frames made the same stream as that depth: B=0: 31 = 32 (and 54 = 32); B=4: 28 = 30 = 31 = 32,
 				// while 27 still differed [T 2026-11-18, RTX 4080 SUPER, driver 621.24, 19 s of mixed footage]. ([H lookaheadDepth] says 31 minus the B-frames.)
 				{
