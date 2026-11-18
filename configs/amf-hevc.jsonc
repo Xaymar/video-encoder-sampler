@@ -58,7 +58,8 @@
 				// Static scene detection codes static frames as skip frames and needs a lookahead [PA]. On the 9800X3D iGPU (RDNA 2, AMF 1.4.37) with the check clip's
 				// still segment it worked (on the 780M too, RDNA 3, AMF 1.5.3), but only with sensitivity 0 or 1: unset (2, high) made the same stream as off, and the max QP before force skip changed
 				// nothing [T on H.264 and HEVC].
-				// It also bluescreened the 780M (RDNA 3, AMF 1.5.3, 0x119 in amdkmdag.sys) again and again, even without the max QP below [T], so it is left out.
+				// It also bluescreens the 780M (RDNA 3, AMF 1.5.3, 0x119 in amdkmdag.sys) whenever two or more encodes run at once ("parallel" 2 or more), and with
+				// the max QP below set even with one at a time [T]. Sweeps run in parallel, so it is left out.
 				// Only on RDNA 2 or later GPUs known to handle it, use:
 				// "pa_static_scene_detection_enable": ["", 1],
 				// "pa_static_scene_detection_sensitivity": ["", 0, 1],   // 0 low, 1 medium, 2 high (default)
