@@ -38,9 +38,9 @@
 				"enable_vbaq": ["", 0, 1],
 				"high_motion_quality_boost_enable": ["", 0, 1],
 				"de_blocking_filter": ["", 0, 1],   // HevcDeBlockingFilter
-				"rate_control_skip_frame_enable": ["", 0, 1],   // lets the rate control drop frames
+				"rate_control_skip_frame_enable": [""],   // lets the rate control drop frames; on or off made the same stream at CBR and VBR [T] Was ["", 0, 1]
 				// "low_latency_internal": [...],   // AMD's own setting, not one to choose
-				"enforce_hrd": ["", 0, 1],
+				"enforce_hrd": [""],   // on or off made the same stream at CBR and VBR [T] Was ["", 0, 1]
 				// AMF's HEVC encoder has no B-frames.
 				// "filler_data_enable": [0, 1],   // pads the stream to the bitrate: the picture stays the same
 				// "vbv_buffer_size": [...],   // bits, so the same value means a different buffer at every bitrate
@@ -65,8 +65,8 @@
 
 				// The pre-encode filter in front of the encoder (ves's own; see config.all-options.jsonc).
 				"pre_filter": ["", 1],
-				"pre_filter_strength": ["", 0, 4, 10],   // 0..10
-				"pre_filter_sensitivity": ["", 0, 4, 10],   // 0..10, lower keeps more detail
+				"pre_filter_strength": [""],   // 0..10; 0, 4 and 10 made the same stream as unset on both GPUs and codecs [T], so AMF seems to ignore it. Was ["", 0, 4, 10]
+				"pre_filter_sensitivity": [""],   // 0..10, lower keeps more detail; ignored like the strength [T]. Was ["", 0, 4, 10]
 			},
 			"rules": [
 				// High quality VBR and CBR "require Pre-Analysis to be enabled" and are 8-bit only [E]; QVBR aims at a quality level instead of the bitrate and is left out.
@@ -160,6 +160,31 @@
 				{
 					"if": { "op": "or", "args": [{ "set": "pa_perceptual_aq_mode" }, { "set": "pa_temporal_aq_mode" }] },
 					"require": { "op": "not", "value": { "set": "enable_vbaq" } },
+				},
+				// [T] below: configs/check/amf-{h264,hevc}-pa-aq and -picture, 2026-11-18, Irkela (780M, AMF 1.5.3), the same on both codecs.
+				// With pre-analysis on, VBAQ changed nothing even without perceptual or temporal AQ [T]; without it, the high motion boost changed nothing [T].
+				{
+					"if": { "op": "==", "left": { "option": "enable_pre_analysis" }, "right": 1 },
+					"require": { "op": "not", "value": { "set": "enable_vbaq" } },
+					"else_require": { "op": "not", "value": { "set": "high_motion_quality_boost_enable" } },
+				},
+				// Temporal AQ wins over perceptual AQ: with it, perceptual AQ and the CAQ strength changed nothing [T].
+				{
+					"if": { "set": "pa_temporal_aq_mode" },
+					"require": [
+						{ "op": "not", "value": { "set": "pa_perceptual_aq_mode" } },
+						{ "op": "not", "value": { "set": "pacaq_strength" } },
+					],
+				},
+				// With a lookahead of 1, temporal AQ 1 and 2 made the same stream [T].
+				{
+					"if": { "op": "==", "left": { "option": "pa_look_ahead_buffer_depth" }, "right": 1 },
+					"require": { "op": "!=", "left": { "option": "pa_temporal_aq_mode" }, "right": 2 },
+				},
+				// Without pre-analysis, the reference count ("", 1, 16) changed nothing (HEVC has no B-frames here) [T].
+				{
+					"if": { "op": "not", "value": { "op": "==", "left": { "option": "enable_pre_analysis" }, "right": 1 } },
+					"require": { "op": "not", "value": { "set": "max_ref_frames" } },
 				},
 				// The pre-filter settings need the pre-filter.
 				{

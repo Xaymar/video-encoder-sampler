@@ -30,7 +30,7 @@
 			"codec": "av1",
 			"options": {
 				"preset": ["speed", "balanced", "quality", "high_quality"],
-				"rate_control": [""],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T on HEVC, assumed here]; also lcvbr, qvbr, hqvbr, hqcbr
+				"rate_control": [""],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T on HEVC and H.264, assumed here]; also lcvbr, qvbr, hqvbr, hqcbr
 				// "rate_control": ["", "vbr", "hqvbr", "hqcbr"],   // to test whether this GPU still has the high quality modes
 				"pre_encode": ["", 0, 1],   // Av1RateControlPreEncode; default depends on the usage [H]
 				"b_pictures_pattern": ["", 1, 3, 7],   // B-frames, 0..127, default 0 [E]; RDNA 4 and later (AV1BFrames)
@@ -46,8 +46,8 @@
 				"palette_mode": ["", 0, 1],
 				"force_integer_mv": ["", 1],
 				"num_tiles_per_frame": ["", 2, 4],   // 1 or more, default 1; a suggestion the encoder may change [H]
-				"rate_control_skip_frame_enable": ["", 0, 1],   // lets the rate control drop frames
-				"enforce_hrd": ["", 0, 1],
+				"rate_control_skip_frame_enable": [""],   // lets the rate control drop frames; on or off made the same stream at CBR and VBR [T] Assumed for AV1. Was ["", 0, 1]
+				"enforce_hrd": [""],   // on or off made the same stream at CBR and VBR [T] Assumed for AV1. Was ["", 0, 1]
 				// "filler_data": [0, 1],   // pads the stream to the bitrate: the picture stays the same
 				// "vbv_buffer_size": [...],   // bits, so the same value means a different buffer at every bitrate
 				// "min_q_index_intra": [...], "max_q_index_intra": [...], ...   // Q index limits only take quality away from the rate control
@@ -71,8 +71,8 @@
 
 				// The pre-encode filter in front of the encoder (ves's own; see config.all-options.jsonc).
 				"pre_filter": ["", 1],
-				"pre_filter_strength": ["", 0, 4, 10],   // 0..10
-				"pre_filter_sensitivity": ["", 0, 4, 10],   // 0..10, lower keeps more detail
+				"pre_filter_strength": [""],   // 0..10; 0, 4 and 10 made the same stream as unset on both GPUs and codecs [T], so AMF seems to ignore it. Was ["", 0, 4, 10]
+				"pre_filter_sensitivity": [""],   // 0..10, lower keeps more detail; ignored like the strength [T]. Was ["", 0, 4, 10]
 			},
 			"rules": [
 				// AMF's AV1 profile is main: 4:2:0 only.
@@ -183,6 +183,26 @@
 				{
 					"if": { "op": "or", "args": [{ "set": "pa_perceptual_aq_mode" }, { "set": "pa_temporal_aq_mode" }] },
 					"require": { "op": "not", "value": { "set": "aq_mode" } },
+				},
+				// [T] below: configs/check/amf-{h264,hevc}-pa-aq and -picture, 2026-11-18, Irkela (780M, AMF 1.5.3), the same on both codecs. Assumed for AV1.
+				// With pre-analysis on, VBAQ changed nothing even without perceptual or temporal AQ [T]; without it, the high motion boost changed nothing [T].
+				{
+					"if": { "op": "==", "left": { "option": "enable_pre_analysis" }, "right": 1 },
+					"require": { "op": "not", "value": { "set": "aq_mode" } },
+					"else_require": { "op": "not", "value": { "set": "high_motion_quality_boost" } },
+				},
+				// Temporal AQ wins over perceptual AQ: with it, perceptual AQ and the CAQ strength changed nothing [T].
+				{
+					"if": { "set": "pa_temporal_aq_mode" },
+					"require": [
+						{ "op": "not", "value": { "set": "pa_perceptual_aq_mode" } },
+						{ "op": "not", "value": { "set": "pacaq_strength" } },
+					],
+				},
+				// With a lookahead of 1, temporal AQ 1 and 2 made the same stream [T].
+				{
+					"if": { "op": "==", "left": { "option": "pa_look_ahead_buffer_depth" }, "right": 1 },
+					"require": { "op": "!=", "left": { "option": "pa_temporal_aq_mode" }, "right": 2 },
 				},
 				// The pre-filter settings need the pre-filter.
 				{

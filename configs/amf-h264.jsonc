@@ -29,23 +29,24 @@
 			"encoder": "amf",
 			"codec": "h264",
 			"options": {
-				"preset": ["speed", "balanced", "quality", "high_quality"],
+				"preset": ["speed", "balanced", "quality"],   // high_quality made the same stream as quality in every test on both GPUs [T]; ["speed", "balanced", "quality", "high_quality"] to retest
 				"profile": ["high"],   // the older profiles are no use any more
-				"rate_control": [""],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T on HEVC, assumed here]; also lcvbr, qvbr, hqvbr, hqcbr
+				"rate_control": [""],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T]; also lcvbr, qvbr, hqvbr, hqcbr
 				// "rate_control": ["", "vbr", "hqvbr", "hqcbr"],   // to test whether this GPU still has the high quality modes
 				"pre_encode": ["", 1],   // pre-encode assisted rate control, off in the transcoding usage [E]
-				"max_b_frames": [0, 1, 2, 3],   // BPicturesPattern, 0..3 [E]
-				"adaptive_mini_gop": ["", 1],   // adaptive B-frames; needs pre-analysis with a lookahead of 1 or more [E]
+				"max_b_frames": [0],   // BPicturesPattern, 0..3 [E]. 1 to 3 made the same stream as 0 on RDNA 2 and RDNA 3 (the caps did not refuse them) [T]
+				// "max_b_frames": [0, 1, 2, 3],   // for GPUs that really have H.264 B-frames (RDNA 4?)
+				"adaptive_mini_gop": [""],   // was ["", 1], see max_b_frames;   // adaptive B-frames; needs pre-analysis with a lookahead of 1 or more [E]
 				// "max_consecutive_b_pictures": [...],   // 0..3; defaults to the B-frame count, or 3 with adaptive mini-GOP [E]
-				"b_reference_mode": ["", "none"],   // BReferenceEnable, on by default
+				"b_reference_mode": [""],   // was ["", "none"], see max_b_frames;   // BReferenceEnable, on by default
 				"max_ref_frames": [1, 2, 4, 8],   // MaxNumRefFrames, 0..16 [E]
 				"enable_vbaq": ["", 0, 1],
 				"high_motion_quality_boost_enable": ["", 0, 1],
 				// "cabac_enable": [...],   // every decoder has CABAC and it is clearly better
 				"de_blocking_filter": ["", 0, 1],
-				"rate_control_skip_frame_enable": ["", 0, 1],   // lets the rate control drop frames
+				"rate_control_skip_frame_enable": [""],   // lets the rate control drop frames; on or off made the same stream at CBR and VBR [T] Was ["", 0, 1]
 				// "low_latency_internal": [...],   // AMD's own setting, not one to choose
-				"enforce_hrd": ["", 0, 1],
+				"enforce_hrd": [""],   // on or off made the same stream at CBR and VBR [T] Was ["", 0, 1]
 				// "filler_data_enable": [0, 1],   // pads the stream to the bitrate: the picture stays the same
 				// "vbv_buffer_size": [...],   // bits, so the same value means a different buffer at every bitrate
 				// "min_qp": [...], "max_qp": [...],   // QP limits only take quality away from the rate control's own choice
@@ -69,8 +70,8 @@
 
 				// The pre-encode filter in front of the encoder (ves's own; see config.all-options.jsonc).
 				"pre_filter": ["", 1],
-				"pre_filter_strength": ["", 0, 4, 10],   // 0..10
-				"pre_filter_sensitivity": ["", 0, 4, 10],   // 0..10, lower keeps more detail
+				"pre_filter_strength": [""],   // 0..10; 0, 4 and 10 made the same stream as unset on both GPUs and codecs [T], so AMF seems to ignore it. Was ["", 0, 4, 10]
+				"pre_filter_sensitivity": [""],   // 0..10, lower keeps more detail; ignored like the strength [T]. Was ["", 0, 4, 10]
 			},
 			"rules": [
 				// Adaptive mini-GOP takes priority over the B-frame count [E]: it runs with one count, 3, the one AMD recommends with it [E].
@@ -180,6 +181,31 @@
 				{
 					"if": { "op": "or", "args": [{ "set": "pa_perceptual_aq_mode" }, { "set": "pa_temporal_aq_mode" }] },
 					"require": { "op": "not", "value": { "set": "enable_vbaq" } },
+				},
+				// [T] below: configs/check/amf-{h264,hevc}-pa-aq and -picture, 2026-11-18, Irkela (780M, AMF 1.5.3), the same on both codecs.
+				// With pre-analysis on, VBAQ changed nothing even without perceptual or temporal AQ [T]; without it, the high motion boost changed nothing [T].
+				{
+					"if": { "op": "==", "left": { "option": "enable_pre_analysis" }, "right": 1 },
+					"require": { "op": "not", "value": { "set": "enable_vbaq" } },
+					"else_require": { "op": "not", "value": { "set": "high_motion_quality_boost_enable" } },
+				},
+				// Temporal AQ wins over perceptual AQ: with it, perceptual AQ and the CAQ strength changed nothing [T].
+				{
+					"if": { "set": "pa_temporal_aq_mode" },
+					"require": [
+						{ "op": "not", "value": { "set": "pa_perceptual_aq_mode" } },
+						{ "op": "not", "value": { "set": "pacaq_strength" } },
+					],
+				},
+				// With a lookahead of 1, temporal AQ 1 and 2 made the same stream [T].
+				{
+					"if": { "op": "==", "left": { "option": "pa_look_ahead_buffer_depth" }, "right": 1 },
+					"require": { "op": "!=", "left": { "option": "pa_temporal_aq_mode" }, "right": 2 },
+				},
+				// With long-term references, 1 and 8 references (and lookahead 0 and 1) made the same stream [T on Irkela and Areldir].
+				{
+					"if": { "set": "pa_long_term_reference_enable" },
+					"require": { "op": "==", "left": { "option": "max_ref_frames" }, "right": 1 },
 				},
 				// The pre-filter settings need the pre-filter.
 				{

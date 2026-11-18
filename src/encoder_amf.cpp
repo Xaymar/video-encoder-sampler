@@ -329,11 +329,13 @@ private:
 		if (!on) return true;
 		AMF_RESULT r = factory->CreateComponent(ctx, AMFPreProcessing, &filter_pp);
 		if (r != AMF_OK) return fail(r, "CreateComponent(PreProcessing)");
-		filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_ENABLE, true);
-		filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_STRENGTH, strength);
-		filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_SENSITIVITY, sensitivity);
-		filter_pp->SetProperty(AMF_PP_TARGET_BITRATE, (amf_int64)p.bitrate);
-		filter_pp->SetProperty(AMF_PP_FRAME_RATE, AMFConstructRate(p.framerate.num, p.framerate.den));
+		// --check found the strength and sensitivity changing nothing, so a property the component refuses is reported.
+		const auto refused = [](AMF_RESULT sr, const char* name) { if (sr != AMF_OK) fprintf(stderr, "amf: the pre-encode filter refused %s (result %d)\n", name, (int)sr); };
+		refused(filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_ENABLE, true), "PPAdaptiveFilterEnable");
+		refused(filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_STRENGTH, strength), "PPAdaptiveFilterStrength");
+		refused(filter_pp->SetProperty(AMF_PP_ADAPTIVE_FILTER_SENSITIVITY, sensitivity), "PPAdaptiveFilterSensitivity");
+		refused(filter_pp->SetProperty(AMF_PP_TARGET_BITRATE, (amf_int64)p.bitrate), "PPTargetBitrate");
+		refused(filter_pp->SetProperty(AMF_PP_FRAME_RATE, AMFConstructRate(p.framerate.num, p.framerate.den)), "PPFrameRate");
 		if ((r = filter_pp->Init(depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init(PreProcessing)");
 		return true;
 	}
