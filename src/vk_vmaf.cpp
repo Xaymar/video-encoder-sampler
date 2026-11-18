@@ -1098,6 +1098,8 @@ private:
 	CambiPC cpc{};
 	bool anti_dither = false;
 	Buf cidx, cfull, cdith, cmask0, cimg[5], cmask[5], ctmp, ctab;
+	Pipe cp_front;
+	bool cfront = false;
 	Pipe cp_pre, cp_dither, cp_mask, cp_dec[5], cp_mode_h[5], cp_mode_v[5];
 	uint32_t cgroups[5] = {};
 	bool cslide = false; // c values by cambi_cslide
@@ -1512,6 +1514,10 @@ private:
 		cp_pre = vk.pipeline("cambi_pre", {&raw_dis, &cidx, &cfull});
 		if (anti_dither) cp_dither = vk.pipeline("cambi_dither", {&cfull, &cdith});
 		cp_mask = vk.pipeline("cambi_mask", {src, &cmask0});
+		// cambi_front: pre, mask and scale 0's decimation in one pass (no anti-dithering; VES_CAMBI_SPLIT_FRONT=1 keeps the passes)
+		cfront = !anti_dither;
+		if (const char* e = getenv("VES_CAMBI_SPLIT_FRONT"); e && atoi(e) > 0) cfront = false;
+		if (cfront) cp_front = cg.speedup ? vk.pipeline("cambi_front", {&raw_dis, &cidx, &cimg[0], &cmask[0]}) : vk.pipeline("cambi_front", {&raw_dis, &cidx, &cfull, &cmask0});
 		for (int s = 0; s < 5; s++) {
 			if (s > 0 || cg.speedup) {
 				Buf* pi = s == 0 ? src : &cimg[s - 1];
@@ -1530,16 +1536,24 @@ private:
 		pc.W = W; pc.H = H; pc.OW = ew; pc.OH = eh;
 		vk.push(&pc, sizeof pc);
 		auto g = groups(ew, eh);
-		vk.bind(cp_pre); vk.dispatch(g.first, g.second); vk.barrier();
+		if (cfront) {
+			CambiPC pf = pc;
+			pf.pad = cg.speedup ? cg.sw[0] : 0; pf.nd = cg.speedup ? cg.sh[0] : 0;
+			vk.push(&pf, sizeof pf);
+			vk.bind(cp_front); vk.dispatch(g.first, g.second); vk.barrier();
+		} else {
+			vk.bind(cp_pre); vk.dispatch(g.first, g.second); vk.barrier();
+			pc.W = ew; pc.H = eh;
+			vk.push(&pc, sizeof pc);
+			if (anti_dither) { vk.bind(cp_dither); vk.dispatch(g.first, g.second); vk.barrier(); }
+			vk.bind(cp_mask); vk.dispatch(g.first, g.second); vk.barrier();
+		}
 		pc.W = ew; pc.H = eh;
-		vk.push(&pc, sizeof pc);
-		if (anti_dither) { vk.bind(cp_dither); vk.dispatch(g.first, g.second); vk.barrier(); }
-		vk.bind(cp_mask); vk.dispatch(g.first, g.second); vk.barrier();
 		int pw = ew, ph = eh;
 		for (int s = 0; s < 5; s++) {
 			const int w = cg.sw[s], h = cg.sh[s];
 			g = groups(w, h);
-			if (s > 0 || cg.speedup) {
+			if (s > 0 || (cg.speedup && !cfront)) {
 				pc.W = pw; pc.H = ph; pc.OW = w; pc.OH = h;
 				vk.push(&pc, sizeof pc);
 				vk.bind(cp_dec[s]); vk.dispatch(g.first, g.second); vk.barrier();
