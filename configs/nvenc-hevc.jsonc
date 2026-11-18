@@ -32,8 +32,8 @@
 				// "level": ["auto"],   // a level only caps the DPB and the bitrate; auto picks one that fits
 				// "rate_control": ["cbr"],   // the default; "vbr" at the same average and peak bitrate is CBR with a looser buffer
 				"max_b_frames": [0, 1, 2, 3, 4],   // the GPU's NUM_MAX_BFRAMES caps it
-				"lookahead_frames": [0, 4, 8, 16, 32, 54],   // 0 off; [H lookaheadDepth] says 31 minus the B-frames, but the driver takes more and silently cuts it to what its surfaces allow (64 became 54 [T])
-				"lookahead_level": [0, 1, 2, 3, 15],   // 15 = auto; needs lookahead (NVIDIA's library aborts the process otherwise [T])
+				"lookahead_frames": [0, 4, 8, 16, 24, 28, 32],   // 0 off; deeper than 32 minus the B-frames changes nothing on H.264, see the rule [T 2026-11-18]
+				"lookahead_level": [0, 1, 2, 3],   // needs lookahead (NVIDIA's library aborts the process otherwise [T]); 15 = auto matched 3 on H.264 [T 2026-11-18]
 				"disable_iadapt": [0, 1],   // adaptive I-frames at scene cuts: lookahead only [H][G 8.2]
 				"disable_badapt": [0, 1],   // adaptive B-frame count: lookahead and B-frames only [H][G 8.2]
 				"multi_pass": [0, 1, 2],   // 0 off, 1 two passes with a quarter resolution first pass, 2 two full passes [G 3.8.4]
@@ -44,7 +44,7 @@
 				"enable_non_ref_p": [0, 1],
 				"enable_weighted_prediction": [0, 1],   // not with B-frames [H][G 8.7]
 				"low_delay_key_frame_scale": ["", 1, 2, 4, 8, 16],   // I- to P-frame bits with CBR and a single-frame VBV, which only ll and ull use; 2 for ll and 1 for ull by default, no range given [H]
-				"mv_precision": [0, 1, 2, 3],   // 0 default (quarter pel), 1 full, 2 half, 3 quarter
+				"mv_precision": [0, 1, 2],   // 0 default (quarter pel), 1 full, 2 half, 3 quarter: 3 matched 0 on H.264 [T 2026-11-18]
 				"b_reference_mode": ["none", "middle", "each", "hierarchical"],
 				"max_ref_frames": ["", 1, 2, 3, 4, 6, 8, 16],   // "": the driver's DPB size
 				"max_ref_frames_l0": [0, 1, 2, 3, 4, 7],   // 0 auto, 1..7 [H NV_ENC_NUM_REF_FRAMES]
@@ -152,6 +152,22 @@
 					"require": [
 						{ "op": ">=", "left": { "option": "max_b_frames" }, "right": 4 },
 						{ "op": "==", "left": { "option": "zero_reorder_delay" }, "right": 0 },
+					],
+				},
+				// Lookahead deeper than 32 minus the B-frames made the same stream as that depth on H.264 [T 2026-11-18, RTX 4080 SUPER, driver 621.24];
+				// assumed the same here until configs/check confirms it.
+				{
+					"if": { "op": ">", "left": { "option": "lookahead_frames" }, "right": 0 },
+					"require": { "op": "<=", "left": { "option": "lookahead_frames" }, "right": { "op": "-", "left": 32, "right": { "option": "max_b_frames" } } },
+				},
+				// With lookahead level 1 to 3, adaptive I/B decisions and temporal AQ made the same stream on or off on H.264 [T 2026-11-18, RTX 4080 SUPER];
+				// assumed the same here until configs/check confirms it.
+				{
+					"if": { "op": ">", "left": { "option": "lookahead_level" }, "right": 0 },
+					"require": [
+						{ "op": "==", "left": { "option": "disable_iadapt" }, "right": 0 },
+						{ "op": "==", "left": { "option": "disable_badapt" }, "right": 0 },
+						{ "op": "==", "left": { "option": "temporal_aq" }, "right": 0 },
 					],
 				},
 			],
