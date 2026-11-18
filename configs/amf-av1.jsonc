@@ -9,8 +9,8 @@
 // lists them with `ves --list-options amf/av1`. ves opens the encoder with usage transcoding and CBR, peak bitrate = target bitrate.
 // Rate control: CBR is the base; rate_control "vbr" is peak constrained VBR, capped at the target as ves sets the peak to it. Pre-analysis and
 // pre-encode work with every rate control [E] (the header's "only works in peak constrained VBR" [H] is older than the API reference) and can help a
-// lot, so they and their options are all here. The high quality modes (hqvbr, hqcbr) need pre-analysis [E] and seem to be gone on RDNA GPUs, where
-// the high_quality preset may stand in for them (untested): they are commented out.
+// lot, so they and their options are all here. The high quality modes (hqvbr, hqcbr) need pre-analysis [E]. RDNA 2 still has them, but they
+// looked much worse than CBR with the high_quality preset [T], so they are commented out.
 // Every list is cut to a spread of its range: ves numbers the combinations with one 64-bit number, so all value lists multiplied (rules aside) must stay
 // below 9.2e18. Pruning tries the middle values only where the ends differ, so the ends of each range matter most.
 // Features this GPU's encoder lacks (B-frames, reference frame counts) are left to the capability check: those runs are ignored, not failed.
