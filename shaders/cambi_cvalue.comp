@@ -14,12 +14,8 @@ layout(std430, binding = 4) writeonly buffer Part { double part[]; }; // per wor
 
 const int MAXD = 8; // nd <= 8 (max_log_contrast <= 3)
 const int TILE = 16;
-const int MAXPAD = 32; // windows up to 65: every scale of 4K (a 65 window) works from shared memory
-// The tile and its border as the histograms see them, 16 bits each, two to a word (under 16 KiB with the sums below): a counted sample's value less
-// the band's base, else NOT_IN_TILE (above every value, so k is past the span whatever the pixel's value).
-shared uint tile[((TILE + 2 * MAXPAD) * (TILE + 2 * MAXPAD) + 1) / 2];
-const uint NOT_IN_TILE = 65535u;
-shared uint gAny;
+const int MAXPAD = 16;
+shared int tile[(TILE + 2 * MAXPAD) * (TILE + 2 * MAXPAD)];
 shared double ssum[256];
 shared uint scnt[256];
 
@@ -58,31 +54,9 @@ void main() {
 	const bool sums_only = pc.OW < 0;
 	const bool tiled = pad <= MAXPAD && !sums_only;
 	const int tw = TILE + 2 * pad;
-	const bool wide = tw * tw <= tile.length(); // a word per sample when they fit (windows up to 41), else two to a word
-	// Most workgroups of real frames have no flat, in-band pixel: they need no tile (their c values are all 0).
-	bool own = false;
-	if (!sums_only && j < pc.W && i < pc.H && mask[i * pc.W + j] != 0u) {
-		const int compact = int(img[i * pc.W + j]) - pc.band_base;
-		own = compact >= 0 && compact < pc.band_size;
-	}
-	if (gl_LocalInvocationIndex == 0u) gAny = 0u;
-	barrier();
-	if (own) gAny = 1u;
-	barrier();
-	if (tiled && gAny != 0u) {
+	if (tiled) {
 		const int r0 = int(gl_WorkGroupID.y) * TILE - pad, c0 = int(gl_WorkGroupID.x) * TILE - pad;
-		if (wide) for (int k = int(gl_LocalInvocationIndex); k < tw * tw; k += 256) {
-			const int v = counted(r0 + k / tw, c0 + k % tw);
-			tile[k] = v == NOT_COUNTED ? NOT_IN_TILE : uint(v - pc.band_base);
-		} else for (int k2 = int(gl_LocalInvocationIndex); 2 * k2 < tw * tw; k2 += 256) {
-			uint w = 0u;
-			for (int h = 0; h < 2; h++) {
-				const int k = 2 * k2 + h;
-				const int v = k < tw * tw ? counted(r0 + k / tw, c0 + k % tw) : NOT_COUNTED;
-				w |= (v == NOT_COUNTED ? NOT_IN_TILE : uint(v - pc.band_base)) << (16 * h);
-			}
-			tile[k2] = w;
-		}
+		for (int k = int(gl_LocalInvocationIndex); k < tw * tw; k += 256) tile[k] = counted(r0 + k / tw, c0 + k % tw);
 		barrier();
 	}
 	float c_value = 0.0;
@@ -96,18 +70,10 @@ void main() {
 			const uint span = uint(2 * nd), off = uint(nd - v);
 			if (tiled) {
 				const int base = int(gl_LocalInvocationID.y) * tw + int(gl_LocalInvocationID.x);
-				const uint offc = uint(nd - compact); // k = value - v + nd, from the tile's value less the band's base
-				if (wide) for (int dr = 0; dr <= 2 * pad; dr++) {
+				for (int dr = 0; dr <= 2 * pad; dr++) {
 					const int row = base + dr * tw;
 					for (int dc = 0; dc <= 2 * pad; dc++) {
-						const uint k = tile[row + dc] + offc;
-						if (k <= span) count(cnt, k);
-					}
-				} else for (int dr = 0; dr <= 2 * pad; dr++) {
-					const int row = base + dr * tw;
-					for (int dc = 0; dc <= 2 * pad; dc++) {
-						const int q = row + dc;
-						const uint k = ((tile[q >> 1] >> (16u * uint(q & 1))) & 65535u) + offc;
+						const uint k = uint(tile[row + dc]) + off;
 						if (k <= span) count(cnt, k);
 					}
 				}
