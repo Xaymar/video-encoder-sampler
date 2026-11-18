@@ -395,6 +395,51 @@ void csf_factors(const AdmOpts& o, int scale, float& f1, float& f2) {
 struct VifPC { int W, H, scale, srckind, bpc, egl_int; double egl; };
 // The gain limit as the VIF statistic's fast path takes it: a whole number from 1 to 1000, else -1 (the exact double path only).
 static int vif_egl_int(double egl) { return egl >= 1.0 && egl <= 1000.0 && egl == (double)(int)egl ? (int)egl : -1; }
+// Records one feature's GPU work: straight into the command buffer (each next() a barrier), or, for waves, into stages that record() then
+// interleaves with the other features' (stage k of every feature, then one barrier), so that their small passes run side by side instead of each
+// waiting for the GPU to drain. Push constants are kept with each dispatch (the layout is shared, so they would carry over between features).
+struct Rec {
+	Vk& vk;
+	bool capture = false;
+	struct Op { const Pipe* pipe; uint32_t x, y, n; uint8_t pc[128]; };
+	std::vector<std::vector<Op>> stages;
+	uint8_t pc[128] = {};
+	uint32_t npc = 0;
+	const Pipe* pipe = nullptr;
+	Rec(Vk& v, bool cap) : vk(v), capture(cap) { if (capture) stages.emplace_back(); }
+	void push(const void* d, uint32_t n) {
+		if (!capture) { vk.push(d, n); return; }
+		memcpy(pc, d, n);
+		npc = std::max(npc, n);
+	}
+	void bind(const Pipe& p) { if (!capture) vk.bind(p); else pipe = &p; }
+	void dispatch(uint32_t x, uint32_t y = 1) {
+		if (!capture) { vk.dispatch(x, y); return; }
+		Op o{pipe, x, y, npc, {}};
+		memcpy(o.pc, pc, npc);
+		stages.back().push_back(o);
+	}
+	void next() { if (!capture) vk.barrier(); else if (!stages.back().empty()) stages.emplace_back(); }
+	// record()'s replay: stage k of each, then a barrier
+	static void replay(Vk& vk, std::initializer_list<Rec*> rs) {
+		size_t n = 0;
+		for (Rec* r : rs) n = std::max(n, r->stages.size());
+		for (size_t k = 0; k < n; k++) {
+			bool any = false;
+			for (Rec* r : rs) {
+				if (k >= r->stages.size()) continue;
+				for (const Op& o : r->stages[k]) {
+					vk.bind(*o.pipe);
+					if (o.n) vk.push(o.pc, o.n);
+					vk.dispatch(o.x, o.y);
+					any = true;
+				}
+			}
+			if (any) vk.barrier();
+		}
+	}
+};
+
 struct AdmPC {
 	int SW, SH, BW, BH, scale, prevN;
 	double egl;
@@ -577,6 +622,7 @@ public:
 		ysize = (size_t)W * H;
 		plane_bytes = ysize * bps;
 		if (const char* e = getenv("VES_SPEED_CHECK"); e && atoi(e) > 0) speed_check = true;
+		if (const char* e = getenv("VES_VMAF_WAVES"); e && *e) use_waves = atoi(e) > 0;
 		if (const char* e = getenv("VES_SCORE_TIMING"); e && atoi(e) > 0) part_timing = true;
 		if (const char* e = getenv("VES_ADM_SPLIT_DWT"); e && atoi(e) > 0) adm_split_dwt = true;
 		if (const char* e = getenv("VES_ADM_SPLIT_CM"); e && atoi(e) > 0) adm_split_cm = true;
@@ -856,6 +902,11 @@ private:
 			if (motion) { vk.copy(alias_raw ? sl.dev_ref : raw_ref, mfr[cur]); vk.barrier(); }
 		}
 		part_done(0);
+		// waves: the features' passes interleaved, stage by stage (not with VES_SCORE_TIMING, whose stamps time the parts one after another, nor
+		// VES_ADM_DUMP). Off by default: slower on an RTX 4080 SUPER (the features' passes compete for its caches), VES_VMAF_WAVES=1
+		const bool waves = use_waves && !part_timing && !vk.pass_timing() && adm_dump.empty();
+		Rec r_mo(vk, waves), r_vif(vk, waves), r_adm(vk, waves), r_cambi(vk, waves), r_speed(vk, waves);
+		Rec* R = &r_mo;
 		bool* with_motion = sl.with_motion;
 		with_motion[0] = with_motion[1] = false;
 		for (int k = 0; k < 2; k++) {
@@ -864,104 +915,126 @@ private:
 			with_motion[k] = true;
 			const int prev = (int)((index - stride) % 3);
 			const int pc[3] = {W, H, bpc};
-			vk.push(pc, sizeof pc);
-			if (motion_fused) { vk.bind(mxy[k][prev][cur]); vk.dispatch(gx, gy); } // the two strides' passes side by side
+			R->push(pc, sizeof pc);
+			if (motion_fused) { R->bind(mxy[k][prev][cur]); R->dispatch(gx, gy); } // the two strides' passes side by side
 			else {
-				vk.bind(my[k][prev][cur]); vk.dispatch(gx, gy); vk.barrier();
-				vk.bind(mx[k][prev][cur]); vk.dispatch(gx, gy); vk.barrier();
+				R->bind(my[k][prev][cur]); R->dispatch(gx, gy); R->next();
+				R->bind(mx[k][prev][cur]); R->dispatch(gx, gy); R->next();
 			}
 		}
-		if (motion_fused && (with_motion[0] || with_motion[1])) vk.barrier();
+		if (motion_fused && (with_motion[0] || with_motion[1])) R->next();
 		part_done(1);
 		auto groups = [](int a, int b) { return std::make_pair((uint32_t)((a + 15) / 16), (uint32_t)((b + 15) / 16)); };
+		R = &r_vif;
 		if (!vif_egl.empty()) {
 			for (int s = 0; s < 4; s++) {
 				if (s > 0) {
 					VifPC pc{vw[s - 1], vh[s - 1], s, s == 1 ? (bps == 2 ? 1 : 0) : 2, bpc, -1, vif_egl[0]};
-					vk.push(&pc, sizeof pc);
-					vk.bind(vsub_v[s]);
+					R->push(&pc, sizeof pc);
+					R->bind(vsub_v[s]);
 					auto g = groups(vw[s - 1], vh[s - 1] / 2);
-					vk.dispatch(g.first, g.second); vk.barrier();
-					vk.bind(vsub_h[s]);
+					R->dispatch(g.first, g.second); R->next();
+					R->bind(vsub_h[s]);
 					g = groups(vw[s - 1] / 2, vh[s - 1] / 2);
-					vk.dispatch(g.first, g.second); vk.barrier();
+					R->dispatch(g.first, g.second); R->next();
 				}
 				for (size_t u = 0; u < vif_egl.size(); u++) { // the statistics with each enhancement gain limit
 					VifPC pc{vw[s], vh[s], s, s == 0 ? (bps == 2 ? 1 : 0) : 2, bpc, vif_egl_int(vif_egl[u]), vif_egl[u]};
-					vk.push(&pc, sizeof pc);
+					R->push(&pc, sizeof pc);
 					auto g = groups(vw[s], vh[s]);
-					vk.bind(vstat_v[u][s]); vk.dispatch(g.first, g.second); vk.barrier();
-					vk.bind(vstat_h[u][s]); vk.dispatch(g.first, g.second); vk.barrier();
+					R->bind(vstat_v[u][s]); R->dispatch(g.first, g.second); R->next();
+					R->bind(vstat_h[u][s]); R->dispatch(g.first, g.second); R->next();
 				}
 			}
 		}
 		part_done(2);
+		R = &r_adm;
 		if (!au.empty()) {
 			for (int s = 0; s < 4; s++) {
 				// the wavelets and the denominator, once
 				AdmPC pc = au[0].apc[s];
-				vk.push(&pc, sizeof pc);
+				R->push(&pc, sizeof pc);
 				auto g = groups(bw[s], bh[s]);
 				if (adm_split_dwt) { // VES_ADM_SPLIT_DWT=1: the two passes through `tmp`, as before (for comparison)
-					vk.bind(adwt_v[s]);
+					R->bind(adwt_v[s]);
 					const auto gv = groups(sw[s], bh[s]);
-					vk.dispatch(gv.first, gv.second); vk.barrier();
-					vk.bind(adwt_h[s]);
-				} else vk.bind(adwt[s]);
-				vk.dispatch(g.first, g.second); vk.barrier();
+					R->dispatch(gv.first, gv.second); R->next();
+					R->bind(adwt_h[s]);
+				} else R->bind(adwt[s]);
+				R->dispatch(g.first, g.second); R->next();
 				AdmPC pd = pc;
 				if (s > 0) pd.shc0 = au[0].ah[s].den_cub;
-				vk.push(&pd, sizeof pd);
-				vk.bind(aden_p[s]); vk.dispatch(1, pc.cb - pc.ct);
+				R->push(&pd, sizeof pd);
+				R->bind(aden_p[s]); R->dispatch(1, pc.cb - pc.ct);
 				// then decouple, csf and masking with each set of options, unit 0 in place, the others on a copy of the bands
-				for (size_t u = 0; u < au.size() && !adm_split_cm; u++) { // adm_dcm: no copy of the bands, nothing written into them
-					AdmUnit& a = au[u];
-					AdmPC pu = a.apc[s];
-					pu.aim = a.aim ? 1 : 0;
-					vk.push(&pu, sizeof pu);
-					vk.bind(a.dcm[s]);
-					vk.dispatch((uint32_t)((pu.ecol - pu.scol + 15) / 16), (uint32_t)((pu.erow - pu.srow + 15) / 16)); vk.barrier();
-					const uint32_t rg = (uint32_t)((pu.erow - pu.srow + 63) / 64);
-					pu.aim = 0;
-					vk.push(&pu, sizeof pu);
-					vk.bind(a.cmsum[s]); vk.dispatch(rg, 1);
-					if (a.aim) {
-						pu.aim = 1;
-						vk.push(&pu, sizeof pu);
-						vk.bind(a.aimsum[s]); vk.dispatch(rg, 1);
+				// adm_dcm: no copy of the bands, nothing written into them. Every unit's tiles go to its own part of tmp (pc.dbg: where), so the units'
+				// passes run side by side: all the masking passes, one barrier, all the row sums, one barrier.
+				for (int phase = 0; phase < 2 && !adm_split_cm; phase++) {
+					for (size_t u = 0; u < au.size(); u++) {
+						AdmUnit& a = au[u];
+						AdmPC pu = a.apc[s];
+						pu.dbg = (int)u * adm_tiles;
+						if (phase == 0) {
+							bool grouped = false; // adm_dcm_multi: the group's first unit dispatches for all of them
+							for (const AdmGroup& g : agroups) {
+								if (g.units.size() < 2 || std::find(g.units.begin(), g.units.end(), (int)u) == g.units.end()) continue;
+								grouped = true;
+								if (g.units[0] == (int)u) {
+									pu.dbg = (int)g.units.size();
+									R->push(&pu, sizeof pu);
+									R->bind(g.p[s]);
+									R->dispatch((uint32_t)((pu.ecol - pu.scol + 15) / 16), (uint32_t)((pu.erow - pu.srow + 15) / 16));
+								}
+							}
+							if (grouped) continue;
+							pu.aim = a.aim ? 1 : 0;
+							R->push(&pu, sizeof pu);
+							R->bind(a.dcm[s]);
+							R->dispatch((uint32_t)((pu.ecol - pu.scol + 15) / 16), (uint32_t)((pu.erow - pu.srow + 15) / 16));
+							continue;
+						}
+						const uint32_t rg = (uint32_t)((pu.erow - pu.srow + 63) / 64);
+						pu.aim = 0;
+						R->push(&pu, sizeof pu);
+						R->bind(a.cmsum[s]); R->dispatch(rg, 1);
+						if (a.aim) {
+							pu.aim = 1;
+							R->push(&pu, sizeof pu);
+							R->bind(a.aimsum[s]); R->dispatch(rg, 1);
+						}
 					}
-					vk.barrier(); // the next unit's tiles go into the same tmp
+					R->next();
 				}
 				for (size_t u = 0; u < au.size() && adm_split_cm; u++) {
 					AdmUnit& a = au[u];
 					if (u > 0) {
 						const int n = 8 * bw[s] * bh[s];
-						vk.push(&n, sizeof n);
-						vk.bind(a.copy[s]);
+						R->push(&n, sizeof n);
+						R->bind(a.copy[s]);
 						const uint32_t total = (uint32_t)((n + 255) / 256), cx = std::min<uint32_t>(total, 65535), cy = (total + cx - 1) / cx;
-						vk.dispatch(cx, cy); vk.barrier();
+						R->dispatch(cx, cy); R->next();
 					}
 					AdmPC pu = a.apc[s];
 					pu.dbg = !adm_dump.empty() && index == 1 && u == 0 && s == 0 ? 1 : 0; // the dump's frame: decouple's inner values into AH, AV, AD
-					vk.push(&pu, sizeof pu);
-					vk.bind(a.dec[s]); vk.dispatch(g.first, g.second); vk.barrier();
+					R->push(&pu, sizeof pu);
+					R->bind(a.dec[s]); R->dispatch(g.first, g.second); R->next();
 					// adm_cm works the csf out itself; its own pass only fills CAH..CFD for VES_ADM_DUMP
-					if (!adm_dump.empty()) { vk.bind(a.csf[s]); vk.dispatch(g.first, g.second); vk.barrier(); }
-					vk.bind(a.cm_p[s]); vk.dispatch(1, pu.erow - pu.srow);
-					vk.barrier();
+					if (!adm_dump.empty()) { R->bind(a.csf[s]); R->dispatch(g.first, g.second); R->next(); }
+					R->bind(a.cm_p[s]); R->dispatch(1, pu.erow - pu.srow);
+					R->next();
 					if (a.aim) { // the csf and the masking again, the other way round, into buffers of their own
 						AdmPC pa = pu;
 						pa.aim = 1;
-						vk.push(&pa, sizeof pa);
-						if (!adm_dump.empty()) { vk.bind(a.aimcsf[s]); vk.dispatch(g.first, g.second); vk.barrier(); }
-						vk.bind(a.aimcm[s]); vk.dispatch(1, pu.erow - pu.srow);
-						vk.barrier();
+						R->push(&pa, sizeof pa);
+						if (!adm_dump.empty()) { R->bind(a.aimcsf[s]); R->dispatch(g.first, g.second); R->next(); }
+						R->bind(a.aimcm[s]); R->dispatch(1, pu.erow - pu.srow);
+						R->next();
 					}
 				}
 			}
 		}
 		if (!adm_dump.empty() && !au.empty() && index == 1) {
-			vk.barrier();
+			R->next();
 			const VkDeviceSize nc = acur[0].size - 16, nm = au[0].cm[0].size - 16, nd = aden[0].size - 16;
 			if (!adump.buf) adump = vk.buffer(nc + nm + nd + 16, 2);
 			vk.copy_range(acur[0], 0, adump, 0, nc);
@@ -969,14 +1042,15 @@ private:
 			vk.copy_range(aden[0], 0, adump, nc + nm, nd);
 		}
 		part_done(3);
-		if (cambi_on) record_cambi(sl);
+		if (cambi_on) record_cambi(sl, r_cambi);
 		part_done(4);
-		if (!su.empty() && !speed2) record_speed(part_done);
+		if (!su.empty() && !speed2) record_speed(part_done, r_speed);
 		else {
 			part_done(5); // no SpEED here: its parts take no time
 			part_done(6);
 			part_done(7);
 		}
+		if (waves) Rec::replay(vk, {&r_mo, &r_vif, &r_adm, &r_cambi, &r_speed});
 		part_done(8);
 		// the sums the shaders wrote, into the slot's own buffers (CAMBI's are written there directly)
 		vk.barrier();
@@ -989,7 +1063,8 @@ private:
 			vk.barrier();
 			for (int p = 0; p < 4; p++) vk.copy(vk.async_upload() ? sl.dev_chroma[p] : sl.in_chroma[p], sraw[p]);
 			vk.barrier();
-			record_speed([](int) {});
+			Rec r2(vk, false);
+			record_speed([](int) {}, r2);
 			vk.barrier();
 			for (auto& [from, to] : sl.out2) vk.copy(*from, to);
 			vk.barrier();
@@ -998,23 +1073,23 @@ private:
 	}
 
 	// SpEED's work for a frame (sraw holds its chroma planes): the decimation, then its statistics step by step, all units at each step.
-	template <class PartDone> void record_speed(PartDone part_done) {
+	template <class PartDone> void record_speed(PartDone part_done, Rec& R) {
 		for (auto& u : su) {
 			for (int p = 0; p < 4; p++) {
 				SpeedPC pc = u.spc;
 				pc.out_off = p * u.spc.DW * u.spc.DH;
-				vk.push(&pc, sizeof pc);
-				vk.bind(u.spipe[p]);
-				vk.dispatch((uint32_t)((u.spc.DW + 7) / 8), (uint32_t)((u.spc.DH + 7) / 8));
+				R.push(&pc, sizeof pc);
+				R.bind(u.spipe[p]);
+				R.dispatch((uint32_t)((u.spc.DW + 7) / 8), (uint32_t)((u.spc.DH + 7) / 8));
 			}
 		}
 		{ // the rest of SpEED, step by step, all units at each step
 			auto step = [&](Pipe SpeedUnit::*pipe, auto groups_x, uint32_t gy) {
-				vk.barrier();
+				R.next();
 				for (auto& u : su) {
-					vk.push(&u.stpc, sizeof u.stpc);
-					vk.bind(u.*pipe);
-					vk.dispatch(groups_x(u), gy);
+					R.push(&u.stpc, sizeof u.stpc);
+					R.bind(u.*pipe);
+					R.dispatch(groups_x(u), gy);
 				}
 			};
 			auto pixels = [](const SpeedUnit& u) { return (uint32_t)((u.stpc.DW * u.stpc.DH + 63) / 64); };
@@ -1191,6 +1266,7 @@ private:
 	uint32_t gx = 0, gy = 0;
 	Buf mfr[3], mtmp, mpart[2];
 	Pipe my[2][3][3], mx[2][3][3], mxy[2][3][3];
+	bool use_waves = false; // see record(): VES_VMAF_WAVES=1 turns it on (2026-11-18, RTX 4080 SUPER: 13-18% slower at 4K, no gain at 1080p)
 	bool motion_fused = true; // motion_xy: both convolutions in one pass (up to 15 bits; VES_MOTION_SPLIT=1: motion_y and motion_x)
 	// vif: the subsampled planes once, the statistics for each enhancement gain limit
 	std::vector<double> vif_egl;
@@ -1204,6 +1280,12 @@ private:
 	int sw[4], sh[4], bw[4], bh[4];
 	std::vector<AdmUnit> au;
 	Buf acur[4], acopy[4], aden[4], atmp, adiv;
+	int adm_tiles = 0; // ints of tmp each ADM unit's adm_dcm tile sums take
+	// adm_dcm_multi: the units of one enhancement gain limit (all of them, usually) in one pass per scale, which reads and decouples the bands once
+	// (VES_ADM_MULTI=0: a pass per unit)
+	struct AdmGroup { std::vector<int> units; Buf tab[4]; Pipe p[4]; };
+	std::vector<AdmGroup> agroups;
+	bool adm_multi = true;
 	// VES_ADM_DUMP=<file>: frame 1's ADM bands and sums of scale 0 (acur[0], unit 0's cm, aden) written to that file, for comparing GPUs; in that
 	// frame AH, AV, AD hold decouple's k, angle flag and restored value before the gain limit (of the h band), so its scores are wrong
 	std::string adm_dump;
@@ -1471,7 +1553,9 @@ private:
 				if (a.aim) a.aimb[s] = vk.buffer((size_t)bh[s] * 3 * 8 + 16, 1);
 			}
 		}
-		atmp = vk.buffer((size_t)4 * bh[0] * W * 4 + 16, 1);
+		// tmp: the DWT's vertical pass (VES_ADM_SPLIT_DWT), or each ADM unit's adm_dcm tile sums (adm_tiles ints per unit, the most of any scale)
+		adm_tiles = 2 * bh[0] * ((bw[0] + 15) / 16) * 3 * 2;
+		atmp = vk.buffer(std::max<size_t>((size_t)4 * bh[0] * W, (size_t)adm_tiles * au.size()) * 4 + 16, 1);
 		adiv = vk.buffer(65537 * 4, 0);
 		{
 			int32_t* d = (int32_t*)adiv.map;
@@ -1503,6 +1587,29 @@ private:
 					std::vector<Buf*> ba{&a.cur[s], prev, &raw_ref, &raw_dis, &atmp, &adiv, &a.aimb[s], &aden[s]};
 					a.aimcsf[s] = vk.pipeline("adm_csf", ba);
 					a.aimcm[s] = vk.pipeline("adm_cm", ba);
+				}
+			}
+		}
+		if (const char* e = getenv("VES_ADM_MULTI"); e && *e) adm_multi = atoi(e) > 0;
+		if (adm_multi && !adm_split_cm) {
+			for (size_t u = 0; u < au.size(); u++) {
+				size_t g = 0;
+				while (g < agroups.size() && au[agroups[g].units[0]].apc[0].egl != au[u].apc[0].egl) g++;
+				if (g == agroups.size()) agroups.emplace_back();
+				agroups[g].units.push_back((int)u);
+			}
+			for (AdmGroup& g : agroups) {
+				if (g.units.size() < 2) continue; // one unit: adm_dcm
+				for (int s = 0; s < 4; s++) {
+					g.tab[s] = vk.buffer(16 * g.units.size() + 16, 0);
+					int32_t* t = (int32_t*)g.tab[s].map;
+					for (size_t k = 0; k < g.units.size(); k++) {
+						const AdmUnit& a = au[g.units[k]];
+						t[4 * k] = a.apc[s].rf0; t[4 * k + 1] = a.apc[s].rf1; t[4 * k + 2] = a.apc[s].rf2;
+						t[4 * k + 3] = (a.aim ? 1 : 0) | ((g.units[k] * adm_tiles) << 1);
+					}
+					Buf* prev = &acur[s ? s - 1 : 0];
+					g.p[s] = vk.pipeline("adm_dcm_multi", {&acur[s], prev, &raw_ref, &raw_dis, &atmp, &adiv, &au[g.units[0]].cm[s], &aden[s], &g.tab[s]});
 				}
 			}
 		}
@@ -1663,24 +1770,24 @@ private:
 		}
 	}
 
-	void record_cambi(const Slot& sl) {
+	void record_cambi(const Slot& sl, Rec& R) {
 		auto groups = [](int a, int b) { return std::make_pair((uint32_t)((a + 15) / 16), (uint32_t)((b + 15) / 16)); };
 		const int ew = cg.ew, eh = cg.eh;
 		CambiPC pc = cpc;
 		pc.W = W; pc.H = H; pc.OW = ew; pc.OH = eh;
-		vk.push(&pc, sizeof pc);
+		R.push(&pc, sizeof pc);
 		auto g = groups(ew, eh);
 		if (cfront) {
 			CambiPC pf = pc;
 			pf.pad = cg.speedup ? cg.sw[0] : 0; pf.nd = cg.speedup ? cg.sh[0] : 0;
-			vk.push(&pf, sizeof pf);
-			vk.bind(cp_front); vk.dispatch(g.first, g.second); vk.barrier();
+			R.push(&pf, sizeof pf);
+			R.bind(cp_front); R.dispatch(g.first, g.second); R.next();
 		} else {
-			vk.bind(cp_pre); vk.dispatch(g.first, g.second); vk.barrier();
+			R.bind(cp_pre); R.dispatch(g.first, g.second); R.next();
 			pc.W = ew; pc.H = eh;
-			vk.push(&pc, sizeof pc);
-			if (anti_dither) { vk.bind(cp_dither); vk.dispatch(g.first, g.second); vk.barrier(); }
-			vk.bind(cp_mask); vk.dispatch(g.first, g.second); vk.barrier();
+			R.push(&pc, sizeof pc);
+			if (anti_dither) { R.bind(cp_dither); R.dispatch(g.first, g.second); R.next(); }
+			R.bind(cp_mask); R.dispatch(g.first, g.second); R.next();
 		}
 		pc.W = ew; pc.H = eh;
 		int pw = ew, ph = eh;
@@ -1689,25 +1796,25 @@ private:
 			g = groups(w, h);
 			if (s > 0 || (cg.speedup && !cfront)) {
 				pc.W = pw; pc.H = ph; pc.OW = w; pc.OH = h;
-				vk.push(&pc, sizeof pc);
-				vk.bind(cp_dec[s]); vk.dispatch(g.first, g.second); vk.barrier();
+				R.push(&pc, sizeof pc);
+				R.bind(cp_dec[s]); R.dispatch(g.first, g.second); R.next();
 			}
 			pc.W = w; pc.H = h; pc.OW = w; pc.OH = h;
 			pc.anti_dither = 0; // cambi_mode: the pass along the rows
-			vk.push(&pc, sizeof pc);
-			vk.bind(cp_mode_h[s]); vk.dispatch(g.first, g.second); vk.barrier();
+			R.push(&pc, sizeof pc);
+			R.bind(cp_mode_h[s]); R.dispatch(g.first, g.second); R.next();
 			pc.anti_dither = 1; // ... and along the columns
-			vk.push(&pc, sizeof pc);
-			vk.bind(cp_mode_v[s]); vk.dispatch(g.first, g.second); vk.barrier();
+			R.push(&pc, sizeof pc);
+			R.bind(cp_mode_v[s]); R.dispatch(g.first, g.second); R.next();
 			pc.anti_dither = cpc.anti_dither;
 			if (cslide) { // the c values with sliding counts, then cambi_cvalue only sums them
 				pc.OH = 128;
-				vk.push(&pc, sizeof pc);
-				vk.bind(sl.cp_slide[s]); vk.dispatch((uint32_t)((w + 63) / 64), (uint32_t)((h + 127) / 128)); vk.barrier();
+				R.push(&pc, sizeof pc);
+				R.bind(sl.cp_slide[s]); R.dispatch((uint32_t)((w + 63) / 64), (uint32_t)((h + 127) / 128)); R.next();
 				pc.OW = -1; pc.OH = h;
 			}
-			vk.push(&pc, sizeof pc);
-			vk.bind(sl.cp_cval[s]); vk.dispatch(g.first, g.second); vk.barrier();
+			R.push(&pc, sizeof pc);
+			R.bind(sl.cp_cval[s]); R.dispatch(g.first, g.second); R.next();
 			pw = w; ph = h;
 		}
 	}

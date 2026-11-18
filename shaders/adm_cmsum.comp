@@ -12,7 +12,7 @@ void main() {
 	for (int q = 0; q < 3; q++) {
 		int64_t sum = 0l;
 		for (int k = 0; k < tx; k++) {
-			const int idx = (((set * rows + r) * tx + k) * 3 + q) * 2;
+			const int idx = pc.dbg + (((set * rows + r) * tx + k) * 3 + q) * 2; // pc.dbg: this unit's part of tmp
 			sum += int64_t(uint64_t(uint(tmp[idx])) | (uint64_t(uint(tmp[idx + 1])) << 32));
 		}
 		cm_rows[r * 3 + q] = sum;
