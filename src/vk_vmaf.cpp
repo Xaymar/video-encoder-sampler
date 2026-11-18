@@ -975,6 +975,18 @@ private:
 						AdmPC pu = a.apc[s];
 						pu.dbg = (int)u * adm_tiles;
 						if (phase == 0) {
+							bool grouped = false; // adm_dcm_multi: the group's first unit dispatches for all of them
+							for (const AdmGroup& g : agroups) {
+								if (g.units.size() < 2 || std::find(g.units.begin(), g.units.end(), (int)u) == g.units.end()) continue;
+								grouped = true;
+								if (g.units[0] == (int)u) {
+									pu.dbg = (int)g.units.size();
+									R->push(&pu, sizeof pu);
+									R->bind(g.p[s]);
+									R->dispatch((uint32_t)((pu.ecol - pu.scol + 15) / 16), (uint32_t)((pu.erow - pu.srow + 15) / 16));
+								}
+							}
+							if (grouped) continue;
 							pu.aim = a.aim ? 1 : 0;
 							R->push(&pu, sizeof pu);
 							R->bind(a.dcm[s]);
@@ -1269,6 +1281,11 @@ private:
 	std::vector<AdmUnit> au;
 	Buf acur[4], acopy[4], aden[4], atmp, adiv;
 	int adm_tiles = 0; // ints of tmp each ADM unit's adm_dcm tile sums take
+	// adm_dcm_multi: the units of one enhancement gain limit (all of them, usually) in one pass per scale, which reads and decouples the bands once
+	// (VES_ADM_MULTI=0: a pass per unit)
+	struct AdmGroup { std::vector<int> units; Buf tab[4]; Pipe p[4]; };
+	std::vector<AdmGroup> agroups;
+	bool adm_multi = true;
 	// VES_ADM_DUMP=<file>: frame 1's ADM bands and sums of scale 0 (acur[0], unit 0's cm, aden) written to that file, for comparing GPUs; in that
 	// frame AH, AV, AD hold decouple's k, angle flag and restored value before the gain limit (of the h band), so its scores are wrong
 	std::string adm_dump;
@@ -1570,6 +1587,29 @@ private:
 					std::vector<Buf*> ba{&a.cur[s], prev, &raw_ref, &raw_dis, &atmp, &adiv, &a.aimb[s], &aden[s]};
 					a.aimcsf[s] = vk.pipeline("adm_csf", ba);
 					a.aimcm[s] = vk.pipeline("adm_cm", ba);
+				}
+			}
+		}
+		if (const char* e = getenv("VES_ADM_MULTI"); e && *e) adm_multi = atoi(e) > 0;
+		if (adm_multi && !adm_split_cm) {
+			for (size_t u = 0; u < au.size(); u++) {
+				size_t g = 0;
+				while (g < agroups.size() && au[agroups[g].units[0]].apc[0].egl != au[u].apc[0].egl) g++;
+				if (g == agroups.size()) agroups.emplace_back();
+				agroups[g].units.push_back((int)u);
+			}
+			for (AdmGroup& g : agroups) {
+				if (g.units.size() < 2) continue; // one unit: adm_dcm
+				for (int s = 0; s < 4; s++) {
+					g.tab[s] = vk.buffer(16 * g.units.size() + 16, 0);
+					int32_t* t = (int32_t*)g.tab[s].map;
+					for (size_t k = 0; k < g.units.size(); k++) {
+						const AdmUnit& a = au[g.units[k]];
+						t[4 * k] = a.apc[s].rf0; t[4 * k + 1] = a.apc[s].rf1; t[4 * k + 2] = a.apc[s].rf2;
+						t[4 * k + 3] = (a.aim ? 1 : 0) | ((g.units[k] * adm_tiles) << 1);
+					}
+					Buf* prev = &acur[s ? s - 1 : 0];
+					g.p[s] = vk.pipeline("adm_dcm_multi", {&acur[s], prev, &raw_ref, &raw_dis, &atmp, &adiv, &au[g.units[0]].cm[s], &aden[s], &g.tab[s]});
 				}
 			}
 		}
