@@ -33,6 +33,7 @@ class Mp4Writer {
 	Codec codec_ = Codec::None;
 	Shape enc_;
 	Color color_;
+	int coded_w_ = 0, coded_h_ = 0;
 	int hint_ = 0;                // B-frame depth, for encoders that report no decode times
 	bool started = false, reported = false, warned = false;
 	int64_t shift = 0, index = 0, last_dts = -1;
@@ -53,7 +54,9 @@ public:
 	Mp4Writer();
 	~Mp4Writer();
 	// `delay_hint` is Encoder::reorder_delay(); it is only used when the packets carry no DTS.
-	bool open(const std::string& path, Codec codec, const Shape& enc, const Color& color, int delay_hint);
+	// `coded_w` x `coded_h`: the size the stream is coded at when the encoder padded the picture (Encoder::coded_w), 0 when it did not. The track is
+	// that large, and a 'clap' box crops it back to `enc`'s size at the top left.
+	bool open(const std::string& path, Codec codec, const Shape& enc, const Color& color, int delay_hint, int coded_w = 0, int coded_h = 0);
 	// Packets in coding order (H.264 and HEVC as Annex B, AV1 as temporal units). `dts` is the encoder's decode time, or INT64_MIN.
 	bool add(const uint8_t* data, size_t size, int64_t pts, bool key, int64_t dts);
 	bool close();

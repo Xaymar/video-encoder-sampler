@@ -20,6 +20,7 @@ extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/intreadwrite.h>
 #ifndef VES_NO_VULKAN
 #include <libavutil/hwcontext_vulkan.h>
 #endif
@@ -51,6 +52,9 @@ class FfSource : public Source {
 	AVBufferRef* hw_dev = nullptr;
 	AVPixelFormat hw_fmt = AV_PIX_FMT_NONE;
 	bool hw_used = false;   // a frame really came from the hardware decoder
+	// What the container crops off the coded picture (MP4 'clap', Matroska PixelCrop): AV1 cannot crop in the stream, so an encoder that codes a larger size
+	// (AMF's AV1 codes 64x16 blocks) has the container say what the picture is. Decoders do not apply it; the frames are cropped here.
+	unsigned crop_top = 0, crop_bottom = 0, crop_left = 0, crop_right = 0;
 	bool fmt_known = true;  // false for hardware decoding until the first frame shows what the download looks like
 	Picture pending;        // the first frame, read early to learn the format
 	bool has_pending = false;
@@ -122,6 +126,10 @@ class FfSource : public Source {
 				if (!fmt_known) {
 					if (!describe_native((AVPixelFormat)f->format, fmt)) { fprintf(stderr, "unsupported source pixel format %s\n", av_get_pix_fmt_name((AVPixelFormat)f->format)); return AVERROR_INVALIDDATA; }
 					fmt_known = true;
+				}
+				if (crop_top | crop_bottom | crop_left | crop_right) {
+					f->crop_top = crop_top; f->crop_bottom = crop_bottom; f->crop_left = crop_left; f->crop_right = crop_right;
+					if (av_frame_apply_cropping(f, AV_FRAME_CROP_UNALIGNED) < 0) { fprintf(stderr, "the container's crop does not fit a %dx%d frame\n", f->width, f->height); return AVERROR_INVALIDDATA; }
 				}
 				f->pts = read++;
 				f->duration = 1;
@@ -226,6 +234,18 @@ public:
 		av_dict_free(&dec_opts);
 		if (opened < 0) { if (hw_type.empty()) fprintf(stderr, "decoder open failed\n"); return false; }
 		width = dec->width; height = dec->height;
+		if (const AVPacketSideData* sd = av_packet_side_data_get(st->codecpar->coded_side_data, st->codecpar->nb_coded_side_data, AV_PKT_DATA_FRAME_CROPPING); sd && sd->size >= 16) {
+			const unsigned t = AV_RL32(sd->data), b = AV_RL32(sd->data + 4), l = AV_RL32(sd->data + 8), r = AV_RL32(sd->data + 12);
+			if ((uint64_t)t + b < (uint64_t)height && (uint64_t)l + r < (uint64_t)width) {
+				crop_top = t; crop_bottom = b; crop_left = l; crop_right = r;
+				width -= (int)(l + r); height -= (int)(t + b);
+#ifndef VES_NO_VULKAN
+				// The frames kept on the GPU (Picture::gpu) are handed on at their full size; a cropped one is read back and cropped here instead. Only AV1
+				// inputs from encoders that pad have a container crop, so this is rare.
+				if (gpu_frames) { gpu_frames = false; fprintf(stderr, "'%s': the container crops the picture, so its frames are read back from the GPU\n", path.c_str()); }
+#endif
+			} else fprintf(stderr, "'%s': the container's crop (%u %u %u %u) does not fit %dx%d, ignored\n", path.c_str(), t, b, l, r, width, height);
+		}
 		framerate = from_av(av_guess_frame_rate(ctx, st, nullptr));
 		tb = from_av(st->time_base);
 		color = {(int)st->codecpar->color_range, (int)st->codecpar->color_space, (int)st->codecpar->color_primaries, (int)st->codecpar->color_trc};
