@@ -253,6 +253,7 @@ struct Vk::Impl {
 	VkCommandPool xpool{};
 	std::vector<Slot> slots;
 	VkCommandBuffer cmd{}; // the one being recorded (either compute queue)
+	std::vector<std::pair<VkBuffer, std::vector<VkBuffer>>> aliases; // alias(): a placeholder, and the buffer of each slot
 	int cur_slot = -1;     // ... its slot
 	const char* cur_name = ""; // the shader bound last
 	bool pass = false;     // VES_SCORE_TIMING=2
@@ -278,9 +279,9 @@ Vk::Vk(int device, int slots) : impl(new Impl) {
 	Shared& s = *impl->s;
 	if (const char* e = getenv("VES_SCORE_TIMING"); e && atoi(e) >= 2) impl->pass = true;
 	try {
-		VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * 256};
+		VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * 1024};
 		VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-		dpi.maxSets = 256;
+		dpi.maxSets = 1024; // aliased pipelines take a set per slot
 		dpi.poolSizeCount = 1;
 		dpi.pPoolSizes = &ps;
 		chk(vkCreateDescriptorPool(s.dev, &dpi, nullptr, &impl->dpool), "descriptor pool");
@@ -463,7 +464,27 @@ Pipe Vk::pipeline(const char* name, const std::vector<Buf*>& bindings) {
 		writes.push_back(w);
 	}
 	vkUpdateDescriptorSets(s.dev, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+	bool aliased = false;
+	for (auto& info : infos) for (auto& [from, to] : impl->aliases) if (info.buffer == from) aliased = true;
+	if (aliased) {
+		p.nslot = (int)impl->slots.size();
+		if (p.nslot > 8) throw std::runtime_error("Vulkan: too many slots for aliased buffers");
+		for (int k = 0; k < p.nslot; k++) {
+			chk(vkAllocateDescriptorSets(s.dev, &ai, &p.slot_sets[k]), "descriptor set");
+			std::vector<VkDescriptorBufferInfo> si = infos;
+			for (auto& info : si) for (auto& [from, to] : impl->aliases) if (info.buffer == from) info.buffer = to[k];
+			for (int i = 0; i < kBindings; i++) { writes[i].dstSet = p.slot_sets[k]; writes[i].pBufferInfo = &si[i]; }
+			vkUpdateDescriptorSets(s.dev, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+		}
+	}
 	return p;
+}
+
+void Vk::alias(const Buf& placeholder, const std::vector<const Buf*>& per_slot) {
+	if (per_slot.size() != impl->slots.size()) throw std::runtime_error("Vulkan: alias needs a buffer per slot");
+	std::vector<VkBuffer> to;
+	for (const Buf* b : per_slot) to.push_back(b->buf);
+	impl->aliases.emplace_back(placeholder.buf, to);
 }
 
 void Vk::begin(int slot) {
@@ -503,7 +524,8 @@ void Vk::copy_range(const Buf& src, VkDeviceSize src_off, const Buf& dst, VkDevi
 void Vk::bind(const Pipe& p) {
 	impl->cur_name = p.name;
 	vkCmdBindPipeline(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
-	vkCmdBindDescriptorSets(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, impl->s->layout, 0, 1, &p.set, 0, nullptr);
+	const VkDescriptorSet set = p.nslot > 0 && impl->cur_slot >= 0 && impl->cur_slot < p.nslot ? p.slot_sets[impl->cur_slot] : p.set;
+	vkCmdBindDescriptorSets(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, impl->s->layout, 0, 1, &set, 0, nullptr);
 }
 
 void Vk::push(const void* data, uint32_t size) { vkCmdPushConstants(impl->cmd, impl->s->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, size, data); }

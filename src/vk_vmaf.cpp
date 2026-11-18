@@ -583,8 +583,24 @@ public:
 		if (const char* e = getenv("VES_ADM_DUMP"); e && *e) adm_dump = e;
 		if (!adm_dump.empty()) adm_split_cm = true; // the dump holds the bands decouple and csf write
 		raw_size = (plane_bytes + 3) / 4 * 4 + 4;
-		raw_ref = vk.buffer(raw_size, 1);
-		raw_dis = vk.buffer(raw_size, 1);
+		// With the copies in on a queue of their own, each slot's frame stays in its own buffers (dev_ref/dev_dis), which the pipelines read in place
+		// of raw_ref/raw_dis (Vk::alias): no copy of the frame on the compute queue. Else they are copied into raw_ref/raw_dis.
+		alias_raw = vk.async_upload();
+		if (const char* e = getenv("VES_VMAF_COPY_FRAMES"); e && atoi(e) > 0) alias_raw = false;
+		if (const char* e = getenv("VES_VMAF_ALIAS_FRAMES"); e && atoi(e) > 0) alias_raw = true; // also without the queue (for testing)
+		raw_ref = vk.buffer(alias_raw ? 16 : raw_size, 1);
+		raw_dis = vk.buffer(alias_raw ? 16 : raw_size, 1);
+		if (alias_raw) {
+			std::vector<const Buf*> r, d;
+			for (Slot& sl : slots) {
+				sl.dev_ref = vk.buffer(raw_size, 1);
+				sl.dev_dis = vk.buffer(raw_size, 1);
+				r.push_back(&sl.dev_ref);
+				d.push_back(&sl.dev_dis);
+			}
+			vk.alias(raw_ref, r);
+			vk.alias(raw_dis, d);
+		}
 		// which model uses which shared part
 		for (auto& m : ms) {
 			if (m.motion) need_stride[m.motion_o.five_frame ? 1 : 0] = true;
@@ -604,12 +620,12 @@ public:
 				speed_of.push_back(u);
 			} else speed_of.push_back(-1);
 		}
+		speed2 = !su.empty() && vk.second_compute() && !part_timing;
 		if (need_stride[0] || need_stride[1]) init_motion();
 		if (!vif_egl.empty()) init_vif();
 		if (!au.empty()) init_adm();
 		if (cambi_on) init_cambi(f);
 		if (!su.empty()) init_speed(f);
-		speed2 = !su.empty() && vk.second_compute() && !part_timing;
 		uint64_t dev0, host0, dev1, host1;
 		vk.memory(dev0, host0);
 		init_slots();
@@ -713,17 +729,19 @@ private:
 		const int cur = (int)(index % 3);
 		const bool motion = need_stride[0] || need_stride[1];
 		if (vk.async_upload()) { // already in VRAM (copied on the second queue, which submit() waits for)
-			vk.copy(sl.dev_ref, raw_ref);
-			vk.copy(sl.dev_dis, raw_dis);
-			if (motion) vk.copy(sl.dev_ref, mfr[cur]);
-			if (!su.empty() && !speed2) for (int p = 0; p < 4; p++) vk.copy(sl.dev_chroma[p], sraw[p]);
+			if (!alias_raw) {
+				vk.copy(sl.dev_ref, raw_ref);
+				vk.copy(sl.dev_dis, raw_dis);
+				if (!su.empty() && !speed2) for (int p = 0; p < 4; p++) vk.copy(sl.dev_chroma[p], sraw[p]);
+			}
+			if (motion) vk.copy(sl.dev_ref, mfr[cur]); // kept: motion reads the frames before, whose slots may take new frames meanwhile
 			vk.barrier();
 		} else { // from system memory, once each: motion's copy of the reference comes from VRAM
-			vk.copy(sl.in_ref, raw_ref);
-			vk.copy(sl.in_dis, raw_dis);
-			if (!su.empty() && !speed2) for (int p = 0; p < 4; p++) vk.copy(sl.in_chroma[p], sraw[p]);
+			vk.copy(sl.in_ref, alias_raw ? sl.dev_ref : raw_ref);
+			vk.copy(sl.in_dis, alias_raw ? sl.dev_dis : raw_dis);
+			if (!su.empty() && !speed2) for (int p = 0; p < 4; p++) vk.copy(sl.in_chroma[p], alias_raw ? sl.dev_chroma[p] : sraw[p]);
 			vk.barrier();
-			if (motion) { vk.copy(raw_ref, mfr[cur]); vk.barrier(); }
+			if (motion) { vk.copy(alias_raw ? sl.dev_ref : raw_ref, mfr[cur]); vk.barrier(); }
 		}
 		part_done(0);
 		bool* with_motion = sl.with_motion;
@@ -1086,6 +1104,8 @@ private:
 	// speed: the chroma planes once, the decimation per unit
 	int cw = 0, ch = 0;
 	Buf sraw[4];
+	size_t craw_size = 0;
+	bool alias_raw = false; // raw_ref, raw_dis and sraw stand for each slot's dev_ref, dev_dis and dev_chroma
 	std::vector<SpeedUnit> su;
 
 	// Waits until slot k is not busy and takes its frame's features, if it has one (in frame order: the slots are used in turn).
@@ -1168,11 +1188,11 @@ private:
 		for (Slot& sl : slots) {
 			sl.in_ref = vk.buffer(raw_size, 3);
 			sl.in_dis = vk.buffer(raw_size, 3);
-			if (!su.empty()) for (int p = 0; p < 4; p++) sl.in_chroma[p] = vk.buffer(sraw[p].size, 3);
+			if (!su.empty()) for (int p = 0; p < 4; p++) sl.in_chroma[p] = vk.buffer(craw_size, 3);
 			if (vk.async_upload()) {
-				sl.dev_ref = vk.buffer(raw_size, 1);
-				sl.dev_dis = vk.buffer(raw_size, 1);
-				if (!su.empty()) for (int p = 0; p < 4; p++) sl.dev_chroma[p] = vk.buffer(sraw[p].size, 1);
+				if (!sl.dev_ref.buf) sl.dev_ref = vk.buffer(raw_size, 1);
+				if (!sl.dev_dis.buf) sl.dev_dis = vk.buffer(raw_size, 1);
+				if (!su.empty()) for (int p = 0; p < 4; p++) if (!sl.dev_chroma[p].buf) sl.dev_chroma[p] = vk.buffer(craw_size, 1);
 			}
 			auto mirror = [&](const Buf& from) { Buf to = vk.buffer(from.size, 2); sl.out.emplace_back(&from, to); return to; };
 			for (int k = 0; k < 2; k++) if (need_stride[k]) sl.mpart[k] = mirror(mpart[k]);
@@ -1573,7 +1593,14 @@ private:
 	void init_speed(const GpuVmafFrame& f) {
 		chroma_size(f.chroma, W, H, cw, ch);
 		const size_t craw = ((size_t)cw * ch * bps + 3) / 4 * 4 + 4;
-		for (auto& b : sraw) b = vk.buffer(craw, 1);
+		craw_size = craw;
+		for (auto& b : sraw) b = vk.buffer(alias_raw && !speed2 ? 16 : craw, 1);
+		if (alias_raw && !speed2) // as raw_ref/raw_dis (the second compute queue's SpEED copies them itself)
+			for (int p = 0; p < 4; p++) {
+				std::vector<const Buf*> c;
+				for (Slot& sl : slots) { sl.dev_chroma[p] = vk.buffer(craw, 1); c.push_back(&sl.dev_chroma[p]); }
+				vk.alias(sraw[p], c);
+			}
 		for (SpeedUnit& u : su) {
 			const SpeedOpts& o = u.o;
 			u.sd = speed_dims(cw, ch, o.prescale);
