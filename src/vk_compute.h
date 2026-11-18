@@ -40,6 +40,7 @@ struct Buf {
 struct Pipe {
 	VkPipeline pipe = VK_NULL_HANDLE;
 	VkDescriptorSet set = VK_NULL_HANDLE;
+	const char* name = ""; // the shader's (pipeline()'s name, which must outlive it: a string literal)
 };
 
 class Vk {
@@ -89,6 +90,11 @@ public:
 	// GPU time between two of the slot's stamps (by default start and end) in its last finished submission; -1 if the device has no timestamps or
 	// the submission did not write both. Safe to call from another thread than the one that records, for a slot that is not being recorded.
 	double gpu_seconds(int slot, int from = 0, int to = 1);
+	// VES_SCORE_TIMING=2: a timestamp after every dispatch on the main queue (up to kPassStamps per submission). The GPU time of each dispatch of
+	// the slot's last finished submission, in order, with its shader's name (from the end of the one before; the first from the start).
+	static constexpr int kPassStamps = 1024;
+	bool pass_timing() const;
+	void pass_seconds(int slot, std::vector<std::pair<const char*, double>>& out);
 	// Bytes of the buffers made so far, in device-local memory (VRAM, or what an integrated GPU sets aside) and in other memory.
 	void memory(uint64_t& device_local, uint64_t& host) const;
 

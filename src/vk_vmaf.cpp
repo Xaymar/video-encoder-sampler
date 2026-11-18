@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <map>
+#include <string>
 
 #include "gpu.h"
 #include "vk_compute.h"
@@ -687,6 +689,7 @@ public:
 		parts.clear();
 		if (t_parts_frames == 0) return;
 		for (int i = 0; i < kGpuPartCount; i++) parts.emplace_back(kGpuParts[i], t_parts[i]);
+		for (auto& [name, secs] : t_pass) parts.emplace_back("  " + name, secs);
 	}
 	// Memory: device local and other in all, and what each slot adds of that (frames in, sums out).
 	uint64_t mem_device = 0, mem_host = 0, mem_slot = 0;
@@ -1005,6 +1008,7 @@ private:
 	double t_gpu = 0, t_results = 0;
 	double t_parts[kGpuPartCount] = {}; // VES_SCORE_TIMING: GPU seconds per part of the work (kGpuParts), over t_parts_frames frames
 	long long t_parts_frames = 0;
+	std::map<std::string, double> t_pass; // VES_SCORE_TIMING=2: GPU seconds per dispatch (the shader's name, #n for its n-th dispatch in a frame)
 	bool part_timing = false;
 	// VES_SPEED_CHECK=1: SpEED is also worked out on the CPU (from the GPU's decimated planes, as before it all moved to the GPU) and compared
 	bool speed_check = false;
@@ -1082,6 +1086,7 @@ private:
 			std::string error;
 			double gpu = 0, res = 0, parts[kGpuPartCount];
 			bool parts_ok = false;
+			std::vector<std::pair<const char*, double>> passes;
 			try {
 				const auto t0 = clock::now();
 				vk.wait(k);
@@ -1094,6 +1099,7 @@ private:
 						parts[i] = vk.gpu_seconds(k, part_start(i), part_stamp(i));
 						if (parts[i] < 0) parts_ok = false;
 					}
+					if (vk.pass_timing()) vk.pass_seconds(k, passes);
 				}
 				if (!adm_dump.empty() && adump.buf && sl.index == 1) {
 					if (FILE* o = fopen(adm_dump.c_str(), "wb")) {
@@ -1114,6 +1120,11 @@ private:
 				t_gpu += gpu; t_results += res;
 				if (parts_ok) {
 					for (int i = 0; i < kGpuPartCount; i++) t_parts[i] += parts[i];
+					std::map<std::string, int> seen;
+					for (auto& [name, secs] : passes) {
+						const int n = seen[name]++;
+						t_pass[n ? std::string(name) + "#" + std::to_string(n + 1) : std::string(name)] += secs;
+					}
 					t_parts_frames++;
 				}
 				sl.feats = std::move(f);
