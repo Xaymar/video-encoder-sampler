@@ -140,6 +140,7 @@ struct Run {
 	const Options* options = nullptr; // the run's encoder options: the variant's, shared by every run of it
 	std::string video;      // the saved stream, relative to the output directory; empty if none was saved
 	std::string video_file; // where run_one() writes it
+	std::string held_video; // "videos": "best": the stream this run was scored on, kept in the scratch folder while the run is among the best of its group
 	std::string video_sha256; // SHA-256 of the encoded stream
 	std::string result;     // its result file (options, bitrates, per-frame VMAF), relative to the output directory; empty if none
 	std::string tag;        // "[run 12/240]", for the progress lines
@@ -1807,6 +1808,35 @@ static int run(int argc, char** argv) {
 	// What picks a group's winner: the score the website ranks by by default, the Distorted Score (the encode against the frames its encoder got), less the
 	// overshoot penalty; the True Score (Run::rwm) when a run of the group has no distorted score.
 	auto winner_score = [](const Run& r, bool distorted) { return distorted ? r.distorted.rwm - r.penalty : r.rwm; };
+	// "videos": "best": which of a group's scored runs keep their streams. cfg.best_count, or cfg.best_percent of the group, whichever is more, in the
+	// order winner_score() ranks them; a run whose stream is identical to a better one's adds nothing and does not count.
+	auto best_of_group = [&](const std::vector<Task*>& runs_ok) {
+		bool distorted = true;
+		for (Task* x : runs_ok) distorted &= x->r.has_distorted;
+		std::vector<Task*> ranked = runs_ok;
+		std::stable_sort(ranked.begin(), ranked.end(), [&](Task* a, Task* b) { return winner_score(a->r, distorted) > winner_score(b->r, distorted); });
+		const size_t want = std::max<size_t>((size_t)cfg.best_count, (size_t)std::ceil(ranked.size() * cfg.best_percent / 100.0));
+		std::vector<Task*> keep;
+		std::set<std::string> streams;
+		for (Task* x : ranked) {
+			if (keep.size() >= want) break;
+			if (!x->r.video_sha256.empty() && !streams.insert(x->r.video_sha256).second) continue;
+			keep.push_back(x);
+		}
+		return keep;
+	};
+	// The scored streams of a group's runs that are not among its best so far are deleted. x264 and x265 with a VBV (the CBR ves runs them at) and more
+	// than one thread do not make the same stream twice (their rate control reads the sizes of frames other threads are still encoding), so the stream
+	// that was scored is kept from the start instead of being encoded again when the group is complete.
+	auto trim_held = [&](const std::vector<Task*>& runs_ok) {
+		const std::vector<Task*> keep = best_of_group(runs_ok);
+		for (Task* x : runs_ok) {
+			if (x->r.held_video.empty() || std::find(keep.begin(), keep.end(), x) != keep.end()) continue;
+			std::error_code ec;
+			fs::remove(x->r.held_video, ec);
+			x->r.held_video.clear();
+		}
+	};
 	// The stream of a run goes to the site with its result, which went out without it (UploadItem::late).
 	auto upload_video = [&](const Task& t) {
 		if (!uploader || t.r.result.empty() || t.r.video.empty()) return;
@@ -1854,8 +1884,12 @@ static int run(int argc, char** argv) {
 			if (!cfg.best_videos && !r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) it.video_file = (fs::path(cfg.output_dir) / r.video).string();
 			uploader->add(std::move(it));
 		}
-		// Only the stream of the group's winner stays, decided when the group is complete (see `finish`).
-		if (cfg.best_videos) group_ok[r.group].push_back(&t);
+		// Only the streams of the group's best runs stay, decided when the group is complete (see `finish`); until then the scored streams of the
+		// group's best runs so far are held, and the others go.
+		if (cfg.best_videos) {
+			group_ok[r.group].push_back(&t);
+			trim_held(group_ok[r.group]);
+		}
 		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf rwm %.3f mean %.3f min %.3f p5 %.3f%s%s%s%s  [wave %.1fs: encoder busy %.1f, starved %.1f; decoder backed up %.1f; scorer starved %.1f]", r.tag.c_str(), r.label.c_str(), r.kbps,
 		         fs_.rwm, fs_.mean, fs_.min, fs_.p5, rel, r.from_site ? " (from the site)" : r.cached ? " (cached)" : "",
 		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.enc_busy_s, r.enc_starved_s, r.decode_blocked_s, r.score_starved_s);
@@ -2412,7 +2446,8 @@ static int run(int argc, char** argv) {
 					continue;
 				}
 				if (t.ok && !check) r.video_sha256 = sha256_file(wr[i].enc.file);
-				if (r.video_file.empty() || cfg.best_videos) fs::remove(wr[i].enc.file, ec); // a temporary file; with "best" the winner is encoded again when its input is done
+				if (t.ok && !check && cfg.best_videos) r.held_video = wr[i].enc.file; // in the scratch folder; finish() deletes it unless the run is among the best so far
+				else if (r.video_file.empty() || cfg.best_videos) fs::remove(wr[i].enc.file, ec); // a temporary file
 				if (cfg.best_videos) r.video.clear();
 				finish(t);
 			}
@@ -2466,23 +2501,12 @@ static int run(int argc, char** argv) {
 		for (auto it = group_ok.begin(); it != group_ok.end();) {
 			auto& runs_ok = it->second;
 			if (runs_ok.empty() || runs_ok.front()->r.input != input_name) { ++it; continue; }
-			bool distorted = true;
-			for (Task* x : runs_ok) distorted &= x->r.has_distorted;
-			// The best runs keep their streams: cfg.best_count, or cfg.best_percent of the group, whichever is more. Runs whose stream is identical to a better one's
-			// add nothing and do not count.
-			std::vector<Task*> ranked = runs_ok;
-			std::stable_sort(ranked.begin(), ranked.end(), [&](Task* a, Task* b) { return winner_score(a->r, distorted) > winner_score(b->r, distorted); });
-			const size_t want = std::max<size_t>((size_t)cfg.best_count, (size_t)std::ceil(ranked.size() * cfg.best_percent / 100.0));
-			std::set<Task*> keep;
-			std::set<std::string> streams;
-			for (Task* x : ranked) {
-				if (keep.size() >= want) break;
-				if (!x->r.video_sha256.empty() && !streams.insert(x->r.video_sha256).second) continue;
-				keep.insert(x);
-			}
+			const std::vector<Task*> winners = best_of_group(runs_ok); // the best runs keep their streams
+			const std::set<Task*> keep(winners.begin(), winners.end());
 			for (Task* x : runs_ok) {
-				if (keep.count(x) || x->r.video.empty()) continue;
 				std::error_code ec;
+				if (!keep.count(x) && !x->r.held_video.empty()) { fs::remove(x->r.held_video, ec); x->r.held_video.clear(); }
+				if (keep.count(x) || x->r.video.empty()) continue;
 				fs::remove(fs::path(cfg.output_dir) / x->r.video, ec);
 				x->r.video.clear();
 				if (uploader && x->r.cached && !x->r.result.empty()) { // an earlier sweep may have sent it to the site as its best
@@ -2493,10 +2517,32 @@ static int run(int argc, char** argv) {
 					uploader->add(std::move(drop));
 				}
 			}
-			for (Task* x : ranked) {
-				if (!keep.count(x)) continue;
+			for (Task* x : winners) {
 				Task* best = x; // one of the best
 				Run& r = best->r;
+				// The stream this sweep scored, held since: it moves next to the result.
+				if (!r.held_video.empty()) {
+					const fs::path to = fs::path(cfg.output_dir) / video_name_of(r);
+					std::error_code ec;
+					fs::remove(to, ec);
+					fs::rename(r.held_video, to, ec);
+					if (ec) { // another drive: copied instead
+						ec.clear();
+						fs::copy_file(r.held_video, to, fs::copy_options::overwrite_existing, ec);
+						std::error_code ec2;
+						fs::remove(r.held_video, ec2);
+					}
+					r.held_video.clear();
+					if (!ec) {
+						r.video = video_name_of(r);
+						ui::log("One of the best of its group  " + r.label + ": stream kept (" + r.video + ")");
+						if (!best->result_file.empty()) store_result(*best, best->result_file, cached_of(r), run_details(*best)); // the result names its stream now
+						upload_video(*best);
+						continue;
+					}
+					ui::log("One of the best of its group  " + r.label + ": its stream could not be moved to " + to.string() + " (" + ec.message() + "); no video");
+					continue;
+				}
 				// A stream an earlier sweep kept is used if it is the one that was scored; anything else there is encoded again.
 				bool kept = false;
 				if (!r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) {
@@ -2507,6 +2553,7 @@ static int run(int argc, char** argv) {
 				if (kept) {}
 				else if (r.result.empty()) {}
 				else if (r.video_sha256.empty()) ui::log("One of the best of its group  " + r.label + ": its result has no video_sha256, so a new encode cannot be checked against it; no video");
+				else if (r.encoder == "x264" || r.encoder == "x265") ui::log("One of the best of its group  " + r.label + ": scored in an earlier sweep or elsewhere, and " + r.encoder + " with a VBV does not make the same stream twice, so there is no video");
 				else if (!best->model.empty()) remote_winners.push_back(best); // a worker's GPU: a worker with it encodes it again
 				else {
 					r.video_file = (fs::path(cfg.output_dir) / video_name_of(r)).string();
