@@ -1491,6 +1491,8 @@ private:
 				for (auto& d : vulkan_devices_fastest_first()) if (d.index == device_index) vendor = d.vendor_id;
 				cpc.lanes = vendor != 0x1002;
 				if (const char* e = getenv("VES_CAMBI_LANES"); e && *e) cpc.lanes = atoi(e) > 0;
+				// cambi_cvalue's column counts for tiles whose values lie close together (VES_CAMBI_COLS=0: off)
+				if (const char* e = getenv("VES_CAMBI_COLS"); e && *e && atoi(e) == 0) cpc.lanes |= 2;
 			}
 			cpc.vlt_luma = vlt_luma(o.vlt, lr, pq);
 			const int v_lo = cpc.vlt_luma - 3 * nd + 1;

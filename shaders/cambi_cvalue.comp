@@ -16,6 +16,11 @@ const int MAXD = 8; // nd <= 8 (max_log_contrast <= 3)
 const int TILE = 16;
 const int MAXPAD = 16;
 shared int tile[(TILE + 2 * MAXPAD) * (TILE + 2 * MAXPAD)];
+// Column counts (tiles whose centres' values lie close together, the usual case): for each centre row of the tile and each column of the region,
+// how many of the window's rows there hold each value base .. base + 31, in 8 bit lanes; laid out [word][row][column] so a warp reads along a row.
+const int CW = TILE + 2 * MAXPAD, RMAX = 32;
+shared uint colc[RMAX / 4 * TILE * CW];
+shared int s_lo, s_hi;
 shared double ssum[256];
 shared uint scnt[256];
 
@@ -110,6 +115,24 @@ void window_direct_plain(inout Counts cnt, int i, int j, int pad, uint off, uint
 		}
 }
 
+// The window's counts from the column counts: the 33 or fewer columns' words for the values a .. a + 2 nd (a = v - nd - base), summed in 8 bit
+// lanes over up to 7 columns at a time (7 x 33 < 256), then into the 16 bit lanes; get_count() then takes k + (a & 3).
+void window_cols(inout Counts cnt, int ly, int lx, int pad, int a, const bool small) {
+	const int w0 = a >> 2, plane = TILE * CW;
+	int base = w0 * plane + ly * CW + lx;
+	Row r = Row(0u, 0u, 0u, 0u, 0u);
+	int n = 0;
+	for (int dc = 0; dc <= 2 * pad; dc++) {
+		const int o = base + dc;
+		r.r0 += colc[o];
+		r.r1 += colc[o + plane];
+		r.r2 += colc[o + 2 * plane];
+		if (!small) { r.r3 += colc[o + 3 * plane]; r.r4 += colc[o + 4 * plane]; }
+		if (++n == 7) { add_row(cnt, r, small); r = Row(0u, 0u, 0u, 0u, 0u); n = 0; }
+	}
+	add_row(cnt, r, small);
+}
+
 int get_count(Counts c, int k) {
 	const int wi = k >> 2;
 	const uint64_t w = wi == 0 ? c.w0 : wi == 1 ? c.w1 : wi == 2 ? c.w2 : wi == 3 ? c.w3 : c.w4;
@@ -127,6 +150,48 @@ void main() {
 		for (int k = int(gl_LocalInvocationIndex); k < tw * tw; k += 256) tile[k] = counted(r0 + k / tw, c0 + k % tw);
 		barrier();
 	}
+	// Column counts when the centres' values span little: then each window is 2 pad + 1 column sums instead of (2 pad + 1)^2 samples.
+	bool cols = false;
+	int cbase = 0;
+	if (tiled && (pc.lanes & 2) == 0) {
+		if (gl_LocalInvocationIndex == 0u) { s_lo = 1 << 30; s_hi = -(1 << 30); }
+		barrier();
+		const int cv0 = tile[(int(gl_LocalInvocationID.y) + pad) * tw + int(gl_LocalInvocationID.x) + pad];
+		if (j < pc.W && i < pc.H && cv0 != NOT_COUNTED) { atomicMin(s_lo, cv0); atomicMax(s_hi, cv0); }
+		barrier();
+		const int lo = s_lo, hi = s_hi;
+		cbase = lo - nd;
+		const int R = hi - lo + 2 * nd + 1;
+		cols = lo <= hi && R <= RMAX;
+		if (cols) {
+			// one invocation per column and run of 4 centre rows: the first row's window counted, then slid down a row at a time
+			for (int e = int(gl_LocalInvocationIndex); e < 4 * tw; e += 256) {
+				const int x = e % tw, ly0 = (e / tw) * 4;
+				uint w[8] = uint[8](0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);
+				for (int dr = 0; dr <= 2 * pad; dr++) {
+					const uint k = uint(tile[(ly0 + dr) * tw + x] - cbase);
+					if (k < uint(R)) {
+						const uint inc = 1u << (8u * (k & 3u)), wi = k >> 2u;
+						for (uint q = 0u; q < 8u; q++) w[q] += wi == q ? inc : 0u;
+					}
+				}
+				for (int q = 0; q < 8; q++) colc[q * TILE * CW + ly0 * CW + x] = w[q];
+				for (int ly = ly0 + 1; ly < ly0 + 4; ly++) {
+					const uint ko = uint(tile[(ly - 1) * tw + x] - cbase), ki = uint(tile[(ly + 2 * pad) * tw + x] - cbase);
+					if (ko < uint(R)) {
+						const uint dec = 1u << (8u * (ko & 3u)), wi = ko >> 2u;
+						for (uint q = 0u; q < 8u; q++) w[q] -= wi == q ? dec : 0u;
+					}
+					if (ki < uint(R)) {
+						const uint inc = 1u << (8u * (ki & 3u)), wi = ki >> 2u;
+						for (uint q = 0u; q < 8u; q++) w[q] += wi == q ? inc : 0u;
+					}
+					for (int q = 0; q < 8; q++) colc[q * TILE * CW + ly * CW + x] = w[q];
+				}
+			}
+			barrier();
+		}
+	}
 	float c_value = 0.0;
 	if (sums_only) {
 		if (j < pc.W && i < pc.H) c_value = cval[i * pc.W + j];
@@ -136,28 +201,34 @@ void main() {
 		if (compact >= 0 && compact < pc.band_size) {
 			Counts cnt = Counts(0ul, 0ul, 0ul, 0ul, 0ul);
 			const uint span = uint(2 * nd), off = uint(nd - v);
-			if (tiled) {
+			int sh = 0; // where count k is: k + sh
+			if (cols) {
+				const int a = v - nd - cbase;
+				sh = a & 3;
+				if (nd <= 4) window_cols(cnt, int(gl_LocalInvocationID.y), int(gl_LocalInvocationID.x), pad, a, true);
+				else window_cols(cnt, int(gl_LocalInvocationID.y), int(gl_LocalInvocationID.x), pad, a, false);
+			} else if (tiled) {
 				const int base = int(gl_LocalInvocationID.y) * tw + int(gl_LocalInvocationID.x);
-				if (pc.lanes != 0) {
+				if ((pc.lanes & 1) != 0) {
 					if (nd <= 4) window_tiled(cnt, base, tw, pad, off, span, true);
 					else window_tiled(cnt, base, tw, pad, off, span, false);
 				} else {
 					if (nd <= 4) window_tiled_plain(cnt, base, tw, pad, off, span, true);
 					else window_tiled_plain(cnt, base, tw, pad, off, span, false);
 				}
-			} else if (pc.lanes != 0) {
+			} else if ((pc.lanes & 1) != 0) {
 				if (nd <= 4) window_direct(cnt, i, j, pad, off, span, true);
 				else window_direct(cnt, i, j, pad, off, span, false);
 			} else {
 				if (nd <= 4) window_direct_plain(cnt, i, j, pad, off, span, true);
 				else window_direct_plain(cnt, i, j, pad, off, span, false);
 			}
-			const int p0 = get_count(cnt, nd);
+			const int p0 = get_count(cnt, nd + sh);
 			const int value = v + nd; // as cambi.c has it: tvi[] is in the same offset space
 			for (int d = 0; d < nd; d++) {
 				if (value <= tb.tvi[d] && value + d + 1 > pc.vlt_luma) {
-					const int p1 = get_count(cnt, nd + d + 1);
-					const int p2 = compact - d - 1 >= 0 ? get_count(cnt, nd - d - 1) : 0;
+					const int p1 = get_count(cnt, nd + d + 1 + sh);
+					const int p2 = compact - d - 1 >= 0 ? get_count(cnt, nd - d - 1 + sh) : 0;
 					precise float val;
 					if (p1 > p2) val = float(tb.weight[d] * p0 * p1) * tb.recip[p1 + p0];
 					else val = float(tb.weight[d] * p0 * p2) * tb.recip[p2 + p0];
