@@ -120,6 +120,12 @@
 					],
 				},
 				// [T] below: configs/check/amf-{h264,hevc}-pa-scene, 2026-11-18, on Areldir (9800X3D iGPU, AMF 1.4.37) and Irkela (780M, AMF 1.5.3): 352 runs, 10 to 12 different streams.
+				// An unset lookahead is the runtime's default: 0 on AMF 1.4.37 (and with scene change detection that overshot CBR by 58%, see below), another depth on
+				// 1.5.3 [T]. So with pre-analysis on the depth is always set, 11 being the documented default [PA].
+				{
+					"if": { "op": "==", "left": { "option": "enable_pre_analysis" }, "right": 1 },
+					"require": { "set": "pa_look_ahead_buffer_depth" },
+				},
 				// The activity type and frame SAD changed nothing without perceptual or temporal AQ [T].
 				{
 					"if": { "op": "and", "args": [{ "op": "not", "value": { "set": "pa_perceptual_aq_mode" } }, { "op": "not", "value": { "set": "pa_temporal_aq_mode" } }] },
@@ -128,7 +134,7 @@
 						{ "op": "not", "value": { "set": "pa_frame_sad_enable" } },
 					],
 				},
-				// With scene change detection off, the lookahead depth ("", 0, 21) changed nothing unless something else reads the lookahead [T].
+				// With scene change detection off, the lookahead depth ("", 0, 21) changed nothing (so 0 stands for all) unless something else reads the lookahead [T].
 				{
 					"if": { "op": "and", "args": [
 						{ "op": "==", "left": { "option": "pa_scene_change_detection_enable" }, "right": 0 },
@@ -137,7 +143,7 @@
 						{ "op": "not", "value": { "set": "pa_static_scene_detection_enable" } },
 						{ "op": "not", "value": { "set": "pa_perceptual_aq_mode" } },
 					] },
-					"require": { "op": "not", "value": { "set": "pa_look_ahead_buffer_depth" } },
+					"require": { "op": "==", "left": { "option": "pa_look_ahead_buffer_depth" }, "right": 0 },
 				},
 				// Lookahead 0 with scene change detection on (and no long-term references) broke CBR: 7.4 to 11.4 Mbps for 6 Mbps [T], so those are left out.
 				{
