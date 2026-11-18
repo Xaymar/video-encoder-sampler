@@ -31,6 +31,7 @@
 #include "gpu.h"
 
 #include <components/PreProcessing.h>
+#include <algorithm>
 #include <components/VideoEncoderAV1.h>
 #include <components/VideoEncoderHEVC.h>
 #include <components/VideoEncoderVCE.h>
@@ -503,7 +504,7 @@ public:
 
 		const auto surface = depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12;
 		bool inited = false;
-		if (p.codec == "av1" && !native_opts.count("alignment_mode")) {
+		if (p.codec == "av1" && std::none_of(native_opts.begin(), native_opts.end(), [](const auto& kv) { return kv.first == "alignment_mode"; })) {
 			// AV1's alignment mode defaults to 64x16 only [H Av1AlignmentMode], which RDNA 3 refuses for 1080 lines with AMF_NOT_SUPPORTED. Try no
 			// restrictions first, then 8x2, then 1080p coded as 1082 lines (RDNA 3's own workaround), keeping the first one Init accepts.
 			for (amf_int64 mode : {(amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_NO_RESTRICTIONS, (amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_8X2_ONLY,
