@@ -35,6 +35,13 @@ const int CFH = 17, CFV = 18, CFD = 19;     // its filtered absolute value
 
 int sext16(int v) { return (v << 16) >> 16; }
 
+// Scale 0's bands are 16 bit values: the reference's and the distorted frame's band of one kind share an int (the reference in the low half),
+// at block b & 3, so the DWT writes and the later passes read half as much. Blocks 4..7 stay unused there.
+int band_of(int w, int b) { return b < DA ? sext16(w) : (w >> 16); }
+int pack16(int r, int d) { return (r & 65535) | (d << 16); }
+int cur_band(int b, int o, int N) { return pc.scale == 0 ? band_of(cur[(b & 3) * N + o], b) : cur[b * N + o]; }
+int prev_band(int b, int o) { return pc.scale == 1 ? band_of(prev[(b & 3) * pc.prevN + o], b) : prev[b * pc.prevN + o]; }
+
 // The four source rows (or columns) of output i of a DWT level over n samples.
 void src_idx(int i, int n, out int ind[4]) {
 	const int hn = (n + 1) / 2;
