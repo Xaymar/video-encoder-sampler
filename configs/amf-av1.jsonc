@@ -30,10 +30,11 @@
 			"codec": "av1",
 			"options": {
 				"preset": ["balanced", "quality", "high_quality"],   // speed made the same stream as balanced in every test on the 780M [T]; add "speed" back to retest
-				"rate_control": ["", "hqvbr", "hqcbr"],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T]; also lcvbr, qvbr
+				"rate_control": ["", "hqvbr"],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T]; hqcbr made the same stream as hqvbr on RDNA 2 [T]; also lcvbr, qvbr, hqcbr
 				// The high quality modes aim at a quality level, QvbrQualityLevel, and only then at the bitrate. Its default of 23 [H] is a far better picture than
-				// most footage gets at these bitrates, which is why they scored far below high_quality on RDNA 2 [T]: they only make sense with it swept.
-				"qvbr_quality_level": ["", 13, 28, 33, 38, 43, 51],   // 1..51, default 23 (""); lower is a better picture [H]; only with qvbr, hqvbr, hqcbr (rule below)
+				// most footage gets at these bitrates, which may be why they scored far below high_quality on RDNA 2 (the level itself changed nothing there [T]).
+				"qvbr_quality_level": [""],   // 1..51, default 23 (""); lower is a better picture [H]; only with qvbr, hqvbr, hqcbr (rule below). 13, 33 and 51 made the same stream as unset under
+				// hqvbr and hqcbr on RDNA 2 (H.264, HEVC) [T], so it stays unset until RDNA 3 is checked (configs/check/amf-*-quality-level.jsonc). Was ["", 13, 28, 33, 38, 43, 51]
 				"pre_encode": ["", 0, 1],   // Av1RateControlPreEncode; default depends on the usage [H]
 				"b_pictures_pattern": ["", 1, 3, 7],   // B-frames, 0..127, default 0 [E]; RDNA 4 and later (AV1BFrames)
 				"adaptive_mini_gop": ["", 1],   // adaptive B-frames; needs pre-analysis with a lookahead of 1 or more [E]

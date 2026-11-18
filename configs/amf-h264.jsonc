@@ -31,10 +31,11 @@
 			"options": {
 				"preset": ["speed", "balanced", "quality"],   // high_quality made the same stream as quality in every test on both GPUs [T]; ["speed", "balanced", "quality", "high_quality"] to retest
 				"profile": ["high"],   // the older profiles are no use any more
-				"rate_control": ["", "hqvbr", "hqcbr"],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T]; also lcvbr, qvbr
+				"rate_control": ["", "hqvbr"],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T]; hqcbr made the same stream as hqvbr on RDNA 2 [T]; also lcvbr, qvbr, hqcbr
 				// The high quality modes aim at a quality level, QvbrQualityLevel, and only then at the bitrate. Its default of 23 [H] is a far better picture than
-				// most footage gets at these bitrates, which is why they scored far below high_quality on RDNA 2 [T]: they only make sense with it swept.
-				"qvbr_quality_level": ["", 13, 28, 33, 38, 43, 51],   // 1..51, default 23 (""); lower is a better picture [H]; only with qvbr, hqvbr, hqcbr (rule below)
+				// most footage gets at these bitrates, which may be why they scored far below high_quality on RDNA 2 (the level itself changed nothing there [T]).
+				"qvbr_quality_level": [""],   // 1..51, default 23 (""); lower is a better picture [H]; only with qvbr, hqvbr, hqcbr (rule below). 13, 33 and 51 made the same stream as unset under
+				// hqvbr and hqcbr on RDNA 2 (H.264, HEVC) [T], so it stays unset until RDNA 3 is checked (configs/check/amf-*-quality-level.jsonc). Was ["", 13, 28, 33, 38, 43, 51]
 				"pre_encode": ["", 1],   // pre-encode assisted rate control, off in the transcoding usage [E]
 				"max_b_frames": [0],   // BPicturesPattern, 0..3 [E]. 1 to 3 made the same stream as 0 on RDNA 2 and RDNA 3 (the caps did not refuse them) [T]
 				// "max_b_frames": [0, 1, 2, 3],   // for GPUs that really have H.264 B-frames (RDNA 4?)
@@ -47,7 +48,7 @@
 				// "cabac_enable": [...],   // every decoder has CABAC and it is clearly better
 				"de_blocking_filter": ["", 0, 1],
 				"rate_control_skip_frame_enable": [""],   // lets the rate control drop frames; on or off made the same stream at CBR and VBR [T] Was ["", 0, 1]
-				"low_latency_internal": ["", 1],   // AMF_VIDEO_ENCODER_LOWLATENCY_MODE (LowLatencyInternal), default off: "enables low latency mode and POC mode 2 in the encoder" [H]
+				"low_latency_internal": ["", 1],   // changes the stream on RDNA 2 [T]; AMF_VIDEO_ENCODER_LOWLATENCY_MODE (LowLatencyInternal), default off: "enables low latency mode and POC mode 2 in the encoder" [H]
 				"enforce_hrd": [""],   // on or off made the same stream at CBR and VBR [T] Was ["", 0, 1]
 				// "filler_data_enable": [0, 1],   // pads the stream to the bitrate: the picture stays the same
 				// "vbv_buffer_size": [...],   // bits, so the same value means a different buffer at every bitrate

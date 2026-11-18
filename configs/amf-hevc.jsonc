@@ -31,17 +31,18 @@
 			"options": {
 				"preset": ["speed", "balanced", "quality", "high_quality"],   // high_quality = quality on RDNA 2 (Areldir, 1.4.37) but differs on RDNA 3 (780M, 1.5.3) [T], so both stay
 				// "profile": [...], "tier": [...],   // the encoder picks main or main10 from the picture; the tier only changes the level's bitrate limits
-				"rate_control": ["", "hqvbr", "hqcbr"],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T]; also lcvbr, qvbr
+				"rate_control": ["", "hqvbr"],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T]; hqcbr made the same stream as hqvbr on RDNA 2 [T]; also lcvbr, qvbr, hqcbr
 				// The high quality modes aim at a quality level, QvbrQualityLevel, and only then at the bitrate. Its default of 23 [H] is a far better picture than
-				// most footage gets at these bitrates, which is why they scored far below high_quality on RDNA 2 [T]: they only make sense with it swept.
-				"qvbr_quality_level": ["", 13, 28, 33, 38, 43, 51],   // 1..51, default 23 (""); lower is a better picture [H]; only with qvbr, hqvbr, hqcbr (rule below)
+				// most footage gets at these bitrates, which may be why they scored far below high_quality on RDNA 2 (the level itself changed nothing there [T]).
+				"qvbr_quality_level": [""],   // 1..51, default 23 (""); lower is a better picture [H]; only with qvbr, hqvbr, hqcbr (rule below). 13, 33 and 51 made the same stream as unset under
+				// hqvbr and hqcbr on RDNA 2 (H.264, HEVC) [T], so it stays unset until RDNA 3 is checked (configs/check/amf-*-quality-level.jsonc). Was ["", 13, 28, 33, 38, 43, 51]
 				"pre_encode": ["", 0, 1],   // pre-encode assisted rate control; default depends on the usage [H]
 				"max_ref_frames": ["", 1, 2, 4, 8, 16],   // HevcMaxNumRefFrames, 0..16, default 1 [E]
 				"enable_vbaq": ["", 0, 1],
 				"high_motion_quality_boost_enable": ["", 0, 1],
 				"de_blocking_filter": ["", 0, 1],   // HevcDeBlockingFilter
 				"rate_control_skip_frame_enable": [""],   // lets the rate control drop frames; on or off made the same stream at CBR and VBR [T] Was ["", 0, 1]
-				"low_latency_internal": ["", 1],   // AMF_VIDEO_ENCODER_HEVC_LOWLATENCY_MODE (LowLatencyInternal), default off: "enables low latency mode" [H]
+				"low_latency_internal": [""],   // was ["", 1]: on made the same stream as off on RDNA 2 [T]; AMF_VIDEO_ENCODER_HEVC_LOWLATENCY_MODE (LowLatencyInternal), default off: "enables low latency mode" [H]
 				"enforce_hrd": [""],   // on or off made the same stream at CBR and VBR [T] Was ["", 0, 1]
 				// AMF's HEVC encoder has no B-frames.
 				// "filler_data_enable": [0, 1],   // pads the stream to the bitrate: the picture stays the same
