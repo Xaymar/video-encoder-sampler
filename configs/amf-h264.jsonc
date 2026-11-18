@@ -63,8 +63,8 @@
 				"pa_static_scene_detection_enable": ["", 1],   // codes static frames as skip frames; needs lookahead [PA]
 				"pa_static_scene_detection_sensitivity": ["", 0, 1],   // 0 low, 1 medium, 2 high (default)
 				"pa_max_qp_before_force_skip": ["", 20, 51],   // 0..51, default 35: static frames are skipped only below this QP [PA]
-				"pa_activity_type": ["", 1],   // 0 luma (default), 1 luma and chroma; no effect without PA AQ [T]
-				"pa_frame_sad_enable": ["", 0],   // on by default; no effect without PA AQ [T]
+				"pa_activity_type": ["", 1],   // 0 luma (default), 1 luma and chroma; no effect without perceptual AQ [T]
+				"pa_frame_sad_enable": ["", 0],   // on by default; no effect without perceptual AQ [T]
 				"pa_long_term_reference_enable": ["", 1],   // automatic long-term references; not with B-frames [E]
 				// "pa_initial_qp_after_scene_change": [...],   // 0..51: a fixed QP after cuts only takes the choice from the rate control
 
@@ -145,9 +145,9 @@
 					"if": { "op": "==", "left": { "option": "enable_pre_analysis" }, "right": 1 },
 					"require": { "set": "pa_look_ahead_buffer_depth" },
 				},
-				// The activity type and frame SAD changed nothing without perceptual or temporal AQ [T].
+				// The activity type and frame SAD changed nothing without perceptual AQ, with or without temporal AQ [T] (with temporal AQ tested on AV1, assumed here).
 				{
-					"if": { "op": "and", "args": [{ "op": "not", "value": { "set": "pa_perceptual_aq_mode" } }, { "op": "not", "value": { "set": "pa_temporal_aq_mode" } }] },
+					"if": { "op": "not", "value": { "set": "pa_perceptual_aq_mode" } },
 					"require": [
 						{ "op": "not", "value": { "set": "pa_activity_type" } },
 						{ "op": "not", "value": { "set": "pa_frame_sad_enable" } },

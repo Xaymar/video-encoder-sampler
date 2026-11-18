@@ -126,9 +126,9 @@
 					"if": { "op": "==", "left": { "option": "enable_pre_analysis" }, "right": 1 },
 					"require": { "set": "pa_look_ahead_buffer_depth" },
 				},
-				// The activity type and frame SAD changed nothing without perceptual or temporal AQ [T].
+				// The activity type and frame SAD changed nothing without perceptual AQ, with or without temporal AQ [T] (with temporal AQ tested on AV1, assumed here).
 				{
-					"if": { "op": "and", "args": [{ "op": "not", "value": { "set": "pa_perceptual_aq_mode" } }, { "op": "not", "value": { "set": "pa_temporal_aq_mode" } }] },
+					"if": { "op": "not", "value": { "set": "pa_perceptual_aq_mode" } },
 					"require": [
 						{ "op": "not", "value": { "set": "pa_activity_type" } },
 						{ "op": "not", "value": { "set": "pa_frame_sad_enable" } },
