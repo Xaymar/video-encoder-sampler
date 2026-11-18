@@ -29,14 +29,14 @@
 			"encoder": "amf",
 			"codec": "av1",
 			"options": {
-				"preset": ["speed", "balanced", "quality", "high_quality"],
-				"rate_control": [""],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T on HEVC and H.264, assumed here]; also lcvbr, qvbr, hqvbr, hqcbr
+				"preset": ["balanced", "quality", "high_quality"],   // speed made the same stream as balanced in every test on the 780M [T]; add "speed" back to retest
+				"rate_control": [""],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T]; also lcvbr, qvbr, hqvbr, hqcbr
 				// "rate_control": ["", "vbr", "hqvbr", "hqcbr"],   // to test whether this GPU still has the high quality modes
 				"pre_encode": ["", 0, 1],   // Av1RateControlPreEncode; default depends on the usage [H]
 				"b_pictures_pattern": ["", 1, 3, 7],   // B-frames, 0..127, default 0 [E]; RDNA 4 and later (AV1BFrames)
 				"adaptive_mini_gop": ["", 1],   // adaptive B-frames; needs pre-analysis with a lookahead of 1 or more [E]
 				// "max_consecutive_b_pictures": [...],   // 0..127; defaults to the B-frame count, or 3 with adaptive mini-GOP [E]
-				"max_ref_frames": ["", 1, 2, 4, 8],   // Av1MaxNumRefFrames, 0..8, default 1 [E]
+				"max_ref_frames": ["", 2, 4, 8],   // Av1MaxNumRefFrames, 0..8, default 1 [E]; 1 made the same stream as unset [T]
 				"aq_mode": ["", 0, 1],   // 0 none, 1 content adaptive
 				"high_motion_quality_boost": ["", 0, 1],
 				"cdef_mode": ["", 0, 1],   // 0 off, 1 on
