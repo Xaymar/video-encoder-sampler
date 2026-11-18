@@ -815,6 +815,10 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	std::optional<double> check;
 	std::optional<double> penalty;
 	std::optional<std::string> vmaf_device, vmaf_gpu;
+	// Flags for what the config's "settings" also has: kept until the config is read, so that the flag wins (a worker passes its own on as flags).
+	std::optional<std::string> hw_decode, decode_gpu, scaling_gpu, priority;
+	std::optional<int> decode_threads;
+	bool low_memory = false, in_process = false;
 	bool videos = true, all_videos = false, upload_videos = true, skip_known = true, quick = false, upscale = false;
 	std::set<std::string> only_lines; // --only-runs
 	bool short_names = false;
@@ -848,8 +852,8 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		}
 		else if (a == "--plain") cfg.plain = true;
 		else if (a == "--log") log_path = value();
-		else if (a == "--low-memory") cfg.low_memory = true;
-		else if (a == "--in-process") cfg.in_process = true;
+		else if (a == "--low-memory") low_memory = true;
+		else if (a == "--in-process") in_process = true;
 		else if (a == "--host") cfg.host_port = atoi(value().c_str());
 		else if (a == "--progress") ui::set_progress_stdout(true);
 		else if (a == "--trust-downloads") set_trust_downloads(true);
@@ -857,11 +861,11 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--only-runs") { std::ifstream f(value()); for (std::string l; std::getline(f, l);) { if (!l.empty() && l.back() == '\r') l.pop_back(); only_lines.insert(l); } only_set = true; }
 		else if (a == "--token") cfg.token = value();
 		else if (a == "--min-workers") cfg.min_workers = std::max(1, atoi(value().c_str()));
-		else if (a == "--decode-threads") cfg.decode_threads = atoi(value().c_str());
-		else if (a == "--hw-decode") cfg.hw_decode = value();
-		else if (a == "--decode-gpu") cfg.decode_gpu = value();
-		else if (a == "--scaling-gpu") cfg.scaling_gpu = value();
-		else if (a == "--priority") cfg.priority = value();
+		else if (a == "--decode-threads") decode_threads = atoi(value().c_str());
+		else if (a == "--hw-decode") hw_decode = value();
+		else if (a == "--decode-gpu") decode_gpu = value();
+		else if (a == "--scaling-gpu") scaling_gpu = value();
+		else if (a == "--priority") priority = value();
 		else if (a == "-c" || a == "--cache") cache = value();
 		else if (a == "--vmaf-model") model = value();
 		else if (a == "--vmaf-threads") threads = atoi(value().c_str());
@@ -913,6 +917,13 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 			if (!job.pool.empty()) j.pool = job.pool;
 		}
 	}
+	if (hw_decode) cfg.hw_decode = *hw_decode;
+	if (decode_gpu) cfg.decode_gpu = *decode_gpu;
+	if (scaling_gpu) cfg.scaling_gpu = *scaling_gpu;
+	if (priority) cfg.priority = *priority;
+	if (decode_threads) cfg.decode_threads = *decode_threads;
+	if (low_memory) cfg.low_memory = true;
+	if (in_process) cfg.in_process = true;
 	if (!inputs.empty()) { cfg.inputs.clear(); for (auto& i : inputs) add_inputs(cfg, i); }
 	if (output) cfg.output_dir = *output == "off" ? "" : *output;
 	cfg.save_videos = cfg.save_videos && videos;
