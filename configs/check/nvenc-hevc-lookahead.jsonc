@@ -34,7 +34,7 @@
 				// "level": ["auto"],   // a level only caps the DPB and the bitrate; auto picks one that fits
 				// "rate_control": ["cbr"],   // the default; "vbr" at the same average and peak bitrate is CBR with a looser buffer
 				"max_b_frames": [0, 1, 2, 3, 4],   // every value
-				"lookahead_frames": [0, 28, 32],   // off and the deepest
+				"lookahead_frames": [0, 30, 31],   // off and the deepest (30 with 4 B-frames, 31 without)
 				"lookahead_level": [0, 1, 2, 3],   // every value
 				"disable_iadapt": [0, 1],   // both
 				"disable_badapt": [0, 1],   // both
@@ -159,8 +159,8 @@
 				// Lookahead deeper than 32 minus the B-frames made the same stream as that depth on H.264 [T 2026-11-18, RTX 4080 SUPER, driver 621.24];
 				// assumed the same here until configs/check confirms it.
 				{
-					"if": { "op": ">", "left": { "option": "lookahead_frames" }, "right": 0 },
-					"require": { "op": "<=", "left": { "option": "lookahead_frames" }, "right": { "op": "-", "left": 32, "right": { "option": "max_b_frames" } } },
+					"if": { "op": ">=", "left": { "option": "max_b_frames" }, "right": 4 },
+					"require": { "op": "<=", "left": { "option": "lookahead_frames" }, "right": 30 },
 				},
 				// With lookahead level 1 to 3, adaptive I/B decisions and temporal AQ made the same stream on or off on H.264 [T 2026-11-18, RTX 4080 SUPER];
 				// assumed the same here until configs/check confirms it.
