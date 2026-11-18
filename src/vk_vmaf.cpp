@@ -910,7 +910,7 @@ private:
 			step(&SpeedUnit::scenter, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.subw * u.stpc.subh + 63) / 64); }, 4);
 			step(&SpeedUnit::scov, [](const SpeedUnit&) { return (uint32_t)((N_SPEED_PAIRS + 31) / 32); }, 4);
 			part_done(6);
-			step(&SpeedUnit::ssmall_p, one, 4);
+			step(&SpeedUnit::ssmall_p, [](const SpeedUnit&) { return 2u; }, 4); // eigenvalues and QR decomposition side by side
 			part_done(7);
 			step(&SpeedUnit::sblocks, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.nb + 63) / 64); }, 4);
 			step(&SpeedUnit::sscore, one, 2);
