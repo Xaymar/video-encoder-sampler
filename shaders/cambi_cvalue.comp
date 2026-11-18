@@ -31,17 +31,57 @@ int counted(int r, int c) {
 }
 
 // The 2 nd + 1 <= 17 counts of the window, 16 bits each (a window has fewer than 4226 samples), four to a 64-bit word: kept in registers (an array
-// indexed by the sample's value would live in slow local memory), each sample adding to its word without a branch.
+// indexed by the sample's value would live in slow local memory), each sample adding to its word without a branch (via Row, below).
 struct Counts { uint64_t w0, w1, w2, w3, w4; };
-void count(inout Counts c, uint k) {
-	const uint64_t inc = 1ul << (16u * (k & 3u));
+// A row of the window (at most 65 samples) counted in 8 bit lanes of 32 bit words first, which is cheaper than 64 bit adds per sample, then
+// spread into the 16 bit lanes of the same word of Counts. `small` (nd <= 4, so k <= 8: three words) is a literal at each call.
+struct Row { uint r0, r1, r2, r3, r4; };
+void count_row(inout Row r, uint k, const bool small) {
+	const uint inc = 1u << (8u * (k & 3u));
 	const uint wi = k >> 2u;
-	c.w0 += wi == 0u ? inc : 0ul;
-	c.w1 += wi == 1u ? inc : 0ul;
-	c.w2 += wi == 2u ? inc : 0ul;
-	c.w3 += wi == 3u ? inc : 0ul;
-	c.w4 += wi == 4u ? inc : 0ul;
+	r.r0 += wi == 0u ? inc : 0u;
+	r.r1 += wi == 1u ? inc : 0u;
+	r.r2 += wi == 2u ? inc : 0u;
+	if (!small) {
+		r.r3 += wi == 3u ? inc : 0u;
+		r.r4 += wi == 4u ? inc : 0u;
+	}
 }
+uint64_t spread(uint b) {
+	const uint64_t x = uint64_t(b);
+	return (x & 0xFFul) | ((x & 0xFF00ul) << 8) | ((x & 0xFF0000ul) << 16) | ((x & 0xFF000000ul) << 24);
+}
+void add_row(inout Counts c, Row r, const bool small) {
+	c.w0 += spread(r.r0);
+	c.w1 += spread(r.r1);
+	c.w2 += spread(r.r2);
+	if (!small) {
+		c.w3 += spread(r.r3);
+		c.w4 += spread(r.r4);
+	}
+}
+void window_tiled(inout Counts cnt, int base, int tw, int pad, uint off, uint span, const bool small) {
+	for (int dr = 0; dr <= 2 * pad; dr++) {
+		const int row = base + dr * tw;
+		Row r = Row(0u, 0u, 0u, 0u, 0u);
+		for (int dc = 0; dc <= 2 * pad; dc++) {
+			const uint k = uint(tile[row + dc]) + off;
+			if (k <= span) count_row(r, k, small);
+		}
+		add_row(cnt, r, small);
+	}
+}
+void window_direct(inout Counts cnt, int i, int j, int pad, uint off, uint span, const bool small) {
+	for (int dr = -pad; dr <= pad; dr++) {
+		Row r = Row(0u, 0u, 0u, 0u, 0u);
+		for (int dc = -pad; dc <= pad; dc++) {
+			const uint k = uint(counted(i + dr, j + dc)) + off;
+			if (k <= span) count_row(r, k, small);
+		}
+		add_row(cnt, r, small);
+	}
+}
+
 int get_count(Counts c, int k) {
 	const int wi = k >> 2;
 	const uint64_t w = wi == 0 ? c.w0 : wi == 1 ? c.w1 : wi == 2 ? c.w2 : wi == 3 ? c.w3 : c.w4;
@@ -70,19 +110,11 @@ void main() {
 			const uint span = uint(2 * nd), off = uint(nd - v);
 			if (tiled) {
 				const int base = int(gl_LocalInvocationID.y) * tw + int(gl_LocalInvocationID.x);
-				for (int dr = 0; dr <= 2 * pad; dr++) {
-					const int row = base + dr * tw;
-					for (int dc = 0; dc <= 2 * pad; dc++) {
-						const uint k = uint(tile[row + dc]) + off;
-						if (k <= span) count(cnt, k);
-					}
-				}
+				if (nd <= 4) window_tiled(cnt, base, tw, pad, off, span, true);
+				else window_tiled(cnt, base, tw, pad, off, span, false);
 			} else {
-				for (int dr = -pad; dr <= pad; dr++)
-					for (int dc = -pad; dc <= pad; dc++) {
-						const uint k = uint(counted(i + dr, j + dc)) + off;
-						if (k <= span) count(cnt, k);
-					}
+				if (nd <= 4) window_direct(cnt, i, j, pad, off, span, true);
+				else window_direct(cnt, i, j, pad, off, span, false);
 			}
 			const int p0 = get_count(cnt, nd);
 			const int value = v + nd; // as cambi.c has it: tvi[] is in the same offset space
