@@ -32,7 +32,7 @@
 				// "level": ["auto"],   // a level only caps the DPB and the bitrate; auto picks one that fits
 				// "rate_control": ["cbr"],   // the default; "vbr" at the same average and peak bitrate is CBR with a looser buffer
 				"max_b_frames": [0, 1, 2, 3, 4],   // the GPU's NUM_MAX_BFRAMES caps it
-				"lookahead_frames": [0, 4, 8, 16, 24, 28, 30, 31],   // 0 off; 32 and up matched 31 without B-frames and 30 with 4, see the rule [T 2026-11-18]
+				"lookahead_frames": [0, 4, 8, 16, 24, 28, 30, 31],   // 0 off; the depth where it stops changing the stream depends on the B-frames, see the rules [T 2026-11-18]
 				"lookahead_level": [0, 1, 2, 3],   // needs lookahead (NVIDIA's library aborts the process otherwise [T]); 15 = auto matched 3 on H.264 [T 2026-11-18]
 				"disable_iadapt": [0, 1],   // adaptive I-frames at scene cuts: lookahead only [H][G 8.2]
 				"disable_badapt": [0, 1],   // adaptive B-frame count: lookahead and B-frames only [H][G 8.2]
@@ -154,11 +154,19 @@
 						{ "op": "==", "left": { "option": "zero_reorder_delay" }, "right": 0 },
 					],
 				},
-				// Lookahead deeper than 31 made the same stream as 31 without B-frames, and deeper than 30 the same as 30 with 4 B-frames
-				// [T 2026-11-18, RTX 4080 SUPER, driver 621.24]; H.264 stops at 32 minus the B-frames instead. 1 to 3 B-frames are untested and keep 31.
+				// The depth past which lookahead made the same stream, by B-frames: 0: 31, 1: 31 (and 28 = 29 = 30), 2: 30, 3: 28, 4: 30
+				// [T 2026-11-18, RTX 4080 SUPER, driver 621.24]. Not monotonic, unlike H.264's 32 minus the B-frames.
 				{
-					"if": { "op": ">=", "left": { "option": "max_b_frames" }, "right": 4 },
+					"if": { "op": "in", "left": { "option": "max_b_frames" }, "right": [2, 4] },
 					"require": { "op": "<=", "left": { "option": "lookahead_frames" }, "right": 30 },
+				},
+				{
+					"if": { "op": "==", "left": { "option": "max_b_frames" }, "right": 3 },
+					"require": { "op": "<=", "left": { "option": "lookahead_frames" }, "right": 28 },
+				},
+				{
+					"if": { "op": "==", "left": { "option": "max_b_frames" }, "right": 1 },
+					"require": { "op": "!=", "left": { "option": "lookahead_frames" }, "right": 30 },
 				},
 				// With the middle B-frame as a reference and the driver's DPB size, a backward list of 3 made the same stream as auto
 				// [T 2026-11-18, RTX 4080 SUPER]; with max_ref_frames 16, or the other modes, it did not.
