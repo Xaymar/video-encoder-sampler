@@ -27,6 +27,15 @@ int sample_at(bool a, int idx) {
 void main() {
 	const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
 	if (p.x >= pc.W || p.y >= pc.H) return;
+	if (pc.bpc <= 15) { // |difference| < 2^15 and the filter sums to 2^16: the sum and its rounding fit in 32 bits (int64 is slow on many GPUs)
+		int acc = 0;
+		for (int k = 0; k < 5; k++) {
+			const int row = mirror(p.y - 2 + k, pc.H);
+			acc += F[k] * (sample_at(true, row * pc.W + p.x) - sample_at(false, row * pc.W + p.x));
+		}
+		ytmp[p.y * pc.W + p.x] = (acc + (1 << (pc.bpc - 1))) >> pc.bpc;
+		return;
+	}
 	int64_t acc = 0l;
 	for (int k = 0; k < 5; k++) {
 		const int row = mirror(p.y - 2 + k, pc.H);

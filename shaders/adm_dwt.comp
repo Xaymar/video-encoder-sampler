@@ -1,0 +1,98 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "adm_common.glsl"
+// DWT, both passes in one (adm_dwt_v then adm_dwt_h, the same integer steps): a workgroup makes a 16x16 tile of the four bands a (lo,lo), v (hi,lo),
+// h (lo,hi), d (hi,hi) of the reference and the distorted frame. The vertical pass of the 34 source columns the tile reads is kept in shared memory
+// instead of going through `tmp`.
+
+const int T = 16, C = 2 * T + 2; // tile; source columns it reads (2 j - 1 .. 2 j + 2)
+shared int gV[4][T][C];          // the vertical pass: lo_ref, hi_ref, lo_dis, hi_dis, per tile row and source column
+
+int sample_at(bool ref, int idx) {
+	if (pc.bpc > 8) {
+		const uint w = ref ? raw_ref[idx >> 1] : raw_dis[idx >> 1];
+		return int((w >> ((idx & 1) * 16)) & 65535u);
+	}
+	const uint w = ref ? raw_ref[idx >> 2] : raw_dis[idx >> 2];
+	return int((w >> ((idx & 3) * 8)) & 255u);
+}
+
+// src_idx()'s mirroring of a source column (or row): -i on the left, 2 n - i - 1 on the right.
+int reflect_idx(int i, int n) { return i < 0 ? -i : (i >= n ? 2 * n - i - 1 : i); }
+
+void main() {
+	const int t = int(gl_LocalInvocationIndex);
+	const int j0 = int(gl_WorkGroupID.x) * T, i0 = int(gl_WorkGroupID.y) * T;
+	const int cx0 = 2 * j0 - 1;
+	for (int e = t; e < T * C; e += T * T) {
+		const int li = e / C, c = e % C, i = i0 + li;
+		if (i >= pc.BH) continue;
+		const int x = clamp(reflect_idx(cx0 + c, pc.SW), 0, pc.SW - 1); // past the band's last column only for unused outputs
+		int ind[4];
+		src_idx(i, pc.SH, ind);
+		for (int p = 0; p < 2; p++) {
+			int s[4];
+			for (int k = 0; k < 4; k++)
+				s[k] = pc.scale == 0 ? sample_at(p == 0, ind[k] * pc.SW + x) : prev[(p == 0 ? RA : DA) * pc.prevN + ind[k] * pc.SW + x];
+			int tl, th;
+			if (pc.scale == 0) {
+				int lo = 0, hi = 0;
+				for (int k = 0; k < 4; k++) { lo += LO[k] * s[k]; hi += HI[k] * s[k]; }
+				const int add = 1 << (pc.bpc - 1);
+				lo -= 46342 * add;
+				tl = sext16((lo + add) >> pc.bpc);
+				th = sext16((hi + add) >> pc.bpc);
+			} else {
+				const int64_t add = pc.scale == 1 ? 0l : 32768l;
+				const int sh = pc.scale == 1 ? 0 : 16;
+				int64_t lo = 0l, hi = 0l;
+				for (int k = 0; k < 4; k++) { lo += int64_t(LO[k]) * int64_t(s[k]); hi += int64_t(HI[k]) * int64_t(s[k]); }
+				tl = int((lo + add) >> sh);
+				th = int((hi + add) >> sh);
+			}
+			gV[2 * p][li][c] = tl;
+			gV[2 * p + 1][li][c] = th;
+		}
+	}
+	barrier();
+	const int lj = int(gl_LocalInvocationID.x), li = int(gl_LocalInvocationID.y);
+	const int j = j0 + lj, i = i0 + li;
+	if (j >= pc.BW || i >= pc.BH) return;
+	const int N = pc.BW * pc.BH;
+	for (int p = 0; p < 2; p++) {
+		int vl[4], vh[4];
+		for (int k = 0; k < 4; k++) { // source column reflect(2 j - 1 + k), held at local column 2 lj + k
+			vl[k] = gV[2 * p][li][2 * lj + k];
+			vh[k] = gV[2 * p + 1][li][2 * lj + k];
+		}
+		int out_a, out_v, out_h, out_d;
+		if (pc.scale == 0) {
+			int al = 0, bl = 0, ah = 0, bh = 0;
+			for (int k = 0; k < 4; k++) { al += LO[k] * vl[k]; bl += HI[k] * vl[k]; ah += LO[k] * vh[k]; bh += HI[k] * vh[k]; }
+			out_a = sext16((al + 32768) >> 16);
+			out_v = sext16((bl + 32768) >> 16);
+			out_h = sext16((ah + 32768) >> 16);
+			out_d = sext16((bh + 32768) >> 16);
+		} else {
+			const int64_t add = pc.scale == 2 ? 32768l : 16384l;
+			const int sh = pc.scale == 2 ? 16 : 15;
+			int64_t al = 0l, bl = 0l, ah = 0l, bh = 0l;
+			for (int k = 0; k < 4; k++) {
+				al += int64_t(LO[k]) * int64_t(vl[k]); bl += int64_t(HI[k]) * int64_t(vl[k]);
+				ah += int64_t(LO[k]) * int64_t(vh[k]); bh += int64_t(HI[k]) * int64_t(vh[k]);
+			}
+			out_a = int((al + add) >> sh);
+			out_v = int((bl + add) >> sh);
+			out_h = int((ah + add) >> sh);
+			out_d = int((bh + add) >> sh);
+		}
+		const int b0 = p == 0 ? RA : DA;
+		const int o = i * pc.BW + j;
+		cur[(b0 + 0) * N + o] = out_a;
+		cur[(b0 + 2) * N + o] = out_v;
+		cur[(b0 + 1) * N + o] = out_h;
+		cur[(b0 + 3) * N + o] = out_d;
+	}
+}

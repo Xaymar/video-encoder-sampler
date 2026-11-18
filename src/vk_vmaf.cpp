@@ -578,6 +578,7 @@ public:
 		plane_bytes = ysize * bps;
 		if (const char* e = getenv("VES_SPEED_CHECK"); e && atoi(e) > 0) speed_check = true;
 		if (const char* e = getenv("VES_SCORE_TIMING"); e && atoi(e) > 0) part_timing = true;
+		if (const char* e = getenv("VES_ADM_SPLIT_DWT"); e && atoi(e) > 0) adm_split_dwt = true;
 		if (const char* e = getenv("VES_ADM_DUMP"); e && *e) adm_dump = e;
 		raw_size = (plane_bytes + 3) / 4 * 4 + 4;
 		raw_ref = vk.buffer(raw_size, 1);
@@ -764,11 +765,13 @@ private:
 				// the wavelets and the denominator, once
 				AdmPC pc = au[0].apc[s];
 				vk.push(&pc, sizeof pc);
-				vk.bind(adwt_v[s]);
-				auto g = groups(sw[s], bh[s]);
-				vk.dispatch(g.first, g.second); vk.barrier();
-				vk.bind(adwt_h[s]);
-				g = groups(bw[s], bh[s]);
+				auto g = groups(bw[s], bh[s]);
+				if (adm_split_dwt) { // VES_ADM_SPLIT_DWT=1: the two passes through `tmp`, as before (for comparison)
+					vk.bind(adwt_v[s]);
+					const auto gv = groups(sw[s], bh[s]);
+					vk.dispatch(gv.first, gv.second); vk.barrier();
+					vk.bind(adwt_h[s]);
+				} else vk.bind(adwt[s]);
 				vk.dispatch(g.first, g.second); vk.barrier();
 				AdmPC pd = pc;
 				if (s > 0) pd.shc0 = au[0].ah[s].den_cub;
@@ -1044,7 +1047,8 @@ private:
 	// frame AH, AV, AD hold decouple's k, angle flag and restored value before the gain limit (of the h band), so its scores are wrong
 	std::string adm_dump;
 	Buf adump; // acopy: the bands the units after the first work on, one after another
-	Pipe adwt_v[4], adwt_h[4], aden_p[4];
+	Pipe adwt[4], adwt_v[4], adwt_h[4], aden_p[4];
+	bool adm_split_dwt = false;
 	// cambi
 	bool cambi_on = false;
 	CambiOpts cambi_o;
@@ -1301,6 +1305,7 @@ private:
 		for (int s = 0; s < 4; s++) {
 			Buf* prev = &acur[s ? s - 1 : 0];
 			std::vector<Buf*> b{&acur[s], prev, &raw_ref, &raw_dis, &atmp, &adiv, &au[0].cm[s], &aden[s]};
+			adwt[s] = vk.pipeline("adm_dwt", b);
 			adwt_v[s] = vk.pipeline("adm_dwt_v", b);
 			adwt_h[s] = vk.pipeline("adm_dwt_h", b);
 			aden_p[s] = vk.pipeline("adm_den", b);
