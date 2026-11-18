@@ -106,76 +106,116 @@ float rf(double d) { precise float f = float(d) * pc.one; return f; }
 // numbers (a GPU may flush the others): else the double way.
 const float FLT_NORMAL = 1.17549435e-38, FLT_BIG = 1.0e38;
 bool normal_f(float x) { const float m = abs(x); return m >= FLT_NORMAL && m <= FLT_BIG; }
+// far enough from the ends of the normal floats that the few steps to a neighbour stay normal (split_f needs that)
+bool inner_f(float x) { const float m = abs(x); return m >= 1.0e-37 && m <= 1.0e37; }
 float up_f(float x) { return uintBitsToFloat(floatBitsToUint(x) + 1u); }   // the next float above x > 0
 float down_f(float x) { return uintBitsToFloat(floatBitsToUint(x) - 1u); } // the next float below x > 0
+// The comparisons below are exact, as with doubles (the products have at most 50 bits), but in integers: consumer GPUs run doubles at 1/64 the
+// float rate, and these sit on the serial path of speed_small's eigenvalue iterations. x = m 2^e for a normal float x > 0 (m: 24 bits).
+void split_f(float x, out uint m, out int e) { const uint b = floatBitsToUint(x); m = (b & 0x7fffffu) | 0x800000u; e = int((b >> 23) & 255u) - 150; }
+// The midpoint of neighbouring normal floats x, y > 0 as S 2^E (S: at most 26 bits).
+void mid_f(float x, float y, out uint S, out int E) {
+	uint mx, my; int ex, ey;
+	split_f(x, mx, ex); split_f(y, my, ey);
+	const int e = min(ex, ey);
+	S = (mx << uint(ex - e)) + (my << uint(ey - e));
+	E = e - 1;
+}
+int msb64(uint64_t v) { const uint hi = uint(v >> 32); return hi != 0u ? 32 + findMSB(hi) : findMSB(uint(v)); }
+// sign of X 2^x - Y 2^y, for X, Y > 0
+int cmp_x2(uint64_t X, int x, uint64_t Y, int y) {
+	const int sx = 63 - msb64(X), sy = 63 - msb64(Y);
+	const int ex = x - sx, ey = y - sy;
+	if (ex != ey) return ex > ey ? 1 : -1;
+	const uint64_t nx = X << uint(sx), ny = Y << uint(sy);
+	return nx == ny ? 0 : (nx > ny ? 1 : -1);
+}
+// sign of a - b m for positive normal floats a, b and the midpoint m = S 2^E
+int cmp_div_mid(uint Ma, int ea, uint Mb, int eb, float q0, float q1) {
+	uint S; int E;
+	mid_f(q0, q1, S, E);
+	return cmp_x2(uint64_t(Ma), ea, uint64_t(Mb) * uint64_t(S), eb + E);
+}
 float fdiv(float a, float b) {
 	const float aa = abs(a), ab = abs(b);
 	float q = aa / ab;
-	if (!normal_f(a) || !normal_f(b) || !normal_f(q)) return rf(ddiv(double(a), double(b)));
-	const double A = double(aa), B = double(ab);
+	if (!normal_f(a) || !normal_f(b) || !inner_f(q)) return rf(ddiv(double(a), double(b)));
+	uint Ma, Mb; int ea, eb;
+	split_f(aa, Ma, ea); split_f(ab, Mb, eb);
 	int i = 0;
 	for (; i < 8; i++) { // q too small while the true quotient is at or above the midpoint to the next float
-		precise double mid = (double(q) + double(up_f(q))) * 0.5LF;
-		precise double bm = B * mid;
-		if (A >= bm) q = up_f(q); else break;
+		if (cmp_div_mid(Ma, ea, Mb, eb, q, up_f(q)) >= 0) q = up_f(q); else break;
 	}
 	int j = 0;
 	for (; j < 8; j++) { // q too big while it is below the midpoint to the float before
-		precise double mid = (double(q) + double(down_f(q))) * 0.5LF;
-		precise double bm = B * mid;
-		if (A < bm) q = down_f(q); else break;
+		if (cmp_div_mid(Ma, ea, Mb, eb, q, down_f(q)) < 0) q = down_f(q); else break;
 	}
-	if (i == 8 || j == 8) return rf(ddiv(double(a), double(b))); // the GPU's quotient was far off
+	if (i == 8 || j == 8 || !normal_f(q)) return rf(ddiv(double(a), double(b))); // the GPU's quotient was far off
 	return (a < 0.0) != (b < 0.0) ? -q : q;
+}
+// sign of x - m^2 for a positive normal float x and the midpoint m = S 2^E
+int cmp_sq_mid(uint Mx, int ex, float s0, float s1) {
+	uint S; int E;
+	mid_f(s0, s1, S, E);
+	return cmp_x2(uint64_t(Mx), ex, uint64_t(S) * uint64_t(S), 2 * E);
 }
 float dsqrt_f(float x) {
 	float s = sqrt(x);
-	if (!normal_f(x) || x < 0.0 || !normal_f(s)) return rf(dsqrt(double(x)));
-	const double X = double(x);
+	if (!normal_f(x) || x < 0.0 || !inner_f(s)) return rf(dsqrt(double(x)));
+	uint Mx; int ex;
+	split_f(x, Mx, ex);
 	int i = 0;
 	for (; i < 8; i++) {
-		precise double mid = (double(s) + double(up_f(s))) * 0.5LF;
-		precise double m2 = mid * mid;
-		if (X >= m2) s = up_f(s); else break;
+		if (cmp_sq_mid(Mx, ex, s, up_f(s)) >= 0) s = up_f(s); else break;
 	}
 	int j = 0;
 	for (; j < 8; j++) {
-		precise double mid = (double(s) + double(down_f(s))) * 0.5LF;
-		precise double m2 = mid * mid;
-		if (X < m2) s = down_f(s); else break;
+		if (cmp_sq_mid(Mx, ex, s, down_f(s)) < 0) s = down_f(s); else break;
 	}
-	if (i == 8 || j == 8) return rf(dsqrt(double(x)));
+	if (i == 8 || j == 8 || !normal_f(s)) return rf(dsqrt(double(x)));
 	return s;
 }
 // (float)(1.0 / sqrt((double)q)), as the CPU's Givens rotation has it, without the double division and square root: the GPU's inverse square root,
 // moved to the float whose rounding interval holds the true value 1/sqrt(q). For a midpoint m between two floats, 1/sqrt(q) >= m exactly when
-// m^2 q <= 1; m has 25 bits, so m^2 is exact in double and m^2 q is exact as p + e (two_prod). The CPU rounds twice (the root, then the quotient, to
-// double) before rounding to float, which can only matter when the true value is within a few double units of a midpoint: there (|m^2 q - 1| below
-// 2^-46), and for numbers that are not normal, the double way.
-double rsqrt_side(double mid, double Q) { // m^2 q - 1
-	precise double m2 = mid * mid;
-	double p, e;
-	two_prod(m2, Q, p, e);
-	precise double r = (p - 1.0LF) + e;
-	return r;
+// m^2 q <= 1; m has at most 26 bits and q 24, so m^2 q is an integer of at most 76 bits times a power of two, compared with 1 exactly. The CPU
+// rounds twice (the root, then the quotient, to double) before rounding to float, which can only matter when the true value is within a few double
+// units of a midpoint: there (|m^2 q - 1| below 2^-46), and for numbers that are not normal, the double way.
+// Returns the sign of m^2 q - 1, or 2 when it is within 2^-46 of 0 (or out of the range handled here).
+int rsqrt_side(uint Mq, int eq, float y0, float y1) {
+	uint S; int E;
+	mid_f(y0, y1, S, E);
+	const uint64_t s2 = uint64_t(S) * uint64_t(S);                 // < 2^52
+	const uint64_t lo = (s2 & 0xffffffffUL) * uint64_t(Mq);      // < 2^56
+	const uint64_t hi = (s2 >> 32) * uint64_t(Mq) + (lo >> 32);  // < 2^45: m^2 q = (hi 2^32 + lo32) 2^K
+	const uint lo32 = uint(lo);
+	const int T = -(2 * E + eq);                                  // 1 = 2^T 2^K
+	if (T < 32 || T > 94) return 2;
+	const int64_t dh = int64_t(hi) - int64_t(1UL << uint(T - 32)); // m^2 q - 1 = (dh 2^32 + lo32) 2^K
+	if (dh >= 2147483648L || dh < -2147483648L) return dh > 0 ? 1 : -1; // |D| >= 2^63 2^K, far from 2^-46 (T - 46 < 63)
+	const int64_t D = dh * 4294967296L + int64_t(lo32);
+	if (D == 0L) return 2;
+	const uint64_t ad = uint64_t(D < 0L ? -D : D);
+	if (T - 46 >= 0 && ad < (1UL << uint(T - 46))) return 2;
+	return D > 0L ? 1 : -1;
 }
 float rsqrt_f(float q) {
 	float y = inversesqrt(q);
-	if (!normal_f(q) || q < 0.0 || !normal_f(y)) return rf(ddiv(1.0LF, dsqrt(double(q))));
-	const double Q = double(q), close = 1.4210854715202004e-14LF; // 2^-46
+	if (!normal_f(q) || q < 0.0 || !inner_f(y)) return rf(ddiv(1.0LF, dsqrt(double(q))));
+	uint Mq; int eq;
+	split_f(q, Mq, eq);
 	int i = 0;
 	for (; i < 8; i++) { // y too small while the true value is at or above the midpoint to the next float
-		const double r = rsqrt_side((double(y) + double(up_f(y))) * 0.5LF, Q);
-		if (abs(r) < close) return rf(ddiv(1.0LF, dsqrt(Q)));
-		if (r <= 0.0LF) y = up_f(y); else break;
+		const int r = rsqrt_side(Mq, eq, y, up_f(y));
+		if (r == 2) return rf(ddiv(1.0LF, dsqrt(double(q))));
+		if (r <= 0) y = up_f(y); else break;
 	}
 	int j = 0;
 	for (; j < 8; j++) { // y too big while the true value is below the midpoint to the float before
-		const double r = rsqrt_side((double(y) + double(down_f(y))) * 0.5LF, Q);
-		if (abs(r) < close) return rf(ddiv(1.0LF, dsqrt(Q)));
-		if (r > 0.0LF) y = down_f(y); else break;
+		const int r = rsqrt_side(Mq, eq, y, down_f(y));
+		if (r == 2) return rf(ddiv(1.0LF, dsqrt(double(q))));
+		if (r > 0) y = down_f(y); else break;
 	}
-	if (i == 8 || j == 8) return rf(ddiv(1.0LF, dsqrt(Q)));
+	if (i == 8 || j == 8 || !normal_f(y)) return rf(ddiv(1.0LF, dsqrt(double(q))));
 	return y;
 }
 int sgn(float x) { return x >= 0.0 ? 1 : -1; }

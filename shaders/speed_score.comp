@@ -1,5 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 256) in;
 #include "speed_common.glsl"
 // One workgroup per chroma plane (q: reference plane q, decoded plane q + 2): get_speed_score() over the blocks, one after another as on the CPU,

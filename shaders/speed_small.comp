@@ -1,5 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 256) in;
 #include "speed_common.glsl"
 // Two workgroups per plane: what est_params() does with the 25x25 covariance matrix. Its eigenvalues (Householder tridiagonalisation, then implicit
@@ -15,10 +16,22 @@ shared bool sh_div;
 
 const double EPS = 1e-6LF;
 
+// double(x) < EPS * double(s) for x, s >= 0, as the CPU tests it: in floats when the two sides are more than 2^-20 apart (the float product is
+// within 2^-22 of the double one), else in doubles (which consumer GPUs run slowly).
+bool lt_eps(float x, float s) {
+	if (s >= 1.0e-30 && s <= 1.0e30) {
+		precise float p = 1.0e-6 * s;
+		precise float lo = p * 0.99999904632568359375, hi = p * 1.00000095367431640625; // 1 -/+ 2^-20
+		if (x < lo) return true;
+		if (x > hi) return false;
+	}
+	return double(x) < EPS * double(s);
+}
+
 void chop(int a, int n) {
 	for (int i = 0; i < n - 1; i++) {
 		precise float s = abs(d[a + i]) + abs(d[a + i + 1]);
-		if (double(abs(sd[a + i])) < EPS * double(s)) sd[a + i] = 0.0;
+		if (lt_eps(abs(sd[a + i]), s)) sd[a + i] = 0.0;
 	}
 }
 
@@ -61,7 +74,7 @@ void givens(float a, float b, out float c, out float s) {
 void qr_step(int a, int n) {
 	float mu = trailing(a, n);
 	precise float lim = abs(d[a]) + abs(sd[a]);
-	if (EPS * double(abs(mu)) > double(lim)) mu = 0.0;
+	if (lt_eps(lim, abs(mu))) mu = 0.0;
 	precise float xx = d[a] - mu;
 	float z = sd[a];
 	float ak = 0.0, bk = 0.0, zk = 0.0;
