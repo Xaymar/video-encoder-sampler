@@ -28,6 +28,10 @@ Layout layout_of(AVPixelFormat f);
 // A software decoder for the codec, never a hardware or hybrid one (those are less exact); nullptr if there is none.
 const AVCodec* software_decoder(AVCodecID id);
 
+// The decoder that reconstructs on a hardware device of `type` ("cuda", "d3d11va", ...) for the codec: FFmpeg's own one, which for AV1 is not the
+// software decoder (libdav1d has no hardware support); nullptr if there is none.
+const AVCodec* hwaccel_decoder(AVCodecID id, const std::string& type);
+
 // Threads for a decoder (see set_decode_threads()).
 int decode_threads();
 

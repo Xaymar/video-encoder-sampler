@@ -157,6 +157,8 @@ public:
 		if (vi < 0) { fprintf(stderr, "'%s' has no video stream\n", path.c_str()); return false; }
 		AVStream* st = ctx->streams[vi];
 		const AVCodec* c = software_decoder(st->codecpar->codec_id);
+		if (!hw_type.empty() && !avcodec_find_decoder_by_name(hw_type.c_str())) c = hwaccel_decoder(st->codecpar->codec_id, hw_type); // libdav1d has no hardware path
+		if (!hw_type.empty() && !c) return false;
 		const AVCodec* dedicated = hw_type.empty() ? nullptr : avcodec_find_decoder_by_name(hw_type.c_str());
 		if (dedicated) {
 			if (dedicated->id != st->codecpar->codec_id) return false; // a decoder for some other codec

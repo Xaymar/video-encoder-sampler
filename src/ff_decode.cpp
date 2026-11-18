@@ -7,7 +7,8 @@
 // The first stream of a kind (codec, bit depth, chroma, size, device) in a process is checked all the way through, later ones on their first
 // frames (VES_HW_DECODE_VERIFY=<frames> or "all"). A device that once differed for a kind is not used for it again.
 // Only FFmpeg's own decoders on a hardware device (hwaccel) are used, not the dedicated ones (h264_cuvid, ...): they parse, reorder and crop
-// the stream with the same code as the software decoder, and only the reconstruction runs on the GPU.
+// the stream with the same code as the software decoder, and only the reconstruction runs on the GPU. (AV1 is the exception: software is libdav1d,
+// the GPU gets FFmpeg's own AV1 decoder, which has no software path of its own; the check covers that as well.)
 #include "decode.h"
 
 #include <cstdio>
@@ -76,7 +77,7 @@ struct Dec {
 
 	// type empty: software.
 	bool open(AVCodecID id, const std::vector<uint8_t>& extradata, const std::string& type, const std::string& device) {
-		const AVCodec* c = software_decoder(id);
+		const AVCodec* c = type.empty() || type == "test" ? software_decoder(id) : hwaccel_decoder(id, type);
 		if (!c) return false;
 		ctx = avcodec_alloc_context3(c);
 		if (!ctx) return false;

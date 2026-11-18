@@ -1,4 +1,8 @@
 #include "ff.h"
+
+extern "C" {
+#include <libavutil/hwcontext.h>
+}
 #include "source.h"
 
 #include <algorithm>
@@ -76,6 +80,21 @@ int decode_threads() {
 	if (const char* e = getenv("VES_DECODE_THREADS")) return atoi(e);
 	if (g_threads > 0) return g_threads;
 	return std::max(2, (int)std::thread::hardware_concurrency());
+}
+
+const AVCodec* hwaccel_decoder(AVCodecID id, const std::string& type) {
+	const AVHWDeviceType t = av_hwdevice_find_type_by_name(type.c_str());
+	if (t == AV_HWDEVICE_TYPE_NONE) return nullptr;
+	void* it = nullptr;
+	while (const AVCodec* c = av_codec_iterate(&it)) {
+		if (c->id != id || !av_codec_is_decoder(c) || (c->capabilities & AV_CODEC_CAP_HARDWARE)) continue;
+		for (int i = 0;; i++) {
+			const AVCodecHWConfig* cfg = avcodec_get_hw_config(c, i);
+			if (!cfg) break;
+			if ((cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) && cfg->device_type == t) return c;
+		}
+	}
+	return nullptr;
 }
 
 const AVCodec* software_decoder(AVCodecID id) {
