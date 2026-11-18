@@ -40,6 +40,9 @@ struct Buf {
 struct Pipe {
 	VkPipeline pipe = VK_NULL_HANDLE;
 	VkDescriptorSet set = VK_NULL_HANDLE;
+	VkDescriptorSet slot_sets[8] = {}; // with a buffer of Vk::alias() bound: one set per slot, with that slot's buffer in its place
+	int nslot = 0;
+	const char* name = ""; // the shader's (pipeline()'s name, which must outlive it: a string literal)
 };
 
 class Vk {
@@ -61,6 +64,9 @@ public:
 	Buf buffer(VkDeviceSize size, int kind);
 	// A compute pipeline from the embedded SPIR-V `name` (shared by all users), with a descriptor set of its own that points at `bindings` (binding i -> bindings[i]).
 	Pipe pipeline(const char* name, const std::vector<Buf*>& bindings);
+	// Makes `placeholder`, wherever a pipeline made after this binds it, stand for per_slot[slot] in the work of that slot (begin(slot)): so each
+	// frame in flight can read its own buffer, with no copy into one shared one.
+	void alias(const Buf& placeholder, const std::vector<const Buf*>& per_slot);
 	// Recording into the command buffer of a slot (whose earlier work must be done: wait()), then submitting it. Submissions to a device run in order
 	// of submission on its one queue; a barrier() also orders the commands after it against everything submitted before (other slots, other users).
 	void begin(int slot = 0);
@@ -89,6 +95,11 @@ public:
 	// GPU time between two of the slot's stamps (by default start and end) in its last finished submission; -1 if the device has no timestamps or
 	// the submission did not write both. Safe to call from another thread than the one that records, for a slot that is not being recorded.
 	double gpu_seconds(int slot, int from = 0, int to = 1);
+	// VES_SCORE_TIMING=2: a timestamp after every dispatch on the main queue (up to kPassStamps per submission). The GPU time of each dispatch of
+	// the slot's last finished submission, in order, with its shader's name (from the end of the one before; the first from the start).
+	static constexpr int kPassStamps = 1024;
+	bool pass_timing() const;
+	void pass_seconds(int slot, std::vector<std::pair<const char*, double>>& out);
 	// Bytes of the buffers made so far, in device-local memory (VRAM, or what an integrated GPU sets aside) and in other memory.
 	void memory(uint64_t& device_local, uint64_t& host) const;
 

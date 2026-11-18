@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <map>
+#include <string>
 
 #include "gpu.h"
 #include "vk_compute.h"
@@ -407,7 +409,7 @@ struct AdmPC {
 	int egl_int;
 	int dbg;
 };
-struct CambiPC { int W, H, OW, OH, bpc, anti_dither, mask_index, pad, nd, vlt_luma, band_base, band_size; };
+struct CambiPC { int W, H, OW, OH, bpc, anti_dither, mask_index, pad, nd, vlt_luma, band_base, band_size, lanes; };
 struct SpeedPC { int W, H, SW, SH, DW, DH, bpc, fw, scaled, out_off; float scaler; };
 struct SpeedStatPC { int DW, DH, fw, subw, subh, nbh, nbv, nb, mode; float sigma_nn, nn_floor, base_entropy, one; double log2_2pie; }; // speed_common.glsl
 
@@ -571,15 +573,34 @@ class VkVmaf {
 	struct Slot; // below
 
 public:
-	VkVmaf(int device, const std::vector<Model>& models, const GpuVmafFrame& f) : vk(device, kSlots), ms(models), W(f.w), H(f.h), bpc(f.depth), bps(f.depth > 8 ? 2 : 1) {
+	VkVmaf(int device, const std::vector<Model>& models, const GpuVmafFrame& f) : vk(device, kSlots), device_index(device), ms(models), W(f.w), H(f.h), bpc(f.depth), bps(f.depth > 8 ? 2 : 1) {
 		ysize = (size_t)W * H;
 		plane_bytes = ysize * bps;
 		if (const char* e = getenv("VES_SPEED_CHECK"); e && atoi(e) > 0) speed_check = true;
 		if (const char* e = getenv("VES_SCORE_TIMING"); e && atoi(e) > 0) part_timing = true;
+		if (const char* e = getenv("VES_ADM_SPLIT_DWT"); e && atoi(e) > 0) adm_split_dwt = true;
+		if (const char* e = getenv("VES_ADM_SPLIT_CM"); e && atoi(e) > 0) adm_split_cm = true;
 		if (const char* e = getenv("VES_ADM_DUMP"); e && *e) adm_dump = e;
+		if (!adm_dump.empty()) adm_split_cm = true; // the dump holds the bands decouple and csf write
 		raw_size = (plane_bytes + 3) / 4 * 4 + 4;
-		raw_ref = vk.buffer(raw_size, 1);
-		raw_dis = vk.buffer(raw_size, 1);
+		// With the copies in on a queue of their own, each slot's frame stays in its own buffers (dev_ref/dev_dis), which the pipelines read in place
+		// of raw_ref/raw_dis (Vk::alias): no copy of the frame on the compute queue. Else they are copied into raw_ref/raw_dis.
+		alias_raw = vk.async_upload();
+		if (const char* e = getenv("VES_VMAF_COPY_FRAMES"); e && atoi(e) > 0) alias_raw = false;
+		if (const char* e = getenv("VES_VMAF_ALIAS_FRAMES"); e && atoi(e) > 0) alias_raw = true; // also without the queue (for testing)
+		raw_ref = vk.buffer(alias_raw ? 16 : raw_size, 1);
+		raw_dis = vk.buffer(alias_raw ? 16 : raw_size, 1);
+		if (alias_raw) {
+			std::vector<const Buf*> r, d;
+			for (Slot& sl : slots) {
+				sl.dev_ref = vk.buffer(raw_size, 1);
+				sl.dev_dis = vk.buffer(raw_size, 1);
+				r.push_back(&sl.dev_ref);
+				d.push_back(&sl.dev_dis);
+			}
+			vk.alias(raw_ref, r);
+			vk.alias(raw_dis, d);
+		}
 		// which model uses which shared part
 		for (auto& m : ms) {
 			if (m.motion) need_stride[m.motion_o.five_frame ? 1 : 0] = true;
@@ -599,12 +620,12 @@ public:
 				speed_of.push_back(u);
 			} else speed_of.push_back(-1);
 		}
+		speed2 = !su.empty() && vk.second_compute() && !part_timing;
 		if (need_stride[0] || need_stride[1]) init_motion();
 		if (!vif_egl.empty()) init_vif();
 		if (!au.empty()) init_adm();
 		if (cambi_on) init_cambi(f);
 		if (!su.empty()) init_speed(f);
-		speed2 = !su.empty() && vk.second_compute() && !part_timing;
 		uint64_t dev0, host0, dev1, host1;
 		vk.memory(dev0, host0);
 		init_slots();
@@ -687,6 +708,7 @@ public:
 		parts.clear();
 		if (t_parts_frames == 0) return;
 		for (int i = 0; i < kGpuPartCount; i++) parts.emplace_back(kGpuParts[i], t_parts[i]);
+		for (auto& [name, secs] : t_pass) parts.emplace_back("  " + name, secs);
 	}
 	// Memory: device local and other in all, and what each slot adds of that (frames in, sums out).
 	uint64_t mem_device = 0, mem_host = 0, mem_slot = 0;
@@ -707,17 +729,19 @@ private:
 		const int cur = (int)(index % 3);
 		const bool motion = need_stride[0] || need_stride[1];
 		if (vk.async_upload()) { // already in VRAM (copied on the second queue, which submit() waits for)
-			vk.copy(sl.dev_ref, raw_ref);
-			vk.copy(sl.dev_dis, raw_dis);
-			if (motion) vk.copy(sl.dev_ref, mfr[cur]);
-			if (!su.empty() && !speed2) for (int p = 0; p < 4; p++) vk.copy(sl.dev_chroma[p], sraw[p]);
+			if (!alias_raw) {
+				vk.copy(sl.dev_ref, raw_ref);
+				vk.copy(sl.dev_dis, raw_dis);
+				if (!su.empty() && !speed2) for (int p = 0; p < 4; p++) vk.copy(sl.dev_chroma[p], sraw[p]);
+			}
+			if (motion) vk.copy(sl.dev_ref, mfr[cur]); // kept: motion reads the frames before, whose slots may take new frames meanwhile
 			vk.barrier();
 		} else { // from system memory, once each: motion's copy of the reference comes from VRAM
-			vk.copy(sl.in_ref, raw_ref);
-			vk.copy(sl.in_dis, raw_dis);
-			if (!su.empty() && !speed2) for (int p = 0; p < 4; p++) vk.copy(sl.in_chroma[p], sraw[p]);
+			vk.copy(sl.in_ref, alias_raw ? sl.dev_ref : raw_ref);
+			vk.copy(sl.in_dis, alias_raw ? sl.dev_dis : raw_dis);
+			if (!su.empty() && !speed2) for (int p = 0; p < 4; p++) vk.copy(sl.in_chroma[p], alias_raw ? sl.dev_chroma[p] : sraw[p]);
 			vk.barrier();
-			if (motion) { vk.copy(raw_ref, mfr[cur]); vk.barrier(); }
+			if (motion) { vk.copy(alias_raw ? sl.dev_ref : raw_ref, mfr[cur]); vk.barrier(); }
 		}
 		part_done(0);
 		bool* with_motion = sl.with_motion;
@@ -761,18 +785,38 @@ private:
 				// the wavelets and the denominator, once
 				AdmPC pc = au[0].apc[s];
 				vk.push(&pc, sizeof pc);
-				vk.bind(adwt_v[s]);
-				auto g = groups(sw[s], bh[s]);
-				vk.dispatch(g.first, g.second); vk.barrier();
-				vk.bind(adwt_h[s]);
-				g = groups(bw[s], bh[s]);
+				auto g = groups(bw[s], bh[s]);
+				if (adm_split_dwt) { // VES_ADM_SPLIT_DWT=1: the two passes through `tmp`, as before (for comparison)
+					vk.bind(adwt_v[s]);
+					const auto gv = groups(sw[s], bh[s]);
+					vk.dispatch(gv.first, gv.second); vk.barrier();
+					vk.bind(adwt_h[s]);
+				} else vk.bind(adwt[s]);
 				vk.dispatch(g.first, g.second); vk.barrier();
 				AdmPC pd = pc;
 				if (s > 0) pd.shc0 = au[0].ah[s].den_cub;
 				vk.push(&pd, sizeof pd);
 				vk.bind(aden_p[s]); vk.dispatch(1, pc.cb - pc.ct);
 				// then decouple, csf and masking with each set of options, unit 0 in place, the others on a copy of the bands
-				for (size_t u = 0; u < au.size(); u++) {
+				for (size_t u = 0; u < au.size() && !adm_split_cm; u++) { // adm_dcm: no copy of the bands, nothing written into them
+					AdmUnit& a = au[u];
+					AdmPC pu = a.apc[s];
+					pu.aim = a.aim ? 1 : 0;
+					vk.push(&pu, sizeof pu);
+					vk.bind(a.dcm[s]);
+					vk.dispatch((uint32_t)((pu.ecol - pu.scol + 15) / 16), (uint32_t)((pu.erow - pu.srow + 15) / 16)); vk.barrier();
+					const uint32_t rg = (uint32_t)((pu.erow - pu.srow + 63) / 64);
+					pu.aim = 0;
+					vk.push(&pu, sizeof pu);
+					vk.bind(a.cmsum[s]); vk.dispatch(rg, 1);
+					if (a.aim) {
+						pu.aim = 1;
+						vk.push(&pu, sizeof pu);
+						vk.bind(a.aimsum[s]); vk.dispatch(rg, 1);
+					}
+					vk.barrier(); // the next unit's tiles go into the same tmp
+				}
+				for (size_t u = 0; u < au.size() && adm_split_cm; u++) {
 					AdmUnit& a = au[u];
 					if (u > 0) {
 						const int n = 8 * bw[s] * bh[s];
@@ -785,14 +829,15 @@ private:
 					pu.dbg = !adm_dump.empty() && index == 1 && u == 0 && s == 0 ? 1 : 0; // the dump's frame: decouple's inner values into AH, AV, AD
 					vk.push(&pu, sizeof pu);
 					vk.bind(a.dec[s]); vk.dispatch(g.first, g.second); vk.barrier();
-					vk.bind(a.csf[s]); vk.dispatch(g.first, g.second); vk.barrier();
+					// adm_cm works the csf out itself; its own pass only fills CAH..CFD for VES_ADM_DUMP
+					if (!adm_dump.empty()) { vk.bind(a.csf[s]); vk.dispatch(g.first, g.second); vk.barrier(); }
 					vk.bind(a.cm_p[s]); vk.dispatch(1, pu.erow - pu.srow);
 					vk.barrier();
 					if (a.aim) { // the csf and the masking again, the other way round, into buffers of their own
 						AdmPC pa = pu;
 						pa.aim = 1;
 						vk.push(&pa, sizeof pa);
-						vk.bind(a.aimcsf[s]); vk.dispatch(g.first, g.second); vk.barrier();
+						if (!adm_dump.empty()) { vk.bind(a.aimcsf[s]); vk.dispatch(g.first, g.second); vk.barrier(); }
 						vk.bind(a.aimcm[s]); vk.dispatch(1, pu.erow - pu.srow);
 						vk.barrier();
 					}
@@ -865,7 +910,7 @@ private:
 			step(&SpeedUnit::scenter, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.subw * u.stpc.subh + 63) / 64); }, 4);
 			step(&SpeedUnit::scov, [](const SpeedUnit&) { return (uint32_t)((N_SPEED_PAIRS + 31) / 32); }, 4);
 			part_done(6);
-			step(&SpeedUnit::ssmall_p, one, 4);
+			step(&SpeedUnit::ssmall_p, [](const SpeedUnit&) { return 2u; }, 4); // eigenvalues and QR decomposition side by side
 			part_done(7);
 			step(&SpeedUnit::sblocks, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.nb + 63) / 64); }, 4);
 			step(&SpeedUnit::sscore, one, 2);
@@ -959,6 +1004,7 @@ private:
 		AdmHost ah[4];
 		Buf cur[4], cm[4], aimb[4];
 		Pipe copy[4], dec[4], csf[4], cm_p[4], aimcsf[4], aimcm[4];
+		Pipe dcm[4], cmsum[4], aimsum[4]; // decouple, csf and masking in one (adm_dcm), and its row sums
 	};
 	// SpEED with one set of the options the shaders use (the decimation by 16, after an optional prescale).
 	struct SpeedUnit {
@@ -997,6 +1043,7 @@ private:
 		std::thread worker;
 	};
 	Vk vk; // first: it releases the buffers and sets below when it goes away
+	int device_index; // in the loader's order
 	std::array<Slot, kSlots> slots;
 	std::mutex mutex;
 	std::condition_variable changed;
@@ -1005,6 +1052,7 @@ private:
 	double t_gpu = 0, t_results = 0;
 	double t_parts[kGpuPartCount] = {}; // VES_SCORE_TIMING: GPU seconds per part of the work (kGpuParts), over t_parts_frames frames
 	long long t_parts_frames = 0;
+	std::map<std::string, double> t_pass; // VES_SCORE_TIMING=2: GPU seconds per dispatch (the shader's name, #n for its n-th dispatch in a frame)
 	bool part_timing = false;
 	// VES_SPEED_CHECK=1: SpEED is also worked out on the CPU (from the GPU's decimated planes, as before it all moved to the GPU) and compared
 	bool speed_check = false;
@@ -1040,7 +1088,9 @@ private:
 	// frame AH, AV, AD hold decouple's k, angle flag and restored value before the gain limit (of the h band), so its scores are wrong
 	std::string adm_dump;
 	Buf adump; // acopy: the bands the units after the first work on, one after another
-	Pipe adwt_v[4], adwt_h[4], aden_p[4];
+	Pipe adwt[4], adwt_v[4], adwt_h[4], aden_p[4];
+	bool adm_split_dwt = false;
+	bool adm_split_cm = false; // VES_ADM_SPLIT_CM=1 (and VES_ADM_DUMP): decouple, csf and masking as passes of their own, as before
 	// cambi
 	bool cambi_on = false;
 	CambiOpts cambi_o;
@@ -1054,6 +1104,8 @@ private:
 	// speed: the chroma planes once, the decimation per unit
 	int cw = 0, ch = 0;
 	Buf sraw[4];
+	size_t craw_size = 0;
+	bool alias_raw = false; // raw_ref, raw_dis and sraw stand for each slot's dev_ref, dev_dis and dev_chroma
 	std::vector<SpeedUnit> su;
 
 	// Waits until slot k is not busy and takes its frame's features, if it has one (in frame order: the slots are used in turn).
@@ -1082,6 +1134,7 @@ private:
 			std::string error;
 			double gpu = 0, res = 0, parts[kGpuPartCount];
 			bool parts_ok = false;
+			std::vector<std::pair<const char*, double>> passes;
 			try {
 				const auto t0 = clock::now();
 				vk.wait(k);
@@ -1094,6 +1147,7 @@ private:
 						parts[i] = vk.gpu_seconds(k, part_start(i), part_stamp(i));
 						if (parts[i] < 0) parts_ok = false;
 					}
+					if (vk.pass_timing()) vk.pass_seconds(k, passes);
 				}
 				if (!adm_dump.empty() && adump.buf && sl.index == 1) {
 					if (FILE* o = fopen(adm_dump.c_str(), "wb")) {
@@ -1114,6 +1168,11 @@ private:
 				t_gpu += gpu; t_results += res;
 				if (parts_ok) {
 					for (int i = 0; i < kGpuPartCount; i++) t_parts[i] += parts[i];
+					std::map<std::string, int> seen;
+					for (auto& [name, secs] : passes) {
+						const int n = seen[name]++;
+						t_pass[n ? std::string(name) + "#" + std::to_string(n + 1) : std::string(name)] += secs;
+					}
 					t_parts_frames++;
 				}
 				sl.feats = std::move(f);
@@ -1129,11 +1188,11 @@ private:
 		for (Slot& sl : slots) {
 			sl.in_ref = vk.buffer(raw_size, 3);
 			sl.in_dis = vk.buffer(raw_size, 3);
-			if (!su.empty()) for (int p = 0; p < 4; p++) sl.in_chroma[p] = vk.buffer(sraw[p].size, 3);
+			if (!su.empty()) for (int p = 0; p < 4; p++) sl.in_chroma[p] = vk.buffer(craw_size, 3);
 			if (vk.async_upload()) {
-				sl.dev_ref = vk.buffer(raw_size, 1);
-				sl.dev_dis = vk.buffer(raw_size, 1);
-				if (!su.empty()) for (int p = 0; p < 4; p++) sl.dev_chroma[p] = vk.buffer(sraw[p].size, 1);
+				if (!sl.dev_ref.buf) sl.dev_ref = vk.buffer(raw_size, 1);
+				if (!sl.dev_dis.buf) sl.dev_dis = vk.buffer(raw_size, 1);
+				if (!su.empty()) for (int p = 0; p < 4; p++) if (!sl.dev_chroma[p].buf) sl.dev_chroma[p] = vk.buffer(craw_size, 1);
 			}
 			auto mirror = [&](const Buf& from) { Buf to = vk.buffer(from.size, 2); sl.out.emplace_back(&from, to); return to; };
 			for (int k = 0; k < 2; k++) if (need_stride[k]) sl.mpart[k] = mirror(mpart[k]);
@@ -1274,8 +1333,8 @@ private:
 				AdmUnit& a = au[u];
 				// The units are recorded one after another, each finished (barrier) before the next copies the bands, and only their sums (cm, aimb) are read
 				// afterwards: one copy of the bands serves every unit after the first. A copy of its own for each took 70 MB per unit at 2560x1440.
-				if (u == 1) acopy[s] = vk.buffer(20 * N * 4 + 16, 1);
-				a.cur[s] = u == 0 ? acur[s] : acopy[s];
+				if (u == 1 && adm_split_cm) acopy[s] = vk.buffer(20 * N * 4 + 16, 1); // adm_dcm needs no copy
+				a.cur[s] = u == 0 || !adm_split_cm ? acur[s] : acopy[s];
 				a.cm[s] = vk.buffer((size_t)bh[s] * 3 * 8 + 16, 1);
 				if (a.aim) a.aimb[s] = vk.buffer((size_t)bh[s] * 3 * 8 + 16, 1);
 			}
@@ -1290,16 +1349,24 @@ private:
 		for (int s = 0; s < 4; s++) {
 			Buf* prev = &acur[s ? s - 1 : 0];
 			std::vector<Buf*> b{&acur[s], prev, &raw_ref, &raw_dis, &atmp, &adiv, &au[0].cm[s], &aden[s]};
+			adwt[s] = vk.pipeline("adm_dwt", b);
 			adwt_v[s] = vk.pipeline("adm_dwt_v", b);
 			adwt_h[s] = vk.pipeline("adm_dwt_h", b);
 			aden_p[s] = vk.pipeline("adm_den", b);
 			for (size_t u = 0; u < au.size(); u++) {
 				AdmUnit& a = au[u];
-				if (u > 0) a.copy[s] = vk.pipeline("copy_u32", {&acur[s], &a.cur[s]});
+				if (u > 0 && adm_split_cm) a.copy[s] = vk.pipeline("copy_u32", {&acur[s], &a.cur[s]});
 				std::vector<Buf*> bu{&a.cur[s], prev, &raw_ref, &raw_dis, &atmp, &adiv, &a.cm[s], &aden[s]};
 				a.dec[s] = vk.pipeline("adm_decouple", bu);
 				a.csf[s] = vk.pipeline("adm_csf", bu);
 				a.cm_p[s] = vk.pipeline("adm_cm", bu);
+				std::vector<Buf*> bf{&acur[s], prev, &raw_ref, &raw_dis, &atmp, &adiv, &a.cm[s], &aden[s]}; // the bands of every unit: adm_dcm writes none
+				a.dcm[s] = vk.pipeline("adm_dcm", bf);
+				a.cmsum[s] = vk.pipeline("adm_cmsum", bf);
+				if (a.aim) {
+					bf[6] = &a.aimb[s];
+					a.aimsum[s] = vk.pipeline("adm_cmsum", bf);
+				}
 				if (a.aim) {
 					std::vector<Buf*> ba{&a.cur[s], prev, &raw_ref, &raw_dis, &atmp, &adiv, &a.aimb[s], &aden[s]};
 					a.aimcsf[s] = vk.pipeline("adm_csf", ba);
@@ -1416,6 +1483,13 @@ private:
 			for (int d = 0; d < nd; d++) { t[d] = tvi_for_diff(d + 1, o.tvi, 10, lr, pq) + nd; t[32 + d] = contrast_weights[d]; }
 			memcpy(t + 64, vmaf_tables::reciprocal_lut, CAMBI_RECIPROCAL_LUT_SIZE * 4);
 			cpc.nd = nd;
+			{ // cambi_cvalue's 8 bit row counts: 25% faster on an RTX 4070 Laptop, 12% slower on a Radeon 780M (2026-11-18). Not on AMD, unless
+			  // VES_CAMBI_LANES says
+				uint32_t vendor = 0;
+				for (auto& d : vulkan_devices_fastest_first()) if (d.index == device_index) vendor = d.vendor_id;
+				cpc.lanes = vendor != 0x1002;
+				if (const char* e = getenv("VES_CAMBI_LANES"); e && *e) cpc.lanes = atoi(e) > 0;
+			}
 			cpc.vlt_luma = vlt_luma(o.vlt, lr, pq);
 			const int v_lo = cpc.vlt_luma - 3 * nd + 1;
 			cpc.band_base = v_lo > 0 ? v_lo : 0;
@@ -1519,7 +1593,14 @@ private:
 	void init_speed(const GpuVmafFrame& f) {
 		chroma_size(f.chroma, W, H, cw, ch);
 		const size_t craw = ((size_t)cw * ch * bps + 3) / 4 * 4 + 4;
-		for (auto& b : sraw) b = vk.buffer(craw, 1);
+		craw_size = craw;
+		for (auto& b : sraw) b = vk.buffer(alias_raw && !speed2 ? 16 : craw, 1);
+		if (alias_raw && !speed2) // as raw_ref/raw_dis (the second compute queue's SpEED copies them itself)
+			for (int p = 0; p < 4; p++) {
+				std::vector<const Buf*> c;
+				for (Slot& sl : slots) { sl.dev_chroma[p] = vk.buffer(craw, 1); c.push_back(&sl.dev_chroma[p]); }
+				vk.alias(sraw[p], c);
+			}
 		for (SpeedUnit& u : su) {
 			const SpeedOpts& o = u.o;
 			u.sd = speed_dims(cw, ch, o.prescale);

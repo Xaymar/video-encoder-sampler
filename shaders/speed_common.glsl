@@ -26,6 +26,14 @@ layout(push_constant) uniform PC {
 const int N = 25;     // elements in a 5x5 block
 const int SMALL = 1280;
 
+// is_matrix_regular() and solve_triangular_system()'s test, from speed_small's eigenvalues and R of the plane at `base` in `small`: whether its
+// covariance matrix cannot be inverted (an eigenvalue or a diagonal element of R below 1e-6).
+bool cannot_invert(int base) {
+	for (int i = 0; i < N; i++) if (double(small[base + 2 * N * N + i]) < 1e-6LF) return true;
+	for (int i = N - 1; i >= 0; i--) if (double(abs(small[base + N * N + i * N + i])) < 1e-6LF) return true;
+	return false;
+}
+
 // Vulkan only asks double division and square root to be about as exact as float ones (llvmpipe's are off by 1e-8): these are correctly rounded,
 // from adds and multiplies (which are), as the CPU's. Exact products by Dekker's splitting; an approximation refined twice by Newton's method on
 // exact residuals, then of it and its neighbours the one closest to the true value.

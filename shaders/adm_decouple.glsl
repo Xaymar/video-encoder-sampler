@@ -1,0 +1,96 @@
+// ADM decouple (integer_adm.c adm_decouple / i4_adm_decouple), shared by adm_decouple.comp and adm_dcm.comp. Needs adm_common.glsl.
+
+// (float)v as C has it: rounded once. The magnitude is cut to 32 bits first, the bits shifted out folded into a sticky lowest bit; that
+// bit sits 8 places below where a float rounds, so float(uint) (correctly rounded) rounds as the whole value would, and ldexp is exact.
+float to_float(int64_t v) {
+	const uint64_t a = uint64_t(v < 0l ? -v : v);
+	const uint hi = uint(a >> 32);
+	float f;
+	if (hi == 0u) f = float(uint(a));
+	else {
+		const int s = findMSB(hi) + 1;
+		uint q = uint(a >> s);
+		if ((uint(a) & (s >= 32 ? 0xffffffffu : (1u << s) - 1u)) != 0u) q |= 1u;  // s is 1..32
+		f = ldexp(float(q), s);
+	}
+	return v < 0l ? -f : f;
+}
+
+// The restored value for one band, from the reference value o and the distorted value t.
+// The products here are taken as unsigned magnitudes and their sign: a negative product gives k <= 0, clamped to 0, so only positive products need
+// the division.
+int restore(int o, int t, bool angle_flag, out int k_out, out int rst0) {
+	int64_t k;
+	if (o == 0) {
+		k = 32768l;
+	} else if (pc.scale == 0) {
+		// div_lookup[o + 32768] is -div_lookup[32768 - o]: read from the upper half only. On RDNA 3 (Radeon 780M, Windows driver 26.10.1) the read
+		// below the table's middle (o < -1) gave 0 (k 0 wherever o and t were both negative: adm_num_scale0 1.4-3.9% low).
+		const uint dl = uint(div_lookup[32768 + abs(o)]);
+		if ((o < 0) != (t < 0) || t == 0) k = 0l;
+		else k = int64_t((uint64_t(dl) * uint64_t(uint(abs(t))) + 16384ul) >> 15);
+	} else {
+		const uint a = uint(abs(o));
+		int shift = 0;
+		uint msb = a;
+		if (a >= 32768u) {
+			shift = findMSB(a) - 14;                       // 17 - clz
+			msb = (a + (1u << uint(shift - 1))) >> uint(shift);
+		}
+		const int dl = div_lookup[int(msb) + 32768];   // msb > 0: dl > 0
+		if ((o < 0) != (t < 0) || t == 0) k = 0l;
+		else k = int64_t((uint64_t(uint(dl)) * uint64_t(uint(abs(t))) + (1ul << uint(14 + shift))) >> uint(15 + shift));
+	}
+	k = k > 32768l ? 32768l : k;
+	// (k o + 16384) >> 15, rounding down as an arithmetic shift does, from the magnitude
+	const uint64_t ko = uint64_t(k) * uint64_t(uint(abs(o)));
+	int rst = o >= 0 ? int((ko + 16384ul) >> 15) : -int((ko + 16383ul) >> 15);
+	if (pc.scale == 0) rst = sext16(rst);
+	k_out = int(k); rst0 = rst;
+	const float rst_f = (float(k) / 32768.0) * (float(o) / 64.0);
+	if (angle_flag && rst_f != 0.0) {
+		// C: MIN (or MAX) of the double rst * limit and t, converted back when assigned; with a whole limit that is exact in integers.
+		if (pc.egl_int > 0) {
+			const int64_t m = int64_t(rst) * int64_t(pc.egl_int);
+			rst = (rst_f > 0.0 ? m < int64_t(t) : m > int64_t(t)) ? int(m) : t;
+		} else {
+			precise double m = double(rst) * pc.egl;
+			rst = (rst_f > 0.0 ? m < double(t) : m > double(t)) ? int(m) : t;
+		}
+	}
+	if (pc.scale == 0) rst = sext16(rst);
+	return rst;
+}
+
+// Decouple at band position o: the restored values x (h, v, d) and the additive impairment a, from the bands of the reference and the distorted
+// frame. k/r0: restore()'s k and unclamped value of the h band (VES_ADM_DUMP).
+void decouple(int o, int N, out int x[3], out int a[3], out bool angle, out int kh_out, out int r0h_out) {
+	const int oh = cur[RH * N + o], ov = cur[RV * N + o], od = cur[RD * N + o];
+	const int th = cur[DH * N + o], tv = cur[DV * N + o], td = cur[DD * N + o];
+	const int64_t ot_dp = int64_t(oh) * int64_t(th) + int64_t(ov) * int64_t(tv);
+	const int64_t o_mag_sq = int64_t(oh) * int64_t(oh) + int64_t(ov) * int64_t(ov);
+	const int64_t t_mag_sq = int64_t(th) * int64_t(th) + int64_t(tv) * int64_t(tv);
+	// C: dp = (float)ot_dp / 4096.0 in double, dp * dp >= cos1sq * a * b in double. dp * dp is exact in double (24 bit factors); the right side
+	// rounds once. Floats settle the test unless the two sides are within 2^-20 of each other (float rounding is under 2^-22 here, and no
+	// value gets near the float limits: the sides are at most 2^102, at least 2^-24 unless zero); then the doubles decide.
+	const float dpf = to_float(ot_dp) * 0.000244140625, af = to_float(o_mag_sq) * 0.000244140625, bf = to_float(t_mag_sq) * 0.000244140625;  // / 4096, exactly (a division need not be)
+	bool angle_flag = false;
+	if (dpf >= 0.0) {
+		const float d2 = dpf * dpf, r = (pc.cos1sq * af) * bf;
+		if (d2 >= r * 1.00000095367431640625) angle_flag = true;       // 1 + 2^-20
+		else if (d2 < r * 0.99999904632568359375) angle_flag = false;  // 1 - 2^-20
+		else {
+			precise double dp = double(dpf);
+			precise double rhs = (double(pc.cos1sq) * double(af)) * double(bf);
+			angle_flag = dp * dp >= rhs;
+		}
+	}
+	int kh, kv, kd, r0h, r0v, r0d;
+	const int rh = restore(oh, th, angle_flag, kh, r0h), rv = restore(ov, tv, angle_flag, kv, r0v), rd = restore(od, td, angle_flag, kd, r0d);
+	x[0] = rh; x[1] = rv; x[2] = rd;
+	int ah = th - rh, av = tv - rv, ad = td - rd;
+	if (pc.scale == 0) { ah = sext16(ah); av = sext16(av); ad = sext16(ad); }
+	a[0] = ah; a[1] = av; a[2] = ad;
+	angle = angle_flag;
+	kh_out = kh; r0h_out = r0h;
+}

@@ -240,6 +240,8 @@ struct Vk::Impl {
 		VkCommandBuffer cmd{};
 		VkFence fence{};
 		VkQueryPool stamps{}; // kStamps timestamps: 0 the work began, 1 it ended, the rest for parts of it
+		VkQueryPool pstamps{}; // VES_SCORE_TIMING=2: 0 the work began, then one after each dispatch, of the shader pnames[i - 1]
+		std::vector<const char*> pnames;
 		VkCommandBuffer xcmd{}; // copies on the second queue (upload_begin()), which the slot's next submit() waits for through xsem
 		VkSemaphore xsem{};
 		bool xpending = false;
@@ -251,6 +253,10 @@ struct Vk::Impl {
 	VkCommandPool xpool{};
 	std::vector<Slot> slots;
 	VkCommandBuffer cmd{}; // the one being recorded (either compute queue)
+	std::vector<std::pair<VkBuffer, std::vector<VkBuffer>>> aliases; // alias(): a placeholder, and the buffer of each slot
+	int cur_slot = -1;     // ... its slot
+	const char* cur_name = ""; // the shader bound last
+	bool pass = false;     // VES_SCORE_TIMING=2
 	bool second = false;   // ... and it is the second one's
 	VkCommandBuffer xrec{}; // the one being recorded (second queue)
 	VkDescriptorPool dpool{};
@@ -271,10 +277,11 @@ Vk::Vk(int device, int slots) : impl(new Impl) {
 	impl->s = bring_up(device, why);
 	if (!impl->s) { delete impl; impl = nullptr; throw std::runtime_error("Vulkan: " + why); }
 	Shared& s = *impl->s;
+	if (const char* e = getenv("VES_SCORE_TIMING"); e && atoi(e) >= 2) impl->pass = true;
 	try {
-		VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * 256};
+		VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * 1024};
 		VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-		dpi.maxSets = 256;
+		dpi.maxSets = 1024; // aliased pipelines take a set per slot
 		dpi.poolSizeCount = 1;
 		dpi.pPoolSizes = &ps;
 		chk(vkCreateDescriptorPool(s.dev, &dpi, nullptr, &impl->dpool), "descriptor pool");
@@ -323,6 +330,10 @@ Vk::Vk(int device, int slots) : impl(new Impl) {
 				qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
 				qi.queryCount = kStamps;
 				chk(vkCreateQueryPool(s.dev, &qi, nullptr, &sl.stamps), "query pool");
+				if (impl->pass) {
+					qi.queryCount = kPassStamps;
+					chk(vkCreateQueryPool(s.dev, &qi, nullptr, &sl.pstamps), "query pool (passes)");
+				}
 			}
 		}
 	} catch (...) {
@@ -339,6 +350,7 @@ void Vk::release() {
 	for (auto& sl : impl->slots) {
 		if (sl.fence) vkDestroyFence(s.dev, sl.fence, nullptr);
 		if (sl.stamps) vkDestroyQueryPool(s.dev, sl.stamps, nullptr);
+		if (sl.pstamps) vkDestroyQueryPool(s.dev, sl.pstamps, nullptr);
 		if (sl.xsem) vkDestroySemaphore(s.dev, sl.xsem, nullptr);
 		if (sl.xsem2) vkDestroySemaphore(s.dev, sl.xsem2, nullptr);
 		if (sl.fence2) vkDestroyFence(s.dev, sl.fence2, nullptr);
@@ -431,6 +443,7 @@ Pipe Vk::pipeline(const char* name, const std::vector<Buf*>& bindings) {
 			it = s.pipelines.emplace(name, pipe).first;
 		}
 		p.pipe = it->second;
+		p.name = it->first.c_str(); // the map's nodes stay put
 	}
 	VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
 	ai.descriptorPool = impl->dpool;
@@ -451,7 +464,27 @@ Pipe Vk::pipeline(const char* name, const std::vector<Buf*>& bindings) {
 		writes.push_back(w);
 	}
 	vkUpdateDescriptorSets(s.dev, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+	bool aliased = false;
+	for (auto& info : infos) for (auto& [from, to] : impl->aliases) if (info.buffer == from) aliased = true;
+	if (aliased) {
+		p.nslot = (int)impl->slots.size();
+		if (p.nslot > 8) throw std::runtime_error("Vulkan: too many slots for aliased buffers");
+		for (int k = 0; k < p.nslot; k++) {
+			chk(vkAllocateDescriptorSets(s.dev, &ai, &p.slot_sets[k]), "descriptor set");
+			std::vector<VkDescriptorBufferInfo> si = infos;
+			for (auto& info : si) for (auto& [from, to] : impl->aliases) if (info.buffer == from) info.buffer = to[k];
+			for (int i = 0; i < kBindings; i++) { writes[i].dstSet = p.slot_sets[k]; writes[i].pBufferInfo = &si[i]; }
+			vkUpdateDescriptorSets(s.dev, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+		}
+	}
 	return p;
+}
+
+void Vk::alias(const Buf& placeholder, const std::vector<const Buf*>& per_slot) {
+	if (per_slot.size() != impl->slots.size()) throw std::runtime_error("Vulkan: alias needs a buffer per slot");
+	std::vector<VkBuffer> to;
+	for (const Buf* b : per_slot) to.push_back(b->buf);
+	impl->aliases.emplace_back(placeholder.buf, to);
 }
 
 void Vk::begin(int slot) {
@@ -463,6 +496,12 @@ void Vk::begin(int slot) {
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	chk(vkBeginCommandBuffer(impl->cmd, &bi), "begin");
 	if (sl.stamps) vkCmdResetQueryPool(impl->cmd, sl.stamps, 0, kStamps);
+	impl->cur_slot = slot;
+	if (sl.pstamps) {
+		vkCmdResetQueryPool(impl->cmd, sl.pstamps, 0, kPassStamps);
+		vkCmdWriteTimestamp(impl->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.pstamps, 0);
+		sl.pnames.clear();
+	}
 }
 
 void Vk::stamp(int slot, int which) {
@@ -483,13 +522,34 @@ void Vk::copy_range(const Buf& src, VkDeviceSize src_off, const Buf& dst, VkDevi
 }
 
 void Vk::bind(const Pipe& p) {
+	impl->cur_name = p.name;
 	vkCmdBindPipeline(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
-	vkCmdBindDescriptorSets(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, impl->s->layout, 0, 1, &p.set, 0, nullptr);
+	const VkDescriptorSet set = p.nslot > 0 && impl->cur_slot >= 0 && impl->cur_slot < p.nslot ? p.slot_sets[impl->cur_slot] : p.set;
+	vkCmdBindDescriptorSets(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, impl->s->layout, 0, 1, &set, 0, nullptr);
 }
 
 void Vk::push(const void* data, uint32_t size) { vkCmdPushConstants(impl->cmd, impl->s->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, size, data); }
 
-void Vk::dispatch(uint32_t x, uint32_t y) { vkCmdDispatch(impl->cmd, x, y, 1); }
+void Vk::dispatch(uint32_t x, uint32_t y) {
+	vkCmdDispatch(impl->cmd, x, y, 1);
+	if (!impl->pass || impl->second || impl->cur_slot < 0) return;
+	Impl::Slot& sl = impl->slots[impl->cur_slot];
+	if (!sl.pstamps || sl.pnames.size() + 1 >= (size_t)kPassStamps) return;
+	sl.pnames.push_back(impl->cur_name);
+	vkCmdWriteTimestamp(impl->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.pstamps, (uint32_t)sl.pnames.size());
+}
+
+bool Vk::pass_timing() const { return impl->pass && impl->s->timestamp_ns > 0; }
+
+void Vk::pass_seconds(int slot, std::vector<std::pair<const char*, double>>& out) {
+	out.clear();
+	Impl::Slot& sl = impl->slots.at(slot);
+	if (!sl.pstamps || sl.pnames.empty()) return;
+	std::vector<uint64_t> t(sl.pnames.size() + 1);
+	if (vkGetQueryPoolResults(impl->s->dev, sl.pstamps, 0, (uint32_t)t.size(), t.size() * 8, t.data(), 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
+	for (size_t i = 0; i < sl.pnames.size(); i++)
+		out.emplace_back(sl.pnames[i], t[i + 1] >= t[i] ? (double)(t[i + 1] - t[i]) * impl->s->timestamp_ns * 1e-9 : 0.0);
+}
 
 void Vk::barrier() {
 	VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};

@@ -3,22 +3,39 @@
 layout(local_size_x = 16, local_size_y = 16) in;
 #include "cambi_common.glsl"
 // The spatial mask: a pixel counts when more than mask_index pixels of the 7x7 window around it equal their right and lower neighbours
-// (the last column and row count as equal; outside the image counts as not).
+// (the last column and row count as equal; outside the image counts as not). A workgroup works out the zero derivatives of its tile and the 3 pixel
+// border once, in shared memory, then sums the window in two steps (rows, then columns): exact integer counts, as before.
 layout(std430, binding = 0) readonly buffer Img { uint img[]; };
 layout(std430, binding = 1) writeonly buffer Mask { uint mask[]; };
 
-int zero_deriv(int r, int c) {
-	if (r < 0 || c < 0 || r >= pc.H || c >= pc.W) return 0;
+const int T = 16, R = 3, E = T + 2 * R; // tile, window radius, tile with its border
+shared uint gZero[E * E];                 // the zero derivative (0/1) of each pixel of the bordered tile
+shared uint gRows[E * T];                 // the sums of 7 along each row, for the tile's columns
+
+uint zero_deriv(int r, int c) {
+	if (r < 0 || c < 0 || r >= pc.H || c >= pc.W) return 0u;
 	const uint v = img[r * pc.W + c];
 	const bool hz = c == pc.W - 1 || v == img[r * pc.W + c + 1];
 	const bool vt = r == pc.H - 1 || v == img[(r + 1) * pc.W + c];
-	return (hz && vt) ? 1 : 0;
+	return (hz && vt) ? 1u : 0u;
 }
 
 void main() {
-	const int c = int(gl_GlobalInvocationID.x), r = int(gl_GlobalInvocationID.y);
+	const int t = int(gl_LocalInvocationIndex);
+	const int c0 = int(gl_WorkGroupID.x) * T - R, r0 = int(gl_WorkGroupID.y) * T - R;
+	for (int i = t; i < E * E; i += T * T) gZero[i] = zero_deriv(r0 + i / E, c0 + i % E);
+	barrier();
+	for (int i = t; i < E * T; i += T * T) {
+		const int row = i / T, col = i % T;
+		uint n = 0u;
+		for (int d = 0; d <= 2 * R; d++) n += gZero[row * E + col + d];
+		gRows[i] = n;
+	}
+	barrier();
+	const int lx = int(gl_LocalInvocationID.x), ly = int(gl_LocalInvocationID.y);
+	const int c = c0 + R + lx, r = r0 + R + ly;
 	if (c >= pc.W || r >= pc.H) return;
-	int n = 0;
-	for (int dr = -3; dr <= 3; dr++) for (int dc = -3; dc <= 3; dc++) n += zero_deriv(r + dr, c + dc);
-	mask[r * pc.W + c] = n > pc.mask_index ? 1u : 0u;
+	uint n = 0u;
+	for (int d = 0; d <= 2 * R; d++) n += gRows[(ly + d) * T + lx];
+	mask[r * pc.W + c] = int(n) > pc.mask_index ? 1u : 0u;
 }

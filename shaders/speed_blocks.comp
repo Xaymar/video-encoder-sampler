@@ -11,7 +11,7 @@ void main() {
 	const int bi = b / pc.nbh, bj = b % pc.nbh;
 	float y[N], tr[N], xs[N];
 	for (int r = 0; r < N; r++) y[r] = prep[base + (5 * bi + r / 5) * pc.DW + 5 * bj + r % 5];
-	const bool bad = small[in0 + 2 * N * N + N] != 0.0;
+	const bool bad = cannot_invert(in0);
 	if (bad) {
 		for (int i = 0; i < N; i++) xs[i] = 0.0;
 	} else {
