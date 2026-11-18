@@ -7,7 +7,7 @@
 //   [E] source/encoder/encoder.cpp, Encoder::configure(): settings it overrides with a warning
 //   [D] doc/reST/cli.rst, the option reference ("only has effect when ...")
 // Option names are x265's command line names with _ for - (ves passes them to x265_param_parse), so any other x265 option works too.
-// ves runs x265 as single pass ABR at the scenario's bitrate; the explicit options here are applied after the preset and tune, so they win over both.
+// ves runs x265 as single pass CBR at the scenario's bitrate (ABR with vbv_maxrate and vbv_bufsize at the bitrate and strict_cbr on); the explicit options here are applied after the preset and tune, so they win over both.
 // Every list is cut to a spread of its range: ves numbers the combinations with one 64-bit number, so all value lists multiplied (rules aside) must stay
 // below 9.2e18. Pruning tries the middle values only where the ends differ, so the ends of each range matter most. The options commented out
 // below are valid too and their rules are already in place: swap them in for others (the warnings about rules reading unlisted options are expected).

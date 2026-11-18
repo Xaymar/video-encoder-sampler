@@ -59,6 +59,9 @@ std::string key_encoder(const std::string& encoder, const std::string& codec, co
 	k << "environment=" << encoder_environment(encoder, options, gpu_override) << '\n';
 	k << "options=";
 	for (auto& [name, value] : options) k << name << '=' << value << ';';
+	// x264 and x265 ran plain ABR (no VBV) by default until they were set up for CBR like the other encoders: the same options encode differently
+	// now, so their runs are new runs. The other encoders keep their keys.
+	if (encoder == "x264" || encoder == "x265") k << "\nrate_control=cbr";
 	return k.str();
 }
 

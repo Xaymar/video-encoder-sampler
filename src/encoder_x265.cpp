@@ -1,7 +1,8 @@
 // Native x265 backend: drives libx265 directly, no libavcodec in between.
 // Options are x265's own long option names (bframes, rc-lookahead, ctu, ...) applied with
 // param_parse, so everything the x265 CLI accepts can be swept. "preset", "tune" and "profile"
-// are handled up front. Rate control is ABR at the target bitrate unless vbv-maxrate/vbv-bufsize are given.
+// are handled up front. Rate control is CBR at the target bitrate: ABR with the VBV's max rate and buffer at the bitrate (a 1 second buffer)
+// and strict-cbr, as x265 has no filler data. vbv-maxrate, vbv-bufsize and strict-cbr override it.
 #include "encoder.h"
 #include "options.h"
 
@@ -73,6 +74,10 @@ public:
 		par->bRepeatHeaders = 1; // parameter sets in-band so the stream decodes on its own
 		par->rc.rateControlMode = X265_RC_ABR;
 		par->rc.bitrate = (int)(p.bitrate / 1000);
+		// Plain ABR has no VBV, so it borrows bits at every scene cut and overshoots its target, where the other encoders run CBR.
+		par->rc.vbvMaxBitrate = par->rc.bitrate;
+		par->rc.vbvBufferSize = par->rc.bitrate;
+		par->rc.bStrictCbr = 1;
 		par->logLevel = X265_LOG_WARNING;
 		if (color_full(p.color) || color_described(p.color)) {
 			par->vui.bEnableVideoSignalTypePresentFlag = 1;
