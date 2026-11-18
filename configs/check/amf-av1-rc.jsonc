@@ -214,6 +214,11 @@
 					"if": { "set": "pa_static_scene_detection_enable" },
 					"require": { "set": "pa_static_scene_detection_sensitivity" },
 				},
+				// With CDF updates off, the frame end update mode changed nothing [T on the 780M].
+				{
+					"if": { "op": "==", "left": { "option": "cdf_update" }, "right": 0 },
+					"require": { "op": "not", "value": { "set": "cdf_frame_end_update_mode" } },
+				},
 				// The pre-filter settings need the pre-filter.
 				{
 					"if": { "op": "not", "value": { "set": "pre_filter" } },

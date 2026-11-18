@@ -46,8 +46,8 @@
 				"palette_mode": ["", 0, 1],
 				"force_integer_mv": ["", 1],
 				"num_tiles_per_frame": ["", 2, 4],   // 1 or more, default 1; a suggestion the encoder may change [H]
-				"rate_control_skip_frame_enable": [""],   // lets the rate control drop frames; on or off made the same stream at CBR and VBR [T] Assumed for AV1. Was ["", 0, 1]
-				"enforce_hrd": [""],   // on or off made the same stream at CBR and VBR [T] Assumed for AV1. Was ["", 0, 1]
+				"rate_control_skip_frame_enable": [""],   // lets the rate control drop frames; on or off made the same stream at CBR and VBR [T, AV1 too]. Was ["", 0, 1]
+				"enforce_hrd": [""],   // on or off made the same stream at CBR and VBR [T, AV1 too]. Was ["", 0, 1]
 				// "filler_data": [0, 1],   // pads the stream to the bitrate: the picture stays the same
 				// "vbv_buffer_size": [...],   // bits, so the same value means a different buffer at every bitrate
 				// "min_q_index_intra": [...], "max_q_index_intra": [...], ...   // Q index limits only take quality away from the rate control
@@ -211,6 +211,11 @@
 				{
 					"if": { "set": "pa_static_scene_detection_enable" },
 					"require": { "set": "pa_static_scene_detection_sensitivity" },
+				},
+				// With CDF updates off, the frame end update mode changed nothing [T on the 780M].
+				{
+					"if": { "op": "==", "left": { "option": "cdf_update" }, "right": 0 },
+					"require": { "op": "not", "value": { "set": "cdf_frame_end_update_mode" } },
 				},
 				// The pre-filter settings need the pre-filter.
 				{
