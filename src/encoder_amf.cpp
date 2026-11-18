@@ -499,7 +499,18 @@ public:
 		names_all = names;
 		for (auto& [k, v] : native_opts) if (k != "enable_pre_analysis" && !apply(k, v)) return false;
 
-		if ((r = enc->Init(depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, w, h)) != AMF_OK) return fail(r, "Init");
+		const auto surface = depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12;
+		bool inited = false;
+		if (p.codec == "av1" && !native_opts.count("alignment_mode")) {
+			// AV1's alignment mode defaults to 64x16 only [H Av1AlignmentMode], which RDNA 3 refuses for 1080 lines with AMF_NOT_SUPPORTED. Try no
+			// restrictions first, then 8x2, then 1080p coded as 1082 lines (RDNA 3's own workaround), keeping the first one Init accepts.
+			for (amf_int64 mode : {(amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_NO_RESTRICTIONS, (amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_8X2_ONLY,
+					(amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_64X16_1080P_CODED_1082, (amf_int64)AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE_64X16_ONLY}) {
+				if (enc->SetProperty(AMF_VIDEO_ENCODER_AV1_ALIGNMENT_MODE, mode) != AMF_OK) break;   // an older runtime without the property
+				if ((r = enc->Init(surface, w, h)) == AMF_OK) { inited = true; break; }   // a failed Init leaves nothing to terminate
+			}
+			if (!inited && (r = enc->Init(surface, w, h)) != AMF_OK) return fail(r, "Init");
+		} else if ((r = enc->Init(surface, w, h)) != AMF_OK) return fail(r, "Init");
 		read_caps();
 		if (!filter_opts.empty() && !open_filter(filter_opts, p)) return false;
 		amf::AMFVariant bp;

@@ -406,6 +406,9 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 	};
 	for (int got; ok && (got = next_dis(d)) != 0;) {
 		if (got < 0) { ok = false; break; }
+		// AMF's AV1 on RDNA 3 codes 1080 lines as 1082 (Av1AlignmentMode 64X16_1080P_CODED_1082); a few padding lines or columns at the bottom and
+		// right are cut off, as the frame's render size says.
+		if (d.fmt == enc.pix && d.width >= enc.w && d.height >= enc.h && d.width - enc.w < 64 && d.height - enc.h < 16) { d.width = enc.w; d.height = enc.h; }
 		if (d.width != enc.w || d.height != enc.h || d.fmt != enc.pix) {
 			fprintf(stderr, "decoded stream is %dx%d %d-bit %d, expected %dx%d %d-bit %d\n", d.width, d.height, d.fmt.depth, d.fmt.chroma, enc.w, enc.h, enc.pix.depth, enc.pix.chroma);
 			ok = false; break;
