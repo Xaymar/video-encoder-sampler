@@ -26,3 +26,7 @@ std::unique_ptr<Converter> make_converter(); // libplacebo, on the GPU through V
 // Converts a small known picture on the device `opt` names and checks what comes back: some drivers hand back nothing but zeros (an AMD Vega iGPU gave an all-green
 // video) without reporting an error. False, with what was wrong in `why`, when the device cannot be trusted with frames.
 bool converter_works(const ScaleOptions& opt, std::string& why);
+// Converters run on FFmpeg's Vulkan device of their GPU (the one its decoders use) instead of one libplacebo makes, so that frames decoded there are
+// converted where they are (Picture::gpu): set when hardware decoding may use Vulkan, before the first converter opens (VES_SHARED_VULKAN=0: never).
+void set_converter_ffmpeg_vulkan(bool on);
+bool converter_shares_ffmpeg_vulkan();

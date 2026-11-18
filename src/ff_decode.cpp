@@ -179,72 +179,17 @@ struct Dec {
 
 	// A Vulkan frame as a picture that stays on the GPU (Picture::gpu); false if the scorer could not read it there.
 	bool gpu_picture(AVFrame* hwf) {
-		if (!hwf->hw_frames_ctx) return false;
-		auto vf = std::make_shared<VkDecodedFrame>();
-		const AVPixelFormat sw_fmt = ((AVHWFramesContext*)hwf->hw_frames_ctx->data)->sw_format;
-		const SemiPlanar* sp = semi_planar(sw_fmt);
-		const AVPixelFormat planar_fmt = sp ? sp->to : sw_fmt;
-		Fmt fmt;
-		if (!describe_native(planar_fmt, fmt) || !fmt.planar || !vulkan_frame(hwf, vk_device, *vf)) return false;
 		Picture p;
-		p.width = hwf->width; p.height = hwf->height;
-		p.fmt = fmt;
-		p.native = planar_fmt;
-		p.layout = layout_of(planar_fmt);
-		p.pts = hwf->pts;
-		p.duration = hwf->duration;
-		p.color = {(int)hwf->color_range, (int)hwf->colorspace, (int)hwf->color_primaries, (int)hwf->color_trc};
-		p.gpu = vf;
+		if (!vulkan_picture(hwf, vk_device, true, p)) return false;
 		ready.push_back(std::move(p));
 		return true;
 	}
 
 	// For testing the GPU path without a GPU decoder: the frame, interleaved to NV12/P010 if VES_HW_DECODE_TEST_UPLOAD=nv12, uploaded to device vk_device.
 	bool upload_test(AVFrame* f) {
-		const bool nv = strcmp(getenv("VES_HW_DECODE_TEST_UPLOAD"), "nv12") == 0;
-		const bool high = f->format == AV_PIX_FMT_YUV420P10LE;
-		if (f->format != AV_PIX_FMT_YUV420P && !high) return false;
-		AVFrame* cpu = f;
-		AVFrame* inter = nullptr;
-		if (nv) {
-			inter = av_frame_alloc();
-			inter->format = high ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
-			inter->width = f->width; inter->height = f->height;
-			if (av_frame_get_buffer(inter, 0) < 0) { av_frame_free(&inter); return false; }
-			av_frame_copy_props(inter, f);
-			const int cw = (f->width + 1) / 2, ch = (f->height + 1) / 2;
-			for (int y = 0; y < f->height; y++) {
-				if (!high) memcpy(inter->data[0] + (size_t)y * inter->linesize[0], f->data[0] + (size_t)y * f->linesize[0], (size_t)f->width);
-				else for (int x = 0; x < f->width; x++) ((uint16_t*)(inter->data[0] + (size_t)y * inter->linesize[0]))[x] = (uint16_t)(((const uint16_t*)(f->data[0] + (size_t)y * f->linesize[0]))[x] << 6);
-			}
-			for (int y = 0; y < ch; y++) for (int x = 0; x < cw; x++) {
-				if (!high) {
-					inter->data[1][(size_t)y * inter->linesize[1] + 2 * x] = f->data[1][(size_t)y * f->linesize[1] + x];
-					inter->data[1][(size_t)y * inter->linesize[1] + 2 * x + 1] = f->data[2][(size_t)y * f->linesize[2] + x];
-				} else {
-					uint16_t* d = (uint16_t*)(inter->data[1] + (size_t)y * inter->linesize[1]);
-					d[2 * x] = (uint16_t)(((const uint16_t*)(f->data[1] + (size_t)y * f->linesize[1]))[x] << 6);
-					d[2 * x + 1] = (uint16_t)(((const uint16_t*)(f->data[2] + (size_t)y * f->linesize[2]))[x] << 6);
-				}
-			}
-			cpu = inter;
-		}
-		if (!test_frames) {
-			AVBufferRef* devref = shared_hw_device("vulkan", std::to_string(vk_device));
-			if (!devref) { av_frame_free(&inter); return false; }
-			test_frames = av_hwframe_ctx_alloc(devref);
-			av_buffer_unref(&devref);
-			AVHWFramesContext* fc = (AVHWFramesContext*)test_frames->data;
-			fc->format = AV_PIX_FMT_VULKAN;
-			fc->sw_format = (AVPixelFormat)cpu->format;
-			fc->width = cpu->width; fc->height = cpu->height;
-			if (av_hwframe_ctx_init(test_frames) < 0) { av_buffer_unref(&test_frames); av_frame_free(&inter); return false; }
-		}
-		AVFrame* hwf = av_frame_alloc();
-		bool ok = av_hwframe_get_buffer(test_frames, hwf, 0) >= 0 && av_hwframe_transfer_data(hwf, cpu, 0) >= 0;
-		if (ok) { av_frame_copy_props(hwf, f); ok = gpu_picture(hwf); }
+		AVFrame* hwf = vulkan_upload(f, vk_device, strcmp(getenv("VES_HW_DECODE_TEST_UPLOAD"), "nv12") == 0, test_frames);
+		const bool ok = hwf && gpu_picture(hwf);
 		av_frame_free(&hwf);
-		av_frame_free(&inter);
 		return ok;
 	}
 #endif

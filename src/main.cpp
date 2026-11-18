@@ -689,6 +689,9 @@ Paths
                             The encoded streams that are scored too (device types only): until a stream of a kind (codec, size, bit depth, chroma) decoded
                             exactly like software all the way through, the GPU and software run side by side; after that the GPU decodes that kind alone.
                             The verdicts are kept per GPU, driver and FFmpeg version (VES_HW_DECODE_VERDICTS=<file|off>; VES_HW_DECODE_VERIFY=<frames|all> checks again)
+                            Vulkan is tried first: its frames stay on the GPU, where the converter and the scorer use them on FFmpeg's own device
+                            (VES_SHARED_VULKAN=0: they make their own devices; VES_HW_DECODE_TO_MEMORY=1: frames are read back as they are decoded).
+                            Vulkan decodes only H.264, HEVC, AV1 and VP9 (the video engine), not FFmpeg's compute shader decoders (FFV1, ...).
         --decode-gpu <auto|own|n|name>  the GPU the sources are decoded on (default: auto, the fastest GPU: discrete first, then the most VRAM); own: the GPU
                             that encodes the run; n: Vulkan device n; name: the first device whose name contains it (--vmaf-gpu list shows them)
         --scaling-gpu <auto|own|n|name>  the GPU frames are scaled and converted on, the same way (default: auto). Beats "scaling": {"gpu"} of the

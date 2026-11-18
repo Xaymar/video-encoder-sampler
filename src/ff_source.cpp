@@ -13,6 +13,7 @@
 #include "encoder.h"
 #include "ff.h"
 #include "gpu.h"
+#include "convert.h"
 #include "vk_compute.h"
 
 extern "C" {
@@ -96,6 +97,9 @@ class FfSource : public Source {
 		for (;;) {
 			int r = avcodec_receive_frame(dec, frame);
 			if (r >= 0) {
+#ifndef VES_NO_VULKAN
+				if (gpu_frames && gpu_picture(out)) return 1;
+#endif
 				AVFrame* f = frame;
 				if (hw_fmt != AV_PIX_FMT_NONE && frame->format == hw_fmt) {
 					av_frame_unref(sw_frame);
@@ -134,8 +138,32 @@ class FfSource : public Source {
 		}
 	}
 
+#ifndef VES_NO_VULKAN
+	// The decoded Vulkan frame as a picture that stays on the GPU (or, for VES_SOURCE_TEST_UPLOAD, the software frame uploaded to the GPU first).
+	bool gpu_picture(Picture& out) {
+		AVFrame* up = nullptr;
+		if (test_upload && frame->format != AV_PIX_FMT_VULKAN && !(up = vulkan_upload(frame, vk_index, test_nv12, test_frames))) return false;
+		Picture p;
+		const bool ok = vulkan_picture(up ? up : frame, vk_index, false, p);
+		av_frame_free(&up);
+		if (!ok) return false;
+		av_frame_unref(frame);
+		if (!fmt_known) { fmt = p.fmt; fmt_known = true; }
+		if (!test_upload) hw_used = true;
+		p.pts = read++;
+		p.duration = 1;
+		out = std::move(p);
+		return true;
+	}
+#endif
+
 public:
 	std::string decoder_name;
+	// Vulkan frames stay on the GPU (Picture::gpu) for the converter, which uses the same device (pl_convert.cpp): set before open(). `vk_index` is the
+	// Vulkan device (Vk::devices() numbering); test_upload (VES_SOURCE_TEST_UPLOAD=nv12|planar) uploads software frames to it, to test without a GPU decoder.
+	bool gpu_frames = false, test_upload = false, test_nv12 = false;
+	int vk_index = -1;
+	AVBufferRef* test_frames = nullptr;
 
 	~FfSource() override {
 		av_frame_free(&frame);
@@ -144,6 +172,7 @@ public:
 		av_packet_free(&pkt);
 		avcodec_free_context(&dec);
 		av_buffer_unref(&hw_dev);
+		av_buffer_unref(&test_frames);
 		avformat_close_input(&ctx);
 	}
 
@@ -291,10 +320,11 @@ std::vector<std::string> dedicated_decoders(AVCodecID id, const std::string& suf
 std::vector<HwChoice> hw_choices(AVCodecID id, const std::string& want) {
 	std::vector<HwChoice> out;
 	if (!g_vendor) { // any GPU: each type's default device
-		if (want != "auto") return {{want, ""}};
+		// (Vulkan's default is its device 0, named so: then the converter and the scorer, which name devices by number, find the very same device.)
+		if (want != "auto") return {{want, want == "vulkan" ? "0" : ""}};
 		// The normal decoders on a hardware device first, then the dedicated hardware decoders of the stream's codec.
 		// (OpenCL is left out: it breaks more often than it works on systems with several GPUs.)
-		for (const char* t : {"cuda", "d3d11va", "d3d12va", "dxva2", "qsv", "amf", "vaapi", "vulkan"}) out.push_back({t, ""});
+		for (const char* t : {"cuda", "d3d11va", "d3d12va", "dxva2", "qsv", "amf", "vaapi", "vulkan"}) out.push_back({t, strcmp(t, "vulkan") == 0 ? "0" : ""});
 		for (const char* suffix : {"_cuvid", "_qsv", "_amf"}) for (auto& d : dedicated_decoders(id, suffix)) out.push_back({d, ""});
 		return out;
 	}
@@ -415,7 +445,10 @@ void set_hw_decode(const std::string& type) {
 	g_hw = type == "off" || type == "none" ? "" : type;
 #ifndef VES_NO_VULKAN
 	// Decoding on the GPU: the scorer uses FFmpeg's Vulkan device where it can, so that frames decoded there can be scored without leaving it.
-	if (!g_hw.empty() && (g_hw == "auto" || g_hw == "vulkan")) vk_set_external_provider(&vulkan_provider);
+	if (!g_hw.empty() && (g_hw == "auto" || g_hw == "vulkan")) {
+		vk_set_external_provider(&vulkan_provider);
+		set_converter_ffmpeg_vulkan(true); // and so does the converter, so that the source's frames are converted where they were decoded
+	}
 #endif
 }
 
@@ -470,6 +503,125 @@ bool vulkan_frame(const AVFrame* f, int device, VkDecodedFrame& out) {
 	out.device = device;
 	return true;
 }
+
+bool vulkan_picture(const AVFrame* hwf, int device, bool for_scorer, Picture& out) {
+	if (!hwf || hwf->format != AV_PIX_FMT_VULKAN || !hwf->hw_frames_ctx) return false;
+	const AVPixelFormat sw_fmt = ((AVHWFramesContext*)hwf->hw_frames_ctx->data)->sw_format;
+	const SemiPlanar* sp = semi_planar(sw_fmt);
+	const AVPixelFormat planar_fmt = sp ? sp->to : sw_fmt;
+	Fmt fmt;
+	if (!describe_native(planar_fmt, fmt) || !fmt.planar) return false;
+	auto vf = std::make_shared<VkDecodedFrame>();
+	if (!vulkan_frame(hwf, device, *vf)) {
+		if (for_scorer) return false;
+		*vf = VkDecodedFrame(); // the scorer cannot read it in place; it is still on the GPU for the converter
+		AVFrame* keep = av_frame_clone(hwf);
+		if (!keep) return false;
+		vf->keep = std::shared_ptr<void>(keep, [](void* a) { AVFrame* f = (AVFrame*)a; av_frame_free(&f); });
+		vf->device = device;
+	}
+	Picture p;
+	p.width = hwf->width; p.height = hwf->height;
+	p.fmt = fmt;
+	p.native = planar_fmt;
+	p.layout = layout_of(planar_fmt);
+	p.pts = hwf->pts;
+	p.duration = hwf->duration;
+	p.color = {(int)hwf->color_range, (int)hwf->colorspace, (int)hwf->color_primaries, (int)hwf->color_trc};
+	p.gpu = vf;
+	out = std::move(p);
+	return true;
+}
+
+const AVFrame* gpu_avframe(const Picture& p) { return p.gpu ? (const AVFrame*)((const VkDecodedFrame*)p.gpu.get())->keep.get() : nullptr; }
+
+AVBufferRef* ffmpeg_vulkan_device(int index, uint32_t vendor_id, uint32_t device_id) {
+	AVBufferRef* ref = shared_hw_device("vulkan", std::to_string(index));
+	if (!ref) return nullptr;
+	const AVVulkanDeviceContext* vk = (const AVVulkanDeviceContext*)((AVHWDeviceContext*)ref->data)->hwctx;
+	auto props = (PFN_vkGetPhysicalDeviceProperties)vk->get_proc_addr(vk->inst, "vkGetPhysicalDeviceProperties");
+	VkPhysicalDeviceProperties pp;
+	if (props) props(vk->phys_dev, &pp);
+	if (!props || pp.vendorID != vendor_id || pp.deviceID != device_id) av_buffer_unref(&ref); // FFmpeg counted the devices differently
+	return ref;
+}
+
+AVFrame* vulkan_upload(const AVFrame* f, int device, bool nv12, AVBufferRef*& frames) {
+	const bool high = f->format == AV_PIX_FMT_YUV420P10LE;
+	if (f->format != AV_PIX_FMT_YUV420P && !high) return nullptr;
+	const AVFrame* cpu = f;
+	AVFrame* inter = nullptr;
+	if (nv12) {
+		inter = av_frame_alloc();
+		inter->format = high ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
+		inter->width = f->width; inter->height = f->height;
+		if (av_frame_get_buffer(inter, 0) < 0) { av_frame_free(&inter); return nullptr; }
+		av_frame_copy_props(inter, f);
+		const int cw = (f->width + 1) / 2, ch = (f->height + 1) / 2;
+		for (int y = 0; y < f->height; y++) {
+			if (!high) memcpy(inter->data[0] + (size_t)y * inter->linesize[0], f->data[0] + (size_t)y * f->linesize[0], (size_t)f->width);
+			else for (int x = 0; x < f->width; x++) ((uint16_t*)(inter->data[0] + (size_t)y * inter->linesize[0]))[x] = (uint16_t)(((const uint16_t*)(f->data[0] + (size_t)y * f->linesize[0]))[x] << 6);
+		}
+		for (int y = 0; y < ch; y++) for (int x = 0; x < cw; x++) {
+			if (!high) {
+				inter->data[1][(size_t)y * inter->linesize[1] + 2 * x] = f->data[1][(size_t)y * f->linesize[1] + x];
+				inter->data[1][(size_t)y * inter->linesize[1] + 2 * x + 1] = f->data[2][(size_t)y * f->linesize[2] + x];
+			} else {
+				uint16_t* d = (uint16_t*)(inter->data[1] + (size_t)y * inter->linesize[1]);
+				d[2 * x] = (uint16_t)(((const uint16_t*)(f->data[1] + (size_t)y * f->linesize[1]))[x] << 6);
+				d[2 * x + 1] = (uint16_t)(((const uint16_t*)(f->data[2] + (size_t)y * f->linesize[2]))[x] << 6);
+			}
+		}
+		cpu = inter;
+	}
+	if (!frames) {
+		AVBufferRef* devref = shared_hw_device("vulkan", std::to_string(device));
+		if (!devref) { av_frame_free(&inter); return nullptr; }
+		frames = av_hwframe_ctx_alloc(devref);
+		av_buffer_unref(&devref);
+		AVHWFramesContext* fc = (AVHWFramesContext*)frames->data;
+		fc->format = AV_PIX_FMT_VULKAN;
+		fc->sw_format = (AVPixelFormat)cpu->format;
+		fc->width = cpu->width; fc->height = cpu->height;
+		if (av_hwframe_ctx_init(frames) < 0) { av_buffer_unref(&frames); av_frame_free(&inter); return nullptr; }
+	}
+	AVFrame* hwf = av_frame_alloc();
+	if (av_hwframe_get_buffer(frames, hwf, 0) < 0 || av_hwframe_transfer_data(hwf, cpu, 0) < 0) av_frame_free(&hwf);
+	else av_frame_copy_props(hwf, f);
+	av_frame_free(&inter);
+	return hwf;
+}
+#endif
+
+#ifndef VES_NO_VULKAN
+// Whether the source's Vulkan frames stay on the GPU: the converter has to be on FFmpeg's device, and the frames that are kept for readers that are
+// behind (up to about 128 of them) have to fit in a third of the GPU's memory; otherwise they are read back as they are decoded, as other devices' are.
+void source_on_gpu(FfSource& s, const std::string& path, const std::string& device) {
+	if (device.empty() || !converter_shares_ffmpeg_vulkan() || getenv("VES_HW_DECODE_TO_MEMORY")) return;
+	const int index = atoi(device.c_str());
+	uint64_t local = 0;
+	for (auto& d : vulkan_devices_fastest_first()) if (d.index == index) local = d.local_memory;
+	AVFormatContext* c = nullptr;
+	int64_t bytes = 0;
+	if (avformat_open_input(&c, path.c_str(), nullptr, nullptr) >= 0) {
+		if (avformat_find_stream_info(c, nullptr) >= 0) {
+			const int v = av_find_best_stream(c, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+			if (v >= 0) {
+				const AVCodecParameters* p = c->streams[v]->codecpar;
+				const AVPixFmtDescriptor* d = av_pix_fmt_desc_get((AVPixelFormat)p->format);
+				if (d) bytes = (int64_t)p->width * p->height * (d->comp[0].depth > 8 ? 2 : 1) * (1 + 2.0 / (1 << (d->log2_chroma_w + d->log2_chroma_h)));
+			}
+		}
+		avformat_close_input(&c);
+	}
+	if (!bytes || !local || (uint64_t)bytes * 128 > local / 3) {
+		static std::once_flag told;
+		std::call_once(told, [&] { fprintf(stderr, "the source's frames are read back from the GPU as they are decoded: kept there they would take too much of its memory\n"); });
+		return;
+	}
+	s.gpu_frames = true;
+	s.vk_index = index;
+}
 #endif
 
 std::unique_ptr<Source> open_source(const std::string& path) {
@@ -480,7 +632,14 @@ std::unique_ptr<Source> open_source(const std::string& path) {
 		want = g_hw;
 	}
 	if (!want.empty()) {
-		for (const auto& [type, device] : hw_choices(codec_id_of(path), want)) {
+		auto choices = hw_choices(codec_id_of(path), want);
+#ifndef VES_NO_VULKAN
+		// Vulkan first where its frames can stay on the GPU: the converter works on them there (on the same device), and only what the encoders need
+		// is read back.
+		if (converter_shares_ffmpeg_vulkan() && !getenv("VES_HW_DECODE_TO_MEMORY"))
+			std::stable_partition(choices.begin(), choices.end(), [](const HwChoice& c) { return c.type == "vulkan" && !c.device.empty(); });
+#endif
+		for (const auto& [type, device] : choices) {
 			const std::string key = path + "|" + type + "|" + device;
 			bool known = false, good = false;
 			{
@@ -496,6 +655,9 @@ std::unique_ptr<Source> open_source(const std::string& path) {
 				if (!good) continue;
 			}
 			auto s = std::make_unique<FfSource>();
+#ifndef VES_NO_VULKAN
+			if (type == "vulkan") source_on_gpu(*s, path, device);
+#endif
 			if (s->open(path, type, true, device)) return s;
 		}
 		static std::mutex once;
@@ -504,5 +666,14 @@ std::unique_ptr<Source> open_source(const std::string& path) {
 		if (!told[path]) { told[path] = true; fprintf(stderr, "hardware decoding is not available for '%s': decoding in software\n", path.c_str()); }
 	}
 	auto s = std::make_unique<FfSource>();
+#ifndef VES_NO_VULKAN
+	if (const char* t = getenv("VES_SOURCE_TEST_UPLOAD")) { // test: software frames go to Vulkan device 0 (VES_SOURCE_TEST_DEVICE=<n> for another), as if decoded there
+		s->test_upload = s->gpu_frames = true;
+		s->test_nv12 = strcmp(t, "nv12") == 0;
+		s->vk_index = getenv("VES_SOURCE_TEST_DEVICE") ? atoi(getenv("VES_SOURCE_TEST_DEVICE")) : 0;
+		static std::once_flag told;
+		std::call_once(told, [&] { fprintf(stderr, "test: the source's frames are uploaded to Vulkan device %d (%s) and converted there\n", s->vk_index, s->test_nv12 ? "NV12/P010" : "planar"); });
+	}
+#endif
 	return s->open(path, "", true) ? std::unique_ptr<Source>(std::move(s)) : nullptr;
 }
