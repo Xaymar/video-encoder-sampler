@@ -65,8 +65,14 @@ int restore(int o, int t, bool angle_flag, out int k_out, out int rst0) {
 // Decouple at band position o: the restored values x (h, v, d) and the additive impairment a, from the bands of the reference and the distorted
 // frame. k/r0: restore()'s k and unclamped value of the h band (VES_ADM_DUMP).
 void decouple(int o, int N, out int x[3], out int a[3], out bool angle, out int kh_out, out int r0h_out) {
-	const int oh = cur[RH * N + o], ov = cur[RV * N + o], od = cur[RD * N + o];
-	const int th = cur[DH * N + o], tv = cur[DV * N + o], td = cur[DD * N + o];
+	int oh, ov, od, th, tv, td;
+	if (pc.scale == 0) {
+		const int wh = cur[RH * N + o], wv = cur[RV * N + o], wd = cur[RD * N + o];
+		oh = sext16(wh); ov = sext16(wv); od = sext16(wd); th = wh >> 16; tv = wv >> 16; td = wd >> 16;
+	} else {
+		oh = cur[RH * N + o]; ov = cur[RV * N + o]; od = cur[RD * N + o];
+		th = cur[DH * N + o]; tv = cur[DV * N + o]; td = cur[DD * N + o];
+	}
 	const int64_t ot_dp = int64_t(oh) * int64_t(th) + int64_t(ov) * int64_t(tv);
 	const int64_t o_mag_sq = int64_t(oh) * int64_t(oh) + int64_t(ov) * int64_t(ov);
 	const int64_t t_mag_sq = int64_t(th) * int64_t(th) + int64_t(tv) * int64_t(tv);

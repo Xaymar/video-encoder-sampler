@@ -1,5 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 32) in;
 #include "speed_common.glsl"
 // One workgroup per plane: the 25 means of compute_covariance_matrix() with the scalar kernel (float sums in row order, one chain each, as on the

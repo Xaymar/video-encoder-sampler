@@ -753,9 +753,13 @@ private:
 			const int prev = (int)((index - stride) % 3);
 			const int pc[3] = {W, H, bpc};
 			vk.push(pc, sizeof pc);
-			vk.bind(my[k][prev][cur]); vk.dispatch(gx, gy); vk.barrier();
-			vk.bind(mx[k][prev][cur]); vk.dispatch(gx, gy); vk.barrier();
+			if (motion_fused) { vk.bind(mxy[k][prev][cur]); vk.dispatch(gx, gy); } // the two strides' passes side by side
+			else {
+				vk.bind(my[k][prev][cur]); vk.dispatch(gx, gy); vk.barrier();
+				vk.bind(mx[k][prev][cur]); vk.dispatch(gx, gy); vk.barrier();
+			}
 		}
+		if (motion_fused && (with_motion[0] || with_motion[1])) vk.barrier();
 		part_done(1);
 		auto groups = [](int a, int b) { return std::make_pair((uint32_t)((a + 15) / 16), (uint32_t)((b + 15) / 16)); };
 		if (!vif_egl.empty()) {
@@ -1071,7 +1075,8 @@ private:
 	bool need_stride[2] = {false, false};
 	uint32_t gx = 0, gy = 0;
 	Buf mfr[3], mtmp, mpart[2];
-	Pipe my[2][3][3], mx[2][3][3];
+	Pipe my[2][3][3], mx[2][3][3], mxy[2][3][3];
+	bool motion_fused = true; // motion_xy: both convolutions in one pass (up to 15 bits; VES_MOTION_SPLIT=1: motion_y and motion_x)
 	// vif: the subsampled planes once, the statistics for each enhancement gain limit
 	std::vector<double> vif_egl;
 	int vw[4], vh[4];
@@ -1098,6 +1103,9 @@ private:
 	CambiPC cpc{};
 	bool anti_dither = false;
 	Buf cidx, cfull, cdith, cmask0, cimg[5], cmask[5], ctmp, ctab;
+	Pipe cp_front;
+	bool cfront = false;
+	bool ccols = false; // cambi_cvalue_cols: column counts where a tile's values lie close together
 	Pipe cp_pre, cp_dither, cp_mask, cp_dec[5], cp_mode_h[5], cp_mode_v[5];
 	uint32_t cgroups[5] = {};
 	bool cslide = false; // c values by cambi_cslide
@@ -1217,7 +1225,7 @@ private:
 				for (int s = 0; s < 5; s++) {
 					sl.ccval[s] = vk.buffer((size_t)cg.sw[s] * cg.sh[s] * 4 + 16, 2);
 					sl.cpart[s] = vk.buffer((size_t)cgroups[s] * 16 + 16, 2);
-					sl.cp_cval[s] = vk.pipeline("cambi_cvalue", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab, &sl.cpart[s]});
+					sl.cp_cval[s] = vk.pipeline(ccols && !cslide ? "cambi_cvalue_cols" : "cambi_cvalue", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab, &sl.cpart[s]});
 					if (cslide) sl.cp_slide[s] = vk.pipeline("cambi_cslide", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab});
 				}
 			}
@@ -1227,15 +1235,24 @@ private:
 	void init_motion() {
 		gx = (W + 15) / 16; gy = (H + 15) / 16;
 		for (auto& b : mfr) b = vk.buffer(raw_size, 1);
-		mtmp = vk.buffer(ysize * 4, 1);
+		// motion_xy: 0.02 ms less on an RTX 4080 SUPER at 4K, 15% slower on an RDNA 2 iGPU (2026-11-18): not on AMD, unless VES_MOTION_SPLIT=0
+		uint32_t vendor = 0;
+		for (auto& d : vulkan_devices_fastest_first()) if (d.index == device_index) vendor = d.vendor_id;
+		motion_fused = vendor != 0x1002;
+		if (const char* e = getenv("VES_MOTION_SPLIT"); e && *e) motion_fused = atoi(e) == 0;
+		if (bpc > 15) motion_fused = false;
+		mtmp = vk.buffer(motion_fused ? 16 : ysize * 4, 1);
 		for (int k = 0; k < 2; k++) {
 			if (!need_stride[k]) continue;
 			mpart[k] = vk.buffer((size_t)gx * gy * 4, 1);
 			for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) {
 				if (a == b) continue;
 				std::vector<Buf*> bind{&mfr[a], &mfr[b], &mtmp, &mpart[k]};
-				my[k][a][b] = vk.pipeline("motion_y", bind);
-				mx[k][a][b] = vk.pipeline("motion_x", bind);
+				if (motion_fused) mxy[k][a][b] = vk.pipeline("motion_xy", bind);
+				else {
+					my[k][a][b] = vk.pipeline("motion_y", bind);
+					mx[k][a][b] = vk.pipeline("motion_x", bind);
+				}
 			}
 		}
 	}
@@ -1489,6 +1506,10 @@ private:
 				for (auto& d : vulkan_devices_fastest_first()) if (d.index == device_index) vendor = d.vendor_id;
 				cpc.lanes = vendor != 0x1002;
 				if (const char* e = getenv("VES_CAMBI_LANES"); e && *e) cpc.lanes = atoi(e) > 0;
+				// cambi_cvalue's column counts for tiles whose values lie close together: CAMBI 30% cheaper on an RTX 4080 SUPER, but cvalue 1.9x
+				// slower on an RDNA 2 iGPU (2026-11-18). Not on AMD, unless VES_CAMBI_COLS says
+				ccols = vendor != 0x1002;
+				if (const char* e = getenv("VES_CAMBI_COLS"); e && *e) ccols = atoi(e) > 0;
 			}
 			cpc.vlt_luma = vlt_luma(o.vlt, lr, pq);
 			const int v_lo = cpc.vlt_luma - 3 * nd + 1;
@@ -1512,6 +1533,10 @@ private:
 		cp_pre = vk.pipeline("cambi_pre", {&raw_dis, &cidx, &cfull});
 		if (anti_dither) cp_dither = vk.pipeline("cambi_dither", {&cfull, &cdith});
 		cp_mask = vk.pipeline("cambi_mask", {src, &cmask0});
+		// cambi_front: pre, mask and scale 0's decimation in one pass (no anti-dithering; VES_CAMBI_SPLIT_FRONT=1 keeps the passes)
+		cfront = !anti_dither;
+		if (const char* e = getenv("VES_CAMBI_SPLIT_FRONT"); e && atoi(e) > 0) cfront = false;
+		if (cfront) cp_front = cg.speedup ? vk.pipeline("cambi_front", {&raw_dis, &cidx, &cimg[0], &cmask[0]}) : vk.pipeline("cambi_front", {&raw_dis, &cidx, &cfull, &cmask0});
 		for (int s = 0; s < 5; s++) {
 			if (s > 0 || cg.speedup) {
 				Buf* pi = s == 0 ? src : &cimg[s - 1];
@@ -1530,16 +1555,24 @@ private:
 		pc.W = W; pc.H = H; pc.OW = ew; pc.OH = eh;
 		vk.push(&pc, sizeof pc);
 		auto g = groups(ew, eh);
-		vk.bind(cp_pre); vk.dispatch(g.first, g.second); vk.barrier();
+		if (cfront) {
+			CambiPC pf = pc;
+			pf.pad = cg.speedup ? cg.sw[0] : 0; pf.nd = cg.speedup ? cg.sh[0] : 0;
+			vk.push(&pf, sizeof pf);
+			vk.bind(cp_front); vk.dispatch(g.first, g.second); vk.barrier();
+		} else {
+			vk.bind(cp_pre); vk.dispatch(g.first, g.second); vk.barrier();
+			pc.W = ew; pc.H = eh;
+			vk.push(&pc, sizeof pc);
+			if (anti_dither) { vk.bind(cp_dither); vk.dispatch(g.first, g.second); vk.barrier(); }
+			vk.bind(cp_mask); vk.dispatch(g.first, g.second); vk.barrier();
+		}
 		pc.W = ew; pc.H = eh;
-		vk.push(&pc, sizeof pc);
-		if (anti_dither) { vk.bind(cp_dither); vk.dispatch(g.first, g.second); vk.barrier(); }
-		vk.bind(cp_mask); vk.dispatch(g.first, g.second); vk.barrier();
 		int pw = ew, ph = eh;
 		for (int s = 0; s < 5; s++) {
 			const int w = cg.sw[s], h = cg.sh[s];
 			g = groups(w, h);
-			if (s > 0 || cg.speedup) {
+			if (s > 0 || (cg.speedup && !cfront)) {
 				pc.W = pw; pc.H = ph; pc.OW = w; pc.OH = h;
 				vk.push(&pc, sizeof pc);
 				vk.bind(cp_dec[s]); vk.dispatch(g.first, g.second); vk.barrier();
