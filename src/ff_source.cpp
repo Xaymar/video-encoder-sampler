@@ -300,7 +300,7 @@ AVCodecID codec_id_of(const std::string& path) {
 }
 
 std::mutex g_mutex;
-std::string g_hw;                  // "", "auto" or a device type
+std::string g_hw;                  // "" (software only) or "vulkan"
 std::map<std::string, bool> g_verdict; // path|type|device -> identical to software
 unsigned g_vendor = 0;             // set_hw_decode_gpu(): decode on this GPU only
 int g_index = -1;
@@ -476,10 +476,18 @@ void set_hw_decode_gpu(unsigned vendor, int index) {
 
 void set_hw_decode(const std::string& type) {
 	std::lock_guard lock(g_mutex);
-	g_hw = type == "off" || type == "none" ? "" : type;
-#ifndef VES_NO_VULKAN
+	// Hardware decoding is Vulkan Video only: on or off. FFmpeg's other hwaccels decode wrongly on some GPUs (d3d12va on GPUs that need reference-only
+	// allocations, fixed after FFmpeg 9.0.1), and only Vulkan's frames stay on the GPU for the converter and the scorer. Older settings ("auto",
+	// "true", a device type or decoder name) mean on.
+	std::string t = type;
+	for (auto& c : t) c = (char)std::tolower((unsigned char)c);
+#ifdef VES_NO_VULKAN
+	g_hw.clear();
+	(void)t;
+#else
+	g_hw = t.empty() || t == "off" || t == "none" || t == "false" || t == "0" || t == "no" ? "" : "vulkan";
 	// Decoding on the GPU: the scorer uses FFmpeg's Vulkan device where it can, so that frames decoded there can be scored without leaving it.
-	if (!g_hw.empty() && (g_hw == "auto" || g_hw == "vulkan")) {
+	if (!g_hw.empty()) {
 		vk_set_external_provider(&vulkan_provider);
 		set_converter_ffmpeg_vulkan(true); // and so does the converter, so that the source's frames are converted where they were decoded
 	}

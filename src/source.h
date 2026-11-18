@@ -34,8 +34,8 @@ public:
 
 std::unique_ptr<Source> open_source(const std::string& path); // nullptr if it cannot be opened
 
-// Hardware decoding of the sources: "" or "off" for software only, "auto" for the first that works, or one device type ("cuda", "d3d11va",
-// "d3d12va", "dxva2", "qsv", "amf", "vaapi", "vulkan") or dedicated hardware decoder ("hevc_cuvid", "h264_qsv", ...). A source is only decoded by hardware after its first frames matched a software decode
+// Hardware decoding of the sources, with Vulkan Video only: "", "off" or "false" for software only, anything else ("on", "true", and from older
+// configs "auto" or a device type) for on. A source is only decoded by hardware after its first frames matched a software decode
 // exactly; otherwise it is decoded in software. The encoded streams that are scored follow the same setting, checked against software frame by
 // frame as they are decoded (see ff_decode.cpp).
 void set_hw_decode(const std::string& type);
