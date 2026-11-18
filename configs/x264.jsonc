@@ -7,7 +7,7 @@
 //   [P] common/base.c, x264_param_apply_profile(), which ves calls after the options
 //   [X] x264.c, the --fullhelp text
 // Option names are x264's command line names with _ for - (ves passes them to x264_param_parse), so any other x264 option works too.
-// ves runs x264 as single pass ABR at the scenario's bitrate; the explicit options here are applied after the preset and tune, so they win over both.
+// ves runs x264 as single pass CBR at the scenario's bitrate (ABR with vbv_maxrate and vbv_bufsize at the bitrate and filler on, like OBS); the explicit options here are applied after the preset and tune, so they win over both.
 // Every list is cut to a spread of its range: ves numbers the combinations with one 64-bit number, so all value lists multiplied (rules aside) must stay
 // below 9.2e18. Pruning tries the middle values only where the ends differ, so the ends of each range matter most.
 {

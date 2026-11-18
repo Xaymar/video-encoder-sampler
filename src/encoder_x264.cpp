@@ -1,7 +1,8 @@
 // Native x264 backend: drives libx264 directly, no libavcodec in between.
 // Options are x264's own long option names (bframes, ref, rc-lookahead, aq-mode, ...) applied with
 // x264_param_parse, so everything the x264 CLI accepts can be swept. "preset", "tune" and "profile"
-// are handled up front. Rate control is ABR at the target bitrate unless vbv-maxrate/vbv-bufsize are given.
+// are handled up front. Rate control is CBR at the target bitrate, set up the way OBS does it: ABR with the VBV's max rate and buffer at the
+// bitrate (a 1 second buffer) and filler data. vbv-maxrate, vbv-bufsize and filler override it.
 #include "encoder.h"
 #include "options.h"
 
@@ -72,6 +73,10 @@ public:
 		par.i_keyint_max = p.gop;
 		par.rc.i_rc_method = X264_RC_ABR;
 		par.rc.i_bitrate = (int)(p.bitrate / 1000);
+		// Plain ABR has no VBV, so it borrows bits at every scene cut and overshoots its target (12% on footage with jumps), where the other encoders run CBR.
+		par.rc.i_vbv_max_bitrate = par.rc.i_bitrate;
+		par.rc.i_vbv_buffer_size = par.rc.i_bitrate;
+		par.rc.b_filler = 1;
 		par.i_log_level = X264_LOG_WARNING;
 		if (color_full(p.color)) par.vui.b_fullrange = 1;
 		if (color_described(p.color)) { par.vui.i_colorprim = p.color.primaries; par.vui.i_transfer = p.color.trc; par.vui.i_colmatrix = p.color.space; }
