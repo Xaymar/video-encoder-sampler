@@ -753,9 +753,13 @@ private:
 			const int prev = (int)((index - stride) % 3);
 			const int pc[3] = {W, H, bpc};
 			vk.push(pc, sizeof pc);
-			vk.bind(my[k][prev][cur]); vk.dispatch(gx, gy); vk.barrier();
-			vk.bind(mx[k][prev][cur]); vk.dispatch(gx, gy); vk.barrier();
+			if (motion_fused) { vk.bind(mxy[k][prev][cur]); vk.dispatch(gx, gy); } // the two strides' passes side by side
+			else {
+				vk.bind(my[k][prev][cur]); vk.dispatch(gx, gy); vk.barrier();
+				vk.bind(mx[k][prev][cur]); vk.dispatch(gx, gy); vk.barrier();
+			}
 		}
+		if (motion_fused && (with_motion[0] || with_motion[1])) vk.barrier();
 		part_done(1);
 		auto groups = [](int a, int b) { return std::make_pair((uint32_t)((a + 15) / 16), (uint32_t)((b + 15) / 16)); };
 		if (!vif_egl.empty()) {
@@ -1071,7 +1075,8 @@ private:
 	bool need_stride[2] = {false, false};
 	uint32_t gx = 0, gy = 0;
 	Buf mfr[3], mtmp, mpart[2];
-	Pipe my[2][3][3], mx[2][3][3];
+	Pipe my[2][3][3], mx[2][3][3], mxy[2][3][3];
+	bool motion_fused = true; // motion_xy: both convolutions in one pass (up to 15 bits; VES_MOTION_SPLIT=1: motion_y and motion_x)
 	// vif: the subsampled planes once, the statistics for each enhancement gain limit
 	std::vector<double> vif_egl;
 	int vw[4], vh[4];
@@ -1229,15 +1234,19 @@ private:
 	void init_motion() {
 		gx = (W + 15) / 16; gy = (H + 15) / 16;
 		for (auto& b : mfr) b = vk.buffer(raw_size, 1);
-		mtmp = vk.buffer(ysize * 4, 1);
+		if (const char* e = getenv("VES_MOTION_SPLIT"); (e && atoi(e) > 0) || bpc > 15) motion_fused = false;
+		mtmp = vk.buffer(motion_fused ? 16 : ysize * 4, 1);
 		for (int k = 0; k < 2; k++) {
 			if (!need_stride[k]) continue;
 			mpart[k] = vk.buffer((size_t)gx * gy * 4, 1);
 			for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) {
 				if (a == b) continue;
 				std::vector<Buf*> bind{&mfr[a], &mfr[b], &mtmp, &mpart[k]};
-				my[k][a][b] = vk.pipeline("motion_y", bind);
-				mx[k][a][b] = vk.pipeline("motion_x", bind);
+				if (motion_fused) mxy[k][a][b] = vk.pipeline("motion_xy", bind);
+				else {
+					my[k][a][b] = vk.pipeline("motion_y", bind);
+					mx[k][a][b] = vk.pipeline("motion_x", bind);
+				}
 			}
 		}
 	}
