@@ -684,7 +684,9 @@ Paths
         --no-upload-videos  upload the results but not the encoded videos
         --no-skip-known     run everything, also runs the site already has (by default those are skipped and their results downloaded)
         --hw-decode <auto|off|name>  decode the sources on the GPU when their first frames match a software decode exactly (default: auto);
-                            a name is a device type (cuda, d3d11va, d3d12va, dxva2, qsv, amf, vaapi, vulkan) or a hardware decoder (hevc_cuvid, h264_qsv, ...)
+                            a name is a device type (cuda, d3d11va, d3d12va, dxva2, qsv, amf, vaapi, vulkan) or a hardware decoder (hevc_cuvid, h264_qsv, ...).
+                            The encoded streams that are scored too (device types only), each checked against software as it decodes: the first stream
+                            of a kind all the way, later ones on their first 30 frames (VES_HW_DECODE_VERIFY=<frames|all>); software takes over on a difference
         --decode-gpu <auto|own|n|name>  the GPU the sources are decoded on (default: auto, the fastest GPU: discrete first, then the most VRAM); own: the GPU
                             that encodes the run; n: Vulkan device n; name: the first device whose name contains it (--vmaf-gpu list shows them)
         --scaling-gpu <auto|own|n|name>  the GPU frames are scaled and converted on, the same way (default: auto). Beats "scaling": {"gpu"} of the

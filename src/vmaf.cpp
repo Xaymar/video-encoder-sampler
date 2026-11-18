@@ -307,7 +307,7 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 	score_clock = ScoreClock();
 	score_clock.began = std::chrono::steady_clock::now();
 	auto decoder = make_decoder();
-	if (!decoder->open(codec, extradata)) return false;
+	if (!decoder->open(codec, extradata, &enc)) return false;
 	long long m = 0;
 	bool flushed = false;
 	const FrameFeed next_dis = [&](Picture& d) -> int {
