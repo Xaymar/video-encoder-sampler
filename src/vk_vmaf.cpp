@@ -1105,6 +1105,7 @@ private:
 	Buf cidx, cfull, cdith, cmask0, cimg[5], cmask[5], ctmp, ctab;
 	Pipe cp_front;
 	bool cfront = false;
+	bool ccols = false; // cambi_cvalue_cols: column counts where a tile's values lie close together
 	Pipe cp_pre, cp_dither, cp_mask, cp_dec[5], cp_mode_h[5], cp_mode_v[5];
 	uint32_t cgroups[5] = {};
 	bool cslide = false; // c values by cambi_cslide
@@ -1224,7 +1225,7 @@ private:
 				for (int s = 0; s < 5; s++) {
 					sl.ccval[s] = vk.buffer((size_t)cg.sw[s] * cg.sh[s] * 4 + 16, 2);
 					sl.cpart[s] = vk.buffer((size_t)cgroups[s] * 16 + 16, 2);
-					sl.cp_cval[s] = vk.pipeline("cambi_cvalue", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab, &sl.cpart[s]});
+					sl.cp_cval[s] = vk.pipeline(ccols && !cslide ? "cambi_cvalue_cols" : "cambi_cvalue", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab, &sl.cpart[s]});
 					if (cslide) sl.cp_slide[s] = vk.pipeline("cambi_cslide", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab});
 				}
 			}
@@ -1234,7 +1235,12 @@ private:
 	void init_motion() {
 		gx = (W + 15) / 16; gy = (H + 15) / 16;
 		for (auto& b : mfr) b = vk.buffer(raw_size, 1);
-		if (const char* e = getenv("VES_MOTION_SPLIT"); (e && atoi(e) > 0) || bpc > 15) motion_fused = false;
+		// motion_xy: 0.02 ms less on an RTX 4080 SUPER at 4K, 15% slower on an RDNA 2 iGPU (2026-11-18): not on AMD, unless VES_MOTION_SPLIT=0
+		uint32_t vendor = 0;
+		for (auto& d : vulkan_devices_fastest_first()) if (d.index == device_index) vendor = d.vendor_id;
+		motion_fused = vendor != 0x1002;
+		if (const char* e = getenv("VES_MOTION_SPLIT"); e && *e) motion_fused = atoi(e) == 0;
+		if (bpc > 15) motion_fused = false;
 		mtmp = vk.buffer(motion_fused ? 16 : ysize * 4, 1);
 		for (int k = 0; k < 2; k++) {
 			if (!need_stride[k]) continue;
@@ -1502,9 +1508,8 @@ private:
 				if (const char* e = getenv("VES_CAMBI_LANES"); e && *e) cpc.lanes = atoi(e) > 0;
 				// cambi_cvalue's column counts for tiles whose values lie close together: CAMBI 30% cheaper on an RTX 4080 SUPER, but cvalue 1.9x
 				// slower on an RDNA 2 iGPU (2026-11-18). Not on AMD, unless VES_CAMBI_COLS says
-				bool cols = vendor != 0x1002;
-				if (const char* e = getenv("VES_CAMBI_COLS"); e && *e) cols = atoi(e) > 0;
-				if (!cols) cpc.lanes |= 2;
+				ccols = vendor != 0x1002;
+				if (const char* e = getenv("VES_CAMBI_COLS"); e && *e) ccols = atoi(e) > 0;
 			}
 			cpc.vlt_luma = vlt_luma(o.vlt, lr, pq);
 			const int v_lo = cpc.vlt_luma - 3 * nd + 1;

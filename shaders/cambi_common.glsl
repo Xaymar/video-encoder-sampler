@@ -9,7 +9,7 @@ layout(push_constant) uniform PC {
 	int nd;            // number of contrast steps (1 << max_log_contrast)
 	int vlt_luma;      // luma below which banding is not visible
 	int band_base, band_size; // the only values that can contribute
-	int lanes;         // cambi_cvalue: 1: count a window's rows in 8 bit lanes first (faster on NVIDIA, slower on RDNA 3); 2: no column counts
+	int lanes;         // cambi_cvalue: 1: count a window's rows in 8 bit lanes first (faster on NVIDIA, slower on RDNA 3)
 } pc;
 
 int mirror_idx(int i, int n) { return i < 0 ? -i : (i >= n ? 2 * n - i - 2 : i); }
