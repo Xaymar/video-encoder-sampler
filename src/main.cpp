@@ -692,9 +692,11 @@ Paths
                             Vulkan is tried first: its frames stay on the GPU, where the converter and the scorer use them on FFmpeg's own device
                             (VES_SHARED_VULKAN=0: they make their own devices; VES_HW_DECODE_TO_MEMORY=1: frames are read back as they are decoded).
                             Vulkan decodes only H.264, HEVC, AV1 and VP9 (the video engine), not FFmpeg's compute shader decoders (FFV1, ...).
-        --decode-gpu <auto|own|n|name>  the GPU the sources are decoded on (default: auto, the fastest GPU: discrete first, then the most VRAM); own: the GPU
-                            that encodes the run; n: Vulkan device n; name: the first device whose name contains it (--vmaf-gpu list shows them)
-        --scaling-gpu <auto|own|n|name>  the GPU frames are scaled and converted on, the same way (default: auto). Beats "scaling": {"gpu"} of the
+        --decode-gpu <auto|own|n|name>  the home GPU, which decodes the sources and the scored streams (default: auto, the fastest GPU: discrete first,
+                            then the most VRAM); own: the GPU that encodes the run; n: Vulkan device n; name: the first device whose name contains it
+                            (--vmaf-gpu list shows them). Converting and scoring follow it. A kind of stream it decodes wrongly goes to the next GPU
+                            that decodes it right, and to software last
+        --scaling-gpu <auto|own|n|name>  the GPU frames are scaled and converted on, the same way (default: auto, the home GPU). Beats "scaling": {"gpu"} of the
                             config; unlike that one it is this machine's choice and does not change which runs count as done
         --priority <low|normal>  low (default): idle CPU priority and the lowest disk priority, so ves never gets in the way of other programs; normal: the system default
         --decode-threads <n> threads per decoder (default: all cores; 4 with --low-memory)
@@ -713,7 +715,7 @@ Scoring
         --vmaf-threads <n>
         --vmaf-device <cpu|gpu|auto>  where VMAF is computed (default: cpu). gpu: on the GPU with Vulkan compute (8 and 10 bit input; v0 and v1 models; scores within 1e-9 of libvmaf's);
                             auto: the GPU where it can be used (8 or 10 bit YUV, a model file, a Vulkan GPU), else the CPU. These scores are kept apart from libvmaf's in the cache
-        --vmaf-gpu <auto|n|name>  the Vulkan device that scores (default: auto, the fastest GPU: discrete first, then the most VRAM); own: the GPU that encodes the run; n: Vulkan device n;
+        --vmaf-gpu <auto|n|name>  the Vulkan device that scores (default: auto, the home GPU, else the fastest: discrete first, then the most VRAM); own: the GPU that encodes the run; n: Vulkan device n;
                             name: the first device whose name contains it. --vmaf-gpu list shows the Vulkan devices
         --over-penalty <p>  VMAF points deducted per percent for a run just over the target bitrate (default: 0.025); it grows exponentially, like the website's
 

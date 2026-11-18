@@ -26,6 +26,10 @@ std::string vulkan_device_name(int index);
 std::vector<VkDeviceInfo> vulkan_devices_fastest_first();
 // The GPU behind Vulkan device `index` as gpu.h numbers it (vendor and the n-th adapter of that vendor), for decoding on it. False if it is none of them.
 bool gpu_of_vulkan_device(int index, unsigned& vendor, int& n);
+// The process's home GPU: the Vulkan device it decodes on (the reference and the scored streams). Converting and scoring go there too unless a
+// setting names another GPU, so that the frames stay on it. -1 while there is none (then each picks the fastest).
+void set_home_vulkan_device(int index);
+int home_vulkan_device();
 
 #ifndef VES_NO_VULKAN
 #define VK_NO_PROTOTYPES

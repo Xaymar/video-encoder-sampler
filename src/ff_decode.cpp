@@ -1,11 +1,13 @@
 // Decoder on top of libavcodec, for the encoded streams that are scored.
 //
 // The software decoder is the truth, but it is only used until a GPU has shown that it decodes a kind of stream (codec, size, bit depth, chroma) exactly
-// the same. With hardware decoding on (--hw-decode, on the GPU --decode-gpu picks), a stream of a kind that is not known yet is decoded by the GPU and
+// the same. With hardware decoding on (--hw-decode, on the home GPU --decode-gpu picks), a stream of a kind that is not known yet is decoded by the GPU and
 // in software side by side, all the way through, and the software frames are the ones handed out. When every frame matched, the GPU is truthful for
 // that kind: this is kept on disk (see save_verdict()), and from then on streams of that kind decode on the GPU alone, with no software decoder at all.
-// A difference (or the GPU giving fewer frames, a format we cannot use, an error) drops the GPU decoder and software carries on; that kind then stays
-// in software on that GPU. VES_HW_DECODE_VERIFY=<frames>|all compares known kinds as well, to look at a machine again.
+// A difference (or the GPU giving fewer frames, a format we cannot use, an error) drops the GPU decoder and software carries on with that stream; that
+// device is not used for that kind again. The next stream of that kind tries the home GPU's other device types, then the other GPUs (fastest first;
+// their frames are read back for the home GPU's scorer), and software only when none of them decodes it right. VES_HW_DECODE_VERIFY=<frames>|all
+// compares known kinds as well, to look at a machine again.
 // Only FFmpeg's own decoders on a hardware device (hwaccel) are used, not the dedicated ones (h264_cuvid, ...): they parse, reorder and crop
 // the stream with the same code as the software decoder, and only the reconstruction runs on the GPU. (AV1 is the exception: software is libdav1d,
 // the GPU gets FFmpeg's own AV1 decoder, which has no software path of its own; the check covers that as well.)
@@ -279,10 +281,11 @@ public:
 		// The first hardware decoder that opens and is not known to be bad for this kind of stream.
 		std::vector<HwChoice> choices = hw_decode_choices(id);
 		if (getenv("VES_HW_DECODE_TEST")) choices = {{"test", ""}};
-		const std::string where = "|" + hw_decode_gpu_identity() + "|lavc " + std::to_string(avcodec_version());
+		const std::string home = hw_decode_gpu_identity(), lavc = "|lavc " + std::to_string(avcodec_version());
 		bool good = false;
+		int rank = 0;
 		for (const HwChoice& c : choices) {
-			const std::string key = kind + "|" + c.type + "|" + c.device + where;
+			const std::string key = kind + "|" + c.type + "|" + c.device + "|" + (c.gpu.empty() ? home : c.gpu) + lavc; // each GPU's own verdicts
 			{
 				std::lock_guard lock(g_mutex);
 				load_verdicts();
@@ -297,7 +300,8 @@ public:
 			}
 			hw = std::move(d);
 			hw_key = key;
-			hw_name = c.type + (c.device.empty() ? "" : ", device " + c.device);
+			hw_name = c.type + (c.device.empty() ? "" : ", device " + c.device) + (c.rank ? " on " + c.gpu + ", not the home GPU" : "");
+			rank = c.rank;
 			if (c.type == "vulkan" && !c.device.empty()) hw->vk_device = atoi(c.device.c_str());
 #ifndef VES_NO_VULKAN
 			if (c.type == "test" && getenv("VES_HW_DECODE_TEST_UPLOAD")) { hw->test_upload = true; hw->vk_device = 0; }
@@ -312,7 +316,8 @@ public:
 		}
 		check = verify_frames();
 		if (good && check == 0) { // truthful for this kind already: the GPU alone, and Vulkan frames stay on it
-			hw->keep_on_gpu = hw->vk_device >= 0 && !getenv("VES_HW_DECODE_TO_MEMORY");
+			// (Another GPU's frames come back to memory as they are decoded: the scorer is on the home GPU.)
+			hw->keep_on_gpu = hw->vk_device >= 0 && rank == 0 && !getenv("VES_HW_DECODE_TO_MEMORY");
 			tell_once("gpu|" + hw_key, "scored streams: " + kind + " streams decode on the GPU (" + hw_name + "), which matched software on a whole stream of this kind before");
 			return true;
 		}

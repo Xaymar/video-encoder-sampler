@@ -694,7 +694,7 @@ bool run_wave(const std::string& input, const SourceInfo& planned, std::vector<W
 			const FrameFeed feed = [&g, reader, rp = run.score_rp](Picture& out) { return g.frames.next(reader, out, rp); };
 			const PacketFeed next_packet = [&pq, rp = run.score_rp](std::vector<uint8_t>& out) { return pq.pop(out, rp); };
 			const ShownFeed shown = [&fr](size_t k, uint32_t& v) { return fr.shown.get(k, v); };
-			VmafOptions run_vo = group_vo; // scoring follows the run's encoder to its GPU (vmaf.gpu "auto")
+			VmafOptions run_vo = group_vo; // scoring can follow the run's encoder to its GPU (vmaf.gpu "own")
 			run_vo.encoder_vendor = encoder_vendor(run.enc.encoder);
 			if (auto it = run.enc.plan->options.find("gpu"); it != run.enc.plan->options.end()) run_vo.encoder_gpu = atoi(it->second.c_str());
 			run.score_ok = vmaf_score(ref, feed, run.codec, next_packet, {}, run.enc.plan->enc, run.enc.plan->color, shown, g.fmt, run_vo, so, run.scores, run.score_rp, &run.detail);

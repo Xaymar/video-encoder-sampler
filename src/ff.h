@@ -51,9 +51,12 @@ void describe_difference(const Picture& a, const Picture& b, int frame);
 
 // Hardware decoding for streams that come as packets (the encoded streams that are scored): the device types to try for the codec, in order, with the
 // device in that type's terms, as --hw-decode and the decode GPU (set_hw_decode(), set_hw_decode_gpu()) say. Empty: software only.
-struct HwChoice { std::string type, device; };
+// The home GPU's choices come first (rank 0, Vulkan first among them), then those of the other GPUs, fastest first (rank 1, 2, ...): a kind of stream
+// the home GPU decodes wrongly is decoded on the next GPU that gets it right, and in software only when none does. `gpu`: that GPU with its driver
+// (as hw_decode_gpu_identity() says it), for the verdict keys; empty for a type's default device.
+struct HwChoice { std::string type, device, gpu; int rank = 0; };
 std::vector<HwChoice> hw_decode_choices(AVCodecID id);
-// The decode GPU with its driver ("<name> (driver <version>)"), for keys of what was found out about it.
+// The decode (home) GPU with its driver ("<name> (driver <version>)"), for keys of what was found out about it.
 std::string hw_decode_gpu_identity();
 // The hardware device of a type, made once per run and shared by every decoder; nullptr if it cannot be made. The caller gets a reference of its own.
 AVBufferRef* shared_hw_device(const std::string& type, const std::string& device);
