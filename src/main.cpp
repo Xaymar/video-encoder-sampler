@@ -60,9 +60,10 @@ namespace fs = std::filesystem;
 // Running under a CBR target is the encoder's own loss, so only overshoot is penalized.
 // Default slope: the 3000 -> 6000 kbps sweep gains roughly 2.5 VMAF over +100%, i.e. ~0.025 per percent.
 static double over_penalty = 0.025; // VMAF points per percent over target, for a hair over; it steepens from there
-// The same curve as the website's over_penalty(): slope * width * (e^(x / width) - 1) with x the percent over target (2% over loses 0.07, 10% 1.9, 20% 59), at most 100.
+// The same curve as the website's over_penalty(): slope * width * (e^(x / width) - 1) with x the percent over target (2% over loses 0.06, 10% 0.64, 12% 0.96, 20% 4.1, 30% 22), at most 100.
+// The width was 3 (12% over cost about 4 points) until x264's ABR, which overshoots at scene cuts, ranked below clearly worse encodes that hit the target.
 static double over_penalty_points(double kbps, double target) {
-	const double width = 3.0;
+	const double width = 6.0;
 	if (target <= 0 || kbps <= target) return 0;
 	return std::min(100.0, over_penalty * width * (std::exp((kbps / target - 1) * 100 / width) - 1));
 }
