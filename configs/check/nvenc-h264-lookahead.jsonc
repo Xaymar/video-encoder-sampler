@@ -34,7 +34,7 @@
 				// "level": ["auto"],   // a level only caps the DPB and the bitrate; auto picks one that fits
 				// "rate_control": ["cbr"],   // the default; "vbr" at the same average and peak bitrate is CBR with a looser buffer
 				"max_b_frames": [0, 1, 2, 3, 4],   // the GPU's NUM_MAX_BFRAMES caps it
-				"lookahead_frames": [0, 32],   // the ends of [0, 4, 8, 16, 32] for this slice
+				"lookahead_frames": [0, 28, 32],   // 0 off; deeper than 32 minus the B-frames changes nothing, see the rule [T 2026-11-18]
 				"lookahead_level": [0, 1, 2, 3],   // needs lookahead (NVIDIA's library aborts the process otherwise [T]); 15 = auto made the same stream as 3 every time [T 2026-11-18, RTX 4080 SUPER]
 				"disable_iadapt": [0, 1],   // adaptive I-frames at scene cuts: lookahead only [H][G 8.2]
 				"disable_badapt": [0, 1],   // adaptive B-frame count: lookahead and B-frames only [H][G 8.2]
@@ -160,6 +160,11 @@
 					],
 				},
 
+				// Lookahead deeper than 32 minus the B-frames made the same stream as that depth [T 2026-11-18] (see nvenc-h264.jsonc).
+				{
+					"if": { "op": ">", "left": { "option": "lookahead_frames" }, "right": 0 },
+					"require": { "op": "<=", "left": { "option": "lookahead_frames" }, "right": { "op": "-", "left": 32, "right": { "option": "max_b_frames" } } },
+				},
 				// Temporal filter: frameIntervalP >= 5 (4 B-frames in a row), not with zero reorder delay [H tfLevel], not with hierarchical P-frames [T].
 				{
 					"if": { "op": "==", "left": { "option": "tf_level" }, "right": 4 },
