@@ -85,9 +85,9 @@ Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::str
 	if (auto it = o.find("range"); it != o.end()) {
 		const std::string& v = it->second;
 		if (v == "source") pl.range = 0;
-		else if (v == "limited") pl.range = 1;
-		else if (v == "full") pl.range = 2;
-		else return ignore("range '" + v + "' is not source, limited or full");
+		else if (v == "limited" || v == "tv") pl.range = 1; // tv and pc: ffmpeg's names
+		else if (v == "full" || v == "pc") pl.range = 2;
+		else return ignore("range '" + v + "' is not source, limited (tv) or full (pc)");
 		o.erase(it);
 	}
 	pl.color = src.color;
