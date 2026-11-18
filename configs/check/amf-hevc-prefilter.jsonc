@@ -57,11 +57,12 @@
 				"pa_high_motion_quality_boost_mode": [""],   // fixed for this slice
 				"pa_scene_change_detection_enable": [""],   // fixed for this slice
 				"pa_scene_change_detection_sensitivity": [""],   // fixed for this slice
-				// Static scene detection codes static frames as skip frames and needs a lookahead [PA]. It is RDNA 4 only as far as we know, and it changed nothing on
-				// RDNA 2 and 3 [T] (the test clip has no static parts either), so it is left out. On RDNA 4, use these lines instead:
-				// "pa_static_scene_detection_enable": ["", 1],
-				// "pa_static_scene_detection_sensitivity": ["", 0, 1],   // 0 low, 1 medium, 2 high (default)
-				// "pa_max_qp_before_force_skip": ["", 20, 51],   // 0..51, default 35: static frames are skipped only below this QP [PA]
+				// Static scene detection codes static frames as skip frames and needs a lookahead [PA]. On the 9800X3D iGPU (RDNA 2, AMF 1.4.37) with the check clip's
+				// still segment it worked, but only with sensitivity 0 or 1: unset (2, high) made the same stream as off, and the max QP before force skip changed
+				// nothing [T on H.264 and HEVC].
+				"pa_static_scene_detection_enable": [""],   // fixed for this slice
+				"pa_static_scene_detection_sensitivity": [""],   // fixed for this slice
+				// "pa_max_qp_before_force_skip": ["", 20, 51],   // 0..51, default 35: static frames are skipped only below this QP [PA]; changed nothing [T]
 				"pa_activity_type": [""],   // fixed for this slice
 				"pa_frame_sad_enable": [""],   // fixed for this slice
 				"pa_long_term_reference_enable": [""],   // fixed for this slice
@@ -189,6 +190,11 @@
 				{
 					"if": { "op": "not", "value": { "op": "==", "left": { "option": "enable_pre_analysis" }, "right": 1 } },
 					"require": { "op": "not", "value": { "set": "max_ref_frames" } },
+				},
+				// Static scene detection only did something with sensitivity 0 or 1 [T].
+				{
+					"if": { "set": "pa_static_scene_detection_enable" },
+					"require": { "set": "pa_static_scene_detection_sensitivity" },
 				},
 				// The pre-filter settings need the pre-filter.
 				{
