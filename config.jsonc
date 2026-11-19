@@ -66,7 +66,8 @@
 		"downscaler": "ewa_lanczos",
 		// "gpu": "NVIDIA GeForce RTX 4080 SUPER",   // Vulkan GPU for scaling, by its exact name; left out, the GPU that decodes, else the fastest
 		// How the BT.709 family of transfer curves (bt709, smpte170m, bt2020-10/12, ...) is turned into linear light and back: "oetf" (the default,
-		// the exact BT.709 camera curve) or "bt1886" (display gamma 2.4). The standards leave it open.
+		// the exact BT.709 camera curve), "bt1886" (display gamma 2.4) or "srgb" (as browsers decode it: Chrome treats BT.709 as sRGB, so
+		// sRGB in and BT.709 out keeps the values as they are). The standards leave it open.
 		// "bt709_curve": "oetf",
 	},
 

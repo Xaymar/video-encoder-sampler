@@ -171,10 +171,11 @@ std::once_flag g_warn_space;
 // The curve a transfer tag is decoded/encoded with in the shaders (cv_common.glsl): unknown ones as BT.709 (YUV) or sRGB (RGB); the BT.709 family
 // by the bt709 curve setting.
 int curve_of(int trc, bool rgb, int bt709_curve) {
+	const int b709 = bt709_curve == 1886 ? 1886 : bt709_curve == 13 ? 13 : 1;
 	switch (trc) {
-	case 1: case 6: case 11: case 12: case 14: case 15: return bt709_curve == 1886 ? 1886 : 1;
+	case 1: case 6: case 11: case 12: case 14: case 15: return b709;
 	case 4: case 5: case 7: case 8: case 9: case 10: case 13: case 16: case 17: case 18: return trc;
-	default: return rgb ? 13 : (bt709_curve == 1886 ? 1886 : 1);
+	default: return rgb ? 13 : b709;
 	}
 }
 
@@ -191,9 +192,10 @@ std::atomic<bool> g_ffmpeg_vulkan{false};
 int bt709_curve_of(const std::string& name) {
 	if (name.empty() || name == "oetf" || name == "bt709") return 1;
 	if (name == "bt1886" || name == "display") return 1886;
+	if (name == "srgb") return 13; // as browsers decode it (Chrome treats BT.709 tags as sRGB)
 	return 0;
 }
-std::string bt709_curve_name(int curve) { return curve == 1886 ? "bt1886" : "oetf"; }
+std::string bt709_curve_name(int curve) { return curve == 1886 ? "bt1886" : curve == 13 ? "srgb" : "oetf"; }
 
 int trc_of(const std::string& name) {
 	if (name.empty() || name == "source") return 0;

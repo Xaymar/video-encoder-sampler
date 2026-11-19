@@ -532,7 +532,7 @@ static void load_config_json(const Json& root, Config& cfg) {
 		if (auto* g = v->find("gpu")) cfg.scale.device = g->text();
 		if (auto* c = v->find("bt709_curve")) {
 			cfg.scale.bt709_curve = bt709_curve_of(c->text());
-			if (!cfg.scale.bt709_curve) throw std::runtime_error(c->where() + "'bt709_curve' must be \"oetf\" or \"bt1886\"");
+			if (!cfg.scale.bt709_curve) throw std::runtime_error(c->where() + "'bt709_curve' must be \"oetf\", \"bt1886\" or \"srgb\"");
 		}
 	}
 	// These live in "settings"; older files have them at the top level, which still works.

@@ -10,7 +10,8 @@ struct ScaleOptions {
 	std::string device;                     // Vulkan GPU for scaling, by its exact name; empty: the home GPU, else the fastest
 	int trc = 0;                            // the output's transfer curve (H.273 number) when it differs from the source's; 0: as the source
 	int bt709_curve = 1;                    // how the BT.709 family of transfer tags (1, 6, 11, 12, 14, 15) is turned into linear light and back:
-	                                        // 1 the exact BT.709 camera curve ("oetf"), 1886 display gamma 2.4 ("bt1886"); see bt709_curve_of()
+	                                        // 1 the exact BT.709 camera curve ("oetf"), 1886 display gamma 2.4 ("bt1886"), 13 the sRGB curve as
+	                                        // browsers decode it ("srgb"); see bt709_curve_of()
 };
 
 // Scales and converts planar frames (YUV or GBR) to a planar YUV format. One frame in, one frame out in order; a converter
@@ -37,7 +38,7 @@ bool converter_works(const ScaleOptions& opt, std::string& why);
 void set_converter_ffmpeg_vulkan(bool on);
 bool converter_shares_ffmpeg_vulkan();
 
-// ScaleOptions::bt709_curve of a name ("oetf" or "bt709", "bt1886" or "display"; empty: the default, oetf); 0 for another name. And the name of one.
+// ScaleOptions::bt709_curve of a name ("oetf" or "bt709", "bt1886" or "display", "srgb"; empty: the default, oetf); 0 for another name. And the name of one.
 int bt709_curve_of(const std::string& name);
 std::string bt709_curve_name(int curve);
 // A transfer characteristic (the "trc" option) by its FFmpeg name ("bt709", "iec61966-2-1", "smpte2084", ...; "srgb" and "pq", "hlg" too) or
