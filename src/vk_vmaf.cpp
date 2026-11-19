@@ -697,6 +697,8 @@ public:
 		if (const char* e = getenv("VES_ADM_SPLIT_CM"); e && atoi(e) > 0) adm_split_cm = true;
 		if (const char* e = getenv("VES_ADM_DUMP"); e && *e) adm_dump = e;
 		if (!adm_dump.empty()) adm_split_cm = true; // the dump holds the bands decouple and csf write
+		if (const char* e = getenv("VES_ADM_SCALE_BY_SCALE"); e && atoi(e) > 0) adm_scales_together = false;
+		if (adm_split_cm || part_timing) adm_scales_together = false; // VES_SCORE_TIMING: the parts one after another
 		raw_size = (plane_bytes + 3) / 4 * 4 + 4;
 		// With the copies in on a queue of their own, each slot's frame stays in its own buffers (dev_ref/dev_dis), which the pipelines read in place
 		// of raw_ref/raw_dis (Vk::alias): no copy of the frame on the compute queue. Else they are copied into raw_ref/raw_dis.
@@ -1023,7 +1025,7 @@ private:
 			const int prev = (int)((index - stride) % 3);
 			const int pc[3] = {W, H, bpc};
 			R->push(pc, sizeof pc);
-			if (motion_fused) { R->bind(mxy[k][prev][cur]); R->dispatch(gx, gy); } // the two strides' passes side by side
+			if (motion_fused) { R->bind(mxy[k][prev][cur]); R->dispatch(mgx, mgy); } // the two strides' passes side by side
 			else {
 				R->bind(my[k][prev][cur]); R->dispatch(gx, gy); R->next();
 				R->bind(mx[k][prev][cur]); R->dispatch(gx, gy); R->next();
@@ -1056,62 +1058,81 @@ private:
 		}
 		part_done(2);
 		R = &r_adm;
-		if (!au.empty()) {
+		// adm_scale_dwt(s): the wavelets of scale s; adm_scale_den(s): its denominator; adm_scale_phase(s, 0): the masking passes of every unit, 1: their
+		// row sums (each with no barrier after it)
+		auto adm_scale_dwt = [&](int s) {
+			// the wavelets and the denominator, once
+			AdmPC pc = au[0].apc[s];
+			R->push(&pc, sizeof pc);
+			auto g = groups(bw[s], bh[s]);
+			if (adm_split_dwt) { // VES_ADM_SPLIT_DWT=1: the two passes through `tmp`, as before (for comparison)
+				R->bind(adwt_v[s]);
+				const auto gv = groups(sw[s], bh[s]);
+				R->dispatch(gv.first, gv.second); R->next();
+				R->bind(adwt_h[s]);
+			} else R->bind(adwt[s]);
+			R->dispatch(g.first, g.second); R->next();
+		};
+		auto adm_scale_den = [&](int s) {
+			AdmPC pc = au[0].apc[s];
+			AdmPC pd = pc;
+			if (s > 0) pd.shc0 = au[0].ah[s].den_cub;
+			R->push(&pd, sizeof pd);
+			R->bind(aden_p[s]); R->dispatch(1, pc.cb - pc.ct);
+		};
+		auto adm_scale_phase = [&](int s, int phase) {
+			for (size_t u = 0; u < au.size(); u++) {
+				AdmUnit& a = au[u];
+				AdmPC pu = a.apc[s];
+				pu.dbg = adm_tile_base[s] + (int)u * adm_tiles_s[s];
+				if (phase == 0) {
+					bool grouped = false; // adm_dcm_multi: the group's first unit dispatches for all of them
+					for (const AdmGroup& g : agroups) {
+						if (g.units.size() < 2 || std::find(g.units.begin(), g.units.end(), (int)u) == g.units.end()) continue;
+						grouped = true;
+						if (g.units[0] == (int)u) {
+							pu.dbg = (int)g.units.size();
+							R->push(&pu, sizeof pu);
+							R->bind(g.p[s]);
+							R->dispatch((uint32_t)((pu.ecol - pu.scol + 15) / 16), (uint32_t)((pu.erow - pu.srow + 15) / 16));
+						}
+					}
+					if (grouped) continue;
+					pu.aim = a.aim ? 1 : 0;
+					R->push(&pu, sizeof pu);
+					R->bind(a.dcm[s]);
+					R->dispatch((uint32_t)((pu.ecol - pu.scol + 15) / 16), (uint32_t)((pu.erow - pu.srow + 15) / 16));
+					continue;
+				}
+				const uint32_t rg = (uint32_t)((pu.erow - pu.srow + 63) / 64);
+				pu.aim = 0;
+				R->push(&pu, sizeof pu);
+				R->bind(a.cmsum[s]); R->dispatch(rg, 1);
+				if (a.aim) {
+					pu.aim = 1;
+					R->push(&pu, sizeof pu);
+					R->bind(a.aimsum[s]); R->dispatch(rg, 1);
+				}
+			}
+		};
+		if (!au.empty() && adm_scales_together) {
+			for (int s = 0; s < 4; s++) adm_scale_dwt(s);
+			for (int s = 0; s < 4; s++) { adm_scale_den(s); adm_scale_phase(s, 0); }
+			R->next();
+			for (int s = 0; s < 4; s++) adm_scale_phase(s, 1);
+			R->next();
+		} else if (!au.empty()) {
 			for (int s = 0; s < 4; s++) {
-				// the wavelets and the denominator, once
-				AdmPC pc = au[0].apc[s];
-				R->push(&pc, sizeof pc);
-				auto g = groups(bw[s], bh[s]);
-				if (adm_split_dwt) { // VES_ADM_SPLIT_DWT=1: the two passes through `tmp`, as before (for comparison)
-					R->bind(adwt_v[s]);
-					const auto gv = groups(sw[s], bh[s]);
-					R->dispatch(gv.first, gv.second); R->next();
-					R->bind(adwt_h[s]);
-				} else R->bind(adwt[s]);
-				R->dispatch(g.first, g.second); R->next();
-				AdmPC pd = pc;
-				if (s > 0) pd.shc0 = au[0].ah[s].den_cub;
-				R->push(&pd, sizeof pd);
-				R->bind(aden_p[s]); R->dispatch(1, pc.cb - pc.ct);
+				adm_scale_dwt(s);
+				adm_scale_den(s);
 				// then decouple, csf and masking with each set of options, unit 0 in place, the others on a copy of the bands
 				// adm_dcm: no copy of the bands, nothing written into them. Every unit's tiles go to its own part of tmp (pc.dbg: where), so the units'
 				// passes run side by side: all the masking passes, one barrier, all the row sums, one barrier.
 				for (int phase = 0; phase < 2 && !adm_split_cm; phase++) {
-					for (size_t u = 0; u < au.size(); u++) {
-						AdmUnit& a = au[u];
-						AdmPC pu = a.apc[s];
-						pu.dbg = (int)u * adm_tiles;
-						if (phase == 0) {
-							bool grouped = false; // adm_dcm_multi: the group's first unit dispatches for all of them
-							for (const AdmGroup& g : agroups) {
-								if (g.units.size() < 2 || std::find(g.units.begin(), g.units.end(), (int)u) == g.units.end()) continue;
-								grouped = true;
-								if (g.units[0] == (int)u) {
-									pu.dbg = (int)g.units.size();
-									R->push(&pu, sizeof pu);
-									R->bind(g.p[s]);
-									R->dispatch((uint32_t)((pu.ecol - pu.scol + 15) / 16), (uint32_t)((pu.erow - pu.srow + 15) / 16));
-								}
-							}
-							if (grouped) continue;
-							pu.aim = a.aim ? 1 : 0;
-							R->push(&pu, sizeof pu);
-							R->bind(a.dcm[s]);
-							R->dispatch((uint32_t)((pu.ecol - pu.scol + 15) / 16), (uint32_t)((pu.erow - pu.srow + 15) / 16));
-							continue;
-						}
-						const uint32_t rg = (uint32_t)((pu.erow - pu.srow + 63) / 64);
-						pu.aim = 0;
-						R->push(&pu, sizeof pu);
-						R->bind(a.cmsum[s]); R->dispatch(rg, 1);
-						if (a.aim) {
-							pu.aim = 1;
-							R->push(&pu, sizeof pu);
-							R->bind(a.aimsum[s]); R->dispatch(rg, 1);
-						}
-					}
+					adm_scale_phase(s, phase);
 					R->next();
 				}
+				auto g = groups(bw[s], bh[s]);
 				for (size_t u = 0; u < au.size() && adm_split_cm; u++) {
 					AdmUnit& a = au[u];
 					if (u > 0) {
@@ -1227,7 +1248,7 @@ private:
 			if (!with_motion[k]) continue;
 			const uint32_t* p = (const uint32_t*)sl.mpart[k].map;
 			uint64_t sum = 0;
-			for (uint32_t q = 0; q < gx * gy; q++) sum += p[q];
+			for (uint32_t q = 0; q < mgx * mgy; q++) sum += p[q];
 			sad_raw[k] = (double)sum / 256. / ((double)W * H);
 		}
 		std::vector<std::array<double, 4>> vif(vif_egl.size());
@@ -1380,6 +1401,8 @@ private:
 	// motion: the last three reference frames; stride 1 compares with the previous frame, stride 2 (the five-frame window) with the one before
 	bool need_stride[2] = {false, false};
 	uint32_t gx = 0, gy = 0;
+	uint32_t mgx = 0, mgy = 0; // the workgroups of the motion pass (motion_xy_wide: 64 x 16 outputs each, else 16 x 16), one sum each
+	bool motion_wide = true;   // motion_xy_wide in place of motion_xy (VES_MOTION_WIDE=0: motion_xy)
 	Buf mfr[3], mtmp, mpart[2];
 	Pipe my[2][3][3], mx[2][3][3], mxy[2][3][3];
 	bool use_waves = false; // see record(): VES_VMAF_WAVES=1 turns it on (2026-11-18, RTX 4080 SUPER: 13-18% slower at 4K, no gain at 1080p)
@@ -1397,6 +1420,10 @@ private:
 	std::vector<AdmUnit> au;
 	Buf acur[4], acopy[4], aden[4], atmp, adiv;
 	int adm_tiles = 0; // ints of tmp each ADM unit's adm_dcm tile sums take
+	int adm_tiles_s[4] = {}, adm_tile_base[4] = {}; // ... at each scale, and where the scale's start
+	// the four scales' wavelets first, then the denominator and masking passes of all of them side by side, one barrier, all the row sums, one
+	// barrier (else scale after scale: three barriers each). VES_ADM_SCALE_BY_SCALE=1: scale after scale
+	bool adm_scales_together = true;
 	// adm_dcm_multi: the units of one enhancement gain limit (all of them, usually) in one pass per scale, which reads and decouples the bands once
 	// (VES_ADM_MULTI=0: a pass per unit)
 	struct AdmGroup { std::vector<int> units; Buf tab[4]; Pipe p[4]; };
@@ -1419,7 +1446,10 @@ private:
 	Pipe cp_front;
 	bool cfront = false;
 	bool ccols = false; // cambi_cvalue_cols: column counts where a tile's values lie close together
-	Pipe cp_pre, cp_dither, cp_mask, cp_dec[5], cp_mode_h[5], cp_mode_v[5];
+	bool cp32 = false;  // cambi_cvalue_p32: windows up to 65 (half window 17 .. 32) from tiles in shared memory (VES_CAMBI_P32=0: from the buffers)
+	Pipe cp_pre, cp_dither, cp_mask, cp_dec[5], cp_mode_h[5], cp_mode_v[5], cp_dmode[5];
+	bool cval_serial = false; // the scales' cambi_cvalue passes each after the scale's mode filter, with barriers between (VES_CAMBI_SERIAL=1; and with cambi_cslide)
+	bool cdmode = true; // cambi_dmode: a scale's decimation and mode filter in one pass (VES_CAMBI_SPLIT_MODE=1: cambi_decimate + cambi_mode twice)
 	uint32_t cgroups[5] = {};
 	bool cslide = false; // c values by cambi_cslide
 	// speed: the chroma planes once, the decimation per unit
@@ -1541,7 +1571,7 @@ private:
 				for (int s = 0; s < 5; s++) {
 					sl.ccval[s] = vk.buffer((size_t)cg.sw[s] * cg.sh[s] * 4 + 16, 2);
 					sl.cpart[s] = vk.buffer((size_t)cgroups[s] * 16 + 16, 2);
-					sl.cp_cval[s] = vk.pipeline(ccols && !cslide ? "cambi_cvalue_cols" : "cambi_cvalue", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab, &sl.cpart[s]});
+					sl.cp_cval[s] = vk.pipeline(cslide ? "cambi_cvalue" : cp32 ? "cambi_cvalue_p32" : ccols ? "cambi_cvalue_cols" : "cambi_cvalue", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab, &sl.cpart[s]});
 					if (cslide) sl.cp_slide[s] = vk.pipeline("cambi_cslide", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab});
 				}
 			}
@@ -1557,14 +1587,18 @@ private:
 		motion_fused = vendor != 0x1002;
 		if (const char* e = getenv("VES_MOTION_SPLIT"); e && *e) motion_fused = atoi(e) == 0;
 		if (bpc > 15) motion_fused = false;
+		if (const char* e = getenv("VES_MOTION_WIDE"); e && *e) motion_wide = atoi(e) > 0;
+		motion_wide = motion_wide && motion_fused;
+		mgx = motion_wide ? (W + 63) / 64 : gx;
+		mgy = gy;
 		mtmp = vk.buffer(motion_fused ? 16 : ysize * 4, 1);
 		for (int k = 0; k < 2; k++) {
 			if (!need_stride[k]) continue;
-			mpart[k] = vk.buffer((size_t)gx * gy * 4, 1);
+			mpart[k] = vk.buffer((size_t)mgx * mgy * 4, 1);
 			for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) {
 				if (a == b) continue;
 				std::vector<Buf*> bind{&mfr[a], &mfr[b], &mtmp, &mpart[k]};
-				if (motion_fused) mxy[k][a][b] = vk.pipeline("motion_xy", bind);
+				if (motion_fused) mxy[k][a][b] = vk.pipeline(motion_wide ? "motion_xy_wide" : "motion_xy", bind);
 				else {
 					my[k][a][b] = vk.pipeline("motion_y", bind);
 					mx[k][a][b] = vk.pipeline("motion_x", bind);
@@ -1674,7 +1708,19 @@ private:
 		}
 		// tmp: the DWT's vertical pass (VES_ADM_SPLIT_DWT), or each ADM unit's adm_dcm tile sums (adm_tiles ints per unit, the most of any scale)
 		adm_tiles = 2 * bh[0] * ((bw[0] + 15) / 16) * 3 * 2;
-		atmp = vk.buffer(std::max<size_t>((size_t)4 * bh[0] * W, (size_t)adm_tiles * au.size()) * 4 + 16, 1);
+		// adm_scales_together: each scale's tile sums in a part of tmp of their own (the units' after one another in it), so that the scales'
+		// masking passes can run side by side
+		{
+			size_t at = 0;
+			for (int s = 0; s < 4; s++) {
+				adm_tiles_s[s] = 2 * bh[s] * ((bw[s] + 15) / 16) * 3 * 2;
+				adm_tile_base[s] = adm_scales_together ? (int)at : 0;
+				if (!adm_scales_together) adm_tiles_s[s] = adm_tiles;
+				at += (size_t)adm_tiles_s[s] * au.size();
+			}
+			if (!adm_scales_together) at = (size_t)adm_tiles * au.size();
+			atmp = vk.buffer(std::max<size_t>((size_t)4 * bh[0] * W, at) * 4 + 16, 1);
+		}
 		adiv = vk.buffer(65537 * 4, 0);
 		{
 			int32_t* d = (int32_t*)adiv.map;
@@ -1725,7 +1771,7 @@ private:
 					for (size_t k = 0; k < g.units.size(); k++) {
 						const AdmUnit& a = au[g.units[k]];
 						t[4 * k] = a.apc[s].rf0; t[4 * k + 1] = a.apc[s].rf1; t[4 * k + 2] = a.apc[s].rf2;
-						t[4 * k + 3] = (a.aim ? 1 : 0) | ((g.units[k] * adm_tiles) << 1);
+						t[4 * k + 3] = (a.aim ? 1 : 0) | ((adm_tile_base[s] + g.units[k] * adm_tiles_s[s]) << 1);
 					}
 					Buf* prev = &acur[s ? s - 1 : 0];
 					g.p[s] = vk.pipeline("adm_dcm_multi", {&acur[s], prev, &raw_ref, &raw_dis, &atmp, &adiv, &au[g.units[0]].cm[s], &aden[s], &g.tab[s]});
@@ -1852,6 +1898,9 @@ private:
 				ccols = vendor != 0x1002;
 				if (const char* e = getenv("VES_CAMBI_COLS"); e && *e) ccols = atoi(e) > 0;
 			}
+			// half windows of 17 .. 32 (65 at 4K) were read sample by sample from the buffers, twice each (mask, value): from an 80 x 80 tile instead
+			cp32 = cg.pad > 16 && cg.pad <= 32;
+			if (const char* e = getenv("VES_CAMBI_P32"); e && *e) cp32 = cp32 && atoi(e) > 0;
 			cpc.vlt_luma = vlt_luma(o.vlt, lr, pq);
 			const int v_lo = cpc.vlt_luma - 3 * nd + 1;
 			cpc.band_base = v_lo > 0 ? v_lo : 0;
@@ -1877,12 +1926,16 @@ private:
 		// cambi_front: pre, mask and scale 0's decimation in one pass (no anti-dithering; VES_CAMBI_SPLIT_FRONT=1 keeps the passes)
 		cfront = !anti_dither;
 		if (const char* e = getenv("VES_CAMBI_SPLIT_FRONT"); e && atoi(e) > 0) cfront = false;
+		if (const char* e = getenv("VES_CAMBI_SPLIT_MODE"); e && atoi(e) > 0) cdmode = false;
+		cval_serial = cslide || vk.pass_timing();
+		if (const char* e = getenv("VES_CAMBI_SERIAL"); e && *e) cval_serial = cval_serial || atoi(e) > 0;
 		if (cfront) cp_front = cg.speedup ? vk.pipeline("cambi_front", {&raw_dis, &cidx, &cimg[0], &cmask[0]}) : vk.pipeline("cambi_front", {&raw_dis, &cidx, &cfull, &cmask0});
 		for (int s = 0; s < 5; s++) {
 			if (s > 0 || cg.speedup) {
 				Buf* pi = s == 0 ? src : &cimg[s - 1];
 				Buf* pm = s == 0 ? &cmask0 : &cmask[s - 1];
 				cp_dec[s] = vk.pipeline("cambi_decimate", {pi, pm, &cimg[s], &cmask[s]});
+				if (cdmode) cp_dmode[s] = vk.pipeline("cambi_dmode", {pi, pm, &cimg[s], &cmask[s]});
 			}
 			cp_mode_h[s] = vk.pipeline("cambi_mode", {&cimg[s], &ctmp});
 			cp_mode_v[s] = cp_mode_h[s];
@@ -1913,19 +1966,29 @@ private:
 		for (int s = 0; s < 5; s++) {
 			const int w = cg.sw[s], h = cg.sh[s];
 			g = groups(w, h);
-			if (s > 0 || (cg.speedup && !cfront)) {
+			const bool dec = s > 0 || (cg.speedup && !cfront);
+			if (dec && cdmode) { // decimation and mode filter in one pass
 				pc.W = pw; pc.H = ph; pc.OW = w; pc.OH = h;
 				R.push(&pc, sizeof pc);
-				R.bind(cp_dec[s]); R.dispatch(g.first, g.second); R.next();
+				R.bind(cp_dmode[s]); R.dispatch(g.first, g.second); R.next();
+				pc.W = w; pc.H = h;
+			} else {
+				if (dec) {
+					pc.W = pw; pc.H = ph; pc.OW = w; pc.OH = h;
+					R.push(&pc, sizeof pc);
+					R.bind(cp_dec[s]); R.dispatch(g.first, g.second); R.next();
+				}
+				pc.W = w; pc.H = h; pc.OW = w; pc.OH = h;
+				pc.anti_dither = 0; // cambi_mode: the pass along the rows
+				R.push(&pc, sizeof pc);
+				R.bind(cp_mode_h[s]); R.dispatch(g.first, g.second); R.next();
+				pc.anti_dither = 1; // ... and along the columns
+				R.push(&pc, sizeof pc);
+				R.bind(cp_mode_v[s]); R.dispatch(g.first, g.second); R.next();
+				pc.anti_dither = cpc.anti_dither;
 			}
-			pc.W = w; pc.H = h; pc.OW = w; pc.OH = h;
-			pc.anti_dither = 0; // cambi_mode: the pass along the rows
-			R.push(&pc, sizeof pc);
-			R.bind(cp_mode_h[s]); R.dispatch(g.first, g.second); R.next();
-			pc.anti_dither = 1; // ... and along the columns
-			R.push(&pc, sizeof pc);
-			R.bind(cp_mode_v[s]); R.dispatch(g.first, g.second); R.next();
-			pc.anti_dither = cpc.anti_dither;
+			pw = w; ph = h;
+			if (!cval_serial) continue;
 			if (cslide) { // the c values with sliding counts, then cambi_cvalue only sums them
 				pc.OH = 128;
 				R.push(&pc, sizeof pc);
@@ -1934,8 +1997,19 @@ private:
 			}
 			R.push(&pc, sizeof pc);
 			R.bind(sl.cp_cval[s]); R.dispatch(g.first, g.second); R.next();
-			pw = w; ph = h;
 		}
+		if (cval_serial) return;
+		// The c values of the scales need nothing from each other (only the images of the scales, all made by now): their passes go one after
+		// another with no barrier between them, so the GPU runs them side by side (each pass of the small scales is mostly a workgroup's latency).
+		for (int s = 0; s < 5; s++) {
+			const int w = cg.sw[s], h = cg.sh[s];
+			g = groups(w, h);
+			pc.W = w; pc.H = h; pc.OW = w; pc.OH = h;
+			pc.anti_dither = cpc.anti_dither;
+			R.push(&pc, sizeof pc);
+			R.bind(sl.cp_cval[s]); R.dispatch(g.first, g.second);
+		}
+		R.next();
 	}
 
 	// cambi.c, cambi_score(): the mean of the largest topk of the c values of each scale, weighted by scale.
