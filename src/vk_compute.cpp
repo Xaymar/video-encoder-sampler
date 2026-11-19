@@ -310,6 +310,7 @@ struct Vk::Impl {
 	VkCommandBuffer xrec{}; // the one being recorded (second queue)
 	VkDescriptorPool dpool{};
 	std::vector<std::pair<VkBuffer, VkDeviceMemory>> owned;
+	std::vector<VkSemaphore> owned_sems; // timeline_semaphore()
 	uint64_t device_bytes = 0, host_bytes = 0;
 };
 
@@ -408,6 +409,7 @@ void Vk::release() {
 	if (impl->xpool) vkDestroyCommandPool(s.dev, impl->xpool, nullptr);
 	if (impl->dpool) vkDestroyDescriptorPool(s.dev, impl->dpool, nullptr);
 	for (auto& [b, m] : impl->owned) { vkDestroyBuffer(s.dev, b, nullptr); vkFreeMemory(s.dev, m, nullptr); }
+	for (VkSemaphore x : impl->owned_sems) vkDestroySemaphore(s.dev, x, nullptr);
 	delete impl;
 	impl = nullptr;
 }
@@ -563,6 +565,38 @@ void Vk::stamp(int slot, int which) {
 void Vk::copy(const Buf& src, const Buf& dst, VkDeviceSize size) {
 	VkBufferCopy c{0, 0, size ? size : std::min(src.size, dst.size)};
 	vkCmdCopyBuffer(impl->cmd, src.buf, dst.buf, 1, &c);
+}
+
+namespace {
+void record_rows(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize src_off, VkDeviceSize src_stride, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize row_bytes, uint32_t rows) {
+	if (src_stride == row_bytes || rows <= 1) {
+		VkBufferCopy c{src_off, dst_off, row_bytes * rows};
+		vkCmdCopyBuffer(cmd, src, dst, 1, &c);
+		return;
+	}
+	std::vector<VkBufferCopy> c(rows);
+	for (uint32_t r = 0; r < rows; r++) c[r] = {src_off + r * src_stride, dst_off + r * row_bytes, row_bytes};
+	vkCmdCopyBuffer(cmd, src, dst, rows, c.data());
+}
+} // namespace
+
+void Vk::copy_rows(VkBuffer src, VkDeviceSize src_off, VkDeviceSize src_stride, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize row_bytes, uint32_t rows) {
+	record_rows(impl->cmd, src, src_off, src_stride, dst, dst_off, row_bytes, rows);
+}
+void Vk::upload_copy_rows(VkBuffer src, VkDeviceSize src_off, VkDeviceSize src_stride, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize row_bytes, uint32_t rows) {
+	record_rows(impl->xrec, src, src_off, src_stride, dst, dst_off, row_bytes, rows);
+}
+
+VkSemaphore Vk::timeline_semaphore() {
+	VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+	ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+	ti.initialValue = 0;
+	VkSemaphoreCreateInfo ci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+	ci.pNext = &ti;
+	VkSemaphore x = VK_NULL_HANDLE;
+	chk(vkCreateSemaphore(impl->s->dev, &ci, nullptr, &x), "timeline semaphore");
+	impl->owned_sems.push_back(x);
+	return x;
 }
 
 void Vk::copy_range(const Buf& src, VkDeviceSize src_off, const Buf& dst, VkDeviceSize dst_off, VkDeviceSize size) {

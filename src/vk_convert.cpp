@@ -261,6 +261,51 @@ constexpr int IN_FLIGHT = 3;
 
 struct Planes { std::vector<uint8_t> mem[3]; }; // the memory of an output picture
 
+// Reads a buffer frame (VkDecodedFrame::buffer, the converter's output) into memory, as picture `p` (whose size, format, times and colour stay),
+// for a reader that cannot take it on the GPU. Through a Vk of its own per device (the converter's may be busy on another thread).
+bool download_buffer_frame(int device, const VkDecodedFrame& f, const Fmt& fmt, Picture& p) {
+	static std::mutex m;
+	static std::vector<std::pair<int, std::unique_ptr<Vk>>> vks;
+	std::lock_guard<std::mutex> g(m);
+	try {
+		Vk* vk = nullptr;
+		for (auto& [d, v] : vks) if (d == device) vk = v.get();
+		if (!vk) { vks.emplace_back(device, std::make_unique<Vk>(device, 1)); vk = vks.back().second.get(); }
+		VkDeviceSize size = 0, off[3];
+		for (int i = 0; i < 3; i++) { off[i] = size; size += ((VkDeviceSize)f.planes[i].w * f.planes[i].h * f.bytes + 3) / 4 * 4; }
+		static std::vector<std::pair<Vk*, Buf>> hosts; // host buffers to read into (a Vk keeps every buffer it made, so reuse what fits)
+		Buf* h = nullptr;
+		for (auto& [v, b] : hosts) if (v == vk && b.size >= size) h = &b;
+		if (!h) { hosts.emplace_back(vk, vk->buffer(size, 2)); h = &hosts.back().second; }
+		vk->begin(0);
+		vk->wait_timeline(0, f.buf_sem, f.buf_value);
+		for (int i = 0; i < 3; i++) {
+			const VkDeviceSize row = (VkDeviceSize)f.planes[i].w * f.bytes;
+			vk->copy_rows(f.buffer, f.buf_offset[i], row, h->buf, off[i], row, f.planes[i].h);
+		}
+		vk->barrier();
+		vk->submit(0);
+		vk->wait(0);
+		Picture o;
+		o.width = p.width; o.height = p.height; o.fmt = fmt; o.pts = p.pts; o.duration = p.duration; o.color = p.color;
+		auto planes = std::make_shared<Planes>();
+		for (int i = 0; i < 3; i++) {
+			const size_t row = (size_t)f.planes[i].w * f.bytes, n = row * f.planes[i].h;
+			planes->mem[i].resize(n);
+			memcpy(planes->mem[i].data(), (const uint8_t*)h->map + off[i], n);
+			o.data[i] = planes->mem[i].data();
+			o.stride[i] = (int)row;
+		}
+		o.owner = planes;
+		o.layout = layout_of(av_planar_format(fmt.chroma, fmt.depth));
+		p = std::move(o);
+		return true;
+	} catch (const std::exception& e) {
+		fprintf(stderr, "converter: reading a converted frame back: %s\n", e.what());
+		return false;
+	}
+}
+
 // One step of resampling a plane: positions and kernel stretch along both axes, and how to run it (see cv_resample.comp).
 struct Resample {
 	int in_w = 0, in_h = 0, out_w = 0, out_h = 0;
@@ -282,7 +327,14 @@ void axis(int in, int out, int log2_in, int log2_out, bool cosited, double& a, d
 }
 
 class VkConverter : public Converter {
-	std::unique_ptr<Vk> vk;
+	std::shared_ptr<Vk> vk; // shared with the buffer frames handed out (buf_out), which may outlive the converter
+	// buf_out: converted frames for the GPU scorer go out as buffer frames (VkDecodedFrame::buffer), from a pool of buffers that each comes back when
+	// its frame is let go; `tl` is signalled with each frame's number when its work is done
+	struct BufPool { std::mutex m; std::vector<Buf> free; VkDeviceSize size = 0; };
+	bool buf_out = false;
+	std::shared_ptr<BufPool> pool;
+	VkSemaphore tl = VK_NULL_HANDLE;
+	uint64_t tl_value = 0;
 	int device = -1;
 	bool gpu_out_wanted = false, gpu_out = false;
 	AVBufferRef* out_frames = nullptr;
@@ -740,15 +792,21 @@ public:
 		device = device_named(opt.device);
 		if (device < 0) { fprintf(stderr, "converter: no Vulkan GPU%s\n", opt.device.empty() ? "" : (" named '" + opt.device + "'").c_str()); return false; }
 		try {
-			vk = std::make_unique<Vk>(device, IN_FLIGHT);
+			vk = std::make_shared<Vk>(device, IN_FLIGHT);
 		} catch (const std::exception& e) {
 			fprintf(stderr, "converter: %s\n", e.what());
 			return false;
 		}
 		if (const char* t = getenv("VES_SCORE_TIMING"); t && atoi(t) >= 1) timing = true;
 		gpu_out = false;
+		buf_out = false;
 		const char* e = getenv("VES_CONVERT_TO_GPU");
-		if (gpu_out_wanted && vk->external() && !(e && atoi(e) == 0)) {
+		const char* eb = getenv("VES_CONVERT_TO_BUFFER");
+		if (gpu_out_wanted && vk->external() && !(e && atoi(e) == 0) && !(eb && atoi(eb) == 0)) {
+			try { tl = vk->timeline_semaphore(); } catch (const std::exception& x) { fprintf(stderr, "converter: %s\n", x.what()); return false; }
+			pool = std::make_shared<BufPool>();
+			buf_out = true;
+		} else if (gpu_out_wanted && vk->external() && !(e && atoi(e) == 0)) {
 			const AVPixelFormat sw = av_planar_format(outf.chroma, outf.depth);
 			AVBufferRef* dev = nullptr;
 			for (auto& d : vulkan_devices_fastest_first()) if (d.index == device) dev = ffmpeg_vulkan_device(d.index, d.vendor_id, d.device_id);
@@ -814,6 +872,7 @@ public:
 			void release() { if (f && f->unlock) f->unlock(f->ctx); f = nullptr; }
 			~FrameLock() { release(); }
 		};
+		std::shared_ptr<VkDecodedFrame> bf; // buf_out: the frame handed on
 		VkDecodedFrame o; // gpu_out: the frame the converted picture goes into (declared before its lock, which outlives the try block)
 		FrameLock in_lock, out_lock;
 		try {
@@ -851,7 +910,44 @@ public:
 			vk->barrier();
 			record_convert();
 			s.frame = nullptr;
-			if (gpu_out) {
+			if (buf_out) {
+				const int bytes = out_fmt.depth > 8 ? 2 : 1;
+				VkDeviceSize off[3], size = 0;
+				for (int i = 0; i < 3; i++) { off[i] = size; size += ((VkDeviceSize)out_plane_w(i) * out_plane_h(i) * bytes + 255) / 256 * 256; }
+				Buf b;
+				{
+					std::lock_guard<std::mutex> g(pool->m);
+					if (pool->size != size) { pool->free.clear(); pool->size = size; } // a new shape: the old ones stay with the Vk until it goes
+					if (!pool->free.empty()) { b = pool->free.back(); pool->free.pop_back(); }
+				}
+				if (!b.buf) b = vk->buffer(size, 1);
+				for (int i = 0; i < 3; i++)
+					vk->copy_rows(out.buf, out_off[i], out_stride[i], b.buf, off[i], (VkDeviceSize)out_plane_w(i) * bytes, (uint32_t)out_plane_h(i));
+				vk->signal_timeline(k, tl, ++tl_value);
+				bf = std::make_shared<VkDecodedFrame>();
+				bf->nplanes = 3;
+				bf->bytes = bytes;
+				for (int i = 0; i < 3; i++) { bf->planes[i].w = (uint32_t)out_plane_w(i); bf->planes[i].h = (uint32_t)out_plane_h(i); bf->buf_offset[i] = off[i]; }
+				bf->buffer = b.buf;
+				bf->buf_sem = tl;
+				bf->buf_value = tl_value;
+				bf->device = device;
+				struct Hold {
+					std::shared_ptr<Vk> vk; std::shared_ptr<BufPool> pool; Buf b; VkDeviceSize size;
+					~Hold() { std::lock_guard<std::mutex> g(pool->m); if (pool->size == size) pool->free.push_back(b); }
+				};
+				std::shared_ptr<Hold> hold(new Hold{vk, pool, b, size}); // (not make_shared(Hold{...}): the temporary's destructor would give the buffer back)
+				bf->keep = hold;
+				const int dev = device;
+				const Fmt f = out_fmt;
+				std::weak_ptr<VkDecodedFrame> self = bf;
+				bf->download = [dev, f, self](void* pic) {
+					auto me = self.lock();
+					return me && download_buffer_frame(dev, *me, f, *(Picture*)pic);
+				};
+				static std::once_flag told;
+				std::call_once(told, [&] { fprintf(stderr, "converter: converted frames go to the GPU scorer in buffers (%s), without copies into images\n", av_get_pix_fmt_name(av_planar_format(out_fmt.chroma, out_fmt.depth))); });
+			} else if (gpu_out) {
 				AVFrame* of = av_frame_alloc();
 				if (!of || av_hwframe_get_buffer(out_frames, of, 0) < 0 || !vulkan_frame(of, device, o) || o.nimages != 3) {
 					av_frame_free(&of);
@@ -892,7 +988,14 @@ public:
 		s.color = st.color_out;
 		order.push_back(k);
 		next_slot = (next_slot + 1) % IN_FLIGHT;
-		if (s.frame) { // on the GPU: hand it on now; whoever reads it waits for its semaphores, which the submitted work signals
+		if (bf) { // in a buffer: hand it on now; whoever reads it waits for `tl`
+			Picture o;
+			o.width = out_w; o.height = out_h; o.fmt = out_fmt; o.pts = s.pts; o.duration = s.duration; o.color = s.color;
+			o.layout = layout_of(av_planar_format(out_fmt.chroma, out_fmt.depth));
+			o.gpu = bf;
+			s.handed = true;
+			ready.push_back(std::move(o));
+		} else if (s.frame) { // on the GPU: hand it on now; whoever reads it waits for its semaphores, which the submitted work signals
 			Picture o;
 			s.frame->pts = s.pts;
 			s.frame->duration = s.duration;

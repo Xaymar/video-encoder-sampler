@@ -601,7 +601,11 @@ bool vulkan_picture(const AVFrame* hwf, int device, bool for_scorer, Picture& ou
 	return true;
 }
 
-const AVFrame* gpu_avframe(const Picture& p) { return p.gpu ? (const AVFrame*)((const VkDecodedFrame*)p.gpu.get())->keep.get() : nullptr; }
+const AVFrame* gpu_avframe(const Picture& p) {
+	if (!p.gpu) return nullptr;
+	const VkDecodedFrame* f = (const VkDecodedFrame*)p.gpu.get();
+	return f->buffer ? nullptr : (const AVFrame*)f->keep.get(); // a buffer frame (the converter's) is no FFmpeg frame
+}
 
 AVBufferRef* ffmpeg_vulkan_device(int index, uint32_t vendor_id, uint32_t device_id) {
 	AVBufferRef* ref = shared_hw_device("vulkan", std::to_string(index));
