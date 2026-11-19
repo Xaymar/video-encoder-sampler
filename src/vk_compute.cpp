@@ -576,7 +576,30 @@ void Vk::bind(const Pipe& p) {
 
 void Vk::push(const void* data, uint32_t size) { vkCmdPushConstants(impl->cmd, impl->s->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, size, data); }
 
+// VES_DEBUG_SKIP=<name>[,<name>...]: leaves out every dispatch of those shaders. Only to measure what a shader costs on the critical path: the scores
+// are wrong with it.
+static bool debug_skip(const char* name) {
+	static const std::vector<std::string> skip = [] {
+		std::vector<std::string> v;
+		if (const char* e = getenv("VES_DEBUG_SKIP")) {
+			std::string s = e;
+			for (size_t a = 0; a <= s.size();) {
+				size_t b = s.find(',', a);
+				if (b == std::string::npos) b = s.size();
+				if (b > a) v.push_back(s.substr(a, b - a));
+				a = b + 1;
+			}
+		}
+		return v;
+	}();
+	if (skip.empty() || !name) return false;
+	for (const std::string& n : skip)
+		if (n == name) return true;
+	return false;
+}
+
 void Vk::dispatch(uint32_t x, uint32_t y) {
+	if (debug_skip(impl->cur_name)) return;
 	vkCmdDispatch(impl->cmd, x, y, 1);
 	if (!impl->pass || impl->second || impl->cur_slot < 0) return;
 	Impl::Slot& sl = impl->slots[impl->cur_slot];
