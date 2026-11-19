@@ -629,6 +629,7 @@ public:
 		ysize = (size_t)W * H;
 		plane_bytes = ysize * bps;
 		if (const char* e = getenv("VES_SPEED_CHECK"); e && atoi(e) > 0) speed_check = true;
+		if (const char* e = getenv("VES_SPEED_CPU"); e && *e) speed_cpu = atoi(e) > 0;
 		if (const char* e = getenv("VES_VMAF_WAVES"); e && *e) use_waves = atoi(e) > 0;
 		if (const char* e = getenv("VES_SCORE_TIMING"); e && atoi(e) > 0) part_timing = true;
 		if (const char* e = getenv("VES_ADM_SPLIT_DWT"); e && atoi(e) > 0) adm_split_dwt = true;
@@ -1102,6 +1103,7 @@ private:
 			step(&SpeedUnit::scenter, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.subw * u.stpc.subh + 63) / 64); }, 4);
 			step(&SpeedUnit::scov, [](const SpeedUnit&) { return (uint32_t)((N_SPEED_PAIRS + 31) / 32); }, 4);
 			part_done(6);
+			if (speed_cpu) { part_done(7); return; } // the rest on the CPU (speed_cpu_scores()), from the slot's copies of scovm and sprep
 			step(&SpeedUnit::ssmall_p, [](const SpeedUnit&) { return 2u; }, 4); // eigenvalues and QR decomposition side by side
 			part_done(7);
 			step(&SpeedUnit::sblocks, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.nb + 63) / 64); }, 4);
@@ -1158,7 +1160,9 @@ private:
 			if (m.speed) {
 				const SpeedOpts& o = m.speed_o;
 				const int k = speed_of[i];
-				const float* fin = (const float*)sl.sfin[k].map; // U score, U failed, V score, V failed
+				float cpu_fin[4];
+				if (speed_cpu) speed_cpu_scores(sl, k, cpu_fin);
+				const float* fin = speed_cpu ? cpu_fin : (const float*)sl.sfin[k].map; // U score, U failed, V score, V failed
 				const float u = fin[0], v = fin[2];
 				const bool err_u = fin[1] != 0, err_v = fin[3] != 0;
 				if (speed_check) check_speed(sl, k, u, v, err_u, err_v);
@@ -1229,6 +1233,7 @@ private:
 		Buf mpart[2], aden[4];
 		std::vector<std::array<Buf, 4>> vpart, cm, aimb; // per VIF unit, per ADM unit (aimb: units with AIM)
 		std::vector<Buf> sfin, sout;                    // per SpEED unit: its scores; its decimated planes (only for VES_SPEED_CHECK)
+		std::vector<Buf> scov, sprep;                   // per SpEED unit, with VES_SPEED_CPU: its covariance matrices and centred planes
 		Buf ccval[5], cpart[5];
 		Pipe cp_cval[5], cp_slide[5];
 		std::vector<std::pair<const Buf*, Buf>> out; // the shared buffer the GPU wrote, the slot's copy
@@ -1251,6 +1256,10 @@ private:
 	bool part_timing = false;
 	// VES_SPEED_CHECK=1: SpEED is also worked out on the CPU (from the GPU's decimated planes, as before it all moved to the GPU) and compared
 	bool speed_check = false;
+	// VES_SPEED_CPU=1: SpEED's covariance matrices and centred planes come back from the GPU, and the rest of est_params() (eigenvalues, the QR
+	// decomposition and the linear systems, the entropies) and get_speed_score() run on the slot's thread, with libvmaf's own code (vmaf_speed.h):
+	// the serial eigenvalue and QR steps leave the GPU, which only has 8 workgroups to give them.
+	bool speed_cpu = false;
 	// SpEED on the device's second compute queue (Vk::second_compute()), beside the other features: its last steps are small and one after another, so
 	// on the main queue the GPU mostly waited on them. Not with VES_SCORE_TIMING, whose timestamps are on the main queue.
 	bool speed2 = false;
@@ -1416,7 +1425,10 @@ private:
 			}
 			for (auto& u : su) {
 				auto mirror2 = [&](const Buf& from) { Buf to = vk.buffer(from.size, 2); (speed2 ? sl.out2 : sl.out).emplace_back(&from, to); return to; };
-				sl.sfin.push_back(mirror2(u.sfin));
+				if (speed_cpu) {
+					sl.scov.push_back(mirror2(u.scovm));
+					sl.sprep.push_back(mirror2(u.sprep));
+				} else sl.sfin.push_back(mirror2(u.sfin));
 				if (speed_check) sl.sout.push_back(mirror2(u.sout));
 			}
 			if (cambi_on) {
@@ -1972,6 +1984,53 @@ private:
 		err = err_ref || err_dis;
 		if ((err_ref && !err_dis) || (!err_ref && err_dis)) return 0.0f;
 		return get_speed_score(s.dimensions, s.ref_results, s.dis_results, (float)o.sigma_nn, (float)o.nn_floor, o.weight_var_mode);
+	}
+
+	// VES_SPEED_CPU: what speed_small, speed_blocks and speed_score work out, here: est_params() from its step 2 on, for each plane, from the
+	// covariance matrix and the centred plane the GPU left in the slot (the same values est_params() works out in its step 1 and gets as `data`),
+	// then get_speed_score() for each pair. `fin`: U score, U failed, V score, V failed, as speed_score writes them.
+	void speed_cpu_scores(const Slot& sl, int k, float fin[4]) const {
+		using namespace vmaf_speed;
+		const SpeedUnit& u = su[k];
+		const SpeedOpts& o = u.o;
+		const auto& sd = u.sd;
+		const size_t E = sd.elements_in_block, nb = sd.num_blocks, n = (size_t)sd.operating_width * sd.operating_height;
+		const float* cov_all = (const float*)sl.scov[k].map;
+		const float* prep = (const float*)sl.sprep[k].map;
+		std::vector<float> independent(nb * E), solution(nb * E), cov(E * E), eig(E), tmp(5 * E * E + E * nb + 8 * E + 64);
+		std::vector<float> ent[4], var[4];
+		int err[4];
+		for (int p = 0; p < 4; p++) {
+			ent[p].assign(nb, 0.0f); var[p].assign(nb, 0.0f);
+			memcpy(cov.data(), cov_all + (size_t)p * E * E, E * E * sizeof(float));
+			const float* data = prep + (size_t)p * n;
+			const size_t stride_px = (size_t)sd.operating_width;
+			const float sigma_nn = (float)o.sigma_nn;
+			// est_params() from step 2 (vmaf_speed.h)
+			compute_eigenvalues(cov.data(), eig.data(), (int)E, tmp.data());
+			compute_independent_term(sd, data, independent.data(), stride_px);
+			int e = 0;
+			const bool regular = is_matrix_regular(sd, eig.data());
+			if (regular) e = solve_linear_system(cov.data(), (int)E, independent.data(), (int)nb, solution.data(), tmp.data());
+			const bool cannot_invert = !regular || e;
+			if (cannot_invert) memset(solution.data(), 0, E * nb * sizeof(float));
+			compute_pointwise_product_and_division(sd, solution.data(), independent.data(), (int)E);
+			sum_columns(sd, solution.data());
+			for (size_t i = 0; i < E; i++) {
+				const float L = eig[i] < 0 ? 0 : eig[i];
+				update_entropy(sd, ent[p].data(), solution.data(), L, sigma_nn);
+			}
+			memcpy(var[p].data(), solution.data(), nb * sizeof(float));
+			err[p] = cannot_invert ? 1 : 0;
+		}
+		for (int q = 0; q < 2; q++) {
+			SpeedResultBuffers r{}, d{};
+			r.entropies = ent[q].data(); r.variances = var[q].data();
+			d.entropies = ent[q + 2].data(); d.variances = var[q + 2].data();
+			const bool er = err[q] != 0, ed = err[q + 2] != 0;
+			fin[q * 2] = er != ed ? 0.0f : get_speed_score(sd, r, d, (float)o.sigma_nn, (float)o.nn_floor, o.weight_var_mode);
+			fin[q * 2 + 1] = er || ed ? 1.0f : 0.0f;
+		}
 	}
 };
 
