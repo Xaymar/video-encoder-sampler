@@ -20,6 +20,9 @@ public:
 	virtual bool open(const Picture& first, Rational time_base, int w, int h, Fmt out, const ScaleOptions& opt, int range = 0) = 0;
 	virtual bool push(const Picture* p) = 0; // nullptr flushes
 	virtual int pop(Picture& out) = 0;       // 1: frame produced, 0: nothing ready (or end of stream), <0: error
+	// Before open(): the converted frames may stay on the GPU (Picture::gpu, FFmpeg Vulkan frames) where the converter works on FFmpeg's device, for a
+	// consumer that takes them there (the GPU scorer) or reads them back itself (picture_to_memory()). VES_CONVERT_TO_GPU=0: never.
+	virtual void set_output_on_gpu(bool) {}
 };
 
 std::unique_ptr<Converter> make_converter(); // libplacebo, on the GPU through Vulkan

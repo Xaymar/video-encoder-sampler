@@ -130,6 +130,7 @@ struct SharedVulkan {
 	}
 	void give_back(const std::string& shape, pl_renderer r) { idle[shape].push_back(r); } // with `use` held
 	void* ffmpeg = nullptr; // the AVBufferRef of FFmpeg's Vulkan device when it is that one (import_ffmpeg())
+	int ffmpeg_index = -1;  // and its index (Vk::devices())
 	~SharedVulkan() {
 		for (auto& [shape, list] : idle) for (auto& r : list) pl_renderer_destroy(&r);
 		pl_vulkan_destroy(&vk);
@@ -202,6 +203,7 @@ pl_vulkan import_ffmpeg(SharedVulkan* s, const std::string& name) {
 		pl_vulkan vk = pl_vulkan_import(s->log, &ip);
 		if (!vk) { av_buffer_unref(&ref); return nullptr; }
 		s->ffmpeg = ref;
+		s->ffmpeg_index = d.index;
 		fprintf(stderr, "libplacebo: converting on FFmpeg's Vulkan device %d (%s), where its decoder's frames are\n", d.index, name.c_str());
 		return vk;
 	}
@@ -267,6 +269,10 @@ class PlConverter : public Converter {
 	int out_w = 0, out_h = 0;
 	Fmt out_fmt;
 	std::deque<Picture> ready;
+	bool gpu_out_wanted = false, gpu_out = false;
+#ifndef VES_NO_VULKAN
+	AVBufferRef* out_frames = nullptr; // with gpu_out: FFmpeg Vulkan frames on the shared device that the converted frames are rendered into
+#endif
 
 	// Waits for the oldest frame in flight (if `wait`; otherwise only takes it if it is done) and copies it out. 1: taken, 0: not done yet, -1: failed.
 	int take_oldest(bool wait) {
@@ -317,6 +323,9 @@ class PlConverter : public Converter {
 
 public:
 	~PlConverter() override {
+#ifndef VES_NO_VULKAN
+		av_buffer_unref(&out_frames); // the frames handed out keep their own references
+#endif
 		if (vk) {
 			std::lock_guard lock(dev->use);
 			for (auto& t : in_tex) pl_tex_destroy(vk->gpu, &t);
@@ -365,8 +374,94 @@ public:
 			for (auto& s : slots) if (!(s.dl[i] = pl_buf_create(vk->gpu, &bp))) { fprintf(stderr, "libplacebo: cannot create the download buffers\n"); return false; }
 		}
 		mapped_up = vk->gpu->limits.buf_transfer && vk->gpu->limits.max_mapped_size > 0;
+#ifndef VES_NO_VULKAN
+		gpu_out = false;
+		const char* e = getenv("VES_CONVERT_TO_GPU");
+		if (gpu_out_wanted && dev->ffmpeg && !(e && atoi(e) == 0)) {
+			const AVPixelFormat sw = planar_yuv(out);
+			AVBufferRef* fr = sw == AV_PIX_FMT_NONE ? nullptr : av_hwframe_ctx_alloc((AVBufferRef*)dev->ffmpeg);
+			if (fr) {
+				AVHWFramesContext* fc = (AVHWFramesContext*)fr->data;
+				fc->format = AV_PIX_FMT_VULKAN;
+				fc->sw_format = sw;
+				fc->width = w; fc->height = h;
+				fc->initial_pool_size = 0; // allocated as needed, reused once let go of
+				// One image per plane (R8/R16): what libplacebo renders into, and what the scorer copies straight from.
+				AVVulkanFramesContext* vfc = (AVVulkanFramesContext*)fc->hwctx;
+				vfc->flags = (AVVkFrameFlags)(vfc->flags | AV_VK_FRAME_FLAG_DISABLE_MULTIPLANE);
+				// libplacebo renders into them (a colour attachment); the scorer and picture_to_memory() copy out of them.
+				vfc->usage = (VkImageUsageFlagBits)(VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+				if (av_hwframe_ctx_init(fr) < 0) av_buffer_unref(&fr);
+			}
+			if (fr) { out_frames = fr; gpu_out = true; }
+			else fprintf(stderr, "libplacebo: cannot make Vulkan frames of %s on FFmpeg's device: the converted frames go through memory\n", sw == AV_PIX_FMT_NONE ? "this format" : av_get_pix_fmt_name(sw));
+		}
+#endif
 		return true;
 	}
+
+	void set_output_on_gpu(bool on) override { gpu_out_wanted = on; }
+
+#ifndef VES_NO_VULKAN
+	static AVPixelFormat planar_yuv(const Fmt& f) {
+		if (!f.planar || f.rgb) return AV_PIX_FMT_NONE;
+		const int c = f.chroma == 420 ? 0 : f.chroma == 422 ? 1 : f.chroma == 444 ? 2 : -1;
+		if (c < 0) return AV_PIX_FMT_NONE;
+		static const AVPixelFormat t[4][3] = {{AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV444P},
+		                                      {AV_PIX_FMT_YUV420P10, AV_PIX_FMT_YUV422P10, AV_PIX_FMT_YUV444P10},
+		                                      {AV_PIX_FMT_YUV420P12, AV_PIX_FMT_YUV422P12, AV_PIX_FMT_YUV444P12},
+		                                      {AV_PIX_FMT_YUV420P16, AV_PIX_FMT_YUV422P16, AV_PIX_FMT_YUV444P16}};
+		const int d = f.depth == 8 ? 0 : f.depth == 10 ? 1 : f.depth == 12 ? 2 : f.depth == 16 ? 3 : -1;
+		return d < 0 ? AV_PIX_FMT_NONE : t[d][c];
+	}
+
+	// With gpu_out: renders the frame into a new Vulkan frame of FFmpeg's device and hands it out as it is (Picture::gpu), without reading it back.
+	// Called with the device's lock held, after `image` was set up; `target` has the output's description (planes aside).
+	bool render_to_gpu(const Picture* p, const pl_frame& image, const pl_frame& target, const pl_render_params& rp) {
+		AVFrame* of = av_frame_alloc();
+		if (!of || av_hwframe_get_buffer(out_frames, of, 0) < 0) { av_frame_free(&of); fprintf(stderr, "libplacebo: cannot get a Vulkan frame for the converted picture\n"); return false; }
+		struct pl_frame t = {};
+		struct pl_avframe_params ap = {};
+		ap.frame = of;
+		if (!pl_map_avframe_ex(vk->gpu, &t, &ap)) { av_frame_free(&of); fprintf(stderr, "libplacebo: cannot map the Vulkan frame for the converted picture\n"); return false; }
+		bool ok = t.num_planes == 3; // pl_render_image() acquires and releases the frame itself (its acquire/release callbacks)
+		if (ok) {
+			for (int i = 0; i < 3; i++) { // the planes as they are, the description as for a frame read back
+				t.planes[i].components = 1;
+				t.planes[i].component_mapping[0] = target.planes[i].component_mapping[0];
+			}
+			t.repr = target.repr;
+			t.color = target.color;
+			t.crop = {};
+			if (out_fmt.chroma != 444) pl_frame_set_chroma_location(&t, PL_CHROMA_LEFT);
+			pl_renderer rr = dev->borrow(shape);
+			ok = rr && pl_render_image(rr, &image, &t, &rp);
+			if (rr) dev->give_back(shape, rr);
+			if (!ok) fprintf(stderr, "libplacebo: rendering failed\n");
+		}
+		pl_unmap_avframe(vk->gpu, &t);
+		pl_gpu_flush(vk->gpu);
+		if (!ok || lost()) { av_frame_free(&of); return false; }
+		of->pts = p->pts;
+		of->duration = p->duration;
+		Picture out;
+		ok = vulkan_picture(of, dev->ffmpeg_index, false, out);
+		av_frame_free(&of); // the picture holds its own reference
+		if (!ok) { fprintf(stderr, "libplacebo: the converted Vulkan frame cannot be handed on\n"); return false; }
+		out.width = out_w; out.height = out_h;
+		out.fmt = out_fmt;
+		out.pts = p->pts;
+		out.duration = p->duration;
+		out.color = p->color;
+		if (p->fmt.rgb) out.color.space = 1;
+		if (target_range) out.color.range = target_range;
+		else if (p->fmt.rgb) out.color.range = 1;
+		ready.push_back(std::move(out));
+		static std::once_flag told;
+		std::call_once(told, [&] { fprintf(stderr, "libplacebo: converted frames stay on the GPU (%s), without reading them back\n", av_get_pix_fmt_name(planar_yuv(out_fmt))); });
+		return true;
+	}
+#endif
 
 	// Rows of output plane i, 64 byte aligned.
 	size_t stride_of(int i) const { return ((size_t)plane_w(out_w, out_fmt.chroma, i) * (out_fmt.depth > 8 ? 2 : 1) + 63) & ~(size_t)63; }
@@ -561,6 +656,12 @@ public:
 		rp.upscaler = up;
 		rp.downscaler = down;
 		if (out_fmt.depth >= p->fmt.depth) rp.dither_params = nullptr; // only reducing the bit depth needs dithering, it would just add noise otherwise
+#ifndef VES_NO_VULKAN
+		if (gpu_out) {
+			// Frames already in flight to memory cannot be: gpu_out is set when the converter opens. Nothing to wait for here.
+			return render_to_gpu(p, image, target, rp);
+		}
+#endif
 		pl_renderer rr = dev->borrow(shape);
 		if (!rr) { fprintf(stderr, "libplacebo: cannot create a renderer\n"); lost(); return false; }
 		const bool rendered = pl_render_image(rr, &image, &target, &rp);
