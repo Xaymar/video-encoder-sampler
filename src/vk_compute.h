@@ -126,6 +126,8 @@ public:
 	Buf buffer(VkDeviceSize size, int kind);
 	// A compute pipeline from the embedded SPIR-V `name` (shared by all users), with a descriptor set of its own that points at `bindings` (binding i -> bindings[i]).
 	Pipe pipeline(const char* name, const std::vector<Buf*>& bindings);
+	// Gives a pipeline()'s descriptor sets back to the pool (the pipeline itself is shared and stays); no work that binds it may be in flight.
+	void release(Pipe& p);
 	// Makes `placeholder`, wherever a pipeline made after this binds it, stand for per_slot[slot] in the work of that slot (begin(slot)): so each
 	// frame in flight can read its own buffer, with no copy into one shared one.
 	void alias(const Buf& placeholder, const std::vector<const Buf*>& per_slot);

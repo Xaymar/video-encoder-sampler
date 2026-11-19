@@ -397,6 +397,7 @@ class VkConverter : public Converter {
 	// reused for the others (the buffers they bind stay while the setup does).
 	std::vector<Pipe> pipes;
 	size_t pipe_next = 0;
+	int setups = 0; // setup() calls (a new shape)
 	Pipe& pipe(const char* name, const std::vector<const Buf*>& b) {
 		if (pipe_next < pipes.size()) return pipes[pipe_next++];
 		std::vector<Buf*> bb;
@@ -485,12 +486,17 @@ class VkConverter : public Converter {
 
 	bool shape_changed(const Picture& p, bool gpu) const {
 		return !st.valid || p.width != in_w || p.height != in_h || p.fmt.rgb != st_rgb || p.fmt.depth != st_depth || gpu != st_gpu || p.color.space != st_color.space ||
-		       p.color.trc != st_color.trc || p.color.range != st_color.range || memcmp(&p.layout, &st_layout, sizeof st_layout) != 0;
+		       p.color.trc != st_color.trc || p.color.range != st_color.range || p.layout != st_layout;
 	}
 
 	// The setup for frames like `p` (its layout as it will be read: for frames from the GPU, the planes as copied out of their images).
 	bool setup(const Picture& p, const Layout& L, bool gpu) {
-		pipes.clear(); // their descriptor sets stay allocated until the converter ends; a new shape is rare
+		if (++setups == 3) { // a stream's frames all have one shape: a converter that keeps making new setups waits for its work every frame
+			static std::once_flag told;
+			std::call_once(told, [&] { fprintf(stderr, "converter: the frame shape keeps changing (%dx%d, %s); each change waits for the frames in flight\n", p.width, p.height, gpu ? "from the GPU" : "from memory"); });
+		}
+		for (auto& pp : pipes) vk->release(pp); // push() waited for the work in flight first; the pool would run out otherwise
+		pipes.clear();
 		pipe_next = 0;
 		st = Setup();
 		st.L = L;
@@ -875,6 +881,7 @@ public:
 		std::shared_ptr<VkDecodedFrame> bf; // buf_out: the frame handed on
 		VkDecodedFrame o; // gpu_out: the frame the converted picture goes into (declared before its lock, which outlives the try block)
 		FrameLock in_lock, out_lock;
+		bool recording = false; // begun and not yet submitted
 		try {
 			if (shape_changed(shape, gf != nullptr)) {
 				while (!order.empty()) if (take_oldest(true) < 0) return false; // the shared buffers change
@@ -882,6 +889,7 @@ public:
 			}
 			for (int pn = 0; pn < L.planes; pn++) cur_stride[pn] = plane_stride(shape, L, pn, gf != nullptr);
 			vk->begin(k);
+			recording = true;
 			if (timing) vk->stamp(k, 0);
 			vk->barrier(); // after everything before on the queue: the shared buffers are free
 			if (gf) {
@@ -973,11 +981,17 @@ public:
 				vk->barrier();
 			}
 			if (timing) vk->stamp(k, 1);
+			recording = false;
 			vk->submit(k);
 			out_lock.release();
 			in_lock.release();
 		} catch (const std::exception& e) {
 			fprintf(stderr, "converter: %s\n", e.what()); // a lost device has been reported (vk_compute.cpp's chk())
+			// The semaphore values of the frames were raised already: their other users (FFmpeg's decoder, freeing or reusing the frame, and the
+			// scorer) wait for them, forever if the work that signals them never goes in. So it goes in as far as it was recorded.
+			if (recording) {
+				try { vk->submit(k); vk->wait(k); } catch (const std::exception& e2) { fprintf(stderr, "converter: %s\n", e2.what()); }
+			}
 			return false;
 		}
 		static std::once_flag told;
