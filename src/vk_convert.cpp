@@ -386,8 +386,23 @@ class VkConverter : public Converter {
 	}
 
 	// Records one resample from `src` to `dst` (through T for separable filters).
+	// EWA weights once per phase (cv_ewa3, cv_resample_ewa) where the sample positions repeat exactly: steps and offsets in 1/256ths (exact in
+	// float), a period of up to 8 outputs, and the weights of every phase fit the shaders' table (1024). px = py = 0 otherwise.
+	static void phases(const Resample& r, double sx, double sy, int32_t& px, int32_t& py) {
+		px = py = 0;
+		static const bool off = [] { const char* e = getenv("VES_CONVERT_PHASES"); return e && atoi(e) == 0; }();
+		auto period = [](double a, double b) {
+			if (std::fabs(a * 256 - std::round(a * 256)) > 1e-12 || std::fabs(b * 256 - std::round(b * 256)) > 1e-12 || a * 256 >= 4096) return 0;
+			for (int q = 1; q <= 8; q++) if (std::fabs(a * q - std::round(a * q)) < 1e-12) return q;
+			return 0;
+		};
+		const int qx = period(r.ax, r.bx), qy = period(r.ay, r.by);
+		const int nx = (int)std::floor(2 * (float)sx) + 2, ny = (int)std::floor(2 * (float)sy) + 2;
+		if (!off && qx && qy && qx * qy * nx * ny <= 1024) { px = qx; py = qy; }
+	}
+
 	void resample(const Buf& src, const Buf& dst, const Resample& r) {
-		struct { int32_t in_w, in_h, out_w, out_h, mode, lut_n; float ax, bx, ay, by, fx, fy, radius; } pc;
+		struct { int32_t in_w, in_h, out_w, out_h, mode, lut_n; float ax, bx, ay, by, fx, fy, radius; int32_t px = 0, py = 0; } pc;
 		Buf& lut = lut_for(r.f);
 		pc.lut_n = LUT_N;
 		pc.radius = (float)r.f->radius;
@@ -399,6 +414,7 @@ class VkConverter : public Converter {
 			const double tw = std::ceil(r.ax * 15 + 2 * sx) + 3, th = std::ceil(r.ay * 15 + 2 * sy) + 3;
 			const bool tiled = tw * th <= 7168 && !getenv("VES_CONVERT_EWA_UNTILED");
 			Pipe& p = pipe(tiled ? "cv_resample_ewa" : "cv_resample", {&src, &dst, &lut});
+			if (tiled) phases(r, (float)sx, (float)sy, pc.px, pc.py);
 			pc.in_w = r.in_w; pc.in_h = r.in_h; pc.out_w = r.out_w; pc.out_h = r.out_h; pc.mode = 2;
 			vk->bind(p); vk->push(&pc, sizeof pc); dispatch_2d(r.out_w, r.out_h);
 			vk->barrier();
@@ -553,8 +569,12 @@ class VkConverter : public Converter {
 						float ax, bx, ay, by, fx, fy, radius;
 						int32_t rgb, trc_in, sig, trc_out, pre;
 						float kr_in, kb_in, kr_out, kb_out;
+						int32_t px, py;
 					} pc{in_w, in_h, out_w, out_h, LUT_N, (float)r.ax, (float)r.bx, (float)r.ay, (float)r.by, (float)fx, (float)fy, (float)r.f->radius,
-					     s.rgb ? 1 : 0, trc_in, sig ? 1 : 0, trc_out, pre, s.kr_in, s.kb_in, s.kr_out, s.kb_out};
+					     s.rgb ? 1 : 0, trc_in, sig ? 1 : 0, trc_out, pre, s.kr_in, s.kb_in, s.kr_out, s.kb_out, 0, 0};
+					// The weights once per phase where the sample positions repeat exactly: steps and offsets in 1/256ths (exact in float), a
+					// period of up to 8 outputs, and the weights of every phase fit the shader's table.
+					phases(r, sx, sy, pc.px, pc.py);
 					Buf& lut = lut_for(r.f);
 					Pipe& p = pipe("cv_ewa3", {Y, U, V, &C[0], &C[1], &C[2], &lut});
 					vk->bind(p); vk->push(&pc, sizeof pc); vk->dispatch(groups(out_w, 16), groups(out_h, 8));

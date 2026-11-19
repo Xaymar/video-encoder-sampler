@@ -8,10 +8,12 @@ const int TILE = 7168, LUT_MAX = 1025;
 layout(std430, binding = 0) readonly buffer Src { float src[]; };
 layout(std430, binding = 1) writeonly buffer Dst { float dst[]; };
 layout(std430, binding = 2) readonly buffer Lut { float lut[]; };
-layout(push_constant) uniform PC { int in_w, in_h, out_w, out_h, mode, lut_n; float ax, bx, ay, by, fx, fy, radius; } pc;
+layout(push_constant) uniform PC { int in_w, in_h, out_w, out_h, mode, lut_n; float ax, bx, ay, by, fx, fy, radius; int px, py; } pc; // px, py > 0: the weights once per phase, as in cv_ewa3.comp
 
 shared float tile[TILE];
 shared float slut[LUT_MAX];
+const int WMAX = 1024;
+shared float wt[WMAX];
 
 float kernel(float d) {
 	if (d >= pc.radius) return 0.0;
@@ -33,10 +35,39 @@ void main() {
 	}
 	for (int i = lid; i < pc.lut_n; i += 256) slut[i] = lut[i];
 	barrier();
+	const int nx = int(floor(2.0 * sx)) + 2, ny = int(floor(2.0 * sy)) + 2;
+	if (pc.px > 0) {
+		for (int i = lid; i < pc.px * pc.py * nx * ny; i += 256) {
+			const int ph = i / (nx * ny), t = i - ph * nx * ny, ty = t / nx, tx = t - ty * nx;
+			const int pj = ph % pc.px, pk = ph / pc.px;
+			const float u = pc.ax * float(pj) + pc.bx, v = pc.ay * float(pk) + pc.by;
+			const int x = int(ceil(u - sx)) + tx, y = int(ceil(v - sy)) + ty;
+			if (float(x) <= u + sx && float(y) <= v + sy) {
+				const float dx = (float(x) - u) / pc.fx, dy = (float(y) - v) / pc.fy;
+				wt[i] = kernel(sqrt(dx * dx + dy * dy));
+			}
+		}
+		barrier();
+	}
 	const int j = j0 + int(gl_LocalInvocationID.x), k = k0 + int(gl_LocalInvocationID.y);
 	if (j >= pc.out_w || k >= pc.out_h) return;
 	const float u = pc.ax * float(j) + pc.bx, v = pc.ay * float(k) + pc.by;
 	float sum = 0.0, wsum = 0.0;
+	if (pc.px > 0) {
+		const int wb = ((k % pc.py) * pc.px + j % pc.px) * nx * ny;
+		const int xs = int(ceil(u - sx)), ys = int(ceil(v - sy));
+		int cx = 0, cy = 0;
+		while (float(xs + cx) <= u + sx) cx++;
+		while (float(ys + cy) <= v + sy) cy++;
+		for (int ty = 0; ty < cy; ty++) {
+			const int row = (ys + ty - y0) * tw - x0 + xs, wr = wb + ty * nx;
+			for (int tx = 0; tx < cx; tx++) {
+				const float w = wt[wr + tx];
+				sum += w * tile[row + tx];
+				wsum += w;
+			}
+		}
+	} else
 	for (int y = int(ceil(v - sy)); float(y) <= v + sy; y++) {
 		const float dy = (float(y) - v) / pc.fy;
 		const int row = (y - y0) * tw - x0;
