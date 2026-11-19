@@ -335,6 +335,9 @@ class VkConverter : public Converter {
 	bool timing = false;
 	double gpu_sum = 0;
 	long long gpu_frames = 0;
+	// VES_SCORE_TIMING=2: GPU time per shader (the first one also holds the copy in), summed over the frames
+	std::vector<std::pair<std::string, double>> pass_sum;
+	std::vector<std::pair<const char*, double>> pass_now;
 	std::deque<int> order;
 	int next_slot = 0;
 	std::deque<Picture> ready;
@@ -633,7 +636,16 @@ class VkConverter : public Converter {
 			if (wait) vk->wait(k);
 			else if (!vk->done(k)) return 0;
 		} catch (const std::exception& e) { fprintf(stderr, "converter: %s\n", e.what()); return -1; }
-		if (timing) if (const double t = vk->gpu_seconds(k); t >= 0) { gpu_sum += t; gpu_frames++; }
+		if (timing) if (const double t = vk->gpu_seconds(k); t >= 0) {
+			gpu_sum += t; gpu_frames++;
+			if (vk->pass_timing()) {
+				vk->pass_seconds(k, pass_now);
+				for (auto& [n, sec] : pass_now) {
+					auto it = std::find_if(pass_sum.begin(), pass_sum.end(), [&](auto& e) { return e.first == n; });
+					if (it == pass_sum.end()) pass_sum.emplace_back(n, sec); else it->second += sec;
+				}
+			}
+		}
 		if (s.handed) { // the picture went on at submit
 			s.keep_in.reset();
 			s.handed = false;
@@ -686,7 +698,12 @@ public:
 
 	~VkConverter() override {
 		if (vk) for (int i = 0; i < IN_FLIGHT; i++) if (slots[i].pending) { try { vk->wait(i); } catch (...) {} }
-		if (timing && gpu_frames) fprintf(stderr, "converter timing: %lld frames, GPU %.3f ms per frame (%dx%d -> %dx%d)\n", gpu_frames, gpu_sum * 1e3 / (double)gpu_frames, in_w, in_h, out_w, out_h);
+		if (timing && gpu_frames) {
+			fprintf(stderr, "converter timing: %lld frames, GPU %.3f ms per frame (%dx%d -> %dx%d)\n", gpu_frames, gpu_sum * 1e3 / (double)gpu_frames, in_w, in_h, out_w, out_h);
+			double in_passes = 0;
+			for (auto& [n, sec] : pass_sum) { fprintf(stderr, "converter timing:   %s %.3f ms\n", n.c_str(), sec * 1e3 / (double)gpu_frames); in_passes += sec; }
+			if (!pass_sum.empty()) fprintf(stderr, "converter timing:   after the last shader (copies out) %.3f ms\n", (gpu_sum - in_passes) * 1e3 / (double)gpu_frames);
+		}
 		for (auto& s : slots) av_frame_free(&s.frame);
 		av_buffer_unref(&out_frames);
 	}
