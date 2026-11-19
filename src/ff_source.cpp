@@ -405,7 +405,17 @@ AVBufferRef* shared_hw_device(const std::string& type, const std::string& device
 	if (t == AV_HWDEVICE_TYPE_NONE) return nullptr;
 	std::lock_guard lock(devices_mutex);
 	AVBufferRef*& shared = devices[type + "|" + device];
-	if (!shared && av_hwdevice_ctx_create(&shared, t, device.empty() ? nullptr : device.c_str(), nullptr, 0) < 0) shared = nullptr;
+	AVDictionary* opts = nullptr;
+#ifdef _WIN32
+	// AMF takes frames from FFmpeg's Vulkan device (AMFContext1::InitVulkan) only when the device has what AMF asks for, VK_KHR_swapchain among them
+	// (GetVulkanDeviceExtensions()), which FFmpeg does not turn on by itself. Extensions a driver lacks are left out by FFmpeg (with a warning).
+	if (t == AV_HWDEVICE_TYPE_VULKAN) {
+		av_dict_set(&opts, "instance_extensions", "VK_KHR_surface+VK_KHR_win32_surface", 0);
+		av_dict_set(&opts, "device_extensions", "VK_KHR_swapchain+VK_KHR_external_memory_win32+VK_KHR_external_semaphore_win32", 0);
+	}
+#endif
+	if (!shared && av_hwdevice_ctx_create(&shared, t, device.empty() ? nullptr : device.c_str(), opts, 0) < 0) shared = nullptr;
+	av_dict_free(&opts);
 	return shared ? av_buffer_ref(shared) : nullptr;
 }
 
