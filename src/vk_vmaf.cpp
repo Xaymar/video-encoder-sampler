@@ -701,6 +701,8 @@ public:
 		// With the copies in on a queue of their own, each slot's frame stays in its own buffers (dev_ref/dev_dis), which the pipelines read in place
 		// of raw_ref/raw_dis (Vk::alias): no copy of the frame on the compute queue. Else they are copied into raw_ref/raw_dis.
 		alias_raw = vk.async_upload();
+		images_async = vk.async_upload();
+		if (const char* e = getenv("VES_VMAF_ASYNC_IMAGES"); e && *e) images_async = images_async && atoi(e) > 0;
 		if (const char* e = getenv("VES_VMAF_COPY_FRAMES"); e && atoi(e) > 0) alias_raw = false;
 		if (const char* e = getenv("VES_VMAF_ALIAS_FRAMES"); e && atoi(e) > 0) alias_raw = true; // also without the queue (for testing)
 		raw_ref = vk.buffer(alias_raw ? 16 : raw_size, 1);
@@ -801,24 +803,29 @@ public:
 				put(sl.in_chroma[3].map, dis[2], dis_stride[2], cw, ch);
 			}
 		}
-		if (vk.async_upload() && (!rf || !df)) {
-			vk.upload_begin(k);
-			if (!rf) vk.upload_copy(sl.in_ref, sl.dev_ref);
-			if (!df) vk.upload_copy(sl.in_dis, sl.dev_dis);
-			if (!su.empty()) for (int p = 0; p < 4; p++) if (p < 2 ? !rf : !df) vk.upload_copy(sl.in_chroma[p], sl.dev_chroma[p]);
-			vk.upload_submit(k, speed2);
-		}
 		sl.held[0] = rf ? rf->keep : nullptr;
 		sl.held[1] = df ? df->keep : nullptr;
 		gpu_in[0] = rf;
 		gpu_in[1] = df;
-		// Each frame's lock is held while its images are read into the command buffer (once where both are guarded by the same one).
+		// Each frame's lock is held while its images are read into a command buffer and submitted (once where both are guarded by the same one).
 		const bool same_lock = rf && df && rf->lock_domain && rf->lock_domain == df->lock_domain;
 		auto lock = [&](const VkDecodedFrame* f) { if (f && f->lock) f->lock(f->ctx); };
 		auto unlock = [&](const VkDecodedFrame* f) { if (f && f->unlock) f->unlock(f->ctx); };
 		lock(rf);
 		if (!same_lock) lock(df);
 		try {
+			// The frames in memory, and those on the GPU (images_async), into VRAM on the copies' queue, beside the compute work on the frames before.
+			if (vk.async_upload() && (!rf || !df || images_async)) {
+				vk.upload_begin(k);
+				if (!rf) vk.upload_copy(sl.in_ref, sl.dev_ref);
+				if (!df) vk.upload_copy(sl.in_dis, sl.dev_dis);
+				if (!su.empty()) for (int p = 0; p < 4; p++) if (p < 2 ? !rf : !df) vk.upload_copy(sl.in_chroma[p], sl.dev_chroma[p]);
+				if (images_async) {
+					if (rf) copy_decoded(k, *rf, 0, true);
+					if (df) copy_decoded(k, *df, 1, true);
+				}
+				vk.upload_submit(k, speed2);
+			}
 			record(k, index);
 		} catch (...) {
 			gpu_in[0] = gpu_in[1] = nullptr;
@@ -868,51 +875,88 @@ public:
 
 private:
 	const VkDecodedFrame* gpu_in[2] = {}; // submit_frames(): the reference and the distorted frame record() starts with, where they are on the GPU
+	// Frames on the GPU are copied out of their images on the copies' queue (Vk::async_upload()), beside the compute work, not at the start of the
+	// slot's work on the compute queue. VES_VMAF_ASYNC_IMAGES=0: on the compute queue.
+	bool images_async = false;
 
 	// The planes of a frame on the GPU (`side` 0: the reference, 1: the distorted frame) out of its images, into the buffers that its upload would
 	// have filled (the slot's own in VRAM with the copies on their own queue, else the ones in system memory, which record() copies on from): exact,
 	// the samples are only moved (and shifted down). Planes that already hold the samples as the scorer takes them (one plane each, the scorer's
 	// sample size, not shifted: NV12's luma, or the planar frames a converter makes) are copied straight in.
 	void read_decoded(int slot, const VkDecodedFrame& f, int side) {
+		if (!images_async) copy_decoded(slot, f, side, false);
+		unpack_decoded(slot, f, side);
+	}
+
+	// The planes of a decoded frame: whether they are copied straight into the scorer's buffers (y: luma, c: chroma), and where they go.
+	struct DecodedTo {
+		bool y_direct, c_direct;
+		Buf *y_to, *u_to, *v_to;
+	};
+	DecodedTo decoded_to(int slot, const VkDecodedFrame& f, int side) {
 		Slot& sl = slots[slot];
 		const bool dev = vk.async_upload();
-		Buf& y_to = side == 0 ? (dev ? sl.dev_ref : sl.in_ref) : (dev ? sl.dev_dis : sl.in_dis);
+		DecodedTo d;
+		d.y_to = side == 0 ? (dev ? &sl.dev_ref : &sl.in_ref) : (dev ? &sl.dev_dis : &sl.in_dis);
 		const int cu = side == 0 ? 0 : 2;
-		Buf* u_to = su.empty() ? nullptr : dev ? &sl.dev_chroma[cu] : &sl.in_chroma[cu];
-		Buf* v_to = su.empty() ? nullptr : dev ? &sl.dev_chroma[cu + 1] : &sl.in_chroma[cu + 1];
-		for (int i = 0; i < f.nimages; i++) {
-			vk.wait_timeline(slot, f.sem[i], *f.sem_value[i]);
-			vk.image_to_transfer(f.images[i], *f.layout[i], *f.access[i]);
-			*f.sem_value[i] += 1;
-			vk.signal_timeline(slot, f.sem[i], *f.sem_value[i]);
-		}
-		const bool y_direct = f.bytes == bps && f.shift == 0;
-		const bool c_direct = y_direct && !f.interleaved;
+		d.u_to = su.empty() ? nullptr : dev ? &sl.dev_chroma[cu] : &sl.in_chroma[cu];
+		d.v_to = su.empty() ? nullptr : dev ? &sl.dev_chroma[cu + 1] : &sl.in_chroma[cu + 1];
+		d.y_direct = f.bytes == bps && f.shift == 0;
+		d.c_direct = d.y_direct && !f.interleaved;
 		Buf* tmp = sl.ftmp[side];
 		Pipe* pipe = sl.fpipe[side];
-		if (!y_direct && !tmp[0].buf) {
+		if (!d.y_direct && !tmp[0].buf) {
 			tmp[0] = vk.buffer(((size_t)W * H * f.bytes + 3) / 4 * 4 + 4, 1);
-			pipe[0] = vk.pipeline("frame_unpack", {&tmp[0], &y_to});
+			pipe[0] = vk.pipeline("frame_unpack", {&tmp[0], d.y_to});
 		}
-		if (u_to && !c_direct && !tmp[1].buf) {
+		if (d.u_to && !d.c_direct && !tmp[1].buf) {
 			const size_t c = (size_t)f.planes[1].w * f.planes[1].h * f.bytes * (f.interleaved ? 2 : 1);
 			tmp[1] = vk.buffer((c + 3) / 4 * 4 + 4, 1);
 			tmp[2] = vk.buffer((c + 3) / 4 * 4 + 4, 1);
-			pipe[1] = vk.pipeline("frame_unpack", {&tmp[1], u_to});
-			pipe[2] = vk.pipeline("frame_unpack", {f.interleaved ? &tmp[1] : &tmp[2], v_to});
+			pipe[1] = vk.pipeline("frame_unpack", {&tmp[1], d.u_to});
+			pipe[2] = vk.pipeline("frame_unpack", {f.interleaved ? &tmp[1] : &tmp[2], d.v_to});
 		}
-		vk.copy_image(f.planes[0], y_direct ? y_to : tmp[0]);
-		if (u_to) {
-			if (c_direct) {
-				vk.copy_image(f.planes[1], *u_to);
-				vk.copy_image(f.planes[2], *v_to);
+		return d;
+	}
+
+	// Copies the planes out of the images (into the scorer's buffers, or the slot's ftmp for frame_unpack): on the compute queue in the slot's
+	// command buffer (`on_x` false, then followed by a barrier), else on the copies' queue in its command buffer (between upload_begin() and
+	// upload_submit(), which the slot's work then waits for).
+	void copy_decoded(int slot, const VkDecodedFrame& f, int side, bool on_x) {
+		const DecodedTo d = decoded_to(slot, f, side);
+		for (int i = 0; i < f.nimages; i++) {
+			if (on_x) {
+				vk.upload_wait_timeline(slot, f.sem[i], *f.sem_value[i]);
+				vk.upload_image_to_transfer(f.images[i], *f.layout[i], *f.access[i]);
+				*f.sem_value[i] += 1;
+				vk.upload_signal_timeline(slot, f.sem[i], *f.sem_value[i]);
 			} else {
-				vk.copy_image(f.planes[1], tmp[1]);
-				if (!f.interleaved) vk.copy_image(f.planes[2], tmp[2]);
+				vk.wait_timeline(slot, f.sem[i], *f.sem_value[i]);
+				vk.image_to_transfer(f.images[i], *f.layout[i], *f.access[i]);
+				*f.sem_value[i] += 1;
+				vk.signal_timeline(slot, f.sem[i], *f.sem_value[i]);
 			}
 		}
-		vk.barrier();
-		if (y_direct && (!u_to || c_direct)) return;
+		auto copy = [&](const VkImagePlane& p, const Buf& to) { if (on_x) vk.upload_copy_image(p, to); else vk.copy_image(p, to); };
+		Buf* tmp = slots[slot].ftmp[side];
+		copy(f.planes[0], d.y_direct ? *d.y_to : tmp[0]);
+		if (d.u_to) {
+			if (d.c_direct) {
+				copy(f.planes[1], *d.u_to);
+				copy(f.planes[2], *d.v_to);
+			} else {
+				copy(f.planes[1], tmp[1]);
+				if (!f.interleaved) copy(f.planes[2], tmp[2]);
+			}
+		}
+		if (!on_x) vk.barrier();
+	}
+
+	// The planes that copy_decoded() left in ftmp, into the scorer's buffers (moved, and shifted down; on the compute queue).
+	void unpack_decoded(int slot, const VkDecodedFrame& f, int side) {
+		const DecodedTo d = decoded_to(slot, f, side);
+		if (d.y_direct && (!d.u_to || d.c_direct)) return;
+		Pipe* pipe = slots[slot].fpipe[side];
 		struct { int32_t words, samples, mode, sbps, dbps, shift; } pc;
 		auto unpack = [&](const Pipe& p, int samples, int mode) {
 			pc.samples = samples;
@@ -926,8 +970,8 @@ private:
 			const uint32_t groups = (uint32_t)((pc.words + 255) / 256);
 			vk.dispatch(std::min<uint32_t>(groups, 65535u), (groups + 65534u) / 65535u);
 		};
-		if (!y_direct) unpack(pipe[0], W * H, 0);
-		if (u_to && !c_direct) {
+		if (!d.y_direct) unpack(pipe[0], W * H, 0);
+		if (d.u_to && !d.c_direct) {
 			unpack(pipe[1], cw * ch, f.interleaved ? 1 : 0);
 			unpack(pipe[2], cw * ch, f.interleaved ? 2 : 0);
 		}

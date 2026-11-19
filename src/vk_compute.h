@@ -146,6 +146,12 @@ public:
 	void upload_begin(int slot);
 	void upload_copy(const Buf& src, const Buf& dst, VkDeviceSize size = 0);
 	void upload_submit(int slot, bool for_second = false); // for_second: the slot's next submit2() waits for these copies too
+	// ... and an image the device made, copied there too (as image_to_transfer(), copy_image(), wait_timeline() and signal_timeline(), for the
+	// copies' command buffer and upload_submit()): the images must be usable by the copies' queue family as well (made for concurrent use).
+	void upload_image_to_transfer(VkImage img, VkImageLayout& layout, uint32_t& access);
+	void upload_copy_image(const VkImagePlane& plane, const Buf& dst);
+	void upload_wait_timeline(int slot, VkSemaphore sem, uint64_t value);
+	void upload_signal_timeline(int slot, VkSemaphore sem, uint64_t value);
 	// A second compute queue (second_compute(): the device has one), for work that needs nothing from the main queue's and can run beside it:
 	// begin2() records the slot's work for it (with bind/push/dispatch/copy/barrier as usual; stamp() does nothing there), submit2() submits it, and
 	// wait() waits for it as well. Work on it runs in submission order only against itself.

@@ -198,6 +198,8 @@ Shared* bring_up(int index, std::string& why) {
 			if (!(no_async && atoi(no_async) > 0)) {
 				if (s.ext.has_transfer) { s.xfamily = s.ext.transfer_family; s.has_x = true; s.xqueue_index = 0; }
 				else if (s.ext.compute_queues >= 2) { s.xfamily = s.family; s.has_x = true; s.xqueue_index = 1; }
+				// for testing the copies' own command buffers on a device with one queue: they go to the compute queue, submitted before its work
+				else if (const char* e = getenv("VES_VMAF_COPIES_ON_COMPUTE_QUEUE"); e && atoi(e) > 0) { s.xfamily = s.family; s.has_x = true; s.xqueue_index = 0; }
 			}
 		} else if (!(no_async && atoi(no_async) > 0)) {
 			for (uint32_t i = 0; i < qn && !s.has_x; i++)
@@ -295,6 +297,7 @@ struct Vk::Impl {
 		VkSemaphore xsem2{};    // the copies, for the second compute queue
 		bool xpending2 = false, pending2 = false;
 		std::vector<std::pair<VkSemaphore, uint64_t>> twait, tsignal; // wait_timeline(), signal_timeline(): for the next submit()
+		std::vector<std::pair<VkSemaphore, uint64_t>> xtwait, xtsignal; // ... upload_wait_timeline(), upload_signal_timeline(): for upload_submit()
 	};
 	VkCommandPool xpool{};
 	std::vector<Slot> slots;
@@ -651,10 +654,28 @@ void Vk::upload_submit(int slot, bool for_second) {
 	VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
 	si.commandBufferCount = 1;
 	si.pCommandBuffers = &sl.xcmd;
-	const VkSemaphore sems[2] = {sl.xsem, sl.xsem2};
 	for_second = for_second && sl.xsem2;
-	si.signalSemaphoreCount = for_second ? 2 : 1;
-	si.pSignalSemaphores = sems;
+	// the binary semaphores the slot's next submit() (and submit2()) wait for, then the timeline semaphores of the images copied (wait for their
+	// maker, tell it when they were read)
+	std::vector<VkSemaphore> ssem{sl.xsem}, wsem;
+	std::vector<uint64_t> sval{0}, wval;
+	std::vector<VkPipelineStageFlags> wstage;
+	if (for_second) { ssem.push_back(sl.xsem2); sval.push_back(0); }
+	for (auto& [sem, v] : sl.xtsignal) { ssem.push_back(sem); sval.push_back(v); }
+	for (auto& [sem, v] : sl.xtwait) { wsem.push_back(sem); wval.push_back(v); wstage.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT); }
+	si.signalSemaphoreCount = (uint32_t)ssem.size();
+	si.pSignalSemaphores = ssem.data();
+	si.waitSemaphoreCount = (uint32_t)wsem.size();
+	si.pWaitSemaphores = wsem.data();
+	si.pWaitDstStageMask = wstage.data();
+	VkTimelineSemaphoreSubmitInfo ti{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+	ti.waitSemaphoreValueCount = (uint32_t)wval.size();
+	ti.pWaitSemaphoreValues = wval.data();
+	ti.signalSemaphoreValueCount = (uint32_t)sval.size();
+	ti.pSignalSemaphoreValues = sval.data();
+	if (!sl.xtwait.empty() || !sl.xtsignal.empty()) si.pNext = &ti;
+	sl.xtwait.clear();
+	sl.xtsignal.clear();
 	{
 		chk(s.submit(s.xqueue, s.xqueue_lock, s.xfamily, s.xqueue_index, si, VK_NULL_HANDLE), "submit (copies)");
 	}
@@ -761,6 +782,32 @@ void Vk::copy_image(const VkImagePlane& p, const Buf& dst) {
 	r.imageExtent = {p.w, p.h, 1};
 	vkCmdCopyImageToBuffer(impl->cmd, p.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.buf, 1, &r);
 }
+
+void Vk::upload_image_to_transfer(VkImage img, VkImageLayout& layout, uint32_t& access) {
+	// No writes to make available here: the wait for the maker's timeline semaphore (upload_wait_timeline()) already covers every write before
+	// its signal, and naming the maker's access types (colour attachment, shader writes) is not allowed on a queue that only copies.
+	VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	b.srcAccessMask = 0;
+	b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	b.oldLayout = layout;
+	b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	b.image = img;
+	b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	vkCmdPipelineBarrier(impl->xrec, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+	layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	access = VK_ACCESS_TRANSFER_READ_BIT;
+}
+
+void Vk::upload_copy_image(const VkImagePlane& p, const Buf& dst) {
+	VkBufferImageCopy r{};
+	r.imageSubresource = {p.aspect, 0, 0, 1};
+	r.imageExtent = {p.w, p.h, 1};
+	vkCmdCopyImageToBuffer(impl->xrec, p.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.buf, 1, &r);
+}
+
+void Vk::upload_wait_timeline(int slot, VkSemaphore sem, uint64_t value) { impl->slots.at(slot).xtwait.emplace_back(sem, value); }
+void Vk::upload_signal_timeline(int slot, VkSemaphore sem, uint64_t value) { impl->slots.at(slot).xtsignal.emplace_back(sem, value); }
 
 void Vk::memory(uint64_t& device_local, uint64_t& host) const { device_local = impl->device_bytes; host = impl->host_bytes; }
 
