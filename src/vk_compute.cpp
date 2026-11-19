@@ -3,9 +3,11 @@
 
 #ifndef VES_NO_VULKAN
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -298,6 +300,8 @@ struct Vk::Impl {
 		bool xpending2 = false, pending2 = false;
 		std::vector<std::pair<VkSemaphore, uint64_t>> twait, tsignal; // wait_timeline(), signal_timeline(): for the next submit()
 		std::vector<std::pair<VkSemaphore, uint64_t>> xtwait, xtsignal; // ... upload_wait_timeline(), upload_signal_timeline(): for upload_submit()
+		std::vector<std::vector<std::function<void(VkCommandBuffer)>>> cap; // capture_begin(): the work, stage by stage
+		int linked = -1; // submit_captured(): the slot whose submission this slot's work went with
 	};
 	VkCommandPool xpool{};
 	std::vector<Slot> slots;
@@ -307,6 +311,7 @@ struct Vk::Impl {
 	const char* cur_name = ""; // the shader bound last
 	bool pass = false;     // VES_SCORE_TIMING=2
 	bool second = false;   // ... and it is the second one's
+	bool capturing = false; // capture_begin(): commands are kept in the slot's cap, not recorded
 	VkCommandBuffer xrec{}; // the one being recorded (second queue)
 	VkDescriptorPool dpool{};
 	std::vector<std::pair<VkBuffer, VkDeviceMemory>> owned;
@@ -555,29 +560,52 @@ void Vk::begin(int slot) {
 
 void Vk::stamp(int slot, int which) {
 	Impl::Slot& sl = impl->slots.at(slot);
-	if (impl->second) return; // the stamps time the main queue's work only
+	if (impl->second || impl->capturing) return; // the stamps time the main queue's work only (and submit_captured()'s as a whole)
 	// bottom of pipe: written once every command before it, in this submission and the ones before on the queue, is done
 	if (sl.stamps) vkCmdWriteTimestamp(impl->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.stamps, (uint32_t)which);
 }
 
+// A buffer as the work of the current slot sees it: an alias()'s placeholder stands for that slot's buffer (copies, unlike pipelines, name buffers).
+static VkBuffer resolve(const std::vector<std::pair<VkBuffer, std::vector<VkBuffer>>>& aliases, VkBuffer b, int slot) {
+	if (slot < 0) return b;
+	for (auto& [from, to] : aliases) if (from == b) return to[slot];
+	return b;
+}
+
 void Vk::copy(const Buf& src, const Buf& dst, VkDeviceSize size) {
-	VkBufferCopy c{0, 0, size ? size : std::min(src.size, dst.size)};
-	vkCmdCopyBuffer(impl->cmd, src.buf, dst.buf, 1, &c);
+	copy_range(src, 0, dst, 0, size ? size : std::min(src.size, dst.size));
 }
 
 void Vk::copy_range(const Buf& src, VkDeviceSize src_off, const Buf& dst, VkDeviceSize dst_off, VkDeviceSize size) {
-	VkBufferCopy c{src_off, dst_off, size};
-	vkCmdCopyBuffer(impl->cmd, src.buf, dst.buf, 1, &c);
+	const VkBufferCopy c{src_off, dst_off, size};
+	const VkBuffer from = resolve(impl->aliases, src.buf, impl->cur_slot), to = resolve(impl->aliases, dst.buf, impl->cur_slot);
+	if (impl->capturing) { impl->slots[impl->cur_slot].cap.back().push_back([=](VkCommandBuffer cb) { vkCmdCopyBuffer(cb, from, to, 1, &c); }); return; }
+	vkCmdCopyBuffer(impl->cmd, from, to, 1, &c);
 }
 
 void Vk::bind(const Pipe& p) {
 	impl->cur_name = p.name;
-	vkCmdBindPipeline(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
 	const VkDescriptorSet set = p.nslot > 0 && impl->cur_slot >= 0 && impl->cur_slot < p.nslot ? p.slot_sets[impl->cur_slot] : p.set;
-	vkCmdBindDescriptorSets(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, impl->s->layout, 0, 1, &set, 0, nullptr);
+	const VkPipeline pipe = p.pipe;
+	const VkPipelineLayout layout = impl->s->layout;
+	auto f = [=](VkCommandBuffer cb) {
+		vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+		vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+	};
+	if (impl->capturing) impl->slots[impl->cur_slot].cap.back().push_back(f);
+	else f(impl->cmd);
 }
 
-void Vk::push(const void* data, uint32_t size) { vkCmdPushConstants(impl->cmd, impl->s->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, size, data); }
+void Vk::push(const void* data, uint32_t size) {
+	if (impl->capturing) {
+		std::array<uint8_t, 128> d{};
+		memcpy(d.data(), data, std::min<uint32_t>(size, 128));
+		const VkPipelineLayout layout = impl->s->layout;
+		impl->slots[impl->cur_slot].cap.back().push_back([=](VkCommandBuffer cb) { vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, size, d.data()); });
+		return;
+	}
+	vkCmdPushConstants(impl->cmd, impl->s->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, size, data);
+}
 
 // VES_DEBUG_SKIP=<name>[,<name>...]: leaves out every dispatch of those shaders. Only to measure what a shader costs on the critical path: the scores
 // are wrong with it.
@@ -603,6 +631,7 @@ static bool debug_skip(const char* name) {
 
 void Vk::dispatch(uint32_t x, uint32_t y) {
 	if (debug_skip(impl->cur_name)) return;
+	if (impl->capturing) { impl->slots[impl->cur_slot].cap.back().push_back([=](VkCommandBuffer cb) { vkCmdDispatch(cb, x, y, 1); }); return; }
 	vkCmdDispatch(impl->cmd, x, y, 1);
 	if (!impl->pass || impl->second || impl->cur_slot < 0) return;
 	Impl::Slot& sl = impl->slots[impl->cur_slot];
@@ -624,6 +653,11 @@ void Vk::pass_seconds(int slot, std::vector<std::pair<const char*, double>>& out
 }
 
 void Vk::barrier() {
+	if (impl->capturing) { // the end of a stage
+		auto& cap = impl->slots[impl->cur_slot].cap;
+		if (!cap.back().empty()) cap.emplace_back();
+		return;
+	}
 	VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
 	mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
 	mb.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT;
@@ -717,45 +751,95 @@ void Vk::submit2(int slot) {
 	impl->second = false;
 }
 
-void Vk::submit(int slot) {
+void Vk::submit(int slot) { submit_with(slot, -1); }
+
+// Submits slot `slot`'s command buffer; with `other` >= 0 also waiting for (and signalling) what that slot's work would have (submit_captured()).
+void Vk::submit_with(int slot, int other) {
 	Shared& s = *impl->s;
 	Impl::Slot& sl = impl->slots.at(slot);
 	chk(vkEndCommandBuffer(sl.cmd), "end");
 	VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
 	si.commandBufferCount = 1;
 	si.pCommandBuffers = &sl.cmd;
-	// the copies of upload_submit() are done before this work starts; the slot's fence then also means they are done
+	// the copies of upload_submit() are done before this work starts; the slot's fence then also means they are done. Timeline semaphores (a
+	// frame decoded on the device: wait for the decoder, tell it when the frame was read).
 	const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-	if (sl.xpending) {
-		si.waitSemaphoreCount = 1;
-		si.pWaitSemaphores = &sl.xsem;
-		si.pWaitDstStageMask = &wait_stage;
-		sl.xpending = false;
-	}
-	// timeline semaphores (a frame decoded on the device: wait for the decoder, tell it when the frame was read)
 	std::vector<VkSemaphore> wsem, ssem;
 	std::vector<uint64_t> wval, sval;
 	std::vector<VkPipelineStageFlags> wstage;
-	if (!sl.twait.empty() || !sl.tsignal.empty()) {
-		if (si.waitSemaphoreCount) { wsem.push_back(sl.xsem); wval.push_back(0); wstage.push_back(wait_stage); }
-		for (auto& [sem, v] : sl.twait) { wsem.push_back(sem); wval.push_back(v); wstage.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT); }
-		for (auto& [sem, v] : sl.tsignal) { ssem.push_back(sem); sval.push_back(v); }
-		si.waitSemaphoreCount = (uint32_t)wsem.size();
-		si.pWaitSemaphores = wsem.data();
-		si.pWaitDstStageMask = wstage.data();
-		si.signalSemaphoreCount = (uint32_t)ssem.size();
-		si.pSignalSemaphores = ssem.data();
+	bool timeline = false;
+	for (int k : {slot, other}) {
+		if (k < 0) continue;
+		Impl::Slot& o = impl->slots.at(k);
+		if (o.xpending) { wsem.push_back(o.xsem); wval.push_back(0); wstage.push_back(wait_stage); o.xpending = false; }
+		for (auto& [sem, v] : o.twait) { wsem.push_back(sem); wval.push_back(v); wstage.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT); timeline = true; }
+		for (auto& [sem, v] : o.tsignal) { ssem.push_back(sem); sval.push_back(v); timeline = true; }
+		o.twait.clear();
+		o.tsignal.clear();
 	}
+	si.waitSemaphoreCount = (uint32_t)wsem.size();
+	si.pWaitSemaphores = wsem.data();
+	si.pWaitDstStageMask = wstage.data();
+	si.signalSemaphoreCount = (uint32_t)ssem.size();
+	si.pSignalSemaphores = ssem.data();
 	VkTimelineSemaphoreSubmitInfo ti{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
 	ti.waitSemaphoreValueCount = (uint32_t)wval.size();
 	ti.pWaitSemaphoreValues = wval.data();
 	ti.signalSemaphoreValueCount = (uint32_t)sval.size();
 	ti.pSignalSemaphoreValues = sval.data();
-	if (!wsem.empty() || !ssem.empty()) si.pNext = &ti;
-	sl.twait.clear();
-	sl.tsignal.clear();
+	if (timeline) si.pNext = &ti;
+	sl.linked = -1;
+	if (other >= 0) impl->slots.at(other).linked = slot;
 	vkResetFences(s.dev, 1, &sl.fence);
 	chk(s.submit(s.queue, s.queue_lock, s.family, s.queue_index, si, sl.fence), "submit");
+}
+
+// Recording a slot's work for submit_captured(): the commands are kept, cut into stages at each barrier(), instead of recorded.
+void Vk::capture_begin(int slot) {
+	Impl::Slot& sl = impl->slots.at(slot);
+	sl.cap.clear();
+	sl.cap.emplace_back();
+	impl->capturing = true;
+	impl->second = false;
+	impl->cur_slot = slot;
+}
+
+void Vk::capture_end() { impl->capturing = false; }
+
+// The captured work of slot a (and of slot b, b >= 0) in a's command buffer: stage k of a, stage k of b, one barrier, and so on. b's wait() and
+// gpu_seconds() then go by a's submission. The two slots' work must not touch the same buffers (lanes), except what a's earlier stages make for
+// b's later ones.
+void Vk::submit_captured(int a, int b) {
+	Impl::Slot& sa = impl->slots.at(a);
+	begin(a);
+	stamp(a, 0);
+	std::vector<std::vector<std::function<void(VkCommandBuffer)>>>* caps[2] = {&sa.cap, b >= 0 ? &impl->slots.at(b).cap : nullptr};
+	size_t n = 0;
+	for (auto* c : caps) if (c) n = std::max(n, c->size());
+	for (size_t k = 0; k < n; k++) {
+		bool any = false;
+		for (auto* c : caps) {
+			if (!c || k >= c->size()) continue;
+			for (auto& f : (*c)[k]) { f(impl->cmd); any = true; }
+		}
+		if (any || k + 1 < n) barrier();
+	}
+	barrier();
+	stamp(a, 1);
+	for (auto* c : caps) if (c) c->clear();
+	submit_with(a, b);
+}
+
+Buf Vk::lane_buffer(VkDeviceSize size, int lanes) {
+	if (lanes <= 1) return buffer(size, 1);
+	Buf placeholder = buffer(16, 1);
+	placeholder.size = size;
+	std::vector<Buf> per_lane;
+	for (int l = 0; l < lanes; l++) per_lane.push_back(buffer(size, 1));
+	std::vector<VkBuffer> to;
+	for (size_t k = 0; k < impl->slots.size(); k++) to.push_back(per_lane[k % lanes].buf);
+	impl->aliases.emplace_back(placeholder.buf, to);
+	return placeholder;
 }
 
 void Vk::wait_timeline(int slot, VkSemaphore sem, uint64_t value) { impl->slots.at(slot).twait.emplace_back(sem, value); }
@@ -763,6 +847,7 @@ void Vk::signal_timeline(int slot, VkSemaphore sem, uint64_t value) { impl->slot
 bool Vk::external() const { return impl->s->external; }
 
 void Vk::image_to_transfer(VkImage img, VkImageLayout& layout, uint32_t& access) {
+	if (impl->capturing) throw std::runtime_error("Vulkan: images are not read in captured work");
 	VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
 	b.srcAccessMask = (VkAccessFlags)access;
 	b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
@@ -777,6 +862,7 @@ void Vk::image_to_transfer(VkImage img, VkImageLayout& layout, uint32_t& access)
 }
 
 void Vk::copy_image(const VkImagePlane& p, const Buf& dst) {
+	if (impl->capturing) throw std::runtime_error("Vulkan: images are not read in captured work");
 	VkBufferImageCopy r{};
 	r.imageSubresource = {p.aspect, 0, 0, 1};
 	r.imageExtent = {p.w, p.h, 1};
@@ -813,6 +899,10 @@ void Vk::memory(uint64_t& device_local, uint64_t& host) const { device_local = i
 
 void Vk::wait(int slot) {
 	Impl::Slot& sl = impl->slots.at(slot);
+	if (sl.linked >= 0) { // its work went with another slot's submission
+		chk(vkWaitForFences(impl->s->dev, 1, &impl->slots.at(sl.linked).fence, VK_TRUE, ~0ull), "wait");
+		return;
+	}
 	chk(vkWaitForFences(impl->s->dev, 1, &sl.fence, VK_TRUE, ~0ull), "wait");
 	if (sl.pending2) {
 		chk(vkWaitForFences(impl->s->dev, 1, &sl.fence2, VK_TRUE, ~0ull), "wait (second queue)");
@@ -822,6 +912,7 @@ void Vk::wait(int slot) {
 
 double Vk::gpu_seconds(int slot, int from, int to) {
 	Impl::Slot& sl = impl->slots.at(slot);
+	if (sl.linked >= 0) return 0; // timed with the slot its work went with
 	if (!sl.stamps || from < 0 || to < 0 || from >= kStamps || to >= kStamps) return -1;
 	uint64_t t[2] = {0, 0};
 	// one at a time: a stamp this submission did not write is not ready (VK_NOT_READY), and then there is no time for it

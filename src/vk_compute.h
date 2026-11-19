@@ -159,6 +159,16 @@ public:
 	void begin2(int slot);
 	void submit2(int slot);
 	void submit(int slot = 0);
+	void submit_with(int slot, int other);
+	// Two slots' work in one submission, stage by stage (barrier() to barrier()) side by side, so each stage has the work of both: capture_begin()
+	// in place of begin() (bind/push/dispatch/copy/barrier as usual; no images, no stamps), capture_end() in place of submit(), then
+	// submit_captured(a, b) (b < 0: a alone). The second slot's wait() and gpu_seconds() go by the first's submission (gpu_seconds() 0).
+	void capture_begin(int slot);
+	void capture_end();
+	void submit_captured(int a, int b);
+	// A buffer the work of each slot sees as one of `lanes` buffers (slot k: lane k % lanes), through alias(): for pipelines made after it, and
+	// copies. lanes <= 1: a plain buffer (kind 1).
+	Buf lane_buffer(VkDeviceSize size, int lanes);
 	void wait(int slot = 0); // until the slot's last submission is done
 	// GPU time between two of the slot's stamps (by default start and end) in its last finished submission; -1 if the device has no timestamps or
 	// the submission did not write both. Safe to call from another thread than the one that records, for a slot that is not being recorded.
