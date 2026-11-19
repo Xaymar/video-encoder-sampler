@@ -30,7 +30,7 @@
 			"codec": "hevc",
 			"options": {
 				"preset": ["speed", "balanced", "quality", "high_quality"],   // high_quality = quality on RDNA 2 (Areldir, 1.4.37) but differs on RDNA 3 (780M, 1.5.3) [T], so both stay
-				// "profile": [...], "tier": [...],   // the encoder picks main or main10 from the picture; the tier only changes the level's bitrate limits
+				// "profile": [...], "tier": [...],   // ves sets main10 for 10-bit pictures (AMF itself says main); the tier only changes the level's bitrate limits
 				"rate_control": [""],   // "": CBR; peak constrained "vbr" made the same stream as CBR with the peak at the target [T]; also lcvbr, qvbr, hqvbr, hqcbr
 				// hqvbr, hqcbr and their quality level (qvbr_quality_level) are left out: the level changed nothing on RDNA 2 or RDNA 3, hqcbr made the same
 				// stream as hqvbr on RDNA 2, and on RDNA 3 both made a different stream on every run with the same options [T].

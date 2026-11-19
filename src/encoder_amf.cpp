@@ -210,10 +210,12 @@ class Amf : public Encoder {
 		amf_size n = 0;
 		if (c1->GetVulkanDeviceExtensions(&n, nullptr) == AMF_OK && n) {
 			std::vector<const char*> need(n);
+			std::string missing;
 			if (c1->GetVulkanDeviceExtensions(&n, need.data()) == AMF_OK)
 				for (amf_size i = 0; i < n; i++)
 					if (need[i] && std::find(nat.extensions.begin(), nat.extensions.end(), std::string(need[i])) == nat.extensions.end())
-						return no(std::string("FFmpeg's Vulkan device lacks ") + need[i] + ", which AMF needs");
+						missing += (missing.empty() ? "" : ", ") + std::string(need[i]);
+			if (!missing.empty()) return no("FFmpeg's Vulkan device lacks " + missing + ", which AMF needs");
 		}
 		ctx->SetProperty(AMF_CONTEXT_VULKAN_COMPUTE_QUEUE, (amf_int64)(nat.compute_queues - 1));
 		amf::AMFVulkanDevice vd{};
@@ -607,6 +609,9 @@ public:
 		enc->SetProperty(n->rate, AMFConstructRate(p.framerate.num, p.framerate.den));
 		enc->SetProperty(n->gop, (amf_int64)p.gop);
 		enc->SetProperty(n->bitdepth, (amf_int64)(depth > 8 ? 10 : 8));
+		// The runtime does not pick the profile from the bit depth: a 10-bit HEVC stream said Main (ffprobe: profile=Main, yuv420p10le), which NVIDIA's Vulkan
+		// decoder refuses. Main 10 unless the options say otherwise (they are set after this).
+		if (p.codec == "hevc" && depth > 8) enc->SetProperty(AMF_VIDEO_ENCODER_HEVC_PROFILE, (amf_int64)AMF_VIDEO_ENCODER_HEVC_PROFILE_MAIN_10);
 		set_color(p.color);
 		NativeOptions native_opts;
 		std::string why;
