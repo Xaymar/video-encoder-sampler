@@ -1,0 +1,51 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+// cv_resample.comp's mode 2 (EWA, a polar kernel) for one 16 x 16 tile of output samples at a time: the input samples the tile needs (and the
+// kernel table) are first read into shared memory by the whole workgroup, so each one is read from VRAM once instead of once per output sample
+// that uses it. The arithmetic and its order are those of cv_resample.comp, so both give the same values. vk_convert.cpp uses it only where the
+// tile's input fits (TILE floats; it checks with the same bounds).
+const int TILE = 7168, LUT_MAX = 1025;
+layout(std430, binding = 0) readonly buffer Src { float src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { float dst[]; };
+layout(std430, binding = 2) readonly buffer Lut { float lut[]; };
+layout(push_constant) uniform PC { int in_w, in_h, out_w, out_h, mode, lut_n; float ax, bx, ay, by, fx, fy, radius; } pc;
+
+shared float tile[TILE];
+shared float slut[LUT_MAX];
+
+float kernel(float d) {
+	if (d >= pc.radius) return 0.0;
+	const float p = d / pc.radius * float(pc.lut_n - 1);
+	const int i = min(int(p), pc.lut_n - 2);
+	return mix(slut[i], slut[i + 1], p - float(i));
+}
+
+void main() {
+	const int j0 = int(gl_WorkGroupID.x) * 16, k0 = int(gl_WorkGroupID.y) * 16;
+	const float sx = pc.radius * pc.fx, sy = pc.radius * pc.fy;
+	const int x0 = int(ceil(pc.ax * float(j0) + pc.bx - sx)), x1 = int(floor(pc.ax * float(j0 + 15) + pc.bx + sx));
+	const int y0 = int(ceil(pc.ay * float(k0) + pc.by - sy)), y1 = int(floor(pc.ay * float(k0 + 15) + pc.by + sy));
+	const int tw = x1 - x0 + 1, th = y1 - y0 + 1;
+	const int lid = int(gl_LocalInvocationIndex);
+	for (int i = lid; i < tw * th; i += 256) {
+		const int ty = i / tw, tx = i - ty * tw;
+		tile[i] = src[clamp(y0 + ty, 0, pc.in_h - 1) * pc.in_w + clamp(x0 + tx, 0, pc.in_w - 1)];
+	}
+	for (int i = lid; i < pc.lut_n; i += 256) slut[i] = lut[i];
+	barrier();
+	const int j = j0 + int(gl_LocalInvocationID.x), k = k0 + int(gl_LocalInvocationID.y);
+	if (j >= pc.out_w || k >= pc.out_h) return;
+	const float u = pc.ax * float(j) + pc.bx, v = pc.ay * float(k) + pc.by;
+	float sum = 0.0, wsum = 0.0;
+	for (int y = int(ceil(v - sy)); float(y) <= v + sy; y++) {
+		const float dy = (float(y) - v) / pc.fy;
+		const int row = (y - y0) * tw - x0;
+		for (int x = int(ceil(u - sx)); float(x) <= u + sx; x++) {
+			const float dx = (float(x) - u) / pc.fx;
+			const float w = kernel(sqrt(dx * dx + dy * dy));
+			sum += w * tile[row + x];
+			wsum += w;
+		}
+	}
+	dst[k * pc.out_w + j] = wsum != 0.0 ? sum / wsum : 0.0;
+}

@@ -57,10 +57,12 @@
 
 	// ---- Scaling ------------------------------------------------------------------------------------------------------------------
 	"scaling": {
-		// Scalers, used for any change of resolution (and for scaling the decoded video back for scoring), in linear light. The names are libplacebo's:
+		// Scalers, used for any change of resolution (and for scaling the decoded video back for scoring). Downscaling runs in linear light, upscaling on the
+		// stored values as players and browsers do (VES_CONVERT_UPSCALE=linear|sigmoid changes that). The names are libplacebo's:
 		// nearest, bilinear, bicubic, catmull_rom, mitchell, hermite, robidoux(sharp), spline16/36/64, sinc, lanczos, ginseng (separable), and
 		// ewa_lanczos, ewa_lanczossharp, ewa_jinc, ewa_ginseng, ewa_hann, ewa_robidoux(sharp) (polar).
-		"upscaler": "ewa_lanczos",
+		// The upscaler defaults to bilinear, what nearly every player and display does (cheap, often free in hardware).
+		"upscaler": "bilinear",
 		"downscaler": "ewa_lanczos",
 		// "gpu": "NVIDIA GeForce RTX 4080 SUPER",   // Vulkan GPU for scaling, by its exact name; left out, the GPU that decodes, else the fastest
 		// How the BT.709 family of transfer curves (bt709, smpte170m, bt2020-10/12, ...) is turned into linear light and back: "oetf" (the default,

@@ -218,7 +218,24 @@ void set_converter_ffmpeg_vulkan(bool on) {
 }
 bool converter_shares_ffmpeg_vulkan() { return g_ffmpeg_vulkan; }
 
-std::string scaler_library_version() { return "ves converter 1 (linear light)"; }
+// VES_CONVERT_UPSCALE=linear|sigmoid|stored: the light upscaling is done in (downscaling always is in linear light). By default the stored
+// values, as most players scale (the NV12 or RGB texture as it is); a change of transfer curve still goes through linear light after it.
+int upscale_light_setting() {
+	static const int v = [] {
+		const char* e = getenv("VES_CONVERT_UPSCALE");
+		if (!e || !strcmp(e, "stored") || !strcmp(e, "gamma")) return 2;
+		if (!strcmp(e, "linear")) return 0;
+		if (!strcmp(e, "sigmoid")) return 1;
+		fprintf(stderr, "converter: VES_CONVERT_UPSCALE=%s is not linear, sigmoid or stored; upscaling the stored values\n", e);
+		return 2;
+	}();
+	return v;
+}
+// In the cache key: a change in how the converter works makes new scores.
+std::string scaler_library_version() {
+	static const char* light[] = {"linear", "sigmoid", "stored"};
+	return std::string("ves converter 2 (downscale linear light, upscale ") + light[upscale_light_setting()] + ")";
+}
 
 bool scaler_known(const std::string& name) { return find_filter(name) != nullptr; }
 
@@ -238,6 +255,7 @@ int device_named(const std::string& name) {
 }
 
 constexpr int IN_FLIGHT = 3;
+
 
 struct Planes { std::vector<uint8_t> mem[3]; }; // the memory of an output picture
 
@@ -280,6 +298,7 @@ class VkConverter : public Converter {
 		int log2_cw = 0, log2_ch = 0; // the source's subsampling
 		int out_cw = 0, out_ch = 0;   // the output's (log2)
 		int curve_in = 0, curve_out = 0; // 0: none (same curve, no scaling)
+		int upscale_light = 0; // an upscale (both sides): 0 in linear light, 1 sigmoidal light, 2 the stored values (VES_CONVERT_UPSCALE)
 		float kr_in = 0, kb_in = 0, kr_out = 0, kb_out = 0;
 		Color color_out;
 		bool valid = false;
@@ -308,7 +327,12 @@ class VkConverter : public Converter {
 		Color color;
 		std::shared_ptr<void> keep_in; // the source frame, until the GPU is done with it
 		AVFrame* frame = nullptr; // gpu_out: the frame it renders into
+		bool handed = false; // gpu_out: the frame went on at submit (its users wait for its semaphores), only the input is still held
 	} slots[IN_FLIGHT];
+	// VES_SCORE_TIMING: the converter's GPU time per frame (stamps 0..1 around its work), summed for the report when it closes
+	bool timing = false;
+	double gpu_sum = 0;
+	long long gpu_frames = 0;
 	std::deque<int> order;
 	int next_slot = 0;
 	std::deque<Picture> ready;
@@ -365,7 +389,11 @@ class VkConverter : public Converter {
 		pc.ax = (float)r.ax; pc.bx = (float)r.bx; pc.ay = (float)r.ay; pc.by = (float)r.by;
 		pc.fx = (float)std::max(1.0, r.ax); pc.fy = (float)std::max(1.0, r.ay);
 		if (r.f->polar) {
-			Pipe& p = pipe("cv_resample", {&src, &dst, &lut});
+			// in tiles through shared memory (cv_resample_ewa.comp) where a tile's input fits: its bounds as the shader works them out, plus a margin
+			const double sx = r.f->radius * pc.fx, sy = r.f->radius * pc.fy;
+			const double tw = std::ceil(r.ax * 15 + 2 * sx) + 3, th = std::ceil(r.ay * 15 + 2 * sy) + 3;
+			const bool tiled = tw * th <= 7168 && !getenv("VES_CONVERT_EWA_UNTILED");
+			Pipe& p = pipe(tiled ? "cv_resample_ewa" : "cv_resample", {&src, &dst, &lut});
 			pc.in_w = r.in_w; pc.in_h = r.in_h; pc.out_w = r.out_w; pc.out_h = r.out_h; pc.mode = 2;
 			vk->bind(p); vk->push(&pc, sizeof pc); dispatch_2d(r.out_w, r.out_h);
 			vk->barrier();
@@ -404,6 +432,7 @@ class VkConverter : public Converter {
 		st.scale = p.width != out_w || p.height != out_h;
 		st.linear = st.scale || cin != cout || st.rgb;
 		if (st.linear && (st.scale || cin != cout)) { st.curve_in = cin; st.curve_out = cout; }
+		if (st.scale && out_w >= p.width && out_h >= p.height) st.upscale_light = upscale_light_setting();
 		matrix_of(st.rgb ? 1 : p.color.space, p.width, p.height, st.kr_in, st.kb_in);
 		if (st.rgb) { st.kr_out = 0.2126f; st.kb_out = 0.0722f; }
 		else { st.kr_out = st.kr_in; st.kb_out = st.kb_in; }
@@ -501,7 +530,8 @@ class VkConverter : public Converter {
 				resample(A[2], B[1], r);
 				U = &B[0]; V = &B[1];
 			}
-			struct { int32_t n, rgb, trc; float kr, kb; } lp{in_w * in_h, s.rgb ? 1 : 0, s.curve_in, s.kr_in, s.kb_in};
+			const bool sig = s.upscale_light == 1, stored = s.upscale_light == 2;
+			struct { int32_t n, rgb, trc, sig; float kr, kb; } lp{in_w * in_h, s.rgb ? 1 : 0, stored ? 0 : s.curve_in, sig ? 1 : 0, s.kr_in, s.kb_in};
 			Pipe& pl = pipe("cv_to_linear", {Y, U, V});
 			vk->bind(pl); vk->push(&lp, sizeof lp); dispatch_1d(lp.n);
 			vk->barrier();
@@ -516,7 +546,8 @@ class VkConverter : public Converter {
 				resample(*V, C[2], r);
 				Y = &C[0]; U = &C[1]; V = &C[2];
 			}
-			struct { int32_t n, trc; float kr, kb; } fp{out_w * out_h, s.curve_out, s.kr_out, s.kb_out};
+			const bool change = s.curve_in != s.curve_out;
+			struct { int32_t n, trc, sig, pre; float kr, kb; } fp{out_w * out_h, stored && !change ? 0 : s.curve_out, sig ? 1 : 0, stored && change ? s.curve_in : 0, s.kr_out, s.kb_out};
 			Pipe& pf = pipe("cv_from_linear", {Y, U, V});
 			vk->bind(pf); vk->push(&fp, sizeof fp); dispatch_1d(fp.n);
 			vk->barrier();
@@ -565,9 +596,20 @@ class VkConverter : public Converter {
 
 	// Waits for the oldest frame in flight (if `wait`; otherwise only takes it if it is done) and hands it out. 1: taken, 0: not done yet, -1: failed.
 	int take_oldest(bool wait) {
-		Slot& s = slots[order.front()];
-		if (!wait) return 0; // (no poll in Vk) the frames come out when their slots are needed again, or at the end
-		try { vk->wait(order.front()); } catch (const std::exception& e) { fprintf(stderr, "converter: %s\n", e.what()); return -1; }
+		const int k = order.front();
+		Slot& s = slots[k];
+		try {
+			if (wait) vk->wait(k);
+			else if (!vk->done(k)) return 0;
+		} catch (const std::exception& e) { fprintf(stderr, "converter: %s\n", e.what()); return -1; }
+		if (timing) if (const double t = vk->gpu_seconds(k); t >= 0) { gpu_sum += t; gpu_frames++; }
+		if (s.handed) { // the picture went on at submit
+			s.keep_in.reset();
+			s.handed = false;
+			s.pending = false;
+			order.pop_front();
+			return 1;
+		}
 		Picture o;
 		o.width = out_w; o.height = out_h;
 		o.fmt = out_fmt;
@@ -601,8 +643,19 @@ class VkConverter : public Converter {
 	}
 
 public:
+	// Takes the frames in flight that are done, oldest first, without waiting.
+	bool take_done() {
+		while (!order.empty()) {
+			const int t = take_oldest(false);
+			if (t < 0) return false;
+			if (t == 0) break;
+		}
+		return true;
+	}
+
 	~VkConverter() override {
 		if (vk) for (int i = 0; i < IN_FLIGHT; i++) if (slots[i].pending) { try { vk->wait(i); } catch (...) {} }
+		if (timing && gpu_frames) fprintf(stderr, "converter timing: %lld frames, GPU %.3f ms per frame (%dx%d -> %dx%d)\n", gpu_frames, gpu_sum * 1e3 / (double)gpu_frames, in_w, in_h, out_w, out_h);
 		for (auto& s : slots) av_frame_free(&s.frame);
 		av_buffer_unref(&out_frames);
 	}
@@ -624,6 +677,7 @@ public:
 			fprintf(stderr, "converter: %s\n", e.what());
 			return false;
 		}
+		if (const char* t = getenv("VES_SCORE_TIMING"); t && atoi(t) >= 1) timing = true;
 		gpu_out = false;
 		const char* e = getenv("VES_CONVERT_TO_GPU");
 		if (gpu_out_wanted && vk->external() && !(e && atoi(e) == 0)) {
@@ -701,6 +755,7 @@ public:
 			}
 			for (int pn = 0; pn < L.planes; pn++) cur_stride[pn] = plane_stride(shape, L, pn, gf != nullptr);
 			vk->begin(k);
+			if (timing) vk->stamp(k, 0);
 			vk->barrier(); // after everything before on the queue: the shared buffers are free
 			if (gf) {
 				in_lock.take(gf);
@@ -753,6 +808,7 @@ public:
 				vk->copy(out, s.dl, out.size);
 				vk->barrier();
 			}
+			if (timing) vk->stamp(k, 1);
 			vk->submit(k);
 			out_lock.release();
 			in_lock.release();
@@ -768,10 +824,22 @@ public:
 		s.color = st.color_out;
 		order.push_back(k);
 		next_slot = (next_slot + 1) % IN_FLIGHT;
-		return true;
+		if (s.frame) { // on the GPU: hand it on now; whoever reads it waits for its semaphores, which the submitted work signals
+			Picture o;
+			s.frame->pts = s.pts;
+			s.frame->duration = s.duration;
+			const bool ok = vulkan_picture(s.frame, device, false, o);
+			av_frame_free(&s.frame);
+			if (!ok) { fprintf(stderr, "converter: the converted Vulkan frame cannot be handed on\n"); return false; }
+			o.width = out_w; o.height = out_h; o.fmt = out_fmt; o.pts = s.pts; o.duration = s.duration; o.color = s.color;
+			s.handed = true;
+			ready.push_back(std::move(o));
+		}
+		return take_done();
 	}
 
 	int pop(Picture& o) override {
+		if (ready.empty() && vk && !take_done()) return -1;
 		if (ready.empty()) return 0;
 		o = std::move(ready.front());
 		ready.pop_front();

@@ -27,7 +27,7 @@
 	X(vkCreatePipelineLayout) X(vkCreateComputePipelines) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) \
 	X(vkUpdateDescriptorSets) X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
 	X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdPipelineBarrier) \
-	X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
+	X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkGetFenceStatus) X(vkResetFences) \
 	X(vkCmdCopyBuffer) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 #define X(n) static PFN_##n n;
@@ -842,6 +842,20 @@ void Vk::wait(int slot) {
 		chk(vkWaitForFences(impl->s->dev, 1, &sl.fence2, VK_TRUE, ~0ull), "wait (second queue)");
 		sl.pending2 = false;
 	}
+}
+
+bool Vk::done(int slot) {
+	Impl::Slot& sl = impl->slots.at(slot);
+	const VkResult r = vkGetFenceStatus(impl->s->dev, sl.fence);
+	if (r == VK_NOT_READY) return false;
+	chk(r, "fence status");
+	if (sl.pending2) {
+		const VkResult r2 = vkGetFenceStatus(impl->s->dev, sl.fence2);
+		if (r2 == VK_NOT_READY) return false;
+		chk(r2, "fence status (second queue)");
+		sl.pending2 = false;
+	}
+	return true;
 }
 
 double Vk::gpu_seconds(int slot, int from, int to) {

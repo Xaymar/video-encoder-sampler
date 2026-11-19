@@ -164,6 +164,7 @@ public:
 	void submit2(int slot);
 	void submit(int slot = 0);
 	void wait(int slot = 0); // until the slot's last submission is done
+	bool done(int slot = 0); // whether the slot's last submission is done, without waiting
 	// GPU time between two of the slot's stamps (by default start and end) in its last finished submission; -1 if the device has no timestamps or
 	// the submission did not write both. Safe to call from another thread than the one that records, for a slot that is not being recorded.
 	double gpu_seconds(int slot, int from = 0, int to = 1);

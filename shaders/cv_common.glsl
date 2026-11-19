@@ -51,3 +51,15 @@ float from_linear_pos(int t, float l) {
 
 float to_linear(int t, float v) { return v < 0.0 ? -to_linear_pos(t, -v) : to_linear_pos(t, v); }
 float from_linear(int t, float l) { return l < 0.0 ? -from_linear_pos(t, -l) : from_linear_pos(t, l); }
+
+// libplacebo's sigmoidal light (center 0.75, slope 6.5) for upscaling: linear light is spread so that ringing at dark and bright edges is damped.
+// Defined on 0..1 (values are clamped to it first).
+const float SIG_C = 0.75, SIG_S = 6.5;
+float sigmoidize(float x) {
+	const float off = 1.0 / (1.0 + exp(SIG_S * SIG_C)), sc = 1.0 / (1.0 + exp(SIG_S * (SIG_C - 1.0))) - off;
+	return SIG_C - log(1.0 / (clamp(x, 0.0, 1.0) * sc + off) - 1.0) / SIG_S;
+}
+float unsigmoidize(float y) {
+	const float off = 1.0 / (1.0 + exp(SIG_S * SIG_C)), sc = 1.0 / (1.0 + exp(SIG_S * (SIG_C - 1.0))) - off;
+	return clamp((1.0 / (1.0 + exp(SIG_S * (SIG_C - y))) - off) / sc, 0.0, 1.0);
+}

@@ -5,7 +5,7 @@
 #include "picture.h"
 
 struct ScaleOptions {
-	std::string upscaler = "ewa_lanczos";   // scaler names as libplacebo has them (vk_convert.cpp lists them)
+	std::string upscaler = "bilinear";      // scaler names as libplacebo has them (vk_convert.cpp lists them)
 	std::string downscaler = "ewa_lanczos";
 	std::string device;                     // Vulkan GPU for scaling, by its exact name; empty: the home GPU, else the fastest
 	int trc = 0;                            // the output's transfer curve (H.273 number) when it differs from the source's; 0: as the source
