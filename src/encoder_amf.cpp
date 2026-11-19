@@ -29,6 +29,11 @@
 #include <vector>
 
 #include "gpu.h"
+#include "decode.h"
+#include "vk_compute.h"
+#ifndef VES_NO_VULKAN
+#include <core/VulkanAMF.h>
+#endif
 
 #include <components/PreProcessing.h>
 #include <algorithm>
@@ -167,6 +172,133 @@ class Amf : public Encoder {
 	std::thread rx;
 	std::atomic<bool> eof{false}, stop{false};
 	int b_delay = 0;
+	uint64_t adapter_luid = 0; // of the D3D11 adapter the encoder runs on
+#ifndef VES_NO_VULKAN
+	// Frames straight from VRAM (VES_ENC_GPU_INPUT, on by default): the converter's output (a buffer frame on FFmpeg's Vulkan device) is packed into
+	// NV12 / P010 by a compute shader (enc_pack, as repack() does in memory, padding included) and copied into a Vulkan surface that AMF allocated on
+	// that same device (the context is initialized for Vulkan as well as D3D11), which AMF then converts to D3D11 itself. The encoder is the same
+	// D3D11 one as for frames from memory. On AMD this sharing is fine; it is NVIDIA's drivers that corrupt VRAM with shared NV12 images.
+	int gstate = 0; // 0: not tried yet, 1: frames from VRAM, -1: through memory
+	int gdevice = -1;
+	std::unique_ptr<Vk> gvk;
+	Buf gstage, gpacked;
+	VkDeviceSize gstage_size = 0;
+	Pipe gpipe;
+	bool gpipe_made = false;
+	uint32_t gpitch = 0;
+	VkDeviceSize guv_off = 0;
+
+	bool gpu_open(const VkDecodedFrame& bf) {
+		gstate = -1;
+		auto no = [&](const std::string& why) {
+			fprintf(stderr, "amf: frames come through memory: %s\n", why.c_str());
+			gvk.reset();
+			return false;
+		};
+		if (const char* e = getenv("VES_ENC_GPU_INPUT"); e && atoi(e) == 0) return no("VES_ENC_GPU_INPUT=0");
+		std::string why;
+		const auto devs = Vk::devices(why);
+		if (bf.device < 0 || bf.device >= (int)devs.size()) return no("the frames' Vulkan device is unknown");
+		const VkDeviceInfo& di = devs[(size_t)bf.device];
+		if (!di.luid_valid || di.luid != adapter_luid) return no("the frames are on another GPU (" + di.name + ")");
+		VkNative nat;
+		if (!vk_native(bf.device, nat)) return no("the frames' Vulkan device is not FFmpeg's");
+		// AMF submits to a compute queue of its own: the last one of the family, which the converter and the scorer (the first) do not use
+		if (nat.compute_queues < 2) return no("FFmpeg's Vulkan device has only one compute queue");
+		amf::AMFContext1Ptr c1(ctx);
+		if (!c1) return no("the AMF runtime has no Vulkan support (AMFContext1)");
+		amf_size n = 0;
+		if (c1->GetVulkanDeviceExtensions(&n, nullptr) == AMF_OK && n) {
+			std::vector<const char*> need(n);
+			if (c1->GetVulkanDeviceExtensions(&n, need.data()) == AMF_OK)
+				for (amf_size i = 0; i < n; i++)
+					if (need[i] && std::find(nat.extensions.begin(), nat.extensions.end(), std::string(need[i])) == nat.extensions.end())
+						return no(std::string("FFmpeg's Vulkan device lacks ") + need[i] + ", which AMF needs");
+		}
+		ctx->SetProperty(AMF_CONTEXT_VULKAN_COMPUTE_QUEUE, (amf_int64)(nat.compute_queues - 1));
+		amf::AMFVulkanDevice vd{};
+		vd.cbSizeof = sizeof vd;
+		vd.hInstance = nat.inst;
+		vd.hPhysicalDevice = nat.phys;
+		vd.hDevice = nat.dev;
+		if (const AMF_RESULT r = c1->InitVulkan(&vd); r != AMF_OK) return no("InitVulkan failed (result " + std::to_string((int)r) + ")");
+		try {
+			gvk = std::make_unique<Vk>(bf.device, 1);
+			const int bps = depth > 8 ? 2 : 1;
+			gpitch = (uint32_t)(((size_t)cw * bps + 255) & ~(size_t)255);
+			guv_off = (VkDeviceSize)gpitch * ch;
+			gpacked = gvk->buffer(guv_off + (VkDeviceSize)gpitch * ((ch + 1) / 2), 1);
+		} catch (const std::exception& e) { return no(e.what()); }
+		gdevice = bf.device;
+		gstate = 1;
+		fprintf(stderr, "amf: frames come straight from VRAM (Vulkan device %d, packed on the GPU into a Vulkan surface of AMF's)\n", bf.device);
+		return true;
+	}
+
+	// A buffer frame into a Vulkan surface of AMF's, ready when this returns. Null (the run fails) when that does not work.
+	amf::AMFSurfacePtr gpu_surface(const VkDecodedFrame& bf) {
+		const int bytes = depth > 8 ? 2 : 1;
+		const int pw = (w + 1) / 2, ph = (h + 1) / 2;
+		if (bf.device != gdevice || bf.nplanes != 3 || bf.bytes != bytes || (int)bf.planes[0].w != w || (int)bf.planes[0].h != h || (int)bf.planes[1].w != pw ||
+		    (int)bf.planes[1].h != ph || (int)bf.planes[2].w != pw || (int)bf.planes[2].h != ph) {
+			fprintf(stderr, "amf: a frame from VRAM is not the %dx%d %d-bit 4:2:0 the encoder takes\n", w, h, depth);
+			return nullptr;
+		}
+		amf::AMFSurfacePtr surf;
+		AMF_RESULT r = ctx->AllocSurface(amf::AMF_MEMORY_VULKAN, depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, cw, ch, &surf);
+		if (r != AMF_OK || !surf) { fail(r, "AllocSurface (Vulkan)"); return nullptr; }
+		// a plane's native object is a view of the surface's one image (both planes of NV12)
+		amf::AMFVulkanView* view = (amf::AMFVulkanView*)surf->GetPlaneAt(0)->GetNative();
+		amf::AMFVulkanSurface* vs = view ? view->pSurface : nullptr;
+		if (!vs || !vs->hImage) { fprintf(stderr, "amf: the Vulkan surface has no image\n"); return nullptr; }
+		VkDeviceSize need = 0;
+		for (int i = 0; i < 3; i++) need = std::max<VkDeviceSize>(need, bf.buf_offset[i] + (VkDeviceSize)bf.planes[i].w * bf.planes[i].h * bytes);
+		need = (need + 3) & ~(VkDeviceSize)3;
+		try {
+			if (gstage_size < need) {
+				if (gpipe_made) { gvk->release(gpipe); gpipe_made = false; }
+				gstage = gvk->buffer(need, 1);
+				gstage_size = need;
+			}
+			if (!gpipe_made) { gpipe = gvk->pipeline("enc_pack", {&gstage, &gpacked}); gpipe_made = true; }
+			struct { int32_t w, h, bytes, shift, mode, src_a, src_b, dst_base, pitch_words, ow, oh; } pc{};
+			pc.bytes = bytes;
+			pc.shift = depth > 8 ? 16 - depth : 0;
+			pc.pitch_words = (int32_t)(gpitch / 4);
+			auto run = [&](int mode, int pw_, int ph_, int ow, int oh, VkDeviceSize a, VkDeviceSize b, VkDeviceSize dst) {
+				pc.w = pw_; pc.h = ph_; pc.ow = ow; pc.oh = oh; pc.mode = mode;
+				pc.src_a = (int32_t)a; pc.src_b = (int32_t)b; pc.dst_base = (int32_t)(dst / 4);
+				const int row = mode == 1 ? ow * 2 : ow, per = 4 / bytes;
+				gvk->bind(gpipe);
+				gvk->push(&pc, sizeof pc);
+				gvk->dispatch((uint32_t)(((row + per - 1) / per + 15) / 16), (uint32_t)((oh + 15) / 16));
+			};
+			gvk->begin(0);
+			gvk->wait_timeline(0, bf.buf_sem, bf.buf_value);
+			if (vs->Sync.hSemaphore && vs->Sync.bSubmitted) { // AMF's last use of the image (a binary semaphore: the value is ignored)
+				gvk->wait_timeline(0, vs->Sync.hSemaphore, 0);
+				vs->Sync.bSubmitted = false;
+			}
+			gvk->copy_rows(bf.buffer, 0, need, gstage.buf, 0, need, 1);
+			gvk->barrier();
+			run(0, w, h, cw, ch, bf.buf_offset[0], 0, 0);
+			run(1, pw, ph, cw / 2, ch / 2, bf.buf_offset[1], bf.buf_offset[2], guv_off);
+			gvk->barrier();
+			VkImageLayout layout = (VkImageLayout)vs->eCurrentLayout;
+			uint32_t access = 0;
+			gvk->image_to_transfer_dst(vs->hImage, layout, access);
+			gvk->copy_to_image(gpacked, 0, gpitch / bytes, VkImagePlane{vs->hImage, VK_IMAGE_ASPECT_PLANE_0_BIT, (uint32_t)cw, (uint32_t)ch});
+			gvk->copy_to_image(gpacked, guv_off, gpitch / (2 * bytes), VkImagePlane{vs->hImage, VK_IMAGE_ASPECT_PLANE_1_BIT, (uint32_t)(cw / 2), (uint32_t)(ch / 2)});
+			gvk->submit(0);
+			gvk->wait(0); // done: AMF need not wait for anything (bSubmitted stays false)
+			vs->eCurrentLayout = (amf_uint32)layout;
+		} catch (const std::exception& e) {
+			fprintf(stderr, "amf: packing a frame on the GPU: %s\n", e.what());
+			return nullptr;
+		}
+		return surf;
+	}
+#endif
 
 	bool fail(AMF_RESULT r, const char* what) {
 		if (probing) return false; // asking whether a codec works is not an error when it does not
@@ -457,7 +589,7 @@ public:
 		for (UINT i = 0; dxgi && dxgi->EnumAdapters1(i, &adapter) == S_OK; i++, adapter.Reset()) {
 			DXGI_ADAPTER_DESC1 d;
 			adapter->GetDesc1(&d);
-			if (d.VendorId == 0x1002 && seen++ == gpu) break;
+			if (d.VendorId == 0x1002 && seen++ == gpu) { memcpy(&adapter_luid, &d.AdapterLuid, sizeof adapter_luid); break; }
 		}
 		if (!adapter) { fprintf(stderr, "amf: no AMD adapter with index %d\n", gpu); return false; }
 		if (FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, nullptr))) {
@@ -544,8 +676,22 @@ public:
 			return eof;
 		}
 		amf::AMFSurfacePtr surf;
-		if ((r = ctx->AllocSurface(amf::AMF_MEMORY_HOST, depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, cw, ch, &surf)) != AMF_OK) return fail(r, "AllocSurface");
-		repack(fr, surf);
+		Picture mem; // a frame on the GPU read back, when it cannot be taken from VRAM
+#ifndef VES_NO_VULKAN
+		if (fr->gpu && gstate >= 0) {
+			const VkDecodedFrame* bf = (const VkDecodedFrame*)fr->gpu.get();
+			if (bf->buffer && (gstate == 1 || gpu_open(*bf)) && !(surf = gpu_surface(*bf))) return false;
+		}
+#endif
+		if (!surf) {
+			if (fr->gpu) {
+				mem = *fr;
+				if (!picture_to_memory(mem)) return false;
+				fr = &mem;
+			}
+			if ((r = ctx->AllocSurface(amf::AMF_MEMORY_HOST, depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, cw, ch, &surf)) != AMF_OK) return fail(r, "AllocSurface");
+			repack(fr, surf);
+		}
 		surf->SetPts(fr->pts);
 		if ((r = surf->Convert(amf::AMF_MEMORY_DX11)) != AMF_OK) return fail(r, "Convert");
 

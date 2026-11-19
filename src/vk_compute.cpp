@@ -317,6 +317,19 @@ void vk_set_external_provider(bool (*provider)(int index, uint32_t vendor_id, ui
 	g_provider = provider;
 }
 
+bool vk_native(int index, VkNative& out) {
+	std::string why;
+	Shared* s = bring_up(index, why);
+	if (!s || !s->external) return false;
+	out.inst = s->ext.inst;
+	out.phys = s->phys;
+	out.dev = s->dev;
+	out.compute_family = s->family;
+	out.compute_queues = s->ext.compute_queues;
+	out.extensions = s->ext.extensions;
+	return out.inst != VK_NULL_HANDLE;
+}
+
 struct Vk::Impl {
 	Shared* s = nullptr;
 	VkCommandPool pool{};

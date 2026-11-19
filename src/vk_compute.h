@@ -47,6 +47,8 @@ struct VkExternal {
 	bool has_transfer = false; // a transfer-only family (for copies beside the compute work)
 	uint32_t transfer_family = 0;
 	uint32_t queue_flags = 0; // VkDeviceQueueCreateFlags its queues were made with (then they are fetched with vkGetDeviceQueue2)
+	VkInstance inst = VK_NULL_HANDLE;
+	std::vector<std::string> extensions; // the device extensions it was made with
 	bool export_memory = false; // made with VK_KHR_external_memory_win32 (Windows) / VK_KHR_external_memory_fd: Vk::exportable_buffer() works
 	void (*lock)(void* ctx, uint32_t family, uint32_t index) = nullptr;
 	void (*unlock)(void* ctx, uint32_t family, uint32_t index) = nullptr;
@@ -55,6 +57,18 @@ struct VkExternal {
 // Where devices come from when one is first brought up: `provider(index, vendor, device, out)` fills `out` for Vulkan device `index` (as Vk::devices()
 // numbers it, with these PCI ids) and returns true, or returns false to have Vk make its own. Set before any device is brought up.
 void vk_set_external_provider(bool (*provider)(int index, uint32_t vendor_id, uint32_t device_id, VkExternal& out));
+
+// The native handles of Vulkan device `index` as Vk brought it up (bringing it up if needed), for a library that works on the same VkDevice (AMF,
+// which takes frames there as Vulkan surfaces). False when it cannot be had or did not come from a VkExternal provider (FFmpeg's device): only that
+// one is guaranteed to hold the frames. `compute_queues` is how many queues the compute family has (the scorer and the converter use the first).
+struct VkNative {
+	VkInstance inst = VK_NULL_HANDLE;
+	VkPhysicalDevice phys = VK_NULL_HANDLE;
+	VkDevice dev = VK_NULL_HANDLE;
+	uint32_t compute_family = 0, compute_queues = 0;
+	std::vector<std::string> extensions;
+};
+bool vk_native(int index, VkNative& out);
 
 // A plane of an image on the device (a frame decoded there) to be copied into a buffer: `aspect` is VK_IMAGE_ASPECT_PLANE_n_BIT of a multi-planar
 // image or VK_IMAGE_ASPECT_COLOR_BIT; w x h texels.

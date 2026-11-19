@@ -438,7 +438,7 @@ void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& h
 }
 
 // Takes the decoded frames, drops frames to the target rate, scales and converts, and hands the result to the encoders and to the distorted scores (`enc`).
-// `gpu_out`: the encoders take frames from VRAM (NVENC, see encoder_nvenc.cpp), so the converted frames stay on the GPU (buffer frames), and frames
+// `gpu_out`: the encoders take frames from VRAM (NVENC and AMF, see encoder_nvenc.cpp, encoder_amf.cpp), so the converted frames stay on the GPU (buffer frames), and frames
 // decoded there that need no conversion go through the converter as they are (an exact copy), instead of being read back.
 // Frame rate conversion drops frames before scaling. Each source frame falls into a slot of the output timeline (its real presentation time times the rate,
 // rounded down) and only the first frame in each slot is kept. `shown[n]` records which encoded frame is on screen at source frame n, for scoring.
@@ -698,10 +698,10 @@ bool run_wave(const std::string& input, const SourceInfo& planned, std::vector<W
 
 	bool decode_ok = false, feed_ok = false;
 	std::thread decoder([&] { decode_input(*src, raw, [&] { return raw.held() || enc_frames.held() || raw.too_far(IDLE_BEYOND) || enc_frames.too_far(IDLE_BEYOND); }, decode_ok, &decode_rp, limit); });
-	// NVENC takes frames from VRAM (VES_ENC_GPU_INPUT=0: never): the feed's frames stay on the GPU when every encoder of the wave is NVENC.
+	// NVENC and AMF take frames from VRAM (VES_ENC_GPU_INPUT=0: never): the feed's frames stay on the GPU when every encoder of the wave is one of them.
 	bool gpu_feed = converter_shares_ffmpeg_vulkan();
 	if (const char* e = getenv("VES_ENC_GPU_INPUT"); e && atoi(e) == 0) gpu_feed = false;
-	for (auto* r : runs) if (r->enc.encoder != "nvenc") gpu_feed = false;
+	for (auto* r : runs) if (r->enc.encoder != "nvenc" && r->enc.encoder != "amf") gpu_feed = false;
 	std::thread feeder([&] { feed_encoders(*src, raw, feed_reader, *runs[0]->enc.plan, so, bc, enc_frames, fr, feed_ok, feed_rp, !check, gpu_feed); });
 	std::vector<std::thread> threads;
 	for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {

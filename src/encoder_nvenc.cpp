@@ -699,12 +699,12 @@ public:
 				g.stage_size = need;
 			}
 			if (!r.has_pipe) { r.pipe = g.vk->pipeline("enc_pack", {&g.stage, &r.eb.b}); r.has_pipe = true; }
-			struct { int32_t w, h, bytes, shift, mode, src_a, src_b, dst_base, pitch_words; } pc{};
+			struct { int32_t w, h, bytes, shift, mode, src_a, src_b, dst_base, pitch_words, ow, oh; } pc{};
 			pc.bytes = bytes;
 			pc.shift = depth > 8 ? 16 - depth : 0;
 			pc.pitch_words = (int32_t)(g.pitch / 4);
 			auto run = [&](int mode, int pw, int ph, VkDeviceSize a, VkDeviceSize b, VkDeviceSize dst) {
-				pc.w = pw; pc.h = ph; pc.mode = mode;
+				pc.w = pc.ow = pw; pc.h = pc.oh = ph; pc.mode = mode;
 				pc.src_a = (int32_t)a; pc.src_b = (int32_t)b; pc.dst_base = (int32_t)(dst / 4);
 				const int row = mode == 1 ? pw * 2 : pw, per = 4 / bytes;
 				g.vk->bind(r.pipe);

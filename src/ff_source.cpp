@@ -460,7 +460,11 @@ bool vulkan_provider(int index, uint32_t vendor_id, uint32_t device_id, VkExtern
 #else
 	const char* ext_mem = "VK_KHR_external_memory_fd";
 #endif
-	for (int i = 0; i < vk->nb_enabled_dev_extensions; i++) if (!strcmp(vk->enabled_dev_extensions[i], ext_mem)) out.export_memory = true;
+	for (int i = 0; i < vk->nb_enabled_dev_extensions; i++) {
+		out.extensions.push_back(vk->enabled_dev_extensions[i]);
+		if (!strcmp(vk->enabled_dev_extensions[i], ext_mem)) out.export_memory = true;
+	}
+	out.inst = vk->inst;
 	out.ctx = hw;
 	out.lock = [](void* c, uint32_t fam, uint32_t i) { auto* h = (AVHWDeviceContext*)c; ((AVVulkanDeviceContext*)h->hwctx)->lock_queue(h, fam, i); };
 	out.unlock = [](void* c, uint32_t fam, uint32_t i) { auto* h = (AVHWDeviceContext*)c; ((AVVulkanDeviceContext*)h->hwctx)->unlock_queue(h, fam, i); };
