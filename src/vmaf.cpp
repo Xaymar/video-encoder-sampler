@@ -363,7 +363,13 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
                        Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp, VmafDetail* detail) {
 	if (rp) rp->begin(2, std::max<long long>(1, ref.frames));
 
-	const bool convert_dis = enc.w != ref.width || enc.h != ref.height || enc.pix != score_fmt || (decoded_color.range ? decoded_color.range : 1) != ref.score_range; // scale back, change format, change range back
+	// The encode's transfer curve differs from the reference's (the "trc" option): converted back to the reference's in linear light.
+	const int ref_trc = ref.color.trc != 2 && ref.color.trc != 0 ? ref.color.trc : ref.rgb ? 13 : 1;
+	const bool trc_back = decoded_color.trc != 2 && decoded_color.trc != 0 && decoded_color.trc != ref_trc;
+	const bool convert_dis = enc.w != ref.width || enc.h != ref.height || enc.pix != score_fmt || (decoded_color.range ? decoded_color.range : 1) != ref.score_range ||
+	                         trc_back; // scale back, change format, change range or curve back
+	ScaleOptions back = scale;
+	back.trc = trc_back ? ref_trc : 0;
 
 	// "gpu" needs the GPU scorer; "auto" falls back to libvmaf when it cannot be used.
 	std::unique_ptr<Scorer> scorer;
@@ -428,7 +434,7 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 			if (rp) rp->step();
 		}
 	};
-	// libplacebo holds frames back until it has seen the next one, so converted frames are collected as they appear.
+	// The converter holds frames back while they are in flight on the GPU, so converted frames are collected as they appear.
 	auto collect_converted = [&] {
 		int got;
 		while (ok && (got = up->pop(u)) == 1) show(u, mo++);
@@ -449,8 +455,8 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 		if (!convert_dis) show(d, m);
 		else {
 			d.pts = m; // a frame on the GPU is converted where it is (or read back by the converter when it is on another device)
-			d.duration = 1; // libplacebo needs it to know when the last frame ends; the packets carry none
-			if (m == 0 && !up->open(d, enc.fps.inverse(), ref.width, ref.height, score_fmt, scale, ref.score_range)) { fprintf(stderr, "vmaf: cannot scale the encoded frames back to %dx%d\n", ref.width, ref.height); ok = false; break; }
+			d.duration = 1; // the packets carry none
+			if (m == 0 && !up->open(d, enc.fps.inverse(), ref.width, ref.height, score_fmt, back, ref.score_range)) { fprintf(stderr, "vmaf: cannot scale the encoded frames back to %dx%d\n", ref.width, ref.height); ok = false; break; }
 			bool pushed;
 			{ Timed t{score_clock.convert}; pushed = up->push(&d); }
 			if (!pushed) { fprintf(stderr, "scaling the decoded frame back failed\n"); ok = false; break; }

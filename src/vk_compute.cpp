@@ -27,8 +27,8 @@
 	X(vkCreatePipelineLayout) X(vkCreateComputePipelines) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) \
 	X(vkUpdateDescriptorSets) X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
 	X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdPipelineBarrier) \
-	X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
-	X(vkCmdCopyBuffer) X(vkCmdCopyImageToBuffer) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+	X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkGetFenceStatus) X(vkResetFences) \
+	X(vkCmdCopyBuffer) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 #define X(n) static PFN_##n n;
 VK_FUNCS(X)
@@ -310,6 +310,7 @@ struct Vk::Impl {
 	VkCommandBuffer xrec{}; // the one being recorded (second queue)
 	VkDescriptorPool dpool{};
 	std::vector<std::pair<VkBuffer, VkDeviceMemory>> owned;
+	std::vector<VkSemaphore> owned_sems; // timeline_semaphore()
 	uint64_t device_bytes = 0, host_bytes = 0;
 };
 
@@ -408,6 +409,7 @@ void Vk::release() {
 	if (impl->xpool) vkDestroyCommandPool(s.dev, impl->xpool, nullptr);
 	if (impl->dpool) vkDestroyDescriptorPool(s.dev, impl->dpool, nullptr);
 	for (auto& [b, m] : impl->owned) { vkDestroyBuffer(s.dev, b, nullptr); vkFreeMemory(s.dev, m, nullptr); }
+	for (VkSemaphore x : impl->owned_sems) vkDestroySemaphore(s.dev, x, nullptr);
 	delete impl;
 	impl = nullptr;
 }
@@ -563,6 +565,38 @@ void Vk::stamp(int slot, int which) {
 void Vk::copy(const Buf& src, const Buf& dst, VkDeviceSize size) {
 	VkBufferCopy c{0, 0, size ? size : std::min(src.size, dst.size)};
 	vkCmdCopyBuffer(impl->cmd, src.buf, dst.buf, 1, &c);
+}
+
+namespace {
+void record_rows(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize src_off, VkDeviceSize src_stride, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize row_bytes, uint32_t rows) {
+	if (src_stride == row_bytes || rows <= 1) {
+		VkBufferCopy c{src_off, dst_off, row_bytes * rows};
+		vkCmdCopyBuffer(cmd, src, dst, 1, &c);
+		return;
+	}
+	std::vector<VkBufferCopy> c(rows);
+	for (uint32_t r = 0; r < rows; r++) c[r] = {src_off + r * src_stride, dst_off + r * row_bytes, row_bytes};
+	vkCmdCopyBuffer(cmd, src, dst, rows, c.data());
+}
+} // namespace
+
+void Vk::copy_rows(VkBuffer src, VkDeviceSize src_off, VkDeviceSize src_stride, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize row_bytes, uint32_t rows) {
+	record_rows(impl->cmd, src, src_off, src_stride, dst, dst_off, row_bytes, rows);
+}
+void Vk::upload_copy_rows(VkBuffer src, VkDeviceSize src_off, VkDeviceSize src_stride, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize row_bytes, uint32_t rows) {
+	record_rows(impl->xrec, src, src_off, src_stride, dst, dst_off, row_bytes, rows);
+}
+
+VkSemaphore Vk::timeline_semaphore() {
+	VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+	ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+	ti.initialValue = 0;
+	VkSemaphoreCreateInfo ci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+	ci.pNext = &ti;
+	VkSemaphore x = VK_NULL_HANDLE;
+	chk(vkCreateSemaphore(impl->s->dev, &ci, nullptr, &x), "timeline semaphore");
+	impl->owned_sems.push_back(x);
+	return x;
 }
 
 void Vk::copy_range(const Buf& src, VkDeviceSize src_off, const Buf& dst, VkDeviceSize dst_off, VkDeviceSize size) {
@@ -776,11 +810,35 @@ void Vk::image_to_transfer(VkImage img, VkImageLayout& layout, uint32_t& access)
 	access = VK_ACCESS_TRANSFER_READ_BIT;
 }
 
-void Vk::copy_image(const VkImagePlane& p, const Buf& dst) {
+void Vk::copy_image(const VkImagePlane& p, const Buf& dst, VkDeviceSize offset) {
 	VkBufferImageCopy r{};
+	r.bufferOffset = offset;
 	r.imageSubresource = {p.aspect, 0, 0, 1};
 	r.imageExtent = {p.w, p.h, 1};
 	vkCmdCopyImageToBuffer(impl->cmd, p.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.buf, 1, &r);
+}
+
+void Vk::image_to_transfer_dst(VkImage img, VkImageLayout& layout, uint32_t& access) {
+	VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	b.srcAccessMask = (VkAccessFlags)access;
+	b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; // its old contents are all overwritten
+	b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	b.image = img;
+	b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	vkCmdPipelineBarrier(impl->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+	layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	access = VK_ACCESS_TRANSFER_WRITE_BIT;
+}
+
+void Vk::copy_to_image(const Buf& src, VkDeviceSize offset, uint32_t row_texels, const VkImagePlane& p) {
+	VkBufferImageCopy r{};
+	r.bufferOffset = offset;
+	r.bufferRowLength = row_texels;
+	r.imageSubresource = {p.aspect, 0, 0, 1};
+	r.imageExtent = {p.w, p.h, 1};
+	vkCmdCopyBufferToImage(impl->cmd, src.buf, p.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
 }
 
 void Vk::upload_image_to_transfer(VkImage img, VkImageLayout& layout, uint32_t& access) {
@@ -818,6 +876,20 @@ void Vk::wait(int slot) {
 		chk(vkWaitForFences(impl->s->dev, 1, &sl.fence2, VK_TRUE, ~0ull), "wait (second queue)");
 		sl.pending2 = false;
 	}
+}
+
+bool Vk::done(int slot) {
+	Impl::Slot& sl = impl->slots.at(slot);
+	const VkResult r = vkGetFenceStatus(impl->s->dev, sl.fence);
+	if (r == VK_NOT_READY) return false;
+	chk(r, "fence status");
+	if (sl.pending2) {
+		const VkResult r2 = vkGetFenceStatus(impl->s->dev, sl.fence2);
+		if (r2 == VK_NOT_READY) return false;
+		chk(r2, "fence status (second queue)");
+		sl.pending2 = false;
+	}
+	return true;
 }
 
 double Vk::gpu_seconds(int slot, int from, int to) {

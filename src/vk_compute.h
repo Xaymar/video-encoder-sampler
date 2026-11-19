@@ -2,6 +2,7 @@
 // A minimal Vulkan compute layer for the GPU VMAF scorer (vk_vmaf.cpp). Each Vulkan device that is used is brought up once and shared by every
 // scorer in the process that uses it; each `Vk` object is one user of one device, with its own buffers, descriptor sets and command buffer, all released when it goes away.
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -81,6 +82,14 @@ struct VkDecodedFrame {
 	const void* lock_domain = nullptr; // frames with the same one share their lock (taken once for both)
 	int device = -1; // the Vulkan device (Vk::devices() index)
 	std::shared_ptr<void> keep;
+	// A frame in a buffer instead (the converter's output, vk_convert.cpp; nimages is 0 and the planes' img null): plane i at buf_offset[i], rows
+	// of planes[i].w samples of `bytes` with no gaps. Readers wait for timeline semaphore `buf_sem` to reach `buf_value`; nothing in it changes
+	// after that, so they signal nothing. `download` (a Picture*, see source.h) reads it into memory, for a reader that cannot take it in place.
+	VkBuffer buffer = VK_NULL_HANDLE;
+	VkDeviceSize buf_offset[3]{};
+	VkSemaphore buf_sem = VK_NULL_HANDLE;
+	uint64_t buf_value = 0;
+	std::function<bool(void* picture)> download;
 };
 
 struct Buf {
@@ -127,12 +136,20 @@ public:
 	void push(const void* data, uint32_t size);
 	void dispatch(uint32_t x, uint32_t y = 1);
 	void copy(const Buf& src, const Buf& dst, VkDeviceSize size = 0); // size 0: the smaller of the two buffers
+	// `rows` rows of `row_bytes` from src (at src_off, src_stride apart) to dst (at dst_off, with no gaps): one region where the rows have none either.
+	void copy_rows(VkBuffer src, VkDeviceSize src_off, VkDeviceSize src_stride, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize row_bytes, uint32_t rows);
+	// A timeline semaphore (starting at 0) that lives as long as this Vk.
+	VkSemaphore timeline_semaphore();
 	void copy_range(const Buf& src, VkDeviceSize src_off, const Buf& dst, VkDeviceSize dst_off, VkDeviceSize size);
 	void barrier();
 	// An image the device made (a decoded frame): moves it from `layout` (with writes `access` to finish first) to the layout copies read from,
 	// and updates `layout` and `access` to that. Then copy_image() copies one of its planes into a buffer, row after row with no gaps.
 	void image_to_transfer(VkImage img, VkImageLayout& layout, uint32_t& access);
-	void copy_image(const VkImagePlane& plane, const Buf& dst);
+	void copy_image(const VkImagePlane& plane, const Buf& dst, VkDeviceSize offset = 0);
+	// The other way (the converter writing its frames into FFmpeg Vulkan frames): moves the image from `layout` (with `access` to finish first) to the
+	// layout copies write to, updating both, then copy_to_image() copies rows of `row_texels` texels from `offset` in a buffer into one of its planes.
+	void image_to_transfer_dst(VkImage img, VkImageLayout& layout, uint32_t& access);
+	void copy_to_image(const Buf& src, VkDeviceSize offset, uint32_t row_texels, const VkImagePlane& plane);
 	// The slot's next submit() waits for timeline semaphore `sem` to reach `value` first / sets it to `value` when done.
 	void wait_timeline(int slot, VkSemaphore sem, uint64_t value);
 	void signal_timeline(int slot, VkSemaphore sem, uint64_t value);
@@ -145,6 +162,7 @@ public:
 	bool async_upload() const;
 	void upload_begin(int slot);
 	void upload_copy(const Buf& src, const Buf& dst, VkDeviceSize size = 0);
+	void upload_copy_rows(VkBuffer src, VkDeviceSize src_off, VkDeviceSize src_stride, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize row_bytes, uint32_t rows);
 	void upload_submit(int slot, bool for_second = false); // for_second: the slot's next submit2() waits for these copies too
 	// ... and an image the device made, copied there too (as image_to_transfer(), copy_image(), wait_timeline() and signal_timeline(), for the
 	// copies' command buffer and upload_submit()): the images must be usable by the copies' queue family as well (made for concurrent use).
@@ -160,6 +178,7 @@ public:
 	void submit2(int slot);
 	void submit(int slot = 0);
 	void wait(int slot = 0); // until the slot's last submission is done
+	bool done(int slot = 0); // whether the slot's last submission is done, without waiting
 	// GPU time between two of the slot's stamps (by default start and end) in its last finished submission; -1 if the device has no timestamps or
 	// the submission did not write both. Safe to call from another thread than the one that records, for a slot that is not being recorded.
 	double gpu_seconds(int slot, int from = 0, int to = 1);

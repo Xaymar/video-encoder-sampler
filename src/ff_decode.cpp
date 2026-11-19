@@ -403,6 +403,10 @@ public:
 bool picture_to_memory(Picture& p) {
 	if (!p.gpu) return true;
 #ifndef VES_NO_VULKAN
+	if (const VkDecodedFrame* bf = (const VkDecodedFrame*)p.gpu.get(); bf->buffer) { // the converter's output in a buffer: it reads it back itself
+		const auto download = bf->download; // (p, and the frame with it, is replaced)
+		return download && download(&p);
+	}
 	const AVFrame* src = (const AVFrame*)((VkDecodedFrame*)p.gpu.get())->keep.get();
 	AVFrame* down = av_frame_alloc();
 	AVFrame* planar = av_frame_alloc();

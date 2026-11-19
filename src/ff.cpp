@@ -109,7 +109,7 @@ const AVCodec* software_decoder(AVCodecID id) {
 }
 
 // Semi-planar formats (NV12, P010, ...) keep U and V interleaved in one plane. The samples are unpacked to planar YUV exactly, on the CPU:
-// the conversion libplacebo would do instead is not exact, it changes sample values by a little even when only the memory layout differs.
+// the encoders take planar frames from memory.
 // This also makes a GPU's decode (which gives NV12/P010 back) reach the encoders the way a software decode does.
 const SemiPlanar* semi_planar(AVPixelFormat f) {
 	static const SemiPlanar table[] = {

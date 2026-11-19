@@ -1,0 +1,53 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+// Resamples a plane of floats (in_w x in_h) to out_w x out_h. Output sample (j, k) sits at input position (ax * j + bx, ay * k + by), in input
+// samples; the kernel (lut: its weight at distance radius * i / (lut_n - 1), i = 0 .. lut_n - 1, linearly between) is stretched by fx, fy (> 1
+// when downscaling) and the weights are normalized to a sum of 1. mode 0: along x only (in_h == out_h), 1: along y only (in_w == out_w), 2: both at
+// once, by the distance in the plane (EWA, a polar kernel). Samples beyond the edges repeat the edge.
+layout(std430, binding = 0) readonly buffer Src { float src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { float dst[]; };
+layout(std430, binding = 2) readonly buffer Lut { float lut[]; };
+layout(push_constant) uniform PC { int in_w, in_h, out_w, out_h, mode, lut_n; float ax, bx, ay, by, fx, fy, radius; } pc;
+
+float kernel(float d) { // d in kernel units, >= 0
+	if (d >= pc.radius) return 0.0;
+	const float p = d / pc.radius * float(pc.lut_n - 1);
+	const int i = min(int(p), pc.lut_n - 2);
+	return mix(lut[i], lut[i + 1], p - float(i));
+}
+
+void main() {
+	const int j = int(gl_GlobalInvocationID.x), k = int(gl_GlobalInvocationID.y);
+	if (j >= pc.out_w || k >= pc.out_h) return;
+	float sum = 0.0, wsum = 0.0;
+	if (pc.mode == 0) {
+		const float u = pc.ax * float(j) + pc.bx, s = pc.radius * pc.fx;
+		const int row = k * pc.in_w;
+		for (int i = int(ceil(u - s)); float(i) <= u + s; i++) {
+			const float w = kernel(abs(float(i) - u) / pc.fx);
+			sum += w * src[row + clamp(i, 0, pc.in_w - 1)];
+			wsum += w;
+		}
+	} else if (pc.mode == 1) {
+		const float v = pc.ay * float(k) + pc.by, s = pc.radius * pc.fy;
+		for (int i = int(ceil(v - s)); float(i) <= v + s; i++) {
+			const float w = kernel(abs(float(i) - v) / pc.fy);
+			sum += w * src[clamp(i, 0, pc.in_h - 1) * pc.in_w + j];
+			wsum += w;
+		}
+	} else {
+		const float u = pc.ax * float(j) + pc.bx, v = pc.ay * float(k) + pc.by;
+		const float sx = pc.radius * pc.fx, sy = pc.radius * pc.fy;
+		for (int y = int(ceil(v - sy)); float(y) <= v + sy; y++) {
+			const float dy = (float(y) - v) / pc.fy;
+			const int row = clamp(y, 0, pc.in_h - 1) * pc.in_w;
+			for (int x = int(ceil(u - sx)); float(x) <= u + sx; x++) {
+				const float dx = (float(x) - u) / pc.fx;
+				const float w = kernel(sqrt(dx * dx + dy * dy));
+				sum += w * src[row + clamp(x, 0, pc.in_w - 1)];
+				wsum += w;
+			}
+		}
+	}
+	dst[k * pc.out_w + j] = wsum != 0.0 ? sum / wsum : 0.0;
+}

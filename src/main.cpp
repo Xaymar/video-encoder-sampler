@@ -86,7 +86,7 @@ struct Scenario {
 	std::vector<int64_t> bitrates;   // kbps
 	std::vector<double> kfs{2.0};    // key frame intervals, seconds
 	std::vector<Shape> shapes{Shape{}}; // resolution / frame rate to encode at; zero fields mean "as the source"
-	std::vector<std::string> chroma, bitdepth, range; // pixel format to encode in (420, 444; 8, 10; source, limited, full); empty: the source's
+	std::vector<std::string> chroma, bitdepth, range, trc; // pixel format to encode in (420, 444; 8, 10; source, limited, full; transfer curve); empty: the source's
 };
 
 struct Config {
@@ -520,6 +520,7 @@ static void load_config_json(const Json& root, Config& cfg) {
 		strs("chroma", [&](const std::string& t) { sc.chroma.push_back(t); });
 		strs("bitdepth", [&](const std::string& t) { sc.bitdepth.push_back(t); });
 		strs("range", [&](const std::string& t) { sc.range.push_back(t); });
+		strs("trc", [&](const std::string& t) { sc.trc.push_back(t); });
 		if (auto* u = o.find("upscale"); u && (u->text() == "1" || u->text() == "true")) for (auto& sh : sc.shapes) sh.upscale = true;
 		if (sc.bitrates.empty()) throw std::runtime_error(o.where() + "a scenario needs bitrates");
 		cfg.scenarios.push_back(std::move(sc));
@@ -529,6 +530,10 @@ static void load_config_json(const Json& root, Config& cfg) {
 		if (auto* u = v->find("upscaler")) cfg.scale.upscaler = u->text();
 		if (auto* d = v->find("downscaler")) cfg.scale.downscaler = d->text();
 		if (auto* g = v->find("gpu")) cfg.scale.device = g->text();
+		if (auto* c = v->find("bt709_curve")) {
+			cfg.scale.bt709_curve = bt709_curve_of(c->text());
+			if (!cfg.scale.bt709_curve) throw std::runtime_error(c->where() + "'bt709_curve' must be \"oetf\", \"bt1886\" or \"srgb\"");
+		}
 	}
 	// These live in "settings"; older files have them at the top level, which still works.
 	auto setting = [&](const char* k) -> const Json* {
@@ -641,7 +646,7 @@ static void load_config_json(const Json& root, Config& cfg) {
 			j.rules.parse(*r);
 			// A misspelt name reads as an unset option: say so for names the entry does not list.
 			for (auto& name : j.rules.names()) {
-				bool listed = is_default_key(name) || name == "range";
+				bool listed = is_default_key(name) || name == "range" || name == "trc";
 				for (auto& ax : j.axes) listed |= ax.key == name;
 				if (!listed) fprintf(stderr, "config: %s%s rules read '%s', which the entry does not list: it reads as the encoder's default where that is known\n",
 				                     r->where().c_str(), j.encoder.c_str(), name.c_str());
@@ -1010,9 +1015,11 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 	if (!sc.chroma.empty()) o << ",\"chroma\":" << list(sc.chroma);
 	if (!sc.bitdepth.empty()) o << ",\"bitdepth\":" << list(sc.bitdepth);
 	if (!sc.range.empty()) o << ",\"range\":" << list(sc.range);
+	if (!sc.trc.empty()) o << ",\"trc\":" << list(sc.trc);
 	if (shape.upscale) o << ",\"upscale\":true";
 	o << "}],\"scaling\":{\"upscaler\":" << jq(cfg.scale.upscaler) << ",\"downscaler\":" << jq(cfg.scale.downscaler);
 	if (!cfg.scale.device.empty()) o << ",\"gpu\":" << jq(cfg.scale.device);
+	if (cfg.scale.bt709_curve != 1) o << ",\"bt709_curve\":" << jq(bt709_curve_name(cfg.scale.bt709_curve));
 	o << "},\"vmaf\":{\"model\":[";
 	for (size_t i = 0, n = vmaf_models(cfg.vo).size(); i < n; i++) o << (i ? "," : "") << jq(vmaf_models(cfg.vo)[i]);
 	o << "],\"device\":" << jq(cfg.vo.device) << "},\"encoders\":[{\"encoder\":" << jq(job.encoder) << ",\"codec\":" << jq(job.codec);
@@ -1319,7 +1326,7 @@ static int run(int argc, char** argv) {
 	};
 
 	for (auto& job : cfg.jobs) for (auto& ax : job.axes) for (auto& sc : cfg.scenarios) {
-		const bool in_scenario = (ax.key == "chroma" && !sc.chroma.empty()) || (ax.key == "bitdepth" && !sc.bitdepth.empty()) || (ax.key == "range" && !sc.range.empty());
+		const bool in_scenario = (ax.key == "chroma" && !sc.chroma.empty()) || (ax.key == "bitdepth" && !sc.bitdepth.empty()) || (ax.key == "range" && !sc.range.empty()) || (ax.key == "trc" && !sc.trc.empty());
 		if (in_scenario && takes_part(job, sc)) {
 			fprintf(stderr, "config: '%s' is listed by encoder '%s' and by scenario '%s'; list it in one of them\n", ax.key.c_str(), job.encoder.c_str(), sc.name.c_str());
 			return 1;
@@ -1342,8 +1349,8 @@ static int run(int argc, char** argv) {
 	};
 	// What an entry's options are made of in a scenario: the scenario only adds its chroma, bit depth and range, so scenarios that list the same ones share the
 	// entry's variants and option table (the sizes and bit rates are put around them later).
-	using ShareKey = std::tuple<const Job*, std::vector<std::string>, std::vector<std::string>, std::vector<std::string>>;
-	auto share_key = [](const Job& job, const Scenario& sc) { return ShareKey{&job, sc.chroma, sc.bitdepth, sc.range}; };
+	using ShareKey = std::tuple<const Job*, std::vector<std::string>, std::vector<std::string>, std::vector<std::string>, std::vector<std::string>>;
+	auto share_key = [](const Job& job, const Scenario& sc) { return ShareKey{&job, sc.chroma, sc.bitdepth, sc.range, sc.trc}; };
 	std::map<ShareKey, std::vector<Variant>> variants;
 	// The options of an entry whose list has "" (not set): for those, a value that is what the encoder has anyway (the default of the run's preset and tune, see
 	// encoder_defaults) is the same run as "", so it is not made. Conditions read an unset option as that default too (unset_value_for), so both make the same runs.
@@ -1353,7 +1360,7 @@ static int run(int argc, char** argv) {
 		if (it != unset_too.end()) return it->second;
 		std::set<std::string> keys;
 		for (auto& ax : job.axes) if (std::find(ax.values.begin(), ax.values.end(), std::string()) != ax.values.end()) keys.insert(ax.key);
-		for (const char* k : {"preset", "tune", "profile", "gpu", "chroma", "bitdepth", "range"}) keys.erase(k);
+		for (const char* k : {"preset", "tune", "profile", "gpu", "chroma", "bitdepth", "range", "trc"}) keys.erase(k);
 		return unset_too[&job] = keys;
 	};
 	// What a condition reads for an option that is not set: the encoder's default with the run's preset, tune, profile, chroma, bit depth and GPU. Not known on a worker
@@ -1366,6 +1373,7 @@ static int run(int argc, char** argv) {
 			int gpu = 0;
 			if (auto it = b.find("gpu"); it != b.end()) { gpu = atoi(it->second.c_str()); b.erase(it); }
 			b.erase("range");
+			b.erase("trc");
 			std::string v;
 			default_of(jp->encoder, jp->codec, key, encoder_defaults(jp->encoder, jp->codec, gpu, b), v);
 			return v;
@@ -1480,8 +1488,9 @@ static int run(int argc, char** argv) {
 			if (models.empty()) ui::log("no worker has a GPU that can encode " + job.encoder + "/" + job.codec + ": those runs are skipped");
 		}
 		for (const Options& base : expand(job.encoder, remote_gpu ? axes_no_gpu : job.axes, {}, unset_value_for(job)))
-			for (auto& chroma : axis(sc.chroma)) for (auto& bitdepth : axis(sc.bitdepth)) for (auto& range : axis(sc.range)) {
+			for (auto& chroma : axis(sc.chroma)) for (auto& bitdepth : axis(sc.bitdepth)) for (auto& range : axis(sc.range)) for (auto& trc : axis(sc.trc)) {
 				Options opts = base;
+				if (!trc.empty()) opts["trc"] = trc;
 				if (!chroma.empty()) opts["chroma"] = chroma;
 				if (!bitdepth.empty()) opts["bitdepth"] = bitdepth;
 				if (!range.empty()) opts["range"] = range;
@@ -1560,6 +1569,7 @@ static int run(int argc, char** argv) {
 			if (!sc.chroma.empty()) free_axes.push_back(Axis{"chroma", sc.chroma, {}, {}});
 			if (!sc.bitdepth.empty()) free_axes.push_back(Axis{"bitdepth", sc.bitdepth, {}, {}});
 			if (!sc.range.empty()) free_axes.push_back(Axis{"range", sc.range, {}, {}});
+			if (!sc.trc.empty()) free_axes.push_back(Axis{"trc", sc.trc, {}, {}});
 			std::vector<Axis> axes;
 			for (auto& ax : job.axes) if (!(remote && is_gpu_encoder(job.encoder) && ax.key == "gpu")) axes.push_back(ax);
 			slot = std::make_unique<LazyTable>(job.encoder, axes, free_axes, job.fixed, job.prune, unset_value_for(job), job.rules);
@@ -1739,8 +1749,8 @@ static int run(int argc, char** argv) {
 			for (size_t k = 0; k < sc.kfs.size(); k++) put("%s%g", k ? "," : "", sc.kfs[k]);
 			put(" s");
 			for (auto& sh : sc.shapes) if (sh.w || sh.fps.num || sh.fps_rule()) put(", %dx%d@%s", sh.w, sh.h, sh.fps.num || sh.fps_rule() ? rate_text(sh).c_str() : "0");
-			for (auto* list : {&sc.chroma, &sc.bitdepth, &sc.range}) if (!list->empty()) {
-				put(", %s ", list == &sc.chroma ? "chroma" : list == &sc.bitdepth ? "bitdepth" : "range");
+			for (auto* list : {&sc.chroma, &sc.bitdepth, &sc.range, &sc.trc}) if (!list->empty()) {
+				put(", %s ", list == &sc.chroma ? "chroma" : list == &sc.bitdepth ? "bitdepth" : list == &sc.range ? "range" : "trc");
 				for (size_t k = 0; k < list->size(); k++) put("%s%s", k ? "," : "", (*list)[k].c_str());
 			}
 			put("\n");
@@ -2175,7 +2185,7 @@ static int run(int argc, char** argv) {
 				sm = samples.emplace(&job, decltype(sm->second){}).first;
 				for (size_t a = 0; a < job.axes.size(); a++) {
 					const Axis& ax = job.axes[a];
-					if (job.fixed.count(ax.key) || ax.key == "gpu" || ax.key == "chroma" || ax.key == "bitdepth" || ax.key == "range") continue;
+					if (job.fixed.count(ax.key) || ax.key == "gpu" || ax.key == "chroma" || ax.key == "bitdepth" || ax.key == "range" || ax.key == "trc") continue;
 					std::vector<std::string> vals;
 					bool numeric = true;
 					for (auto& v : ax.values) {

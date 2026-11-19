@@ -77,6 +77,7 @@ struct Plan {
 	Fmt dist_fmt;         // and for the distorted score (the encode against the frames its encoder got) in this one
 	bool convert_rate = false, rescale = false;
 	int range = 0;        // the range the encoder gets: 0 the source's, 1 limited, 2 full (the "range" option)
+	int trc = 0;          // the transfer curve the encoder gets (H.273 number, the "trc" option): 0 the source's; the frames are converted to it in linear light
 	Color color;          // the colour of the frames the encoder gets: what the stream is tagged with
 	Options options;      // the encoder's options, without chroma and bitdepth
 	std::string feed_key() const; // runs with equal keys (and the same input) can share one decode

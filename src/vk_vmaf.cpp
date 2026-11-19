@@ -926,6 +926,23 @@ private:
 	// upload_submit(), which the slot's work then waits for).
 	void copy_decoded(int slot, const VkDecodedFrame& f, int side, bool on_x) {
 		const DecodedTo d = decoded_to(slot, f, side);
+		if (f.buffer) { // the converter's output in a buffer (vk_compute.h): wait for its work, then buffer to buffer, plane by plane
+			if (on_x) vk.upload_wait_timeline(slot, f.buf_sem, f.buf_value);
+			else vk.wait_timeline(slot, f.buf_sem, f.buf_value);
+			Buf* tmp = slots[slot].ftmp[side];
+			auto copy = [&](int i, const Buf& to) {
+				const VkDeviceSize row = (VkDeviceSize)f.planes[i].w * f.bytes;
+				if (on_x) vk.upload_copy_rows(f.buffer, f.buf_offset[i], row, to.buf, 0, row, f.planes[i].h);
+				else vk.copy_rows(f.buffer, f.buf_offset[i], row, to.buf, 0, row, f.planes[i].h);
+			};
+			copy(0, d.y_direct ? *d.y_to : tmp[0]);
+			if (d.u_to) {
+				copy(1, d.c_direct ? *d.u_to : tmp[1]);
+				copy(2, d.c_direct ? *d.v_to : tmp[2]);
+			}
+			if (!on_x) vk.barrier();
+			return;
+		}
 		for (int i = 0; i < f.nimages; i++) {
 			if (on_x) {
 				vk.upload_wait_timeline(slot, f.sem[i], *f.sem_value[i]);

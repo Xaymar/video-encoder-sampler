@@ -1,6 +1,6 @@
 #!/bin/sh
 # Compiles the compute shaders to SPIR-V (the .spv files are committed and embedded into ves by CMake, so building ves needs no shader compiler).
-# Needs glslc (the Vulkan SDK, the shaderc package, or third-party/libplacebo/ucrt64/bin/glslc.exe). Run from anywhere: sh shaders/build.sh [path/to/glslc]
+# Needs glslc (the Vulkan SDK, or the shaderc package: MSYS2 mingw-w64-ucrt-x86_64-shaderc, Ubuntu glslc). Run from anywhere: sh shaders/build.sh [path/to/glslc]
 cd "$(dirname "$0")" || exit 1
 GLSLC=${1:-glslc}
 for f in *.comp; do
