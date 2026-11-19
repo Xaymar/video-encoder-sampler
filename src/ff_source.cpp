@@ -565,6 +565,7 @@ bool vulkan_frame(const AVFrame* f, int device, VkDecodedFrame& out) {
 	AVFrame* keep = av_frame_clone(f);
 	out.keep = std::shared_ptr<void>(keep, [l](void* p) { AVFrame* a = (AVFrame*)p; av_frame_free(&a); delete l; });
 	out.ctx = l;
+	out.lock_domain = fc; // FFmpeg's frame lock is the frames context's
 	out.lock = [](void* c) { auto* k = (Lock*)c; if (k->vfc->lock_frame) k->vfc->lock_frame(k->fc, k->vf); };
 	out.unlock = [](void* c) { auto* k = (Lock*)c; if (k->vfc->unlock_frame) k->vfc->unlock_frame(k->fc, k->vf); };
 	out.device = device;

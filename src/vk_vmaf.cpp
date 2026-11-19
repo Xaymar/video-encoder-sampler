@@ -124,6 +124,7 @@ int GpuVmaf::pick_device(const std::string& spec, unsigned encoder_vendor, int e
 #include <cstring>
 #include <fstream>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <sstream>
@@ -550,6 +551,66 @@ CambiGeom cambi_geom(const CambiOpts& o, int ew, int eh) {
 }
 
 // --- SpEED: the sizes (speed.c, speed_init_dimensions()) ---
+// Runs fn(0) .. fn(n - 1) on a few threads shared by every scorer of the process, and on the caller's, which takes tasks as well (so the pool cannot
+// be held up by callers waiting on it); returns when all are done. For VES_SPEED_CPU's planes, which are independent of each other.
+class CpuPool {
+	std::mutex m;
+	std::condition_variable cv;
+	struct Job { const std::function<void(int)>* fn; int n; std::atomic<int> next{0}, done{0}; int users = 0; }; // users: pool threads in it (under m)
+	std::deque<Job*> jobs;
+	std::vector<std::thread> threads;
+	static bool run_one(Job& j) { // one task of j, if any is left
+		const int i = j.next.fetch_add(1);
+		if (i >= j.n) return false;
+		(*j.fn)(i);
+		j.done.fetch_add(1);
+		return true;
+	}
+	CpuPool() {
+		const unsigned n = std::max(2u, std::min(16u, std::thread::hardware_concurrency())) - 1;
+		for (unsigned t = 0; t < n; t++)
+			threads.emplace_back([this] {
+				for (;;) {
+					Job* j;
+					{
+						std::unique_lock lock(m);
+						cv.wait(lock, [&] { return !jobs.empty(); });
+						j = jobs.front();
+						if (j->next.load() >= j->n) { jobs.pop_front(); continue; }
+						j->users++;
+					}
+					while (run_one(*j)) {}
+					{
+						std::lock_guard lock(m);
+						j->users--; // the caller may let go of j once no pool thread is in it
+					}
+					cv.notify_all();
+				}
+			});
+		for (auto& t : threads) t.detach(); // lives as long as the process
+	}
+
+public:
+	static CpuPool& get() { static CpuPool* p = new CpuPool; return *p; }
+	void parallel_for(int n, const std::function<void(int)>& fn) {
+		if (n <= 1) { if (n == 1) fn(0); return; }
+		Job j;
+		j.fn = &fn; j.n = n;
+		{
+			std::lock_guard lock(m);
+			jobs.push_back(&j);
+		}
+		cv.notify_all();
+		while (run_one(j)) {}
+		{
+			std::unique_lock lock(m);
+			cv.wait(lock, [&] { return j.done.load() >= n && j.users == 0; });
+			auto it = std::find(jobs.begin(), jobs.end(), &j);
+			if (it != jobs.end()) jobs.erase(it);
+		}
+	}
+};
+
 vmaf_speed::SpeedDimensions speed_dims(int w, int h, double prescale) {
 	vmaf_speed::SpeedDimensions d{};
 	d.original_height = h; d.original_width = w;
@@ -629,6 +690,7 @@ public:
 		ysize = (size_t)W * H;
 		plane_bytes = ysize * bps;
 		if (const char* e = getenv("VES_SPEED_CHECK"); e && atoi(e) > 0) speed_check = true;
+		if (const char* e = getenv("VES_SPEED_CPU"); e && *e) speed_cpu = atoi(e) > 0;
 		if (const char* e = getenv("VES_VMAF_WAVES"); e && *e) use_waves = atoi(e) > 0;
 		if (const char* e = getenv("VES_SCORE_TIMING"); e && atoi(e) > 0) part_timing = true;
 		if (const char* e = getenv("VES_ADM_SPLIT_DWT"); e && atoi(e) > 0) adm_split_dwt = true;
@@ -700,46 +762,6 @@ public:
 			        check.values, check.differ, check.largest, check.flags);
 	}
 
-	// Copies a frame pair in and has the GPU score it, for every model; returns once it is on its way (or, with all slots busy, once the oldest one is
-	// done). Frame `index` 0 has no motion. Throws when scoring an earlier frame failed.
-	void submit(const uint8_t* const ref[3], const size_t ref_stride[3], const uint8_t* const dis[3], const size_t dis_stride[3], size_t index) {
-		using clock = std::chrono::steady_clock;
-		const int k = (int)(index % kSlots);
-		Slot& sl = slots[k];
-		const auto t0 = clock::now();
-		collect(k);
-		const auto t1 = clock::now();
-		t_wait += std::chrono::duration<double>(t1 - t0).count();
-		auto put = [&](void* dst, const uint8_t* src, size_t stride, int w, int h) {
-			const size_t row = (size_t)w * bps;
-			if (stride == row) memcpy(dst, src, row * h);
-			else for (int y = 0; y < h; y++) memcpy((uint8_t*)dst + (size_t)y * row, src + (size_t)y * stride, row);
-		};
-		put(sl.in_ref.map, ref[0], ref_stride[0], W, H);
-		put(sl.in_dis.map, dis[0], dis_stride[0], W, H);
-		if (!su.empty()) {
-			put(sl.in_chroma[0].map, ref[1], ref_stride[1], cw, ch);
-			put(sl.in_chroma[1].map, ref[2], ref_stride[2], cw, ch);
-			put(sl.in_chroma[2].map, dis[1], dis_stride[1], cw, ch);
-			put(sl.in_chroma[3].map, dis[2], dis_stride[2], cw, ch);
-		}
-		if (vk.async_upload()) {
-			vk.upload_begin(k);
-			vk.upload_copy(sl.in_ref, sl.dev_ref);
-			vk.upload_copy(sl.in_dis, sl.dev_dis);
-			if (!su.empty()) for (int p = 0; p < 4; p++) vk.upload_copy(sl.in_chroma[p], sl.dev_chroma[p]);
-			vk.upload_submit(k, speed2);
-		}
-		record(k, index);
-		{
-			std::lock_guard lock(mutex);
-			sl.index = index;
-			sl.state = Slot::Busy;
-		}
-		changed.notify_all();
-		t_copy += std::chrono::duration<double>(clock::now() - t1).count();
-	}
-
 	// Whether frame `f`, decoded on the GPU, can be read in place: on this device (which must be its decoder's), in the layout the scorer takes.
 	bool takes(const VkDecodedFrame& f) const {
 		if (f.device != device_index || !vk.external() || speed2) return false;
@@ -748,8 +770,11 @@ public:
 		return f.planes[0].w == (uint32_t)W && f.planes[0].h == (uint32_t)H && (su.empty() || (f.planes[1].w == (uint32_t)cw && f.planes[1].h == (uint32_t)ch));
 	}
 
-	// submit() for a decoded frame on the GPU (takes(f)): its planes are copied out of its images at the start of the slot's work.
-	void submit_gpu(const uint8_t* const ref[3], const size_t ref_stride[3], const VkDecodedFrame& f, size_t index) {
+	// Copies a frame pair in and has the GPU score it, for every model; returns once it is on its way (or, with all slots busy, once the oldest one is
+	// done). Frame `index` 0 has no motion. Throws when scoring an earlier frame failed. Either frame (or both) may still be on the GPU (takes(f)),
+	// `rf` / `df` (the planes in memory of that side are not read then): their planes are copied out of their images at the start of the slot's work.
+	void submit_frames(const uint8_t* const ref[3], const size_t ref_stride[3], const VkDecodedFrame* rf, const uint8_t* const dis[3], const size_t dis_stride[3],
+	                   const VkDecodedFrame* df, size_t index) {
 		using clock = std::chrono::steady_clock;
 		const int k = (int)(index % kSlots);
 		Slot& sl = slots[k];
@@ -762,29 +787,48 @@ public:
 			if (stride == row) memcpy(dst, src, row * h);
 			else for (int y = 0; y < h; y++) memcpy((uint8_t*)dst + (size_t)y * row, src + (size_t)y * stride, row);
 		};
-		put(sl.in_ref.map, ref[0], ref_stride[0], W, H);
-		if (!su.empty()) {
-			put(sl.in_chroma[0].map, ref[1], ref_stride[1], cw, ch);
-			put(sl.in_chroma[1].map, ref[2], ref_stride[2], cw, ch);
+		if (!rf) {
+			put(sl.in_ref.map, ref[0], ref_stride[0], W, H);
+			if (!su.empty()) {
+				put(sl.in_chroma[0].map, ref[1], ref_stride[1], cw, ch);
+				put(sl.in_chroma[1].map, ref[2], ref_stride[2], cw, ch);
+			}
 		}
-		if (vk.async_upload()) {
+		if (!df) {
+			put(sl.in_dis.map, dis[0], dis_stride[0], W, H);
+			if (!su.empty()) {
+				put(sl.in_chroma[2].map, dis[1], dis_stride[1], cw, ch);
+				put(sl.in_chroma[3].map, dis[2], dis_stride[2], cw, ch);
+			}
+		}
+		if (vk.async_upload() && (!rf || !df)) {
 			vk.upload_begin(k);
-			vk.upload_copy(sl.in_ref, sl.dev_ref);
-			if (!su.empty()) for (int p = 0; p < 2; p++) vk.upload_copy(sl.in_chroma[p], sl.dev_chroma[p]);
+			if (!rf) vk.upload_copy(sl.in_ref, sl.dev_ref);
+			if (!df) vk.upload_copy(sl.in_dis, sl.dev_dis);
+			if (!su.empty()) for (int p = 0; p < 4; p++) if (p < 2 ? !rf : !df) vk.upload_copy(sl.in_chroma[p], sl.dev_chroma[p]);
 			vk.upload_submit(k, speed2);
 		}
-		sl.held = f.keep;
-		gpu_in = &f;
-		if (f.lock) f.lock(f.ctx);
+		sl.held[0] = rf ? rf->keep : nullptr;
+		sl.held[1] = df ? df->keep : nullptr;
+		gpu_in[0] = rf;
+		gpu_in[1] = df;
+		// Each frame's lock is held while its images are read into the command buffer (once where both are guarded by the same one).
+		const bool same_lock = rf && df && rf->lock_domain && rf->lock_domain == df->lock_domain;
+		auto lock = [&](const VkDecodedFrame* f) { if (f && f->lock) f->lock(f->ctx); };
+		auto unlock = [&](const VkDecodedFrame* f) { if (f && f->unlock) f->unlock(f->ctx); };
+		lock(rf);
+		if (!same_lock) lock(df);
 		try {
 			record(k, index);
 		} catch (...) {
-			gpu_in = nullptr;
-			if (f.unlock) f.unlock(f.ctx);
+			gpu_in[0] = gpu_in[1] = nullptr;
+			if (!same_lock) unlock(df);
+			unlock(rf);
 			throw;
 		}
-		gpu_in = nullptr;
-		if (f.unlock) f.unlock(f.ctx);
+		gpu_in[0] = gpu_in[1] = nullptr;
+		if (!same_lock) unlock(df);
+		unlock(rf);
 		{
 			std::lock_guard lock(mutex);
 			sl.index = index;
@@ -823,40 +867,52 @@ public:
 	uint64_t mem_device = 0, mem_host = 0, mem_slot = 0;
 
 private:
-	const VkDecodedFrame* gpu_in = nullptr; // submit_gpu(): the frame record() starts with
+	const VkDecodedFrame* gpu_in[2] = {}; // submit_frames(): the reference and the distorted frame record() starts with, where they are on the GPU
 
-	// The planes of a decoded frame out of its images, into the buffers that its upload would have filled (the slot's own in VRAM with the copies
-	// on their own queue, else the ones in system memory, which record() copies on from): exact, the samples are only moved (and shifted down).
-	void read_decoded(int slot, const VkDecodedFrame& f) {
+	// The planes of a frame on the GPU (`side` 0: the reference, 1: the distorted frame) out of its images, into the buffers that its upload would
+	// have filled (the slot's own in VRAM with the copies on their own queue, else the ones in system memory, which record() copies on from): exact,
+	// the samples are only moved (and shifted down). Planes that already hold the samples as the scorer takes them (one plane each, the scorer's
+	// sample size, not shifted: NV12's luma, or the planar frames a converter makes) are copied straight in.
+	void read_decoded(int slot, const VkDecodedFrame& f, int side) {
 		Slot& sl = slots[slot];
 		const bool dev = vk.async_upload();
-		Buf& y_to = dev ? sl.dev_dis : sl.in_dis;
-		Buf* u_to = su.empty() ? nullptr : dev ? &sl.dev_chroma[2] : &sl.in_chroma[2];
-		Buf* v_to = su.empty() ? nullptr : dev ? &sl.dev_chroma[3] : &sl.in_chroma[3];
+		Buf& y_to = side == 0 ? (dev ? sl.dev_ref : sl.in_ref) : (dev ? sl.dev_dis : sl.in_dis);
+		const int cu = side == 0 ? 0 : 2;
+		Buf* u_to = su.empty() ? nullptr : dev ? &sl.dev_chroma[cu] : &sl.in_chroma[cu];
+		Buf* v_to = su.empty() ? nullptr : dev ? &sl.dev_chroma[cu + 1] : &sl.in_chroma[cu + 1];
 		for (int i = 0; i < f.nimages; i++) {
 			vk.wait_timeline(slot, f.sem[i], *f.sem_value[i]);
 			vk.image_to_transfer(f.images[i], *f.layout[i], *f.access[i]);
 			*f.sem_value[i] += 1;
 			vk.signal_timeline(slot, f.sem[i], *f.sem_value[i]);
 		}
-		if (!sl.ftmp[0].buf) {
-			sl.ftmp[0] = vk.buffer(((size_t)W * H * f.bytes + 3) / 4 * 4 + 4, 1);
+		const bool y_direct = f.bytes == bps && f.shift == 0;
+		const bool c_direct = y_direct && !f.interleaved;
+		Buf* tmp = sl.ftmp[side];
+		Pipe* pipe = sl.fpipe[side];
+		if (!y_direct && !tmp[0].buf) {
+			tmp[0] = vk.buffer(((size_t)W * H * f.bytes + 3) / 4 * 4 + 4, 1);
+			pipe[0] = vk.pipeline("frame_unpack", {&tmp[0], &y_to});
+		}
+		if (u_to && !c_direct && !tmp[1].buf) {
 			const size_t c = (size_t)f.planes[1].w * f.planes[1].h * f.bytes * (f.interleaved ? 2 : 1);
-			sl.ftmp[1] = vk.buffer((c + 3) / 4 * 4 + 4, 1);
-			sl.ftmp[2] = vk.buffer((c + 3) / 4 * 4 + 4, 1);
-			sl.fpipe[0] = vk.pipeline("frame_unpack", {&sl.ftmp[0], &y_to});
-			if (u_to) {
-				sl.fpipe[1] = vk.pipeline("frame_unpack", {&sl.ftmp[1], u_to});
-				sl.fpipe[2] = vk.pipeline("frame_unpack", {f.interleaved ? &sl.ftmp[1] : &sl.ftmp[2], v_to});
+			tmp[1] = vk.buffer((c + 3) / 4 * 4 + 4, 1);
+			tmp[2] = vk.buffer((c + 3) / 4 * 4 + 4, 1);
+			pipe[1] = vk.pipeline("frame_unpack", {&tmp[1], u_to});
+			pipe[2] = vk.pipeline("frame_unpack", {f.interleaved ? &tmp[1] : &tmp[2], v_to});
+		}
+		vk.copy_image(f.planes[0], y_direct ? y_to : tmp[0]);
+		if (u_to) {
+			if (c_direct) {
+				vk.copy_image(f.planes[1], *u_to);
+				vk.copy_image(f.planes[2], *v_to);
+			} else {
+				vk.copy_image(f.planes[1], tmp[1]);
+				if (!f.interleaved) vk.copy_image(f.planes[2], tmp[2]);
 			}
 		}
-		const bool y_direct = f.bytes == 1 && f.shift == 0; // NV12's luma is already what the scorer takes
-		vk.copy_image(f.planes[0], y_direct ? y_to : sl.ftmp[0]);
-		if (u_to) {
-			vk.copy_image(f.planes[1], sl.ftmp[1]);
-			if (!f.interleaved) vk.copy_image(f.planes[2], sl.ftmp[2]);
-		}
 		vk.barrier();
+		if (y_direct && (!u_to || c_direct)) return;
 		struct { int32_t words, samples, mode, sbps, dbps, shift; } pc;
 		auto unpack = [&](const Pipe& p, int samples, int mode) {
 			pc.samples = samples;
@@ -870,10 +926,10 @@ private:
 			const uint32_t groups = (uint32_t)((pc.words + 255) / 256);
 			vk.dispatch(std::min<uint32_t>(groups, 65535u), (groups + 65534u) / 65535u);
 		};
-		if (!y_direct) unpack(sl.fpipe[0], W * H, 0);
-		if (u_to) {
-			unpack(sl.fpipe[1], cw * ch, f.interleaved ? 1 : 0);
-			unpack(sl.fpipe[2], cw * ch, f.interleaved ? 2 : 0);
+		if (!y_direct) unpack(pipe[0], W * H, 0);
+		if (u_to && !c_direct) {
+			unpack(pipe[1], cw * ch, f.interleaved ? 1 : 0);
+			unpack(pipe[2], cw * ch, f.interleaved ? 2 : 0);
 		}
 		vk.barrier();
 	}
@@ -885,7 +941,7 @@ private:
 		// The frames before on the queue (this scorer's other slots) are done with the shared buffers before this one writes them.
 		vk.barrier();
 		vk.stamp(slot, 0);
-		if (gpu_in) read_decoded(slot, *gpu_in);
+		for (int side = 0; side < 2; side++) if (gpu_in[side]) read_decoded(slot, *gpu_in[side], side);
 		auto part_done = [&](int part) { // VES_SCORE_TIMING: the end of one part of the work
 			if (!part_timing) return;
 			vk.barrier();
@@ -1108,6 +1164,7 @@ private:
 			step(&SpeedUnit::scenter, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.subw * u.stpc.subh + 63) / 64); }, 4);
 			step(&SpeedUnit::scov, [](const SpeedUnit&) { return (uint32_t)((N_SPEED_PAIRS + 31) / 32); }, 4);
 			part_done(6);
+			if (speed_cpu) { part_done(7); return; } // the rest on the CPU (speed_cpu_scores()), from the slot's copies of scovm and sprep
 			step(&SpeedUnit::ssmall_p, [](const SpeedUnit&) { return 2u; }, 4); // eigenvalues and QR decomposition side by side
 			part_done(7);
 			step(&SpeedUnit::sblocks, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.nb + 63) / 64); }, 4);
@@ -1118,6 +1175,8 @@ private:
 	// The features of the frame in a slot, for every model, from the sums the GPU left there.
 	std::vector<Features> results(const Slot& sl) const {
 		const bool* with_motion = sl.with_motion;
+		std::vector<std::array<float, 4>> cpu_fin;
+		if (speed_cpu) cpu_fin = speed_cpu_scores(sl);
 		// the sums, once for each shared part
 		double sad_raw[2] = {0, 0};
 		for (int k = 0; k < 2; k++) {
@@ -1164,7 +1223,7 @@ private:
 			if (m.speed) {
 				const SpeedOpts& o = m.speed_o;
 				const int k = speed_of[i];
-				const float* fin = (const float*)sl.sfin[k].map; // U score, U failed, V score, V failed
+				const float* fin = speed_cpu ? cpu_fin[k].data() : (const float*)sl.sfin[k].map; // U score, U failed, V score, V failed
 				const float u = fin[0], v = fin[2];
 				const bool err_u = fin[1] != 0, err_v = fin[3] != 0;
 				if (speed_check) check_speed(sl, k, u, v, err_u, err_v);
@@ -1226,15 +1285,16 @@ private:
 		size_t index = 0;
 		bool with_motion[2] = {false, false};
 		Buf in_ref, in_dis, in_chroma[4];
-		Buf ftmp[3];                // a frame decoded on the GPU: its planes as copied out of its images (read_decoded())
-		Pipe fpipe[3];              // ... and the unpacking of each into the frame's buffers
-		std::shared_ptr<void> held; // ... and the frame itself, until the slot is used again
+		Buf ftmp[2][3];                // the reference / distorted frame on the GPU: its planes as copied out of its images (read_decoded())
+		Pipe fpipe[2][3];              // ... and the unpacking of each into the frame's buffers
+		std::shared_ptr<void> held[2]; // ... and the frames themselves, until the slot is used again
 		// With a second queue (Vk::async_upload()): the frame copied into VRAM there, while the compute queue works on other frames; the compute
 		// work then starts with fast copies from these into the shared buffers.
 		Buf dev_ref, dev_dis, dev_chroma[4];
 		Buf mpart[2], aden[4];
 		std::vector<std::array<Buf, 4>> vpart, cm, aimb; // per VIF unit, per ADM unit (aimb: units with AIM)
 		std::vector<Buf> sfin, sout;                    // per SpEED unit: its scores; its decimated planes (only for VES_SPEED_CHECK)
+		std::vector<Buf> scov, sprep;                   // per SpEED unit, with VES_SPEED_CPU: its covariance matrices and centred planes
 		Buf ccval[5], cpart[5];
 		Pipe cp_cval[5], cp_slide[5];
 		std::vector<std::pair<const Buf*, Buf>> out; // the shared buffer the GPU wrote, the slot's copy
@@ -1257,6 +1317,11 @@ private:
 	bool part_timing = false;
 	// VES_SPEED_CHECK=1: SpEED is also worked out on the CPU (from the GPU's decimated planes, as before it all moved to the GPU) and compared
 	bool speed_check = false;
+	// SpEED's covariance matrices and centred planes come back from the GPU, and the rest of est_params() (eigenvalues, the QR decomposition and
+	// the linear systems, the entropies) and get_speed_score() run on the CPU (CpuPool), with libvmaf's own code (vmaf_speed.h): the serial
+	// eigenvalue and QR steps leave the GPU, which only has 8 workgroups to give them. 4 v1 models on an RTX 4080 SUPER (2026-11-19): 1080p 667 ->
+	// 1002 fps, 4K 281 -> 332, for about 1 to 5 ms of CPU time per frame. VES_SPEED_CPU=0: all of it on the GPU (speed_small, speed_blocks, speed_score).
+	bool speed_cpu = true;
 	// SpEED on the device's second compute queue (Vk::second_compute()), beside the other features: its last steps are small and one after another, so
 	// on the main queue the GPU mostly waited on them. Not with VES_SCORE_TIMING, whose timestamps are on the main queue.
 	bool speed2 = false;
@@ -1422,7 +1487,10 @@ private:
 			}
 			for (auto& u : su) {
 				auto mirror2 = [&](const Buf& from) { Buf to = vk.buffer(from.size, 2); (speed2 ? sl.out2 : sl.out).emplace_back(&from, to); return to; };
-				sl.sfin.push_back(mirror2(u.sfin));
+				if (speed_cpu) {
+					sl.scov.push_back(mirror2(u.scovm));
+					sl.sprep.push_back(mirror2(u.sprep));
+				} else sl.sfin.push_back(mirror2(u.sfin));
 				if (speed_check) sl.sout.push_back(mirror2(u.sout));
 			}
 			if (cambi_on) {
@@ -1979,6 +2047,57 @@ private:
 		if ((err_ref && !err_dis) || (!err_ref && err_dis)) return 0.0f;
 		return get_speed_score(s.dimensions, s.ref_results, s.dis_results, (float)o.sigma_nn, (float)o.nn_floor, o.weight_var_mode);
 	}
+
+	// VES_SPEED_CPU: what speed_small, speed_blocks and speed_score work out, here: est_params() from its step 2 on, for each plane, from the
+	// covariance matrix and the centred plane the GPU left in the slot (the same values est_params() works out in its step 1 and gets as `data`),
+	// then get_speed_score() for each pair. Every unit's planes side by side on the CpuPool, then the pairs' scores. Per unit: U score, U failed,
+	// V score, V failed, as speed_score writes them.
+	std::vector<std::array<float, 4>> speed_cpu_scores(const Slot& sl) const {
+		using namespace vmaf_speed;
+		struct PlaneOut { std::vector<float> ent, var; bool err = false; };
+		std::vector<std::array<PlaneOut, 4>> planes(su.size());
+		CpuPool::get().parallel_for((int)su.size() * 4, [&](int task) {
+			const int k = task / 4, p = task % 4;
+			const SpeedUnit& u = su[k];
+			const auto& sd = u.sd;
+			const size_t E = sd.elements_in_block, nb = sd.num_blocks, n = (size_t)sd.operating_width * sd.operating_height;
+			std::vector<float> independent(nb * E), solution(nb * E), cov(E * E), eig(E), tmp(5 * E * E + E * nb + 8 * E + 64);
+			PlaneOut& po = planes[k][p];
+			po.ent.assign(nb, 0.0f);
+			memcpy(cov.data(), (const float*)sl.scov[k].map + (size_t)p * E * E, E * E * sizeof(float));
+			const float* data = (const float*)sl.sprep[k].map + (size_t)p * n;
+			const float sigma_nn = (float)u.o.sigma_nn;
+			// est_params() from step 2 (vmaf_speed.h)
+			compute_eigenvalues(cov.data(), eig.data(), (int)E, tmp.data());
+			compute_independent_term(sd, data, independent.data(), (size_t)sd.operating_width);
+			int e = 0;
+			const bool regular = is_matrix_regular(sd, eig.data());
+			if (regular) e = solve_linear_system(cov.data(), (int)E, independent.data(), (int)nb, solution.data(), tmp.data());
+			const bool cannot_invert = !regular || e;
+			if (cannot_invert) memset(solution.data(), 0, E * nb * sizeof(float));
+			compute_pointwise_product_and_division(sd, solution.data(), independent.data(), (float)E);
+			sum_columns(sd, solution.data());
+			for (size_t i = 0; i < E; i++) {
+				const float L = eig[i] < 0 ? 0 : eig[i];
+				update_entropy(sd, po.ent.data(), solution.data(), L, sigma_nn);
+			}
+			po.var.assign(solution.begin(), solution.begin() + nb);
+			po.err = cannot_invert;
+		});
+		std::vector<std::array<float, 4>> fin(su.size());
+		CpuPool::get().parallel_for((int)su.size() * 2, [&](int task) {
+			const int k = task / 2, q = task % 2;
+			const SpeedUnit& u = su[k];
+			PlaneOut& r = planes[k][q];
+			PlaneOut& d = planes[k][q + 2];
+			SpeedResultBuffers rb{}, db{};
+			rb.entropies = r.ent.data(); rb.variances = r.var.data();
+			db.entropies = d.ent.data(); db.variances = d.var.data();
+			fin[k][q * 2] = r.err != d.err ? 0.0f : get_speed_score(u.sd, rb, db, (float)u.o.sigma_nn, (float)u.o.nn_floor, u.o.weight_var_mode);
+			fin[k][q * 2 + 1] = r.err || d.err ? 1.0f : 0.0f;
+		});
+		return fin;
+	}
 };
 
 } // namespace
@@ -2032,7 +2151,7 @@ std::unique_ptr<GpuVmaf> GpuVmaf::create(const std::vector<std::string>& model_p
 
 bool GpuVmaf::add(const uint8_t* const ref[3], const size_t ref_stride[3], const uint8_t* const dis[3], const size_t dis_stride[3]) {
 	try {
-		impl->gpu->submit(ref, ref_stride, dis, dis_stride, impl->frames);
+		impl->gpu->submit_frames(ref, ref_stride, nullptr, dis, dis_stride, nullptr, impl->frames);
 		impl->frames++;
 	} catch (const std::exception& e) {
 		fprintf(stderr, "vmaf (GPU): %s\n", e.what());
@@ -2041,12 +2160,14 @@ bool GpuVmaf::add(const uint8_t* const ref[3], const size_t ref_stride[3], const
 	return true;
 }
 
-bool GpuVmaf::add_gpu(const uint8_t* const ref[3], const size_t ref_stride[3], const void* dis, bool& refused) {
-	const VkDecodedFrame& f = *(const VkDecodedFrame*)dis;
-	refused = !impl->gpu->takes(f);
+bool GpuVmaf::takes(const void* gpu) const { return gpu && impl->gpu->takes(*(const VkDecodedFrame*)gpu); }
+
+bool GpuVmaf::add_any(const uint8_t* const ref[3], const size_t ref_stride[3], const void* ref_gpu, const uint8_t* const dis[3], const size_t dis_stride[3],
+                      const void* dis_gpu, bool& refused) {
+	refused = (ref_gpu && !takes(ref_gpu)) || (dis_gpu && !takes(dis_gpu));
 	if (refused) return false;
 	try {
-		impl->gpu->submit_gpu(ref, ref_stride, f, impl->frames);
+		impl->gpu->submit_frames(ref, ref_stride, (const VkDecodedFrame*)ref_gpu, dis, dis_stride, (const VkDecodedFrame*)dis_gpu, impl->frames);
 		impl->frames++;
 	} catch (const std::exception& e) {
 		fprintf(stderr, "vmaf (GPU): %s\n", e.what());
@@ -2054,6 +2175,8 @@ bool GpuVmaf::add_gpu(const uint8_t* const ref[3], const size_t ref_stride[3], c
 	}
 	return true;
 }
+
+bool GpuVmaf::add_gpu(const uint8_t* const ref[3], const size_t ref_stride[3], const void* dis, bool& refused) { return add_any(ref, ref_stride, nullptr, nullptr, nullptr, dis, refused); }
 
 int GpuVmaf::device() const { return impl->gpu->device(); }
 

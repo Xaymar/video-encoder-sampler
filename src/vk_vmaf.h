@@ -34,6 +34,11 @@ public:
 	// The same with a decoded frame that is still on the GPU (`dis`, opaque: a VkDecodedFrame of vk_compute.h), read where it is: false if it is on
 	// another device or in a form this cannot read (then download it and use add()). `refused` tells that apart from a failure of the scoring.
 	bool add_gpu(const uint8_t* const ref[3], const size_t ref_stride[3], const void* dis, bool& refused);
+	// The same with either frame, or both, on the GPU (`ref_gpu` / `dis_gpu`, opaque VkDecodedFrames, or null for the planes in memory): false
+	// and `refused` if one of them is where or in a form this cannot read (takes()); nothing was added then.
+	bool add_any(const uint8_t* const ref[3], const size_t ref_stride[3], const void* ref_gpu, const uint8_t* const dis[3], const size_t dis_stride[3],
+	             const void* dis_gpu, bool& refused);
+	bool takes(const void* gpu) const; // whether a frame on the GPU (an opaque VkDecodedFrame) can be read in place: this device, a layout it reads
 	int device() const; // the Vulkan device it scores on
 	// For each model (in the order given), the VMAF score of every pair added; and, if asked for, every frame's features as libvmaf names them.
 	bool finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<std::map<std::string, double>>>* features = nullptr);

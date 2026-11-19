@@ -12,8 +12,20 @@ void main() {
 	while ((x + 1) * (x + 2) / 2 <= t) x++;
 	const int y = t - x * (x + 1) / 2;
 	const int cx = (p * N + x) * S, cy = (p * N + y) * S;
+	// The loads of a run of K samples go out before its sum, so that they overlap instead of each waiting for memory in turn (with one invocation
+	// per sum there are only ~40 warps on the whole GPU to hide that); the products and the additions stay one after another, in order.
+	const int K = 16;
 	precise double acc = 0.0LF;
-	for (int s = 0; s < S; s++) {
+	int s = 0;
+	for (; s + K <= S; s += K) {
+		double a[K], b[K];
+		for (int k = 0; k < K; k++) { a[k] = cen[cx + s + k]; b[k] = cen[cy + s + k]; }
+		for (int k = 0; k < K; k++) {
+			precise double d = a[k] * b[k];
+			acc += d;
+		}
+	}
+	for (; s < S; s++) {
 		precise double d = cen[cx + s] * cen[cy + s];
 		acc += d;
 	}

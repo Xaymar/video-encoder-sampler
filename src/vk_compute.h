@@ -78,6 +78,7 @@ struct VkDecodedFrame {
 	void (*lock)(void* ctx) = nullptr;
 	void (*unlock)(void* ctx) = nullptr;
 	void* ctx = nullptr;
+	const void* lock_domain = nullptr; // frames with the same one share their lock (taken once for both)
 	int device = -1; // the Vulkan device (Vk::devices() index)
 	std::shared_ptr<void> keep;
 };
