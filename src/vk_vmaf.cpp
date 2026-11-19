@@ -124,6 +124,7 @@ int GpuVmaf::pick_device(const std::string& spec, unsigned encoder_vendor, int e
 #include <cstring>
 #include <fstream>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <sstream>
@@ -550,6 +551,66 @@ CambiGeom cambi_geom(const CambiOpts& o, int ew, int eh) {
 }
 
 // --- SpEED: the sizes (speed.c, speed_init_dimensions()) ---
+// Runs fn(0) .. fn(n - 1) on a few threads shared by every scorer of the process, and on the caller's, which takes tasks as well (so the pool cannot
+// be held up by callers waiting on it); returns when all are done. For VES_SPEED_CPU's planes, which are independent of each other.
+class CpuPool {
+	std::mutex m;
+	std::condition_variable cv;
+	struct Job { const std::function<void(int)>* fn; int n; std::atomic<int> next{0}, done{0}; int users = 0; }; // users: pool threads in it (under m)
+	std::deque<Job*> jobs;
+	std::vector<std::thread> threads;
+	static bool run_one(Job& j) { // one task of j, if any is left
+		const int i = j.next.fetch_add(1);
+		if (i >= j.n) return false;
+		(*j.fn)(i);
+		j.done.fetch_add(1);
+		return true;
+	}
+	CpuPool() {
+		const unsigned n = std::max(2u, std::min(16u, std::thread::hardware_concurrency())) - 1;
+		for (unsigned t = 0; t < n; t++)
+			threads.emplace_back([this] {
+				for (;;) {
+					Job* j;
+					{
+						std::unique_lock lock(m);
+						cv.wait(lock, [&] { return !jobs.empty(); });
+						j = jobs.front();
+						if (j->next.load() >= j->n) { jobs.pop_front(); continue; }
+						j->users++;
+					}
+					while (run_one(*j)) {}
+					{
+						std::lock_guard lock(m);
+						j->users--; // the caller may let go of j once no pool thread is in it
+					}
+					cv.notify_all();
+				}
+			});
+		for (auto& t : threads) t.detach(); // lives as long as the process
+	}
+
+public:
+	static CpuPool& get() { static CpuPool* p = new CpuPool; return *p; }
+	void parallel_for(int n, const std::function<void(int)>& fn) {
+		if (n <= 1) { if (n == 1) fn(0); return; }
+		Job j;
+		j.fn = &fn; j.n = n;
+		{
+			std::lock_guard lock(m);
+			jobs.push_back(&j);
+		}
+		cv.notify_all();
+		while (run_one(j)) {}
+		{
+			std::unique_lock lock(m);
+			cv.wait(lock, [&] { return j.done.load() >= n && j.users == 0; });
+			auto it = std::find(jobs.begin(), jobs.end(), &j);
+			if (it != jobs.end()) jobs.erase(it);
+		}
+	}
+};
+
 vmaf_speed::SpeedDimensions speed_dims(int w, int h, double prescale) {
 	vmaf_speed::SpeedDimensions d{};
 	d.original_height = h; d.original_width = w;
@@ -1114,6 +1175,8 @@ private:
 	// The features of the frame in a slot, for every model, from the sums the GPU left there.
 	std::vector<Features> results(const Slot& sl) const {
 		const bool* with_motion = sl.with_motion;
+		std::vector<std::array<float, 4>> cpu_fin;
+		if (speed_cpu) cpu_fin = speed_cpu_scores(sl);
 		// the sums, once for each shared part
 		double sad_raw[2] = {0, 0};
 		for (int k = 0; k < 2; k++) {
@@ -1160,9 +1223,7 @@ private:
 			if (m.speed) {
 				const SpeedOpts& o = m.speed_o;
 				const int k = speed_of[i];
-				float cpu_fin[4];
-				if (speed_cpu) speed_cpu_scores(sl, k, cpu_fin);
-				const float* fin = speed_cpu ? cpu_fin : (const float*)sl.sfin[k].map; // U score, U failed, V score, V failed
+				const float* fin = speed_cpu ? cpu_fin[k].data() : (const float*)sl.sfin[k].map; // U score, U failed, V score, V failed
 				const float u = fin[0], v = fin[2];
 				const bool err_u = fin[1] != 0, err_v = fin[3] != 0;
 				if (speed_check) check_speed(sl, k, u, v, err_u, err_v);
@@ -1988,49 +2049,53 @@ private:
 
 	// VES_SPEED_CPU: what speed_small, speed_blocks and speed_score work out, here: est_params() from its step 2 on, for each plane, from the
 	// covariance matrix and the centred plane the GPU left in the slot (the same values est_params() works out in its step 1 and gets as `data`),
-	// then get_speed_score() for each pair. `fin`: U score, U failed, V score, V failed, as speed_score writes them.
-	void speed_cpu_scores(const Slot& sl, int k, float fin[4]) const {
+	// then get_speed_score() for each pair. Every unit's planes side by side on the CpuPool, then the pairs' scores. Per unit: U score, U failed,
+	// V score, V failed, as speed_score writes them.
+	std::vector<std::array<float, 4>> speed_cpu_scores(const Slot& sl) const {
 		using namespace vmaf_speed;
-		const SpeedUnit& u = su[k];
-		const SpeedOpts& o = u.o;
-		const auto& sd = u.sd;
-		const size_t E = sd.elements_in_block, nb = sd.num_blocks, n = (size_t)sd.operating_width * sd.operating_height;
-		const float* cov_all = (const float*)sl.scov[k].map;
-		const float* prep = (const float*)sl.sprep[k].map;
-		std::vector<float> independent(nb * E), solution(nb * E), cov(E * E), eig(E), tmp(5 * E * E + E * nb + 8 * E + 64);
-		std::vector<float> ent[4], var[4];
-		int err[4];
-		for (int p = 0; p < 4; p++) {
-			ent[p].assign(nb, 0.0f); var[p].assign(nb, 0.0f);
-			memcpy(cov.data(), cov_all + (size_t)p * E * E, E * E * sizeof(float));
-			const float* data = prep + (size_t)p * n;
-			const size_t stride_px = (size_t)sd.operating_width;
-			const float sigma_nn = (float)o.sigma_nn;
+		struct PlaneOut { std::vector<float> ent, var; bool err = false; };
+		std::vector<std::array<PlaneOut, 4>> planes(su.size());
+		CpuPool::get().parallel_for((int)su.size() * 4, [&](int task) {
+			const int k = task / 4, p = task % 4;
+			const SpeedUnit& u = su[k];
+			const auto& sd = u.sd;
+			const size_t E = sd.elements_in_block, nb = sd.num_blocks, n = (size_t)sd.operating_width * sd.operating_height;
+			std::vector<float> independent(nb * E), solution(nb * E), cov(E * E), eig(E), tmp(5 * E * E + E * nb + 8 * E + 64);
+			PlaneOut& po = planes[k][p];
+			po.ent.assign(nb, 0.0f);
+			memcpy(cov.data(), (const float*)sl.scov[k].map + (size_t)p * E * E, E * E * sizeof(float));
+			const float* data = (const float*)sl.sprep[k].map + (size_t)p * n;
+			const float sigma_nn = (float)u.o.sigma_nn;
 			// est_params() from step 2 (vmaf_speed.h)
 			compute_eigenvalues(cov.data(), eig.data(), (int)E, tmp.data());
-			compute_independent_term(sd, data, independent.data(), stride_px);
+			compute_independent_term(sd, data, independent.data(), (size_t)sd.operating_width);
 			int e = 0;
 			const bool regular = is_matrix_regular(sd, eig.data());
 			if (regular) e = solve_linear_system(cov.data(), (int)E, independent.data(), (int)nb, solution.data(), tmp.data());
 			const bool cannot_invert = !regular || e;
 			if (cannot_invert) memset(solution.data(), 0, E * nb * sizeof(float));
-			compute_pointwise_product_and_division(sd, solution.data(), independent.data(), (int)E);
+			compute_pointwise_product_and_division(sd, solution.data(), independent.data(), (float)E);
 			sum_columns(sd, solution.data());
 			for (size_t i = 0; i < E; i++) {
 				const float L = eig[i] < 0 ? 0 : eig[i];
-				update_entropy(sd, ent[p].data(), solution.data(), L, sigma_nn);
+				update_entropy(sd, po.ent.data(), solution.data(), L, sigma_nn);
 			}
-			memcpy(var[p].data(), solution.data(), nb * sizeof(float));
-			err[p] = cannot_invert ? 1 : 0;
-		}
-		for (int q = 0; q < 2; q++) {
-			SpeedResultBuffers r{}, d{};
-			r.entropies = ent[q].data(); r.variances = var[q].data();
-			d.entropies = ent[q + 2].data(); d.variances = var[q + 2].data();
-			const bool er = err[q] != 0, ed = err[q + 2] != 0;
-			fin[q * 2] = er != ed ? 0.0f : get_speed_score(sd, r, d, (float)o.sigma_nn, (float)o.nn_floor, o.weight_var_mode);
-			fin[q * 2 + 1] = er || ed ? 1.0f : 0.0f;
-		}
+			po.var.assign(solution.begin(), solution.begin() + nb);
+			po.err = cannot_invert;
+		});
+		std::vector<std::array<float, 4>> fin(su.size());
+		CpuPool::get().parallel_for((int)su.size() * 2, [&](int task) {
+			const int k = task / 2, q = task % 2;
+			const SpeedUnit& u = su[k];
+			PlaneOut& r = planes[k][q];
+			PlaneOut& d = planes[k][q + 2];
+			SpeedResultBuffers rb{}, db{};
+			rb.entropies = r.ent.data(); rb.variances = r.var.data();
+			db.entropies = d.ent.data(); db.variances = d.var.data();
+			fin[k][q * 2] = r.err != d.err ? 0.0f : get_speed_score(u.sd, rb, db, (float)u.o.sigma_nn, (float)u.o.nn_floor, u.o.weight_var_mode);
+			fin[k][q * 2 + 1] = r.err || d.err ? 1.0f : 0.0f;
+		});
+		return fin;
 	}
 };
 
