@@ -7,6 +7,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <memory>
@@ -17,6 +18,7 @@
 #include "formats.h"
 #include "gpu.h"
 #include "mux.h"
+#include "convert.h"
 #include "decode.h"
 #include "source.h"
 
@@ -436,12 +438,16 @@ void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& h
 }
 
 // Takes the decoded frames, drops frames to the target rate, scales and converts, and hands the result to the encoders and to the distorted scores (`enc`).
+// `gpu_out`: the encoders take frames from VRAM (NVENC, see encoder_nvenc.cpp), so the converted frames stay on the GPU (buffer frames), and frames
+// decoded there that need no conversion go through the converter as they are (an exact copy), instead of being read back.
 // Frame rate conversion drops frames before scaling. Each source frame falls into a slot of the output timeline (its real presentation time times the rate,
 // rounded down) and only the first frame in each slot is kept. `shown[n]` records which encoded frame is on screen at source frame n, for scoring.
 void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Plan& pl, const ScaleOptions& so, Broadcast& bc, FrameHistory& enc, FeedResult& fr, bool& ok, RunProgress* rp,
-                   bool keep_for_scores = true) {
+                   bool keep_for_scores = true, bool gpu_out = false) {
 	const Shape& e = pl.enc;
 	auto scaler = make_converter();
+	scaler->set_output_on_gpu(gpu_out);
+	bool copy_through = false; // !pl.rescale, frames on the GPU: through the converter as they are
 	Picture frame, scaled;
 	int64_t last_slot = -1;
 	long long kept = 0;
@@ -464,12 +470,18 @@ void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Pl
 		if (keep) {
 			frame.pts = kept++; // encoded frames are numbered consecutively, whatever the gaps in the source timing
 			frame.duration = 1; // one tick of the 1/enc.fps time base
-			if (!pl.rescale) {
+			if (frame.pts == 0 && !pl.rescale && gpu_out && frame.gpu) {
+				copy_through = true;
+				ScaleOptions to = so;
+				to.trc = 0;
+				ok = scaler->open(frame, e.fps.inverse(), e.w, e.h, e.pix, to, 0);
+			}
+			if (!pl.rescale && !copy_through) {
 				if (!picture_to_memory(frame)) { ok = false; break; } // decoded on the GPU, and the encoders take frames from memory
 				hand_on(frame);
 			}
 			else {
-				if (frame.pts == 0) {
+				if (frame.pts == 0 && pl.rescale) {
 					ScaleOptions to = so;
 					to.trc = pl.trc;
 					ok = scaler->open(frame, e.fps.inverse(), e.w, e.h, e.pix, to, pl.range);
@@ -481,7 +493,7 @@ void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Pl
 		fr.shown.push((uint32_t)(kept - 1));
 	}
 	raw.leave(reader);
-	if (ok && pl.rescale && kept) { ok = scaler->push(nullptr); queue_scaled(); }
+	if (ok && (pl.rescale || copy_through) && kept) { ok = scaler->push(nullptr); queue_scaled(); }
 	if (rp) rp->finish();
 	fr.shown.finish();
 	enc.close();
@@ -686,7 +698,11 @@ bool run_wave(const std::string& input, const SourceInfo& planned, std::vector<W
 
 	bool decode_ok = false, feed_ok = false;
 	std::thread decoder([&] { decode_input(*src, raw, [&] { return raw.held() || enc_frames.held() || raw.too_far(IDLE_BEYOND) || enc_frames.too_far(IDLE_BEYOND); }, decode_ok, &decode_rp, limit); });
-	std::thread feeder([&] { feed_encoders(*src, raw, feed_reader, *runs[0]->enc.plan, so, bc, enc_frames, fr, feed_ok, feed_rp, !check); });
+	// NVENC takes frames from VRAM (VES_ENC_GPU_INPUT=0: never): the feed's frames stay on the GPU when every encoder of the wave is NVENC.
+	bool gpu_feed = converter_shares_ffmpeg_vulkan();
+	if (const char* e = getenv("VES_ENC_GPU_INPUT"); e && atoi(e) == 0) gpu_feed = false;
+	for (auto* r : runs) if (r->enc.encoder != "nvenc") gpu_feed = false;
+	std::thread feeder([&] { feed_encoders(*src, raw, feed_reader, *runs[0]->enc.plan, so, bc, enc_frames, fr, feed_ok, feed_rp, !check, gpu_feed); });
 	std::vector<std::thread> threads;
 	for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {
 		consume(runs[i]->enc, si, bc.at(i), holding[i].get(), [&, i] {

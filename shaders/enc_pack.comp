@@ -1,0 +1,33 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+// A plane of a GPU encoder's input (NVENC: NV12, P010, YUV444, YUV444 10-bit) from the converter's planar output, exactly as repack.h does it in
+// memory: samples of `bytes` (1 or 2, little-endian), rows of `w` samples with no gaps, plane A from byte `src_a` on (and plane B from `src_b`).
+// mode 0: plane A, mode 1: planes A and B interleaved (U, V, U, V, ...: the chroma of NV12 and P010). Each sample is shifted up by `shift` (6: 10-bit
+// samples in the top bits of 16). Output rows are `pitch_words` words apart from word `dst_base` on; each invocation writes one word.
+layout(std430, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, binding = 1) buffer Dst { uint dst[]; };
+layout(push_constant) uniform PC { int w, h, bytes, shift, mode, src_a, src_b, dst_base, pitch_words; } pc;
+
+uint sample_at(int base, int i) {
+	if (pc.bytes == 1) { const uint b = uint(base + i); return (src[b >> 2] >> ((b & 3u) * 8u)) & 0xFFu; }
+	const uint b = uint(base + i * 2);
+	return (src[b >> 2] >> ((b & 2u) * 8u)) & 0xFFFFu;
+}
+
+void main() {
+	const int kx = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+	const int per = 4 / pc.bytes;
+	const int row = pc.mode == 1 ? pc.w * 2 : pc.w; // samples in an output row
+	if (kx * per >= row || y >= pc.h) return;
+	const uint mask = pc.bytes == 1 ? 0xFFu : 0xFFFFu;
+	uint word = 0u;
+	for (int s = 0; s < per; s++) {
+		const int x = kx * per + s;
+		if (x >= row) break;
+		uint v;
+		if (pc.mode == 1) v = sample_at((x & 1) != 0 ? pc.src_b : pc.src_a, y * pc.w + (x >> 1));
+		else v = sample_at(pc.src_a, y * pc.w + x);
+		word |= ((v << uint(pc.shift)) & mask) << uint(s * 8 * pc.bytes);
+	}
+	dst[pc.dst_base + y * pc.pitch_words + kx] = word;
+}

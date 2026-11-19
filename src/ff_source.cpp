@@ -454,6 +454,13 @@ bool vulkan_provider(int index, uint32_t vendor_id, uint32_t device_id, VkExtern
 	out.phys = vk->phys_dev;
 	out.dev = vk->act_dev;
 	out.queue_flags = ffmpeg_queue_flags(*vk, 0);
+	// FFmpeg turns the platform's external memory extension on where the driver has it: then encoders can take frames from VRAM (Vk::exportable_buffer())
+#ifdef _WIN32
+	const char* ext_mem = "VK_KHR_external_memory_win32";
+#else
+	const char* ext_mem = "VK_KHR_external_memory_fd";
+#endif
+	for (int i = 0; i < vk->nb_enabled_dev_extensions; i++) if (!strcmp(vk->enabled_dev_extensions[i], ext_mem)) out.export_memory = true;
 	out.ctx = hw;
 	out.lock = [](void* c, uint32_t fam, uint32_t i) { auto* h = (AVHWDeviceContext*)c; ((AVVulkanDeviceContext*)h->hwctx)->lock_queue(h, fam, i); };
 	out.unlock = [](void* c, uint32_t fam, uint32_t i) { auto* h = (AVHWDeviceContext*)c; ((AVVulkanDeviceContext*)h->hwctx)->unlock_queue(h, fam, i); };

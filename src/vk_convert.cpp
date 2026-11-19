@@ -846,7 +846,10 @@ public:
 		}
 		const VkDecodedFrame* gf = nullptr;
 		VkDecodedFrame here;
-		if (p->gpu) {
+		// a buffer frame (a converter's output) on this device: its planes are copied from where they are, rows with no gaps, as from an image
+		const VkDecodedFrame* bin = p->gpu && ((const VkDecodedFrame*)p->gpu.get())->buffer && ((const VkDecodedFrame*)p->gpu.get())->device == device
+		                                ? (const VkDecodedFrame*)p->gpu.get() : nullptr;
+		if (p->gpu && !bin) {
 			const AVFrame* af = gpu_avframe(*p);
 			if (!af || !vulkan_frame(af, device, here)) { // on another device, or not readable in place: through memory
 				Picture m = *p;
@@ -883,11 +886,12 @@ public:
 		FrameLock in_lock, out_lock;
 		bool recording = false; // begun and not yet submitted
 		try {
-			if (shape_changed(shape, gf != nullptr)) {
+			const bool in_gpu = gf || bin;
+			if (shape_changed(shape, in_gpu)) {
 				while (!order.empty()) if (take_oldest(true) < 0) return false; // the shared buffers change
-				if (!setup(shape, L, gf != nullptr)) return false;
+				if (!setup(shape, L, in_gpu)) return false;
 			}
-			for (int pn = 0; pn < L.planes; pn++) cur_stride[pn] = plane_stride(shape, L, pn, gf != nullptr);
+			for (int pn = 0; pn < L.planes; pn++) cur_stride[pn] = plane_stride(shape, L, pn, in_gpu);
 			vk->begin(k);
 			recording = true;
 			if (timing) vk->stamp(k, 0);
@@ -907,6 +911,13 @@ public:
 					vk->copy_image(pl, raw, plane_off[pn]);
 				}
 				s.keep_in = gf->keep;
+			} else if (bin) {
+				vk->wait_timeline(k, bin->buf_sem, bin->buf_value); // nothing in it changes after that: no lock, nothing to signal
+				for (int pn = 0; pn < L.planes && pn < bin->nplanes; pn++) {
+					const VkDeviceSize row = (VkDeviceSize)plane_samples_w(shape, L, pn) * L.step[pn];
+					vk->copy_rows(bin->buffer, bin->buf_offset[pn], (VkDeviceSize)bin->planes[pn].w * bin->bytes, raw.buf, plane_off[pn], row, (uint32_t)plane_rows(shape, L, pn));
+				}
+				s.keep_in = p->gpu;
 			} else {
 				if (!s.up.buf || s.up.size < raw_size) s.up = vk->buffer(raw_size + 16, 3);
 				for (int pn = 0; pn < L.planes; pn++) {
@@ -995,7 +1006,7 @@ public:
 			return false;
 		}
 		static std::once_flag told;
-		std::call_once(told, [&] { fprintf(stderr, "converter: %s path, %s, %dx%d -> %dx%d\n", st.linear ? (st.curve_in ? "linear light" : "RGB matrix") : "direct", gf ? "from the GPU" : "from memory", in_w, in_h, out_w, out_h); });
+		std::call_once(told, [&] { fprintf(stderr, "converter: %s path, %s, %dx%d -> %dx%d\n", st.linear ? (st.curve_in ? "linear light" : "RGB matrix") : "direct", gf ? "from the GPU" : bin ? "from a GPU buffer" : "from memory", in_w, in_h, out_w, out_h); });
 		s.pending = true;
 		s.pts = p->pts;
 		s.duration = p->duration;

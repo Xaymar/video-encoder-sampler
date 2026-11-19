@@ -14,6 +14,7 @@
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
+#include <vulkan/vulkan_win32.h> // exportable_buffer(): VkMemoryGetWin32HandleInfoKHR
 #else
 #include <dlfcn.h>
 #endif
@@ -28,7 +29,8 @@
 	X(vkUpdateDescriptorSets) X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
 	X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdPipelineBarrier) \
 	X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkGetFenceStatus) X(vkResetFences) \
-	X(vkCmdCopyBuffer) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+	X(vkCmdCopyBuffer) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) \
+	X(vkGetDeviceProcAddr) X(vkEnumerateDeviceExtensionProperties)
 
 #define X(n) static PFN_##n n;
 VK_FUNCS(X)
@@ -37,6 +39,14 @@ VK_FUNCS(X)
 namespace {
 
 constexpr int kBindings = 16;
+
+#ifdef _WIN32
+#define EXT_MEMORY_NAME VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
+constexpr VkExternalMemoryHandleTypeFlagBits kExportType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+#else
+#define EXT_MEMORY_NAME VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME
+constexpr VkExternalMemoryHandleTypeFlagBits kExportType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+#endif
 
 void chk(VkResult r, const char* what) {
 	if (r == VK_ERROR_DEVICE_LOST) gpu_lost(std::string("Vulkan device lost while scoring VMAF (") + what + ")");
@@ -76,6 +86,12 @@ struct Shared {
 	std::mutex queue_lock, xqueue_lock, cqueue2_lock, pipe_lock;
 	std::map<std::string, VkPipeline> pipelines;
 	VkExternal ext;        // where the device came from, if it is not ours
+	bool export_mem = false; // the external memory extension of the platform is on (exportable_buffer())
+#ifdef _WIN32
+	PFN_vkGetMemoryWin32HandleKHR get_handle = nullptr;
+#else
+	PFN_vkGetMemoryFdKHR get_fd = nullptr;
+#endif
 	bool external = false;
 	uint32_t queue_index = 0, xqueue_index = 0;
 	// Submits to one of the device's queues, under its lock (and its maker's, for a device that is not ours).
@@ -146,6 +162,7 @@ bool instance_up(std::string& why) {
 			d.vendor_id = p2.properties.vendorID;
 			d.device_id = p2.properties.deviceID;
 			if (vkGetPhysicalDeviceProperties2 && idp.deviceLUIDValid) { memcpy(&d.luid, idp.deviceLUID, sizeof d.luid); d.luid_valid = true; }
+			if (vkGetPhysicalDeviceProperties2) { memcpy(d.uuid, idp.deviceUUID, sizeof d.uuid); d.uuid_valid = true; }
 			VkPhysicalDeviceMemoryProperties mp;
 			vkGetPhysicalDeviceMemoryProperties(in.phys[i], &mp);
 			for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
@@ -233,8 +250,28 @@ Shared* bring_up(int index, std::string& why) {
 			dci.queueCreateInfoCount = qcount;
 			dci.pQueueCreateInfos = qcis;
 			dci.pEnabledFeatures = &feats;
+			// memory that CUDA can take in (exportable_buffer()), where the driver has it
+			const char* ext_mem = EXT_MEMORY_NAME;
+			{
+				uint32_t en = 0;
+				vkEnumerateDeviceExtensionProperties(s.phys, nullptr, &en, nullptr);
+				std::vector<VkExtensionProperties> ep(en);
+				if (en) vkEnumerateDeviceExtensionProperties(s.phys, nullptr, &en, ep.data());
+				for (auto& e : ep) if (!strcmp(e.extensionName, ext_mem)) s.export_mem = true;
+			}
+			if (s.export_mem) { dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &ext_mem; }
 			chk(vkCreateDevice(s.phys, &dci, nullptr, &s.dev), "vkCreateDevice");
 			s.xqueue_index = s.xfamily == s.family ? 1 : 0;
+		}
+		if (s.external) s.export_mem = s.ext.export_memory;
+		if (s.export_mem) {
+#ifdef _WIN32
+			s.get_handle = (PFN_vkGetMemoryWin32HandleKHR)vkGetDeviceProcAddr(s.dev, "vkGetMemoryWin32HandleKHR");
+			if (!s.get_handle) s.export_mem = false;
+#else
+			s.get_fd = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(s.dev, "vkGetMemoryFdKHR");
+			if (!s.get_fd) s.export_mem = false;
+#endif
 		}
 		// Queues made with flags (FFmpeg's, with VK_KHR_internally_synchronized_queues) can only be had with the same flags.
 		auto get_queue = [&](uint32_t family, uint32_t index, VkQueue& q) {
@@ -413,6 +450,75 @@ void Vk::release() {
 	for (VkSemaphore x : impl->owned_sems) vkDestroySemaphore(s.dev, x, nullptr);
 	delete impl;
 	impl = nullptr;
+}
+
+bool Vk::exportable_buffer(VkDeviceSize size, ExportedBuf& out, std::string& why) {
+	Shared& s = *impl->s;
+	out = ExportedBuf();
+	if (!s.export_mem) { why = std::string("the Vulkan device has no ") + EXT_MEMORY_NAME; return false; }
+	VkBuffer buf = VK_NULL_HANDLE;
+	VkDeviceMemory mem = VK_NULL_HANDLE;
+	try {
+		VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+		eb.handleTypes = kExportType;
+		VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		bi.pNext = &eb;
+		bi.size = size;
+		bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		const uint32_t families[2] = {s.family, s.xfamily};
+		if (s.has_x && s.xfamily != s.family) {
+			bi.sharingMode = VK_SHARING_MODE_CONCURRENT;
+			bi.queueFamilyIndexCount = 2;
+			bi.pQueueFamilyIndices = families;
+		}
+		chk(vkCreateBuffer(s.dev, &bi, nullptr, &buf), "vkCreateBuffer (exportable)");
+		VkMemoryRequirements mr;
+		vkGetBufferMemoryRequirements(s.dev, buf, &mr);
+		int type = -1;
+		for (uint32_t i = 0; i < s.mem.memoryTypeCount && type < 0; i++)
+			if ((mr.memoryTypeBits & (1u << i)) && (s.mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = (int)i;
+		if (type < 0) throw std::runtime_error("Vulkan: no device-local memory for an exportable buffer");
+		VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+		ded.buffer = buf;
+		VkExportMemoryAllocateInfo ex{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+		ex.pNext = &ded;
+		ex.handleTypes = kExportType;
+		VkMemoryAllocateInfo mi{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+		mi.pNext = &ex;
+		mi.allocationSize = mr.size;
+		mi.memoryTypeIndex = (uint32_t)type;
+		chk(vkAllocateMemory(s.dev, &mi, nullptr, &mem), "vkAllocateMemory (exportable)");
+		chk(vkBindBufferMemory(s.dev, buf, mem, 0), "vkBindBufferMemory (exportable)");
+#ifdef _WIN32
+		VkMemoryGetWin32HandleInfoKHR hi{VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR};
+		hi.memory = mem;
+		hi.handleType = kExportType;
+		HANDLE h = nullptr;
+		chk(s.get_handle(s.dev, &hi, &h), "vkGetMemoryWin32HandleKHR");
+		out.win32 = h;
+#else
+		VkMemoryGetFdInfoKHR fi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+		fi.memory = mem;
+		fi.handleType = kExportType;
+		int fd = -1;
+		chk(s.get_fd(s.dev, &fi, &fd), "vkGetMemoryFdKHR");
+		out.fd = fd;
+#endif
+	} catch (const std::exception& e) {
+		if (mem) vkFreeMemory(s.dev, mem, nullptr);
+		if (buf) vkDestroyBuffer(s.dev, buf, nullptr);
+		why = e.what();
+		return false;
+	}
+	VkMemoryRequirements mr;
+	vkGetBufferMemoryRequirements(s.dev, buf, &mr);
+	impl->owned.emplace_back(buf, mem);
+	impl->device_bytes += mr.size;
+	out.b.buf = buf;
+	out.b.mem = mem;
+	out.b.size = size;
+	out.alloc_size = mr.size;
+	return true;
 }
 
 Buf Vk::buffer(VkDeviceSize size, int kind) {
