@@ -1421,6 +1421,7 @@ private:
 	Pipe cp_front;
 	bool cfront = false;
 	bool ccols = false; // cambi_cvalue_cols: column counts where a tile's values lie close together
+	bool cp32 = false;  // cambi_cvalue_p32: windows up to 65 (half window 17 .. 32) from tiles in shared memory (VES_CAMBI_P32=0: from the buffers)
 	Pipe cp_pre, cp_dither, cp_mask, cp_dec[5], cp_mode_h[5], cp_mode_v[5], cp_dmode[5];
 	bool cdmode = true; // cambi_dmode: a scale's decimation and mode filter in one pass (VES_CAMBI_SPLIT_MODE=1: cambi_decimate + cambi_mode twice)
 	uint32_t cgroups[5] = {};
@@ -1544,7 +1545,7 @@ private:
 				for (int s = 0; s < 5; s++) {
 					sl.ccval[s] = vk.buffer((size_t)cg.sw[s] * cg.sh[s] * 4 + 16, 2);
 					sl.cpart[s] = vk.buffer((size_t)cgroups[s] * 16 + 16, 2);
-					sl.cp_cval[s] = vk.pipeline(ccols && !cslide ? "cambi_cvalue_cols" : "cambi_cvalue", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab, &sl.cpart[s]});
+					sl.cp_cval[s] = vk.pipeline(cslide ? "cambi_cvalue" : cp32 ? "cambi_cvalue_p32" : ccols ? "cambi_cvalue_cols" : "cambi_cvalue", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab, &sl.cpart[s]});
 					if (cslide) sl.cp_slide[s] = vk.pipeline("cambi_cslide", {&cimg[s], &cmask[s], &sl.ccval[s], &ctab});
 				}
 			}
@@ -1859,6 +1860,9 @@ private:
 				ccols = vendor != 0x1002;
 				if (const char* e = getenv("VES_CAMBI_COLS"); e && *e) ccols = atoi(e) > 0;
 			}
+			// half windows of 17 .. 32 (65 at 4K) were read sample by sample from the buffers, twice each (mask, value): from an 80 x 80 tile instead
+			cp32 = cg.pad > 16 && cg.pad <= 32;
+			if (const char* e = getenv("VES_CAMBI_P32"); e && *e) cp32 = cp32 && atoi(e) > 0;
 			cpc.vlt_luma = vlt_luma(o.vlt, lr, pq);
 			const int v_lo = cpc.vlt_luma - 3 * nd + 1;
 			cpc.band_base = v_lo > 0 ? v_lo : 0;
