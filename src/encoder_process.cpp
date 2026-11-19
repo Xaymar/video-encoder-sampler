@@ -927,7 +927,8 @@ void pick_decode_gpu() {
 		if (!gpu_of_vulkan_device(index, vendor, n)) continue;
 		set_hw_decode_gpu(vendor, n);
 		set_home_vulkan_device(index); // converting and scoring follow it (unless --scaling-gpu or vmaf.gpu say otherwise)
-		fprintf(stderr, "decoding on %s (home GPU: converting and scoring there as well)\n", gpu_description(vendor, n).c_str());
+		if (hw_decode_on()) fprintf(stderr, "decoding on %s (home GPU: converting and scoring there as well)\n", gpu_description(vendor, n).c_str());
+		else fprintf(stderr, "home GPU: %s (converting and scoring; decoding in software)\n", gpu_description(vendor, n).c_str());
 		return;
 	}
 	if (process_vendor) set_hw_decode_gpu(process_vendor, process_gpu); // no Vulkan to tell the GPUs apart: as before, on this process's GPU

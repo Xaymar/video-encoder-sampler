@@ -106,7 +106,7 @@ struct Config {
 	UploadOptions upload; // where the results go after a sweep; no address: nowhere
 	bool plain = false; // no live display, just lines
 	std::string log_file; // --log: the lines also go to this file, with the date and time
-	std::string hw_decode = "auto"; // "" software only, "auto", or a device type or decoder name: see set_hw_decode()
+	std::string hw_decode = "on"; // "" software only, anything else on (Vulkan Video): see set_hw_decode()
 	int decode_threads = 0;  // 0: as many as the cores allow within a memory budget
 	// Where the encoder processes decode and scale (vmaf.gpu says where they score): "" or "auto" the fastest GPU, "own" the GPU that encodes, a Vulkan index or a
 	// name. This machine's choice, so not part of a run's key; scaling_gpu beats the sweep's "scaling": {"gpu"} in the processes.
@@ -538,7 +538,7 @@ static void load_config_json(const Json& root, Config& cfg) {
 	if (auto* v = setting("log")) cfg.log_file = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "ves.log" : "") : v->text();
 	if (auto* v = setting("cache")) cfg.cache_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "cache" : "") : v->text();
 	if (auto* v = root.find("output")) cfg.output_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "output" : "") : v->text();
-	if (auto* v = setting("hw_decode")) cfg.hw_decode = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "auto" : "") : v->text();
+	if (auto* v = setting("hw_decode")) cfg.hw_decode = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "on" : "") : v->text();
 	if (auto* v = setting("decode_threads")) cfg.decode_threads = atoi(v->text().c_str());
 	if (auto* v = setting("decode_gpu")) cfg.decode_gpu = v->text();
 	if (auto* v = setting("scaling_gpu")) cfg.scaling_gpu = v->text();
@@ -684,12 +684,12 @@ Paths
         --upload-key <key>  the API key from the website's account page; better in the config ("upload": {"key": ...}) or the VES_API_KEY environment variable
         --no-upload-videos  upload the results but not the encoded videos
         --no-skip-known     run everything, also runs the site already has (by default those are skipped and their results downloaded)
-        --hw-decode <auto|off|name>  decode the sources on the GPU when their first frames match a software decode exactly (default: auto);
-                            a name is a device type (cuda, d3d11va, d3d12va, dxva2, qsv, amf, vaapi, vulkan) or a hardware decoder (hevc_cuvid, h264_qsv, ...).
-                            The encoded streams that are scored too (device types only): until a stream of a kind (codec, size, bit depth, chroma) decoded
+        --hw-decode <on|off>  decode the sources on the GPU with Vulkan Video when their first frames match a software decode exactly (default: on;
+                            "auto", "true" or a device type name from older configs mean on, "false" off).
+                            The encoded streams that are scored too: until a stream of a kind (codec, size, bit depth, chroma) decoded
                             exactly like software all the way through, the GPU and software run side by side; after that the GPU decodes that kind alone.
                             The verdicts are kept per GPU, driver and FFmpeg version (VES_HW_DECODE_VERDICTS=<file|off>; VES_HW_DECODE_VERIFY=<frames|all> checks again)
-                            Vulkan is tried first: its frames stay on the GPU, where the converter and the scorer use them on FFmpeg's own device
+                            Its frames stay on the GPU, where the converter and the scorer use them on FFmpeg's own device
                             (VES_SHARED_VULKAN=0: they make their own devices; VES_HW_DECODE_TO_MEMORY=1: frames are read back as they are decoded).
                             Vulkan decodes only H.264, HEVC, AV1 and VP9 (the video engine), not FFmpeg's compute shader decoders (FFV1, ...).
         --decode-gpu <auto|own|n|name>  the home GPU, which decodes the sources and the scored streams (default: auto, the fastest GPU: discrete first,
