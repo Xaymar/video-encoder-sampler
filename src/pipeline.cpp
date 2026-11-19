@@ -478,8 +478,11 @@ void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Pl
 // larger: scored at 10 bit or more). A scorer that waits for its encoder's packets does not hold it back: the busy scorers may need frames that encoder
 // has not been given yet (an encoder that holds more frames back than the others), and waiting for it would wait forever. `waiting` is set while it
 // waits for room.
-void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, Fmt fmt, const ScaleOptions& so, FrameHistory& out, std::atomic<bool>& waiting, RunProgress& rp) {
+// `on_gpu`: the frames are scored on the GPU, so frames decoded there stay there (converted or not) and are only read back by a scorer that cannot take them.
+void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, Fmt fmt, const ScaleOptions& so, FrameHistory& out, std::atomic<bool>& waiting, RunProgress& rp,
+                       bool on_gpu) {
 	auto conv = make_converter();
+	conv->set_output_on_gpu(on_gpu);
 	Picture t, o;
 	bool ok = true, first = true;
 	auto flush_converted = [&] {
@@ -501,8 +504,8 @@ void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, F
 		}
 		if (!out.read() || raw.next(reader, t, &rp) != 1) break; // the end, or every scorer of this format has ended
 		rp.step();
-		if (t.fmt == fmt) { // nothing to convert: the scorer takes the frame as it is, from memory
-			if (!picture_to_memory(t)) { ok = false; break; }
+		if (t.fmt == fmt) { // nothing to convert: the scorer takes the frame as it is (on the GPU when it can read it there)
+			if (!on_gpu && !picture_to_memory(t)) { ok = false; break; }
 			out.push(t);
 			continue;
 		}
@@ -683,7 +686,7 @@ bool run_wave(const std::string& input, const SourceInfo& planned, std::vector<W
 	ref.score_range = si.fmt.rgb ? 1 : (si.color.range ? si.color.range : 1); // the reference side is converted to YUV without changing the range (RGB: limited)
 	for (auto& gp : groups) {
 		Group& g = *gp;
-		threads.emplace_back([&, gptr = &g] { convert_reference(si, raw, gptr->raw_reader, gptr->fmt, so, gptr->frames, gptr->waiting, gptr->ref_rp); });
+		threads.emplace_back([&, gptr = &g] { convert_reference(si, raw, gptr->raw_reader, gptr->fmt, so, gptr->frames, gptr->waiting, gptr->ref_rp, vo.device != "cpu"); });
 		VmafOptions group_vo = vo;
 		if (group_vo.threads <= 0) group_vo.threads = std::max(2, (int)std::thread::hardware_concurrency() / (int)runs.size());
 		for (size_t m = 0; m < g.members.size(); m++) threads.emplace_back([&, gptr = &g, m, group_vo] {
