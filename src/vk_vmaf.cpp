@@ -1467,6 +1467,7 @@ private:
 	bool cdmode = true; // cambi_dmode: a scale's decimation and mode filter in one pass (VES_CAMBI_SPLIT_MODE=1: cambi_decimate + cambi_mode twice)
 	uint32_t cgroups[5] = {};
 	bool cslide = false; // c values by cambi_cslide
+	bool cslide_serial = false; // VES_CAMBI_SLIDE_SERIAL=1: each scale's cambi_cslide and sums right after its mode filter, as before
 	// speed: the chroma planes once, the decimation per unit
 	int cw = 0, ch = 0;
 	Buf sraw[4];
@@ -1936,6 +1937,7 @@ private:
 		  // llvmpipe only); else cambi_cvalue's direct counts
 			const char* e = getenv("VES_CAMBI_SLIDE");
 			cslide = cg.pad <= 32 && nd <= 4 && e && atoi(e) > 0;
+			if (const char* e2 = getenv("VES_CAMBI_SLIDE_SERIAL"); e2 && atoi(e2) > 0) cslide_serial = true;
 		}
 		cpc.bpc = bpc;
 		cpc.anti_dither = anti_dither ? 1 : 0;
@@ -1946,7 +1948,7 @@ private:
 		cfront = !anti_dither;
 		if (const char* e = getenv("VES_CAMBI_SPLIT_FRONT"); e && atoi(e) > 0) cfront = false;
 		if (const char* e = getenv("VES_CAMBI_SPLIT_MODE"); e && atoi(e) > 0) cdmode = false;
-		cval_serial = cslide || vk.pass_timing();
+		cval_serial = vk.pass_timing() || (cslide && cslide_serial);
 		if (const char* e = getenv("VES_CAMBI_SERIAL"); e && *e) cval_serial = cval_serial || atoi(e) > 0;
 		if (cfront) cp_front = cg.speedup ? vk.pipeline("cambi_front", {&raw_dis, &cidx, &cimg[0], &cmask[0]}) : vk.pipeline("cambi_front", {&raw_dis, &cidx, &cfull, &cmask0});
 		for (int s = 0; s < 5; s++) {
@@ -2020,10 +2022,19 @@ private:
 		if (cval_serial) return;
 		// The c values of the scales need nothing from each other (only the images of the scales, all made by now): their passes go one after
 		// another with no barrier between them, so the GPU runs them side by side (each pass of the small scales is mostly a workgroup's latency).
+		// With cambi_cslide: all scales' sliding passes, one barrier, all their sums.
+		for (int s = 0; s < 5 && cslide; s++) {
+			const int w = cg.sw[s], h = cg.sh[s];
+			pc.W = w; pc.H = h; pc.OW = w; pc.OH = 128;
+			pc.anti_dither = cpc.anti_dither;
+			R.push(&pc, sizeof pc);
+			R.bind(sl.cp_slide[s]); R.dispatch((uint32_t)((w + 63) / 64), (uint32_t)((h + 127) / 128));
+		}
+		if (cslide) R.next();
 		for (int s = 0; s < 5; s++) {
 			const int w = cg.sw[s], h = cg.sh[s];
 			g = groups(w, h);
-			pc.W = w; pc.H = h; pc.OW = w; pc.OH = h;
+			pc.W = w; pc.H = h; pc.OW = cslide ? -1 : w; pc.OH = h;
 			pc.anti_dither = cpc.anti_dither;
 			R.push(&pc, sizeof pc);
 			R.bind(sl.cp_cval[s]); R.dispatch(g.first, g.second);
