@@ -533,7 +533,35 @@ class VkConverter : public Converter {
 				U = &B[0]; V = &B[1];
 			}
 			const bool sig = s.upscale_light == 1, stored = s.upscale_light == 2;
-			struct { int32_t n, rgb, trc, sig; float kr, kb; } lp{in_w * in_h, s.rgb ? 1 : 0, stored ? 0 : s.curve_in, sig ? 1 : 0, s.kr_in, s.kb_in};
+			const bool change = s.curve_in != s.curve_out;
+			const int trc_in = stored ? 0 : s.curve_in, trc_out = stored && !change ? 0 : s.curve_out, pre = stored && change ? s.curve_in : 0;
+			if (s.scale) { // a polar kernel: to linear light, scale and back in one pass (cv_ewa3.comp) where its tile fits
+				Resample r;
+				r.in_w = in_w; r.in_h = in_h; r.out_w = out_w; r.out_h = out_h;
+				axis(in_w, out_w, 0, 0, true, r.ax, r.bx);
+				axis(in_h, out_h, 0, 0, false, r.ay, r.by);
+				r.f = (out_w < in_w || out_h < in_h) ? down : up;
+				const double fx = std::max(1.0, r.ax), fy = std::max(1.0, r.ay), sx = r.f->radius * fx, sy = r.f->radius * fy;
+				const double tw = std::ceil(r.ax * 15 + 2 * sx) + 3, th = std::ceil(r.ay * 7 + 2 * sy) + 3;
+				static const bool off = [] { const char* e = getenv("VES_CONVERT_FUSED"); return e && atoi(e) == 0; }();
+				if (r.f->polar && tw * th <= 3072 && !off) {
+					struct {
+						int32_t in_w, in_h, out_w, out_h, lut_n;
+						float ax, bx, ay, by, fx, fy, radius;
+						int32_t rgb, trc_in, sig, trc_out, pre;
+						float kr_in, kb_in, kr_out, kb_out;
+					} pc{in_w, in_h, out_w, out_h, LUT_N, (float)r.ax, (float)r.bx, (float)r.ay, (float)r.by, (float)fx, (float)fy, (float)r.f->radius,
+					     s.rgb ? 1 : 0, trc_in, sig ? 1 : 0, trc_out, pre, s.kr_in, s.kb_in, s.kr_out, s.kb_out};
+					Buf& lut = lut_for(r.f);
+					Pipe& p = pipe("cv_ewa3", {Y, U, V, &C[0], &C[1], &C[2], &lut});
+					vk->bind(p); vk->push(&pc, sizeof pc); vk->dispatch(groups(out_w, 16), groups(out_h, 8));
+					vk->barrier();
+					Y = &C[0]; U = &C[1]; V = &C[2];
+					goto chroma_down;
+				}
+			}
+			{
+			struct { int32_t n, rgb, trc, sig; float kr, kb; } lp{in_w * in_h, s.rgb ? 1 : 0, trc_in, sig ? 1 : 0, s.kr_in, s.kb_in};
 			Pipe& pl = pipe("cv_to_linear", {Y, U, V});
 			vk->bind(pl); vk->push(&lp, sizeof lp); dispatch_1d(lp.n);
 			vk->barrier();
@@ -548,11 +576,12 @@ class VkConverter : public Converter {
 				resample(*V, C[2], r);
 				Y = &C[0]; U = &C[1]; V = &C[2];
 			}
-			const bool change = s.curve_in != s.curve_out;
-			struct { int32_t n, trc, sig, pre; float kr, kb; } fp{out_w * out_h, stored && !change ? 0 : s.curve_out, sig ? 1 : 0, stored && change ? s.curve_in : 0, s.kr_out, s.kb_out};
+			struct { int32_t n, trc, sig, pre; float kr, kb; } fp{out_w * out_h, trc_out, sig ? 1 : 0, pre, s.kr_out, s.kb_out};
 			Pipe& pf = pipe("cv_from_linear", {Y, U, V});
 			vk->bind(pf); vk->push(&fp, sizeof fp); dispatch_1d(fp.n);
 			vk->barrier();
+			}
+		chroma_down:
 			if (s.out_cw || s.out_ch) {
 				Resample r;
 				r.in_w = out_w; r.in_h = out_h; r.out_w = ocw; r.out_h = och;
