@@ -1317,10 +1317,11 @@ private:
 	bool part_timing = false;
 	// VES_SPEED_CHECK=1: SpEED is also worked out on the CPU (from the GPU's decimated planes, as before it all moved to the GPU) and compared
 	bool speed_check = false;
-	// VES_SPEED_CPU=1: SpEED's covariance matrices and centred planes come back from the GPU, and the rest of est_params() (eigenvalues, the QR
-	// decomposition and the linear systems, the entropies) and get_speed_score() run on the slot's thread, with libvmaf's own code (vmaf_speed.h):
-	// the serial eigenvalue and QR steps leave the GPU, which only has 8 workgroups to give them.
-	bool speed_cpu = false;
+	// SpEED's covariance matrices and centred planes come back from the GPU, and the rest of est_params() (eigenvalues, the QR decomposition and
+	// the linear systems, the entropies) and get_speed_score() run on the CPU (CpuPool), with libvmaf's own code (vmaf_speed.h): the serial
+	// eigenvalue and QR steps leave the GPU, which only has 8 workgroups to give them. 4 v1 models on an RTX 4080 SUPER (2026-11-19): 1080p 667 ->
+	// 1002 fps, 4K 281 -> 332, for about 1 to 5 ms of CPU time per frame. VES_SPEED_CPU=0: all of it on the GPU (speed_small, speed_blocks, speed_score).
+	bool speed_cpu = true;
 	// SpEED on the device's second compute queue (Vk::second_compute()), beside the other features: its last steps are small and one after another, so
 	// on the main queue the GPU mostly waited on them. Not with VES_SCORE_TIMING, whose timestamps are on the main queue.
 	bool speed2 = false;
