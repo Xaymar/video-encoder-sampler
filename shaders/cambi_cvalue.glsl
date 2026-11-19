@@ -137,6 +137,25 @@ void window_cols(inout Counts cnt, int ly, int lx, int pad, int a, const bool sm
 	add_row(cnt, r, small);
 }
 
+// The same from prefix sums (tiles whose counted values span at most 16, cols16): the column counts in 16 bit lanes, two values to a word, summed
+// along each row of the tile, so a window's counts are two reads a word (the prefix at its last column less the one before its first) instead
+// of 2 pad + 1. Counts' 64 bit words take the values a0 .. a0 + 3 (a0: a rounded down to a multiple of 4), as window_cols leaves them.
+uint prefix_window(int q, int row, int xs, int xe) {
+	if (q >= 8) return 0u;
+	const int o = q * TILE * CW + row;
+	return colc[o + xe] - (xs >= 0 ? colc[o + xs] : 0u);
+}
+void window_cols16(inout Counts cnt, int ly, int lx, int pad, int a, const bool small) {
+	const int q0 = (a & ~3) >> 1, row = ly * CW, xs = lx - 1, xe = lx + 2 * pad;
+	cnt.w0 = uint64_t(prefix_window(q0, row, xs, xe)) | (uint64_t(prefix_window(q0 + 1, row, xs, xe)) << 32);
+	cnt.w1 = uint64_t(prefix_window(q0 + 2, row, xs, xe)) | (uint64_t(prefix_window(q0 + 3, row, xs, xe)) << 32);
+	cnt.w2 = uint64_t(prefix_window(q0 + 4, row, xs, xe)) | (uint64_t(prefix_window(q0 + 5, row, xs, xe)) << 32);
+	if (!small) {
+		cnt.w3 = uint64_t(prefix_window(q0 + 6, row, xs, xe)) | (uint64_t(prefix_window(q0 + 7, row, xs, xe)) << 32);
+		cnt.w4 = uint64_t(prefix_window(q0 + 8, row, xs, xe)) | (uint64_t(prefix_window(q0 + 9, row, xs, xe)) << 32);
+	}
+}
+
 #endif
 
 int get_count(Counts c, int k) {
@@ -156,7 +175,7 @@ void main() {
 		for (int k = int(gl_LocalInvocationIndex); k < tw * tw; k += 256) tile[k] = counted(r0 + k / tw, c0 + k % tw);
 		barrier();
 	}
-	bool cols = false;
+	bool cols = false, cols16 = false;
 	int cbase = 0;
 #ifdef CAMBI_COLS
 	// Column counts when the centres' values span little: then each window is 2 pad + 1 column sums instead of (2 pad + 1)^2 samples.
@@ -170,6 +189,9 @@ void main() {
 		cbase = lo - nd;
 		const int R = hi - lo + 2 * nd + 1;
 		cols = lo <= hi && R <= RMAX;
+		cols16 = cols && R <= 16 && (pc.lanes & 2) == 0;
+		// 8 bit lanes, four values to a word (cols16: 16 bit lanes, two to a word)
+		const uint lane_shift = cols16 ? 1u : 2u, lane_mask = cols16 ? 1u : 3u, lane_bits = cols16 ? 16u : 8u;
 		if (cols) {
 			// one invocation per column and run of 4 centre rows: the first row's window counted, then slid down a row at a time
 			for (int e = int(gl_LocalInvocationIndex); e < 4 * tw; e += 256) {
@@ -178,7 +200,7 @@ void main() {
 				for (int dr = 0; dr <= 2 * pad; dr++) {
 					const uint k = uint(tile[(ly0 + dr) * tw + x] - cbase);
 					if (k < uint(R)) {
-						const uint inc = 1u << (8u * (k & 3u)), wi = k >> 2u;
+						const uint inc = 1u << (lane_bits * (k & lane_mask)), wi = k >> lane_shift;
 						for (uint q = 0u; q < 8u; q++) w[q] += wi == q ? inc : 0u;
 					}
 				}
@@ -186,17 +208,25 @@ void main() {
 				for (int ly = ly0 + 1; ly < ly0 + 4; ly++) {
 					const uint ko = uint(tile[(ly - 1) * tw + x] - cbase), ki = uint(tile[(ly + 2 * pad) * tw + x] - cbase);
 					if (ko < uint(R)) {
-						const uint dec = 1u << (8u * (ko & 3u)), wi = ko >> 2u;
+						const uint dec = 1u << (lane_bits * (ko & lane_mask)), wi = ko >> lane_shift;
 						for (uint q = 0u; q < 8u; q++) w[q] -= wi == q ? dec : 0u;
 					}
 					if (ki < uint(R)) {
-						const uint inc = 1u << (8u * (ki & 3u)), wi = ki >> 2u;
+						const uint inc = 1u << (lane_bits * (ki & lane_mask)), wi = ki >> lane_shift;
 						for (uint q = 0u; q < 8u; q++) w[q] += wi == q ? inc : 0u;
 					}
 					for (int q = 0; q < 8; q++) colc[q * TILE * CW + ly * CW + x] = w[q];
 				}
 			}
 			barrier();
+			if (cols16) { // the prefix sums along each row (at most 33 x 48 per lane: no carries between the lanes)
+				for (int e = int(gl_LocalInvocationIndex); e < 8 * TILE; e += 256) {
+					const int o = (e / TILE) * TILE * CW + (e % TILE) * CW;
+					uint run = 0u;
+					for (int x = 0; x < tw; x++) { run += colc[o + x]; colc[o + x] = run; }
+				}
+				barrier();
+			}
 		}
 	}
 #endif
@@ -214,7 +244,10 @@ void main() {
 			if (cols) {
 				const int a = v - nd - cbase;
 				sh = a & 3;
-				if (nd <= 4) window_cols(cnt, int(gl_LocalInvocationID.y), int(gl_LocalInvocationID.x), pad, a, true);
+				if (cols16) {
+					if (nd <= 4) window_cols16(cnt, int(gl_LocalInvocationID.y), int(gl_LocalInvocationID.x), pad, a, true);
+					else window_cols16(cnt, int(gl_LocalInvocationID.y), int(gl_LocalInvocationID.x), pad, a, false);
+				} else if (nd <= 4) window_cols(cnt, int(gl_LocalInvocationID.y), int(gl_LocalInvocationID.x), pad, a, true);
 				else window_cols(cnt, int(gl_LocalInvocationID.y), int(gl_LocalInvocationID.x), pad, a, false);
 			} else
 #endif

@@ -1855,6 +1855,8 @@ private:
 				for (auto& d : vulkan_devices_fastest_first()) if (d.index == device_index) vendor = d.vendor_id;
 				cpc.lanes = vendor != 0x1002;
 				if (const char* e = getenv("VES_CAMBI_LANES"); e && *e) cpc.lanes = atoi(e) > 0;
+				// cambi_cvalue_cols: prefix sums of the column counts where a tile's values span at most 16 (VES_CAMBI_COLS16=0: off)
+				if (const char* e = getenv("VES_CAMBI_COLS16"); e && *e && atoi(e) == 0) cpc.lanes |= 2;
 				// cambi_cvalue's column counts for tiles whose values lie close together: CAMBI 30% cheaper on an RTX 4080 SUPER, but cvalue 1.9x
 				// slower on an RDNA 2 iGPU (2026-11-18). Not on AMD, unless VES_CAMBI_COLS says
 				ccols = vendor != 0x1002;
