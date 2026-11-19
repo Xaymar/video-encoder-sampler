@@ -12,7 +12,10 @@ layout(std430, binding = 4) writeonly buffer Part { double part[]; }; // per wor
 
 const int MAXD = 8; // nd <= 8 (max_log_contrast <= 3)
 const int TILE = 16;
-const int MAXPAD = 16;
+#ifndef CAMBI_MAXPAD
+#define CAMBI_MAXPAD 16 // the largest half window read from a tile in shared memory (larger ones: from the buffers, window_direct)
+#endif
+const int MAXPAD = CAMBI_MAXPAD;
 shared int tile[(TILE + 2 * MAXPAD) * (TILE + 2 * MAXPAD)];
 #ifdef CAMBI_COLS
 // Column counts (tiles whose centres' values lie close together, the usual case): for each centre row of the tile and each column of the region,
