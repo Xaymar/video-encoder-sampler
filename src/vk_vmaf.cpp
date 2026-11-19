@@ -1023,7 +1023,7 @@ private:
 			const int prev = (int)((index - stride) % 3);
 			const int pc[3] = {W, H, bpc};
 			R->push(pc, sizeof pc);
-			if (motion_fused) { R->bind(mxy[k][prev][cur]); R->dispatch(gx, gy); } // the two strides' passes side by side
+			if (motion_fused) { R->bind(mxy[k][prev][cur]); R->dispatch(mgx, mgy); } // the two strides' passes side by side
 			else {
 				R->bind(my[k][prev][cur]); R->dispatch(gx, gy); R->next();
 				R->bind(mx[k][prev][cur]); R->dispatch(gx, gy); R->next();
@@ -1227,7 +1227,7 @@ private:
 			if (!with_motion[k]) continue;
 			const uint32_t* p = (const uint32_t*)sl.mpart[k].map;
 			uint64_t sum = 0;
-			for (uint32_t q = 0; q < gx * gy; q++) sum += p[q];
+			for (uint32_t q = 0; q < mgx * mgy; q++) sum += p[q];
 			sad_raw[k] = (double)sum / 256. / ((double)W * H);
 		}
 		std::vector<std::array<double, 4>> vif(vif_egl.size());
@@ -1380,6 +1380,8 @@ private:
 	// motion: the last three reference frames; stride 1 compares with the previous frame, stride 2 (the five-frame window) with the one before
 	bool need_stride[2] = {false, false};
 	uint32_t gx = 0, gy = 0;
+	uint32_t mgx = 0, mgy = 0; // the workgroups of the motion pass (motion_xy_wide: 64 x 16 outputs each, else 16 x 16), one sum each
+	bool motion_wide = true;   // motion_xy_wide in place of motion_xy (VES_MOTION_WIDE=0: motion_xy)
 	Buf mfr[3], mtmp, mpart[2];
 	Pipe my[2][3][3], mx[2][3][3], mxy[2][3][3];
 	bool use_waves = false; // see record(): VES_VMAF_WAVES=1 turns it on (2026-11-18, RTX 4080 SUPER: 13-18% slower at 4K, no gain at 1080p)
@@ -1419,7 +1421,8 @@ private:
 	Pipe cp_front;
 	bool cfront = false;
 	bool ccols = false; // cambi_cvalue_cols: column counts where a tile's values lie close together
-	Pipe cp_pre, cp_dither, cp_mask, cp_dec[5], cp_mode_h[5], cp_mode_v[5];
+	Pipe cp_pre, cp_dither, cp_mask, cp_dec[5], cp_mode_h[5], cp_mode_v[5], cp_dmode[5];
+	bool cdmode = true; // cambi_dmode: a scale's decimation and mode filter in one pass (VES_CAMBI_SPLIT_MODE=1: cambi_decimate + cambi_mode twice)
 	uint32_t cgroups[5] = {};
 	bool cslide = false; // c values by cambi_cslide
 	// speed: the chroma planes once, the decimation per unit
@@ -1557,14 +1560,18 @@ private:
 		motion_fused = vendor != 0x1002;
 		if (const char* e = getenv("VES_MOTION_SPLIT"); e && *e) motion_fused = atoi(e) == 0;
 		if (bpc > 15) motion_fused = false;
+		if (const char* e = getenv("VES_MOTION_WIDE"); e && *e) motion_wide = atoi(e) > 0;
+		motion_wide = motion_wide && motion_fused;
+		mgx = motion_wide ? (W + 63) / 64 : gx;
+		mgy = gy;
 		mtmp = vk.buffer(motion_fused ? 16 : ysize * 4, 1);
 		for (int k = 0; k < 2; k++) {
 			if (!need_stride[k]) continue;
-			mpart[k] = vk.buffer((size_t)gx * gy * 4, 1);
+			mpart[k] = vk.buffer((size_t)mgx * mgy * 4, 1);
 			for (int a = 0; a < 3; a++) for (int b = 0; b < 3; b++) {
 				if (a == b) continue;
 				std::vector<Buf*> bind{&mfr[a], &mfr[b], &mtmp, &mpart[k]};
-				if (motion_fused) mxy[k][a][b] = vk.pipeline("motion_xy", bind);
+				if (motion_fused) mxy[k][a][b] = vk.pipeline(motion_wide ? "motion_xy_wide" : "motion_xy", bind);
 				else {
 					my[k][a][b] = vk.pipeline("motion_y", bind);
 					mx[k][a][b] = vk.pipeline("motion_x", bind);
@@ -1877,12 +1884,14 @@ private:
 		// cambi_front: pre, mask and scale 0's decimation in one pass (no anti-dithering; VES_CAMBI_SPLIT_FRONT=1 keeps the passes)
 		cfront = !anti_dither;
 		if (const char* e = getenv("VES_CAMBI_SPLIT_FRONT"); e && atoi(e) > 0) cfront = false;
+		if (const char* e = getenv("VES_CAMBI_SPLIT_MODE"); e && atoi(e) > 0) cdmode = false;
 		if (cfront) cp_front = cg.speedup ? vk.pipeline("cambi_front", {&raw_dis, &cidx, &cimg[0], &cmask[0]}) : vk.pipeline("cambi_front", {&raw_dis, &cidx, &cfull, &cmask0});
 		for (int s = 0; s < 5; s++) {
 			if (s > 0 || cg.speedup) {
 				Buf* pi = s == 0 ? src : &cimg[s - 1];
 				Buf* pm = s == 0 ? &cmask0 : &cmask[s - 1];
 				cp_dec[s] = vk.pipeline("cambi_decimate", {pi, pm, &cimg[s], &cmask[s]});
+				if (cdmode) cp_dmode[s] = vk.pipeline("cambi_dmode", {pi, pm, &cimg[s], &cmask[s]});
 			}
 			cp_mode_h[s] = vk.pipeline("cambi_mode", {&cimg[s], &ctmp});
 			cp_mode_v[s] = cp_mode_h[s];
@@ -1913,19 +1922,27 @@ private:
 		for (int s = 0; s < 5; s++) {
 			const int w = cg.sw[s], h = cg.sh[s];
 			g = groups(w, h);
-			if (s > 0 || (cg.speedup && !cfront)) {
+			const bool dec = s > 0 || (cg.speedup && !cfront);
+			if (dec && cdmode) { // decimation and mode filter in one pass
 				pc.W = pw; pc.H = ph; pc.OW = w; pc.OH = h;
 				R.push(&pc, sizeof pc);
-				R.bind(cp_dec[s]); R.dispatch(g.first, g.second); R.next();
+				R.bind(cp_dmode[s]); R.dispatch(g.first, g.second); R.next();
+				pc.W = w; pc.H = h;
+			} else {
+				if (dec) {
+					pc.W = pw; pc.H = ph; pc.OW = w; pc.OH = h;
+					R.push(&pc, sizeof pc);
+					R.bind(cp_dec[s]); R.dispatch(g.first, g.second); R.next();
+				}
+				pc.W = w; pc.H = h; pc.OW = w; pc.OH = h;
+				pc.anti_dither = 0; // cambi_mode: the pass along the rows
+				R.push(&pc, sizeof pc);
+				R.bind(cp_mode_h[s]); R.dispatch(g.first, g.second); R.next();
+				pc.anti_dither = 1; // ... and along the columns
+				R.push(&pc, sizeof pc);
+				R.bind(cp_mode_v[s]); R.dispatch(g.first, g.second); R.next();
+				pc.anti_dither = cpc.anti_dither;
 			}
-			pc.W = w; pc.H = h; pc.OW = w; pc.OH = h;
-			pc.anti_dither = 0; // cambi_mode: the pass along the rows
-			R.push(&pc, sizeof pc);
-			R.bind(cp_mode_h[s]); R.dispatch(g.first, g.second); R.next();
-			pc.anti_dither = 1; // ... and along the columns
-			R.push(&pc, sizeof pc);
-			R.bind(cp_mode_v[s]); R.dispatch(g.first, g.second); R.next();
-			pc.anti_dither = cpc.anti_dither;
 			if (cslide) { // the c values with sliding counts, then cambi_cvalue only sums them
 				pc.OH = 128;
 				R.push(&pc, sizeof pc);
