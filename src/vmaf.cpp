@@ -227,9 +227,9 @@ public:
 		return true;
 	}
 
-	bool add(const Picture& ref, const Picture& dis_in) override {
-		Picture dis = dis_in;
-		if (!picture_to_memory(dis)) return false;
+	bool add(const Picture& ref_in, const Picture& dis_in) override {
+		Picture ref = ref_in, dis = dis_in;
+		if (!picture_to_memory(ref) || !picture_to_memory(dis)) return false;
 		VmafPicture rp{}, dp{};
 		if (!to_picture(ref, rp)) return false;
 		if (!to_picture(dis, dp)) { vmaf_picture_unref(&rp); return false; }
@@ -269,30 +269,43 @@ class GpuScorer : public Scorer {
 	int w, h;
 
 public:
-	long long in_place = 0; // frames scored where the GPU decoded them
-	bool told_refused = false;
+	long long in_place = 0, ref_in_place = 0; // frames scored where they are on the GPU (encoded, original)
+	bool told_refused = false, told_ref_refused = false;
 	GpuScorer(std::unique_ptr<GpuVmaf> g, int w, int h) : gpu(std::move(g)), w(w), h(h) {}
-	bool add(const Picture& ref, const Picture& dis_in) override {
-		if (ref.width != w || ref.height != h || dis_in.width != w || dis_in.height != h) { fprintf(stderr, "vmaf: the frames are not %dx%d\n", w, h); return false; }
-		if (ref.fmt != dis_in.fmt || !ref.fmt.planar || ref.fmt.rgb) { fprintf(stderr, "vmaf: the frames are not in the same planar YUV format\n"); return false; }
+	bool add(const Picture& ref_in, const Picture& dis_in) override {
+		if (ref_in.width != w || ref_in.height != h || dis_in.width != w || dis_in.height != h) { fprintf(stderr, "vmaf: the frames are not %dx%d\n", w, h); return false; }
+		if (ref_in.fmt != dis_in.fmt || !ref_in.fmt.planar || ref_in.fmt.rgb) { fprintf(stderr, "vmaf: the frames are not in the same planar YUV format\n"); return false; }
+		// Either frame may still be on the GPU (decoded or converted there): it is scored where it is when this device can read it, else read back first.
+		Picture ref = ref_in, dis = dis_in;
+		if (ref.gpu && !gpu->takes(ref.gpu.get())) {
+			if (!told_ref_refused) { told_ref_refused = true; fprintf(stderr, "vmaf: original frames on the GPU are read back to memory to be scored (another device, or a layout the scorer cannot read)\n"); }
+			if (!picture_to_memory(ref)) return false;
+		}
+		if (dis.gpu && !gpu->takes(dis.gpu.get())) {
+			if (!told_refused) { told_refused = true; fprintf(stderr, "vmaf: frames decoded on the GPU are read back to memory to be scored (another device, or a layout the scorer cannot read)\n"); }
+			if (!picture_to_memory(dis)) return false;
+		}
 		const uint8_t* rd[3] = {ref.data[0], ref.data[1], ref.data[2]};
 		const size_t rs[3] = {(size_t)ref.stride[0], (size_t)ref.stride[1], (size_t)ref.stride[2]};
-		if (dis_in.gpu) { // decoded on the GPU: scored where it is when it is on this device
-			bool refused = false;
-			if (gpu->add_gpu(rd, rs, dis_in.gpu.get(), refused)) {
-				static std::atomic<bool> told{false};
-				if (!told.exchange(true)) fprintf(stderr, "vmaf: frames decoded on the GPU are scored there, without reading them back\n");
-				in_place++;
-				return true;
-			}
-			if (!refused) return false;
-			if (!told_refused) { told_refused = true; fprintf(stderr, "vmaf: frames decoded on the GPU are read back to memory to be scored (another device, or a layout the scorer cannot read)\n"); }
-		}
-		Picture dis = dis_in;
-		if (!picture_to_memory(dis)) return false;
 		const uint8_t* dd[3] = {dis.data[0], dis.data[1], dis.data[2]};
 		const size_t ds[3] = {(size_t)dis.stride[0], (size_t)dis.stride[1], (size_t)dis.stride[2]};
-		return gpu->add(rd, rs, dd, ds);
+		bool refused = false;
+		if (gpu->add_any(rd, rs, ref.gpu.get(), dd, ds, dis.gpu.get(), refused)) {
+			if (dis.gpu) in_place++;
+			if (ref.gpu) ref_in_place++;
+			static std::atomic<bool> told_dis{false}, told_ref{false};
+			if (dis.gpu && !told_dis.exchange(true)) fprintf(stderr, "vmaf: encoded frames on the GPU are scored there, without reading them back\n");
+			if (ref.gpu && !told_ref.exchange(true)) fprintf(stderr, "vmaf: original frames on the GPU are scored there, without reading them back\n");
+			return true;
+		}
+		if (!refused) return false;
+		// takes() said yes but add_any() refused after all: read both back.
+		if (!picture_to_memory(ref) || !picture_to_memory(dis)) return false;
+		const uint8_t* rd2[3] = {ref.data[0], ref.data[1], ref.data[2]};
+		const size_t rs2[3] = {(size_t)ref.stride[0], (size_t)ref.stride[1], (size_t)ref.stride[2]};
+		const uint8_t* dd2[3] = {dis.data[0], dis.data[1], dis.data[2]};
+		const size_t ds2[3] = {(size_t)dis.stride[0], (size_t)dis.stride[1], (size_t)dis.stride[2]};
+		return gpu->add(rd2, rs2, dd2, ds2);
 	}
 	bool timing(double& copy, double& wait, double& g, double& results) const override { gpu->timing(copy, wait, g, results); return true; }
 	void gpu_parts(std::vector<std::pair<std::string, double>>& parts) const override { gpu->gpu_parts(parts); }
@@ -390,6 +403,7 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 		scorer = std::move(cpu);
 	}
 	auto up = make_converter();
+	up->set_output_on_gpu(dynamic_cast<GpuScorer*>(scorer.get()) != nullptr); // the GPU scorer takes the frames scaled back where they are
 	Picture d, u, r;
 	long long m = 0, mo = 0, k = 0; // decoded frames in, converted frames out, original frame index
 
@@ -434,8 +448,7 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 		d.color = decoded_color;
 		if (!convert_dis) show(d, m);
 		else {
-			if (!picture_to_memory(d)) { ok = false; break; } // libplacebo gets frames in memory (for now)
-			d.pts = m;
+			d.pts = m; // a frame on the GPU is converted where it is (or read back by the converter when it is on another device)
 			d.duration = 1; // libplacebo needs it to know when the last frame ends; the packets carry none
 			if (m == 0 && !up->open(d, enc.fps.inverse(), ref.width, ref.height, score_fmt, scale, ref.score_range)) { fprintf(stderr, "vmaf: cannot scale the encoded frames back to %dx%d\n", ref.width, ref.height); ok = false; break; }
 			bool pushed;
