@@ -28,7 +28,7 @@
 	X(vkUpdateDescriptorSets) X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
 	X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdPipelineBarrier) \
 	X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
-	X(vkCmdCopyBuffer) X(vkCmdCopyImageToBuffer) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+	X(vkCmdCopyBuffer) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 #define X(n) static PFN_##n n;
 VK_FUNCS(X)
@@ -755,11 +755,35 @@ void Vk::image_to_transfer(VkImage img, VkImageLayout& layout, uint32_t& access)
 	access = VK_ACCESS_TRANSFER_READ_BIT;
 }
 
-void Vk::copy_image(const VkImagePlane& p, const Buf& dst) {
+void Vk::copy_image(const VkImagePlane& p, const Buf& dst, VkDeviceSize offset) {
 	VkBufferImageCopy r{};
+	r.bufferOffset = offset;
 	r.imageSubresource = {p.aspect, 0, 0, 1};
 	r.imageExtent = {p.w, p.h, 1};
 	vkCmdCopyImageToBuffer(impl->cmd, p.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.buf, 1, &r);
+}
+
+void Vk::image_to_transfer_dst(VkImage img, VkImageLayout& layout, uint32_t& access) {
+	VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	b.srcAccessMask = (VkAccessFlags)access;
+	b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; // its old contents are all overwritten
+	b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	b.image = img;
+	b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	vkCmdPipelineBarrier(impl->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+	layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	access = VK_ACCESS_TRANSFER_WRITE_BIT;
+}
+
+void Vk::copy_to_image(const Buf& src, VkDeviceSize offset, uint32_t row_texels, const VkImagePlane& p) {
+	VkBufferImageCopy r{};
+	r.bufferOffset = offset;
+	r.bufferRowLength = row_texels;
+	r.imageSubresource = {p.aspect, 0, 0, 1};
+	r.imageExtent = {p.w, p.h, 1};
+	vkCmdCopyBufferToImage(impl->cmd, src.buf, p.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
 }
 
 void Vk::memory(uint64_t& device_local, uint64_t& host) const { device_local = impl->device_bytes; host = impl->host_bytes; }

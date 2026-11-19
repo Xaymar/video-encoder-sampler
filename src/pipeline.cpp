@@ -41,7 +41,7 @@ bool source_info(const std::string& path, SourceInfo& out) {
 
 std::string Plan::feed_key() const {
 	char b[160];
-	snprintf(b, sizeof b, "%dx%d@%d/%d rate=%d fmt=%d/%d range=%d", enc.w, enc.h, enc.fps.num, enc.fps.den, convert_rate, enc.pix.chroma, enc.pix.depth, range);
+	snprintf(b, sizeof b, "%dx%d@%d/%d rate=%d fmt=%d/%d range=%d trc=%d", enc.w, enc.h, enc.fps.num, enc.fps.den, convert_rate, enc.pix.chroma, enc.pix.depth, range, trc);
 	return b;
 }
 
@@ -91,8 +91,19 @@ Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::str
 		else return ignore("range '" + v + "' is not source, limited (tv) or full (pc)");
 		o.erase(it);
 	}
+	// "trc": the transfer curve the encoder gets, by FFmpeg's names (bt709, iec61966-2-1 or srgb, smpte2084 or pq, arib-std-b67 or hlg, ...) or
+	// H.273 numbers; "source" or left out: the source's. The frames are converted to it in linear light (sRGB desktop captures to BT.709, say),
+	// and the decoded stream is converted back to the source's curve for scoring.
+	if (auto it = o.find("trc"); it != o.end()) {
+		const int t = trc_of(it->second);
+		if (t < 0) return ignore("trc '" + it->second + "' is not a transfer characteristic (FFmpeg's names, or H.273 numbers)");
+		const int src_trc = src.color.trc == 2 || src.color.trc == 0 ? 0 : src.color.trc;
+		pl.trc = t == src_trc ? 0 : t;
+		o.erase(it);
+	}
 	pl.color = src.color;
 	if (src.fmt.rgb) pl.color.space = 1; // the converter makes BT.709 from RGB
+	if (pl.trc) pl.color.trc = pl.trc;
 	const int source_range = src.fmt.rgb ? 1 : (src.color.range ? src.color.range : 1);
 	if (pl.range) pl.color.range = pl.range;
 	else if (src.fmt.rgb) pl.color.range = 1;
@@ -105,7 +116,7 @@ Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::str
 	pl.dist_fmt = planar_fmt(chroma == 422 ? 444 : chroma, std::max(depth, min_score_depth));
 	if (!valid(enc.pix) || !valid(pl.score_fmt) || !valid(pl.dist_fmt)) return ignore("unsupported chroma " + std::to_string(chroma) + " / bit depth " + std::to_string(depth));
 	pl.convert_rate = want.fps.num != 0 && !same_rate;
-	pl.rescale = enc.w != src.width || enc.h != src.height || enc.pix != src.fmt || (pl.range && pl.range != source_range); // scale, convert and/or change the range
+	pl.rescale = enc.w != src.width || enc.h != src.height || enc.pix != src.fmt || (pl.range && pl.range != source_range) || pl.trc; // scale, convert, change the range and/or the curve
 	pl.options = std::move(o);
 	return pl;
 }
@@ -458,7 +469,11 @@ void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Pl
 				hand_on(frame);
 			}
 			else {
-				if (frame.pts == 0) ok = scaler->open(frame, e.fps.inverse(), e.w, e.h, e.pix, so, pl.range);
+				if (frame.pts == 0) {
+					ScaleOptions to = so;
+					to.trc = pl.trc;
+					ok = scaler->open(frame, e.fps.inverse(), e.w, e.h, e.pix, to, pl.range);
+				}
 				ok = ok && scaler->push(&frame);
 				queue_scaled();
 			}
@@ -682,7 +697,7 @@ bool run_wave(const std::string& input, const SourceInfo& planned, std::vector<W
 
 	// Scoring runs at the same time, following the encoders' output as it is written.
 	RefInfo ref;
-	ref.width = si.width; ref.height = si.height; ref.framerate = si.framerate; ref.color = si.color; ref.frames = si.frame_count;
+	ref.width = si.width; ref.height = si.height; ref.framerate = si.framerate; ref.color = si.color; ref.frames = si.frame_count; ref.rgb = si.fmt.rgb;
 	ref.score_range = si.fmt.rgb ? 1 : (si.color.range ? si.color.range : 1); // the reference side is converted to YUV without changing the range (RGB: limited)
 	for (auto& gp : groups) {
 		Group& g = *gp;

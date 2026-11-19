@@ -34,6 +34,8 @@
 			// "chroma": [420, 444],        // the pixel format and sample range the encoders get; left out, the source's. Every combination is tested
 			// "bitdepth": [8, 10],
 			// "range": ["limited", "full"],   // source, limited or full: the samples are converted before encoding and back for scoring
+			// "trc": ["source", "bt709"],     // the transfer curve the encoders get (FFmpeg's names: bt709, iec61966-2-1 (srgb), smpte2084 (pq),
+			//                                 // arib-std-b67 (hlg), ...): converted in linear light before encoding and back for scoring
 			// "upscale": true,             // allow encoding above the source's resolution, chroma layout and bit depth (off by default)
 		},
 		{
@@ -55,10 +57,15 @@
 
 	// ---- Scaling ------------------------------------------------------------------------------------------------------------------
 	"scaling": {
-		// libplacebo scalers, used for any change of resolution (and for scaling the decoded video back for scoring).
+		// Scalers, used for any change of resolution (and for scaling the decoded video back for scoring), in linear light. The names are libplacebo's:
+		// nearest, bilinear, bicubic, catmull_rom, mitchell, hermite, robidoux(sharp), spline16/36/64, sinc, lanczos, ginseng (separable), and
+		// ewa_lanczos, ewa_lanczossharp, ewa_jinc, ewa_ginseng, ewa_hann, ewa_robidoux(sharp) (polar).
 		"upscaler": "ewa_lanczos",
 		"downscaler": "ewa_lanczos",
-		// "gpu": "NVIDIA GeForce RTX 4080 SUPER",   // Vulkan GPU for scaling, by its exact name; left out, libplacebo picks one
+		// "gpu": "NVIDIA GeForce RTX 4080 SUPER",   // Vulkan GPU for scaling, by its exact name; left out, the GPU that decodes, else the fastest
+		// How the BT.709 family of transfer curves (bt709, smpte170m, bt2020-10/12, ...) is turned into linear light and back: "oetf" (the default,
+		// the exact BT.709 camera curve) or "bt1886" (display gamma 2.4). The standards leave it open.
+		// "bt709_curve": "oetf",
 	},
 
 	// ---- Scoring ------------------------------------------------------------------------------------------------------------------

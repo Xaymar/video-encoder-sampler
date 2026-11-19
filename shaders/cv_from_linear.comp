@@ -1,0 +1,21 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "cv_common.glsl"
+layout(local_size_x = 256) in;
+// The way back of cv_to_linear, in place: with `trc` > 0 linear RGB to R'G'B' through that curve, then R'G'B' to Y'CbCr (nominal values) with the
+// matrix of Kr, Kb.
+layout(std430, binding = 0) buffer P0 { float p0[]; };
+layout(std430, binding = 1) buffer P1 { float p1[]; };
+layout(std430, binding = 2) buffer P2 { float p2[]; };
+layout(push_constant) uniform PC { int n, trc; float kr, kb; } pc;
+
+void main() {
+	const int i = int(gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u + gl_GlobalInvocationID.x);
+	if (i >= pc.n) return;
+	float r = p0[i], g = p1[i], b = p2[i];
+	if (pc.trc > 0) { r = from_linear(pc.trc, r); g = from_linear(pc.trc, g); b = from_linear(pc.trc, b); }
+	const float y = pc.kr * r + (1.0 - pc.kr - pc.kb) * g + pc.kb * b;
+	p0[i] = y;
+	p1[i] = (b - y) / (2.0 * (1.0 - pc.kb));
+	p2[i] = (r - y) / (2.0 * (1.0 - pc.kr));
+}

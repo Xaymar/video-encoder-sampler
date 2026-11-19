@@ -13,7 +13,7 @@
 //    names for the codec; the list leaves out the read-only, per-frame and feedback properties.
 //  - Run-tested with a short clip: every value of NVENC (H.264, HEVC, AV1), x264, x265 and SVT-AV1. AMF and QuickSync need hardware this was not
 //    tested on: their names come from the SDK headers, and an unknown name fails the run with a message.
-//  - Scenarios take "chroma" (420, 444), "bitdepth" (8, 10) and "range" (source, limited, full), the pixel format every encoder gets; GPU encoders also take
+//  - Scenarios take "chroma" (420, 444), "bitdepth" (8, 10) and "range" (source, limited, full) and "trc" (source, or a transfer curve: bt709, iec61966-2-1, ...), the pixel format every encoder gets; GPU encoders also take
 //    "gpu" (index, or "all") among their options.
 {
 	"output": "output",

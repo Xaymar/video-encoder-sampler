@@ -107,7 +107,7 @@ ComboTable::ComboTable(const std::string& encoder, const std::vector<Axis>& axes
 		// "" (the option left out) is no point of the range: it is always run, like the ends, and never pruned
 		std::vector<int> set;
 		for (int i = 0; i < (int)a.values.size(); i++) if (!a.values[(size_t)i].empty()) set.push_back(i);
-		if (!prune || fixed.count(a.key) || a.key == "gpu" || a.key == "chroma" || a.key == "bitdepth" || a.key == "range" || set.size() < 3) continue;
+		if (!prune || fixed.count(a.key) || a.key == "gpu" || a.key == "chroma" || a.key == "bitdepth" || a.key == "range" || a.key == "trc" || set.size() < 3) continue;
 		bool numeric = true;
 		for (int i : set) { double d; numeric &= Cond::number(a.values[(size_t)i], d); }
 		if (numeric) {

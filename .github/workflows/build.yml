@@ -117,12 +117,7 @@ jobs:
             mingw-w64-ucrt-x86_64-x265
             mingw-w64-ucrt-x86_64-svt-av1
             mingw-w64-ucrt-x86_64-vmaf
-            mingw-w64-ucrt-x86_64-libplacebo
             mingw-w64-ucrt-x86_64-libvpl
-            mingw-w64-ucrt-x86_64-lcms2
-            mingw-w64-ucrt-x86_64-libdovi
-            mingw-w64-ucrt-x86_64-shaderc
-            mingw-w64-ucrt-x86_64-spirv-cross
             mingw-w64-ucrt-x86_64-vulkan-headers
             mingw-w64-ucrt-x86_64-vulkan-loader
             mingw-w64-ucrt-x86_64-libgcc

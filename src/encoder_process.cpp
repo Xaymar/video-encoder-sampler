@@ -119,10 +119,10 @@ void get(Reader& r, Options& o) {
 }
 void put(Writer& w, const SourceInfo& s) { w.num(s.width).num(s.height); put(w, s.fmt); put(w, s.framerate); put(w, s.color); w.num(s.duration).str(s.decoder).num(s.frame_count); }
 void get(Reader& r, SourceInfo& s) { s.width = r.num<int>(); s.height = r.num<int>(); get(r, s.fmt); get(r, s.framerate); get(r, s.color); s.duration = r.num<double>(); s.decoder = r.str(); s.frame_count = r.num<long long>(); }
-void put(Writer& w, const Plan& p) { put(w, p.enc); put(w, p.score_fmt); w.num((uint8_t)p.convert_rate).num((uint8_t)p.rescale).num(p.range); put(w, p.color); put(w, p.options); }
-void get(Reader& r, Plan& p) { get(r, p.enc); get(r, p.score_fmt); p.convert_rate = r.num<uint8_t>() != 0; p.rescale = r.num<uint8_t>() != 0; p.range = r.num<int>(); get(r, p.color); get(r, p.options); }
-void put(Writer& w, const ScaleOptions& s) { w.str(s.upscaler).str(s.downscaler).str(s.device); }
-void get(Reader& r, ScaleOptions& s) { s.upscaler = r.str(); s.downscaler = r.str(); s.device = r.str(); }
+void put(Writer& w, const Plan& p) { put(w, p.enc); put(w, p.score_fmt); w.num((uint8_t)p.convert_rate).num((uint8_t)p.rescale).num(p.range).num(p.trc); put(w, p.color); put(w, p.options); }
+void get(Reader& r, Plan& p) { get(r, p.enc); get(r, p.score_fmt); p.convert_rate = r.num<uint8_t>() != 0; p.rescale = r.num<uint8_t>() != 0; p.range = r.num<int>(); p.trc = r.num<int>(); get(r, p.color); get(r, p.options); }
+void put(Writer& w, const ScaleOptions& s) { w.str(s.upscaler).str(s.downscaler).str(s.device).num(s.trc).num(s.bt709_curve); }
+void get(Reader& r, ScaleOptions& s) { s.upscaler = r.str(); s.downscaler = r.str(); s.device = r.str(); s.trc = r.num<int>(); s.bt709_curve = r.num<int>(); }
 void put(Writer& w, const VmafOptions& v) {
 	w.str(v.model).num(v.threads).str(v.device).str(v.gpu).num(v.encoder_vendor).num(v.encoder_gpu).num((uint32_t)v.extra_models.size());
 	for (auto& m : v.extra_models) w.str(m);
@@ -961,7 +961,7 @@ std::string scaling_device() {
 			}
 			fprintf(stderr, "converting frames on %s does not work: %s\n", d->name.c_str(), wrong.c_str());
 		}
-		fprintf(stderr, "no Vulkan device converts frames right; leaving the choice to libplacebo\n");
+		fprintf(stderr, "no Vulkan device converts frames right; leaving the choice to the converter\n");
 	});
 	return name;
 }

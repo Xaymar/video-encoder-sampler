@@ -132,7 +132,11 @@ public:
 	// An image the device made (a decoded frame): moves it from `layout` (with writes `access` to finish first) to the layout copies read from,
 	// and updates `layout` and `access` to that. Then copy_image() copies one of its planes into a buffer, row after row with no gaps.
 	void image_to_transfer(VkImage img, VkImageLayout& layout, uint32_t& access);
-	void copy_image(const VkImagePlane& plane, const Buf& dst);
+	void copy_image(const VkImagePlane& plane, const Buf& dst, VkDeviceSize offset = 0);
+	// The other way (the converter writing its frames into FFmpeg Vulkan frames): moves the image from `layout` (with `access` to finish first) to the
+	// layout copies write to, updating both, then copy_to_image() copies rows of `row_texels` texels from `offset` in a buffer into one of its planes.
+	void image_to_transfer_dst(VkImage img, VkImageLayout& layout, uint32_t& access);
+	void copy_to_image(const Buf& src, VkDeviceSize offset, uint32_t row_texels, const VkImagePlane& plane);
 	// The slot's next submit() waits for timeline semaphore `sem` to reach `value` first / sets it to `value` when done.
 	void wait_timeline(int slot, VkSemaphore sem, uint64_t value);
 	void signal_timeline(int slot, VkSemaphore sem, uint64_t value);

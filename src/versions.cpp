@@ -8,7 +8,6 @@ extern "C" {
 
 extern "C" {
 #include <libavutil/avutil.h>
-#include <libplacebo/config.h>
 #include <libvmaf/libvmaf.h>
 #include <svt-av1/EbSvtAv1Enc.h>
 #include <x264.h>
@@ -25,7 +24,5 @@ std::string encoder_library_version(const std::string& encoder) {
 }
 
 std::string decoder_library_version() { return std::string("ffmpeg ") + av_version_info(); }
-
-std::string scaler_library_version() { return std::string("libplacebo ") + pl_version(); }
 
 std::string vmaf_library_version() { return vmaf_version(); }
