@@ -691,6 +691,8 @@ public:
 		plane_bytes = ysize * bps;
 		if (const char* e = getenv("VES_SPEED_CHECK"); e && atoi(e) > 0) speed_check = true;
 		if (const char* e = getenv("VES_SPEED_CPU"); e && *e) speed_cpu = atoi(e) > 0;
+		if (const char* e = getenv("VES_SPEED_CPU_COV"); e && *e) speed_cpu_cov = atoi(e) > 0;
+		if (!speed_cpu) speed_cpu_cov = false;
 		if (const char* e = getenv("VES_VMAF_WAVES"); e && *e) use_waves = atoi(e) > 0;
 		if (const char* e = getenv("VES_SCORE_TIMING"); e && atoi(e) > 0) part_timing = true;
 		if (const char* e = getenv("VES_ADM_SPLIT_DWT"); e && atoi(e) > 0) adm_split_dwt = true;
@@ -1225,6 +1227,7 @@ private:
 			part_done(5);
 			step(&SpeedUnit::sblur_v, pixels, 4);
 			step(&SpeedUnit::sblur_h, pixels, 4);
+			if (speed_cpu_cov) { part_done(6); part_done(7); return; } // the rest on the CPU, from the slot's copy of sprep
 			step(&SpeedUnit::smean, one, 4);
 			step(&SpeedUnit::scenter, [](const SpeedUnit& u) { return (uint32_t)((u.stpc.subw * u.stpc.subh + 63) / 64); }, 4);
 			step(&SpeedUnit::scov, [](const SpeedUnit&) { return (uint32_t)((N_SPEED_PAIRS + 31) / 32); }, 4);
@@ -1387,6 +1390,9 @@ private:
 	// eigenvalue and QR steps leave the GPU, which only has 8 workgroups to give them. 4 v1 models on an RTX 4080 SUPER (2026-11-19): 1080p 667 ->
 	// 1002 fps, 4K 281 -> 332, for about 1 to 5 ms of CPU time per frame. VES_SPEED_CPU=0: all of it on the GPU (speed_small, speed_blocks, speed_score).
 	bool speed_cpu = true;
+	// ... and the covariance matrices too (est_params() step 1, compute_covariance_matrix_scalar_5(), bit for bit what speed_cov makes), from the
+	// centred planes, as libvmaf-fast does: the GPU stops after the blur (no speed_mean, speed_center, speed_cov). VES_SPEED_CPU_COV=0: on the GPU.
+	bool speed_cpu_cov = true;
 	// SpEED on the device's second compute queue (Vk::second_compute()), beside the other features: its last steps are small and one after another, so
 	// on the main queue the GPU mostly waited on them. Not with VES_SCORE_TIMING, whose timestamps are on the main queue.
 	bool speed2 = false;
@@ -1563,7 +1569,7 @@ private:
 			for (auto& u : su) {
 				auto mirror2 = [&](const Buf& from) { Buf to = vk.buffer(from.size, 2); (speed2 ? sl.out2 : sl.out).emplace_back(&from, to); return to; };
 				if (speed_cpu) {
-					sl.scov.push_back(mirror2(u.scovm));
+					if (!speed_cpu_cov) sl.scov.push_back(mirror2(u.scovm));
 					sl.sprep.push_back(mirror2(u.sprep));
 				} else sl.sfin.push_back(mirror2(u.sfin));
 				if (speed_check) sl.sout.push_back(mirror2(u.sout));
@@ -2193,8 +2199,10 @@ private:
 			std::vector<float> independent(nb * E), solution(nb * E), cov(E * E), eig(E), tmp(5 * E * E + E * nb + 8 * E + 64);
 			PlaneOut& po = planes[k][p];
 			po.ent.assign(nb, 0.0f);
-			memcpy(cov.data(), (const float*)sl.scov[k].map + (size_t)p * E * E, E * E * sizeof(float));
 			const float* data = (const float*)sl.sprep[k].map + (size_t)p * n;
+			if (speed_cpu_cov) { // est_params() step 1 (the means go into eig, as there; step 2 overwrites them)
+				compute_covariance_matrix(sd, data, cov.data(), eig.data(), (size_t)sd.operating_width, compute_cov_kernel_scalar); // 5x5: the _scalar_5 path
+			} else memcpy(cov.data(), (const float*)sl.scov[k].map + (size_t)p * E * E, E * E * sizeof(float));
 			const float sigma_nn = (float)u.o.sigma_nn;
 			// est_params() from step 2 (vmaf_speed.h)
 			compute_eigenvalues(cov.data(), eig.data(), (int)E, tmp.data());
