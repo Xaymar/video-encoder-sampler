@@ -24,7 +24,7 @@
 	X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) \
 	X(vkGetPhysicalDeviceFeatures) X(vkCreateDevice) X(vkGetDeviceQueue) X(vkGetDeviceQueue2) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
 	X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkCreateShaderModule) X(vkCreateDescriptorSetLayout) \
-	X(vkCreatePipelineLayout) X(vkCreateComputePipelines) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) \
+	X(vkCreatePipelineLayout) X(vkCreateComputePipelines) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkFreeDescriptorSets) \
 	X(vkUpdateDescriptorSets) X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
 	X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdPipelineBarrier) \
 	X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkGetFenceStatus) X(vkResetFences) \
@@ -331,6 +331,7 @@ Vk::Vk(int device, int slots) : impl(new Impl) {
 	try {
 		VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * 1024};
 		VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+		dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT; // release(): users that make pipelines again (the converter, on a new shape)
 		dpi.maxSets = 1024; // aliased pipelines take a set per slot
 		dpi.poolSizeCount = 1;
 		dpi.pPoolSizes = &ps;
@@ -529,6 +530,17 @@ Pipe Vk::pipeline(const char* name, const std::vector<Buf*>& bindings) {
 		}
 	}
 	return p;
+}
+
+void Vk::release(Pipe& p) {
+	Shared& s = *impl->s;
+	std::vector<VkDescriptorSet> sets;
+	if (p.set) sets.push_back(p.set);
+	for (int k = 0; k < p.nslot; k++) if (p.slot_sets[k]) sets.push_back(p.slot_sets[k]);
+	if (!sets.empty()) vkFreeDescriptorSets(s.dev, impl->dpool, (uint32_t)sets.size(), sets.data());
+	p.set = VK_NULL_HANDLE;
+	for (auto& x : p.slot_sets) x = VK_NULL_HANDLE;
+	p.nslot = 0;
 }
 
 void Vk::alias(const Buf& placeholder, const std::vector<const Buf*>& per_slot) {

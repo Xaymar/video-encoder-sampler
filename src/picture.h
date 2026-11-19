@@ -39,6 +39,14 @@ struct Layout {
 	int log2_cw = 0, log2_ch = 0; // chroma subsampling
 	bool big_endian = false;
 };
+// Field by field: a byte compare would also compare the padding after big_endian, which differs between copies made apart.
+inline bool operator==(const Layout::Comp& a, const Layout::Comp& b) { return a.plane == b.plane && a.offset == b.offset && a.shift == b.shift && a.depth == b.depth; }
+inline bool operator==(const Layout& a, const Layout& b) {
+	if (a.planes != b.planes || a.log2_cw != b.log2_cw || a.log2_ch != b.log2_ch || a.big_endian != b.big_endian) return false;
+	for (int i = 0; i < 4; i++) if (a.step[i] != b.step[i] || !(a.comp[i] == b.comp[i])) return false;
+	return true;
+}
+inline bool operator!=(const Layout& a, const Layout& b) { return !(a == b); }
 
 // One video frame. The memory belongs to `owner`, so a Picture can be copied and kept around cheaply.
 struct Picture {
