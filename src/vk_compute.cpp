@@ -28,7 +28,7 @@
 	X(vkUpdateDescriptorSets) X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
 	X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdPipelineBarrier) \
 	X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
-	X(vkCmdCopyBuffer) X(vkCmdFillBuffer) X(vkCmdCopyImageToBuffer) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+	X(vkCmdCopyBuffer) X(vkCmdCopyImageToBuffer) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
 
 #define X(n) static PFN_##n n;
 VK_FUNCS(X)
@@ -621,10 +621,6 @@ void Vk::pass_seconds(int slot, std::vector<std::pair<const char*, double>>& out
 	if (vkGetQueryPoolResults(impl->s->dev, sl.pstamps, 0, (uint32_t)t.size(), t.size() * 8, t.data(), 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
 	for (size_t i = 0; i < sl.pnames.size(); i++)
 		out.emplace_back(sl.pnames[i], t[i + 1] >= t[i] ? (double)(t[i + 1] - t[i]) * impl->s->timestamp_ns * 1e-9 : 0.0);
-}
-
-void Vk::fill(const Buf& dst, VkDeviceSize off, VkDeviceSize size, uint32_t value) {
-	vkCmdFillBuffer(impl->cmd, dst.buf, off, size, value);
 }
 
 void Vk::barrier() {

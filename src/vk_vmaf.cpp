@@ -699,8 +699,6 @@ public:
 		if (!adm_dump.empty()) adm_split_cm = true; // the dump holds the bands decouple and csf write
 		if (const char* e = getenv("VES_ADM_SCALE_BY_SCALE"); e && atoi(e) > 0) adm_scales_together = false;
 		if (adm_split_cm || part_timing) adm_scales_together = false; // VES_SCORE_TIMING: the parts one after another
-		if (const char* e = getenv("VES_ADM_CMSUM"); e && atoi(e) > 0) adm_last = false;
-		if (adm_split_dwt || !adm_scales_together) adm_last = false; // its counters need each scale's own part of tmp, which nothing else writes
 		raw_size = (plane_bytes + 3) / 4 * 4 + 4;
 		// With the copies in on a queue of their own, each slot's frame stays in its own buffers (dev_ref/dev_dis), which the pipelines read in place
 		// of raw_ref/raw_dis (Vk::alias): no copy of the frame on the compute queue. Else they are copied into raw_ref/raw_dis.
@@ -989,7 +987,6 @@ private:
 		// The frames before on the queue (this scorer's other slots) are done with the shared buffers before this one writes them.
 		vk.barrier();
 		vk.stamp(slot, 0);
-		if (adm_last && !au.empty() && !atmp_zeroed) { vk.fill(atmp, 0, atmp.size / 4 * 4, 0); atmp_zeroed = true; } // the barriers below cover it
 		for (int side = 0; side < 2; side++) if (gpu_in[side]) read_decoded(slot, *gpu_in[side], side);
 		auto part_done = [&](int part) { // VES_SCORE_TIMING: the end of one part of the work
 			if (!part_timing) return;
@@ -1107,7 +1104,6 @@ private:
 					R->dispatch((uint32_t)((pu.ecol - pu.scol + 15) / 16), (uint32_t)((pu.erow - pu.srow + 15) / 16));
 					continue;
 				}
-				if (adm_last && !adm_grouped(u)) continue; // adm_dcm_last made the row sums
 				const uint32_t rg = (uint32_t)((pu.erow - pu.srow + 63) / 64);
 				pu.aim = 0;
 				R->push(&pu, sizeof pu);
@@ -1123,12 +1119,8 @@ private:
 			for (int s = 0; s < 4; s++) adm_scale_dwt(s);
 			for (int s = 0; s < 4; s++) { adm_scale_den(s); adm_scale_phase(s, 0); }
 			R->next();
-			bool sums = !adm_last;
-			for (size_t u = 0; u < au.size(); u++) sums = sums || adm_grouped(u);
-			if (sums) {
-				for (int s = 0; s < 4; s++) adm_scale_phase(s, 1);
-				R->next();
-			}
+			for (int s = 0; s < 4; s++) adm_scale_phase(s, 1);
+			R->next();
 		} else if (!au.empty()) {
 			for (int s = 0; s < 4; s++) {
 				adm_scale_dwt(s);
@@ -1437,19 +1429,12 @@ private:
 	struct AdmGroup { std::vector<int> units; Buf tab[4]; Pipe p[4]; };
 	std::vector<AdmGroup> agroups;
 	bool adm_multi = true;
-	bool adm_grouped(size_t u) const { // adm_dcm_multi does unit u's masking
-		for (const AdmGroup& g : agroups) if (g.units.size() > 1 && std::find(g.units.begin(), g.units.end(), (int)u) != g.units.end()) return true;
-		return false;
-	}
 	// VES_ADM_DUMP=<file>: frame 1's ADM bands and sums of scale 0 (acur[0], unit 0's cm, aden) written to that file, for comparing GPUs; in that
 	// frame AH, AV, AD hold decouple's k, angle flag and restored value before the gain limit (of the h band), so its scores are wrong
 	std::string adm_dump;
 	Buf adump; // acopy: the bands the units after the first work on, one after another
 	Pipe adwt[4], adwt_v[4], adwt_h[4], aden_p[4];
 	bool adm_split_dwt = false;
-	// adm_dcm_last: the masking pass's last workgroup adds up the row sums (no adm_cmsum pass and no barrier after it); VES_ADM_CMSUM=1: as before.
-	// Units grouped by adm_dcm_multi keep adm_cmsum. atmp is zeroed once, in the first frame (the counters reset themselves).
-	bool adm_last = true, atmp_zeroed = false;
 	bool adm_split_cm = false; // VES_ADM_SPLIT_CM=1 (and VES_ADM_DUMP): decouple, csf and masking as passes of their own, as before
 	// cambi
 	bool cambi_on = false;
@@ -1729,7 +1714,7 @@ private:
 		{
 			size_t at = 0;
 			for (int s = 0; s < 4; s++) {
-				adm_tiles_s[s] = 2 * bh[s] * ((bw[s] + 15) / 16) * 3 * 2 + (adm_last ? 2 : 0); // adm_dcm_last: + its counter
+				adm_tiles_s[s] = 2 * bh[s] * ((bw[s] + 15) / 16) * 3 * 2;
 				adm_tile_base[s] = adm_scales_together ? (int)at : 0;
 				if (!adm_scales_together) adm_tiles_s[s] = adm_tiles;
 				at += (size_t)adm_tiles_s[s] * au.size();
@@ -1758,11 +1743,7 @@ private:
 				a.csf[s] = vk.pipeline("adm_csf", bu);
 				a.cm_p[s] = vk.pipeline("adm_cm", bu);
 				std::vector<Buf*> bf{&acur[s], prev, &raw_ref, &raw_dis, &atmp, &adiv, &a.cm[s], &aden[s]}; // the bands of every unit: adm_dcm writes none
-				if (adm_last) {
-					std::vector<Buf*> bl = bf;
-					bl.push_back(a.aim ? &a.aimb[s] : &a.cm[s]);
-					a.dcm[s] = vk.pipeline("adm_dcm_last", bl);
-				} else a.dcm[s] = vk.pipeline("adm_dcm", bf);
+				a.dcm[s] = vk.pipeline("adm_dcm", bf);
 				a.cmsum[s] = vk.pipeline("adm_cmsum", bf);
 				if (a.aim) {
 					bf[6] = &a.aimb[s];
