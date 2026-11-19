@@ -10,6 +10,9 @@ const int T = 16, E = T + 2;
 shared int sX[3][E * E]; // restored
 shared int sA[3][E * E]; // additive impairment
 shared int64_t sRed[3][T][T];
+#ifdef ADM_LAST
+shared bool s_last;
+#endif
 
 // The unit's csf factors (pc's, or with ADM_MULTI the table's for the unit being worked on)
 int g_rf0, g_rf1, g_rf2;
@@ -110,5 +113,29 @@ void main() {
 	}
 #ifdef ADM_MULTI
 	}
+#endif
+#ifdef ADM_LAST
+	// The last workgroup to finish adds up every row's tiles (what adm_cmsum.comp does, the same integer sums), so no pass and no barrier
+	// follow. Its counter sits right after the unit's tile sums and is back at 0 when it is done.
+	const int ctr = toff + 2 * rows * tx * 3 * 2;
+	if (t == 0) {
+		memoryBarrierBuffer();
+		s_last = atomicAdd(tmp[ctr], 1) == int(gl_NumWorkGroups.x * gl_NumWorkGroups.y) - 1;
+	}
+	barrier();
+	if (!s_last) return;
+	memoryBarrierBuffer();
+	for (int set = 0; set < (unit_aim != 0 ? 2 : 1); set++)
+		for (int e = t; e < rows * 3; e += T * T) {
+			const int r = e / 3, q = e - r * 3;
+			int64_t sum = 0l;
+			for (int k = 0; k < tx; k++) {
+				const int idx = toff + (((set * rows + r) * tx + k) * 3 + q) * 2;
+				sum += int64_t(uint64_t(uint(tmp[idx])) | (uint64_t(uint(tmp[idx + 1])) << 32));
+			}
+			if (set == 0) cm_rows[e] = sum;
+			else aim_rows[e] = sum;
+		}
+	if (t == 0) tmp[ctr] = 0;
 #endif
 }

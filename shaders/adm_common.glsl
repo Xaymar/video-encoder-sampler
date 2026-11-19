@@ -22,7 +22,12 @@ layout(std430, binding = 0) buffer Cur { int cur[]; };            // 20 blocks o
 layout(std430, binding = 1) readonly buffer Prev { int prev[]; };
 layout(std430, binding = 2) readonly buffer RawRef { uint raw_ref[]; };
 layout(std430, binding = 3) readonly buffer RawDis { uint raw_dis[]; };
-layout(std430, binding = 4) buffer Tmp { int tmp[]; };            // DWT vertical pass: lo_ref, hi_ref, lo_dis, hi_dis
+#ifdef ADM_LAST
+layout(std430, binding = 4) coherent buffer Tmp { int tmp[]; };   // adm_dcm_last: the last workgroup reads the others' tile sums
+layout(std430, binding = 8) buffer AimRows { int64_t aim_rows[]; };
+#else
+layout(std430, binding = 4) buffer Tmp { int tmp[]; };
+#endif            // DWT vertical pass: lo_ref, hi_ref, lo_dis, hi_dis
 layout(std430, binding = 5) readonly buffer Div { int div_lookup[]; };
 layout(std430, binding = 6) buffer CmRows { int64_t cm_rows[]; };
 layout(std430, binding = 7) buffer DenRows { int64_t den_rows[]; };

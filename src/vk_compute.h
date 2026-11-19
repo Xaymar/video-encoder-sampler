@@ -128,6 +128,7 @@ public:
 	void dispatch(uint32_t x, uint32_t y = 1);
 	void copy(const Buf& src, const Buf& dst, VkDeviceSize size = 0); // size 0: the smaller of the two buffers
 	void copy_range(const Buf& src, VkDeviceSize src_off, const Buf& dst, VkDeviceSize dst_off, VkDeviceSize size);
+	void fill(const Buf& dst, VkDeviceSize off, VkDeviceSize size, uint32_t value); // vkCmdFillBuffer (size and offset multiples of 4)
 	void barrier();
 	// An image the device made (a decoded frame): moves it from `layout` (with writes `access` to finish first) to the layout copies read from,
 	// and updates `layout` and `access` to that. Then copy_image() copies one of its planes into a buffer, row after row with no gaps.
