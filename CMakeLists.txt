@@ -112,7 +112,7 @@ string(APPEND SPV_TEXT "const unsigned char* spv_find(const char* name, size_t& 
 file(WRITE "${CMAKE_BINARY_DIR}/shaders_spv.cpp.new" "${SPV_TEXT}")
 execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/shaders_spv.cpp.new" "${CMAKE_BINARY_DIR}/shaders_spv.cpp")
 
-add_executable(ves src/main.cpp src/combos.cpp src/rules.cpp src/source.cpp src/ff.cpp src/ff_source.cpp src/vk_convert.cpp src/ff_decode.cpp src/formats.cpp src/cache.cpp src/gpu.cpp src/versions.cpp src/ui.cpp src/pipeline.cpp src/mux.cpp src/download.cpp src/hash.cpp src/options.cpp src/list_options.cpp src/upload.cpp src/priority.cpp src/vmaf.cpp src/net.cpp src/remote.cpp src/encoder_process.cpp src/vk_compute.cpp src/vk_vmaf.cpp "${CMAKE_BINARY_DIR}/shaders_spv.cpp" src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_qsv.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
+add_executable(ves src/main.cpp src/combos.cpp src/rules.cpp src/source.cpp src/ff.cpp src/ff_source.cpp src/vk_convert.cpp src/ff_decode.cpp src/formats.cpp src/cache.cpp src/gpu.cpp src/versions.cpp src/ui.cpp src/pipeline.cpp src/mux.cpp src/download.cpp src/fsutil.cpp src/hash.cpp src/options.cpp src/list_options.cpp src/upload.cpp src/priority.cpp src/vmaf.cpp src/net.cpp src/remote.cpp src/encoder_process.cpp src/vk_compute.cpp src/vk_vmaf.cpp "${CMAKE_BINARY_DIR}/shaders_spv.cpp" src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_qsv.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
 target_include_directories(ves PRIVATE "${CMAKE_SOURCE_DIR}/src")
 target_compile_definitions(ves PRIVATE "VES_VERSION=\"${VES_VERSION}\"")
 if(WIN32)

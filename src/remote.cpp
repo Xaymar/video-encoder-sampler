@@ -30,6 +30,7 @@
 #endif
 
 #include "download.h"
+#include "fsutil.h"
 #include "encoder.h"
 #include "gpu.h"
 #include "hash.h"
@@ -227,7 +228,7 @@ struct RemoteHost::Impl {
 			if (!replace_key(content, r.key)) return false;
 			std::error_code ec;
 			fs::create_directories(fs::path(r.result_file).parent_path(), ec);
-			const fs::path tmp = r.result_file + ".tmp";
+			const fs::path tmp = unique_temp_path(r.result_file);
 			{
 				std::ofstream f(tmp, std::ios::binary);
 				f << content;
@@ -1040,7 +1041,7 @@ bool fetch_input(const std::function<bool(uint8_t, const std::string&)>& send, I
 	if (fs::exists(out, ec)) return true;
 	if (!send(M_NEED, id_bytes(job_id) + "{\"sha256\":" + jq(sha) + "}")) { err = "connection lost"; return false; }
 	fs::create_directories(dir, ec);
-	const fs::path tmp = out.string() + ".part" + std::to_string(job_id);
+	const fs::path tmp = unique_temp_path(out, "part");
 	std::ofstream f(tmp, std::ios::binary);
 	RunProgress rp; // shown while the file comes in
 	rp.begin(5, size);

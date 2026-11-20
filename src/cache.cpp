@@ -11,6 +11,7 @@
 #include <sstream>
 
 #include "download.h"
+#include "fsutil.h"
 #include "gpu.h"
 #include "json.h"
 
@@ -193,8 +194,7 @@ bool result_load(const std::string& file, const std::string& key, CachedRun& out
 void result_store(const std::string& file, const std::string& key, const CachedRun& run, const std::string& details, const VmafOptions& vo) {
 	std::error_code ec;
 	fs::create_directories(fs::path(file).parent_path(), ec);
-	fs::path tmp = file;
-	tmp += ".tmp";
+	const fs::path tmp = unique_temp_path(file); // not shared with another process storing the same result
 	{
 		std::ofstream f(tmp, std::ios::binary);
 		char b[32];
