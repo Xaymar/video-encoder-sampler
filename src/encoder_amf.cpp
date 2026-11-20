@@ -158,6 +158,35 @@ const Names AV1 = {AMFVideoEncoder_AV1, AMF_VIDEO_ENCODER_AV1_USAGE, AMF_VIDEO_E
 
 std::wstring wide(const std::string& s) { return std::wstring(s.begin(), s.end()); } // property names are ASCII
 
+// AMF's trace (warnings and errors, and its debug lines) into the log while one is alive: InitVulkan only returns AMF_FAIL and says why there.
+class TraceToLog : public amf::AMFTraceWriter {
+public:
+	explicit TraceToLog(amf::AMFFactory* f) {
+		if (!f || f->GetTrace(&trace) != AMF_OK || !trace) { trace = nullptr; return; }
+		trace->RegisterWriter(kId, this, true);
+		trace->SetWriterLevel(kId, AMF_TRACE_DEBUG);
+		level = trace->SetGlobalLevel(AMF_TRACE_DEBUG);
+	}
+	~TraceToLog() {
+		if (!trace) return;
+		trace->TraceFlush();
+		trace->SetGlobalLevel(level);
+		trace->UnregisterWriter(kId);
+	}
+	void AMF_CDECL_CALL Write(const wchar_t* scope, const wchar_t* message) override {
+		std::string line = "amf trace: ";
+		for (const wchar_t* p = scope; p && *p; p++) line += *p < 128 ? (char)*p : '?';
+		line += ": ";
+		for (const wchar_t* p = message; p && *p; p++) if (*p != L'\r' && *p != L'\n') line += *p < 128 ? (char)*p : '?';
+		fprintf(stderr, "%s\n", line.c_str());
+	}
+	void AMF_CDECL_CALL Flush() override { fflush(stderr); }
+private:
+	static constexpr const wchar_t* kId = L"ves";
+	amf::AMFTrace* trace = nullptr;
+	amf_int32 level = AMF_TRACE_INFO;
+};
+
 class Amf : public Encoder {
 	HMODULE dll = nullptr;
 	amf::AMFFactory* factory = nullptr;
@@ -223,7 +252,26 @@ class Amf : public Encoder {
 		vd.hInstance = nat.inst;
 		vd.hPhysicalDevice = nat.phys;
 		vd.hDevice = nat.dev;
-		if (const AMF_RESULT r = c1->InitVulkan(&vd); r != AMF_OK) return no("InitVulkan failed (result " + std::to_string((int)r) + ")");
+		AMF_RESULT ir;
+		{
+			TraceToLog trace(factory); // AMF says why in its trace only
+			ir = c1->InitVulkan(&vd);
+		}
+		if (ir != AMF_OK) {
+			// Which part AMF does not take: FFmpeg's device on a context that already has D3D11, FFmpeg's device on a context of its own, or a device AMF makes itself.
+			auto alone = [&](bool own_device) {
+				amf::AMFContextPtr c;
+				if (factory->CreateContext(&c) != AMF_OK) return std::string("no context");
+				amf::AMFContext1Ptr x(c);
+				if (!x) return std::string("no AMFContext1");
+				TraceToLog trace(factory);
+				const AMF_RESULT r = x->InitVulkan(own_device ? nullptr : &vd);
+				x->Terminate();
+				return std::to_string((int)r);
+			};
+			const std::string a = alone(false), b = alone(true);
+			return no("InitVulkan failed (result " + std::to_string((int)ir) + "; on a context without D3D11: " + a + "; with a device AMF makes: " + b + ")");
+		}
 		try {
 			gvk = std::make_unique<Vk>(bf.device, 1);
 			const int bps = depth > 8 ? 2 : 1;
