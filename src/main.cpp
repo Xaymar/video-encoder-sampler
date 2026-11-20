@@ -2085,8 +2085,6 @@ static int run(int argc, char** argv) {
 		}
 	};
 
-	// Runs the site has already (anyone ran them, here or on another machine, with the very same key: input, encoder and options, GPU and driver, library
-	// versions, scoring models) are not run again: before runs are settled, the site is asked for their keys, a batch at a time, and the result files of
 	// A run whose encoder does not know one of its options (AMF: a property the GPU and codec lack) cannot work there, and always will not: it is ignored, and
 	// the file next to where its result would be says so, so that later sweeps ignore it without opening an encoder. The key has the GPU and driver in it.
 	auto ignored_marker = [](const Task& t) { return t.result_file + ".ignored"; };
@@ -2110,6 +2108,8 @@ static int run(int argc, char** argv) {
 			return true;
 		} catch (const std::exception&) { return false; }
 	};
+	// Runs the site has already (anyone ran them, here or on another machine, with the very same key: input, encoder and options, GPU and driver, library
+	// versions, scoring models) are not run again: before runs are settled, the site is asked for their keys, a batch at a time, and the result files of
 	// those it has are downloaded into the output folder, where settle() finds them like the results of an earlier sweep (and the next sweep finds them there
 	// without asking). They are not uploaded again. Their streams are not here; with "videos": "best" a winner among them is encoded again as usual.
 	int site_hits = 0, site_failed = 0;
