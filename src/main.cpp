@@ -2019,6 +2019,10 @@ static int run(int argc, char** argv) {
 			CachedRun hit;
 			if (!result_load(file, t.key(), hit)) { ui::log("remote: the worker's result for " + t.r.label + " cannot be used (" + file + "): unreadable, or without the distorted score (a worker older than this host?); it is not used"); return; }
 			t.r.kbps = hit.kbps; t.r.scores = std::move(hit.scores); t.r.detail = std::move(hit.detail);
+			// The host never opens the input for a run that names no size or rate, so the geometry the worker encoded at is taken from its result (otherwise the
+			// rewritten result has fps 0 and the site refuses it).
+			if (!t.r.shape.w && hit.width > 0 && hit.height > 0) { t.r.shape.w = hit.width; t.r.shape.h = hit.height; }
+			if (!t.r.shape.fps.num && hit.fps > 0) t.r.shape.fps = Rational{(int)std::lround(hit.fps * 1000), 1000};
 			store_result(t, file, cached_of(t.r), run_details(t));
 			t.r.imported = false; // already rewritten
 			if (uploader && !t.r.result.empty()) {
@@ -2148,7 +2152,8 @@ static int run(int argc, char** argv) {
 				if (!r.shape.w && hit.width > 0 && hit.height > 0 && hit.fps > 0) { // the geometry the run was encoded at, for the summary: from its result file
 					r.shape.w = hit.width; r.shape.h = hit.height;
 					r.shape.fps = Rational{(int)std::lround(hit.fps * 1000), 1000};
-				} else if (!r.shape.w) if (const SourceInfo* src = source_of(r.input)) { // an older result file: ask the source (which has to be had for that)
+				} else if (r.shape.w && !r.shape.fps.num && hit.fps > 0) r.shape.fps = Rational{(int)std::lround(hit.fps * 1000), 1000}; // a size was asked for, the rate was not
+				else if (!r.shape.w) if (const SourceInfo* src = source_of(r.input)) { // an older result file: ask the source (which has to be had for that)
 					t.plan = make_plan(*src, t.job->encoder, t.job->codec, *t.opts, r.shape);
 					fit_shape(t);
 				}
