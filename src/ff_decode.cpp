@@ -22,6 +22,7 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <thread>
 #include <set>
 #include <string>
 
@@ -177,7 +178,15 @@ struct Dec {
 		return opened;
 	}
 
-	bool send(const AVPacket* pkt) { return avcodec_send_packet(ctx, pkt) >= 0; }
+	bool send(const AVPacket* pkt) {
+		const int r = avcodec_send_packet(ctx, pkt);
+		if (r < 0) { // said, so a refused packet can be told apart (EAGAIN, out of memory, invalid data, a GPU error)
+			char e[AV_ERROR_MAX_STRING_SIZE] = {};
+			av_strerror(r, e, sizeof e);
+			fprintf(stderr, "decode: %s decoder refused a packet: %s (%d)\n", ctx->hw_device_ctx ? "GPU" : "software", e, r);
+		}
+		return r >= 0;
+	}
 
 #ifndef VES_NO_VULKAN
 	bool test_upload = false;           // VES_HW_DECODE_TEST_UPLOAD: the "test" decoder's frames are uploaded to a Vulkan device, as if decoded there
@@ -239,12 +248,52 @@ struct Dec {
 	}
 };
 
+// A hardware decoder that failed, freed on a thread of its own that may never come back. FFmpeg's Vulkan code (libavutil/vulkan.c, 8.0) resets an
+// execution context's fence in ff_vk_exec_start(); when vkEndCommandBuffer or the submit then fails ("Unable to finish command buffer"), the fence is
+// never signaled, and ff_vk_exec_pool_free() (avcodec_free_context) waits for it with no timeout once that context had a submission before. Freed on
+// the scorer's thread, that held the run, and its whole wave, for good (seen on an RTX 4070 Laptop GPU with NVIDIA's Vulkan H.264 decoder).
+static void discard_failed(std::unique_ptr<Dec> d) {
+	if (d) std::thread([p = d.release()] { delete p; }).detach();
+}
+
 class FfDecoder : public Decoder {
 	AVPacket* pkt = av_packet_alloc();
 	std::unique_ptr<Dec> sw, hw;
 	std::string kind, hw_key, hw_name; // the stream's kind, the hardware decoder's verdict key, and what to call it
 	long long check = 0;               // frames still to compare; -1: all of them
 	long long compared = 0;
+	// GPU alone (a kind the GPU decoded right before): the packets so far are kept, so that a stream the GPU decoder refuses partway (NVENC wrote an
+	// H.264 SPS with too few reference frames once, which software decoders take and NVIDIA's Vulkan decoder does not) can be decoded again in software
+	// from the start, the frames already handed out skipped. Such a refusal is the stream's fault, not the GPU's: its verdict for the kind stays.
+	bool gpu_only = false;
+	AVCodecID codec_id = AV_CODEC_ID_NONE;
+	std::vector<uint8_t> extra;
+	std::vector<std::vector<uint8_t>> sent;
+	bool flushed = false;
+	long long handed = 0, skip = 0;
+
+	bool fall_back(const std::string& why) {
+		fprintf(stderr, "scored streams: hardware decoding (%s) refused a %s stream after %lld frames (%s): decoding this stream again in software\n", hw_name.c_str(), kind.c_str(),
+		        handed, why.c_str());
+		discard_failed(std::move(hw));
+		gpu_only = false;
+		sw = std::make_unique<Dec>();
+		if (!sw->open(codec_id, extra, "", "")) { fprintf(stderr, "no decoder for encoded stream\n"); sent.clear(); return false; }
+		bool ok = true;
+		for (auto& b : sent) {
+			if (av_new_packet(pkt, (int)b.size()) < 0) { ok = false; break; }
+			memcpy(pkt->data, b.data(), b.size());
+			ok = sw->send(pkt);
+			av_packet_unref(pkt);
+			std::string w;
+			if (!ok || sw->pump(w) < 0) { ok = false; break; } // (pumped as it goes: the decoder takes a packet only once its frames are out)
+		}
+		sent.clear();
+		sent.shrink_to_fit();
+		if (ok && flushed) ok = sw->send(nullptr);
+		skip = handed;
+		return ok;
+	}
 
 	void drop_hw(const std::string& why) {
 		{
@@ -253,7 +302,7 @@ class FfDecoder : public Decoder {
 			save_verdict(hw_key, false);
 		}
 		tell_once("drop|" + hw_key, "scored streams: hardware decoding (" + hw_name + ") is not used for " + kind + ": " + why + "; decoding in software");
-		hw.reset();
+		discard_failed(std::move(hw));
 	}
 
 	// The comparison ends with every frame the same; `whole`: it covered the whole stream, which makes the device truthful for this kind.
@@ -273,6 +322,8 @@ public:
 	bool open(Codec codec, const std::vector<uint8_t>& extradata, const Shape* enc) override {
 		const AVCodecID id = codec == Codec::H264 ? AV_CODEC_ID_H264 : codec == Codec::HEVC ? AV_CODEC_ID_HEVC : codec == Codec::AV1 ? AV_CODEC_ID_AV1 : AV_CODEC_ID_NONE;
 		if (id == AV_CODEC_ID_NONE) { fprintf(stderr, "no decoder for encoded stream\n"); return false; }
+		codec_id = id;
+		extra = extradata;
 		auto open_sw = [&] {
 			sw = std::make_unique<Dec>();
 			if (sw->open(id, extradata, "", "")) return true;
@@ -323,6 +374,7 @@ public:
 			// (Another GPU's frames come back to memory as they are decoded: the scorer is on the home GPU.)
 			hw->keep_on_gpu = hw->vk_device >= 0 && rank == 0 && !getenv("VES_HW_DECODE_TO_MEMORY");
 			tell_once("gpu|" + hw_key, "scored streams: " + kind + " streams decode on the GPU (" + hw_name + "), which matched software on a whole stream of this kind before");
+			gpu_only = true;
 			return true;
 		}
 		if (!good) check = -1; // not known yet: this stream is compared all the way through
@@ -333,9 +385,11 @@ public:
 		if (av_new_packet(pkt, (int)size) < 0) return false;
 		memcpy(pkt->data, data, size);
 		bool ok = true;
+		if (gpu_only) sent.emplace_back(data, data + size);
 		if (sw) ok = sw->send(pkt);
 		if (hw && !hw->send(pkt)) {
 			if (sw) drop_hw("it refused a packet");
+			else if (gpu_only) { av_packet_unref(pkt); return fall_back("it refused a packet"); } // (the packet is among those replayed)
 			else ok = false;
 		}
 		av_packet_unref(pkt);
@@ -344,9 +398,11 @@ public:
 
 	bool flush() override {
 		bool ok = true;
+		flushed = true;
 		if (sw) ok = sw->send(nullptr);
 		if (hw && !hw->send(nullptr)) {
 			if (sw) drop_hw("it refused the end of the stream");
+			else if (gpu_only) return fall_back("it refused the end of the stream");
 			else ok = false;
 		}
 		return ok;
@@ -358,10 +414,15 @@ public:
 			if (hw && hw->pump(why) < 0) {
 				if (!sw) { // past the check: there is no software decode to fall back on
 					if (why.rfind("reading", 0) == 0) gpu_lost(why);
+					if (gpu_only) {
+						if (!fall_back(why)) return -1;
+						continue;
+					}
 					fprintf(stderr, "scored streams: hardware decoding (%s) failed after %lld frames: %s\n", hw_name.c_str(), hw->got, why.c_str());
 					std::lock_guard lock(g_mutex);
 					g_bad.insert(hw_key);
 					save_verdict(hw_key, false); // the run fails; when it is tried again, it decodes in software
+					discard_failed(std::move(hw));
 					return -1;
 				}
 				drop_hw(why);
@@ -372,6 +433,8 @@ public:
 				if (d.ready.empty()) return 0;
 				out = std::move(d.ready.front());
 				d.ready.pop_front();
+				if (skip > 0) { skip--; continue; } // handed out by the GPU decoder before it refused the stream
+				handed++;
 				return 1;
 			}
 			if (!sw->ready.empty() && !hw->ready.empty()) { // the check: software's frame goes out, the GPU's is compared with it

@@ -727,7 +727,7 @@ Scoring
         --vmaf-model <spec>[,<spec>...]  VMAF models, scored in one pass; the first one ranks, the others' scores go into the result files
                             (default: the four VMAF v1 models in models/, vmaf_v1.0.16_1d5h_2160 first)
         --vmaf-threads <n>
-        --vmaf-device <cpu|gpu|auto>  where VMAF is computed (default: cpu). gpu: on the GPU with Vulkan compute (8 and 10 bit input; v0 and v1 models; scores within 1e-9 of libvmaf's);
+        --vmaf-device <cpu|gpu|auto>  where VMAF is computed (default: auto, the GPU where it can be used, else libvmaf on the CPU). gpu: on the GPU with Vulkan compute (8 and 10 bit input; v0 and v1 models; scores within 1e-9 of libvmaf's);
                             auto: the GPU where it can be used (8 or 10 bit YUV, a model file, a Vulkan GPU), else the CPU. These scores are kept apart from libvmaf's in the cache
         --vmaf-gpu <auto|n|name>  the Vulkan device that scores (default: auto, the home GPU, else the fastest: discrete first, then the most VRAM); own: the GPU that encodes the run; n: Vulkan device n;
                             name: the first device whose name contains it. --vmaf-gpu list shows the Vulkan devices

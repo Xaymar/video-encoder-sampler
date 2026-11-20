@@ -540,6 +540,20 @@ public:
 			}
 			it->second.set(n);
 		}
+		if (codec == NV_ENC_CODEC_H264_GUID) {
+			// NVENC takes a reference count below what the GOP needs without a word and writes an SPS whose max_num_ref_frames is too small for the
+			// stream: software decoders drop a reference ("number of reference frames (1+1) exceeds max (1)"), GPU decoders refuse the stream. Such a run
+			// cannot give a valid stream, so it is ignored, not failed. Needed: one short-term reference, two once there are B-frames, plus the long-term ones.
+			const auto& c = cfg.encodeCodecConfig.h264Config;
+			const uint32_t need = (cfg.frameIntervalP > 1 ? 2u : 1u) + (c.enableLTR ? c.ltrNumFrames : 0u);
+			if (c.maxNumRefFrames > 0 && c.maxNumRefFrames < need) {
+				unsupported = "max_ref_frames " + std::to_string(c.maxNumRefFrames) + " is below the " + std::to_string(need) + " references this GOP needs (" +
+				              (cfg.frameIntervalP > 1 ? "B-frames" : "P-frames") + (c.enableLTR ? " and " + std::to_string(c.ltrNumFrames) + " long-term" : "") +
+				              "); NVENC would write an H.264 stream that does not decode";
+				fprintf(stderr, "nvenc: %s\n", unsupported.c_str());
+				return false;
+			}
+		}
 		if (rc.lookaheadLevel != 0 && !rc.enableLookahead) { // NVIDIA's user-mode library aborts the process on this (fast-fail) instead of returning an error
 			fprintf(stderr, "nvenc: lookaheadLevel needs lookahead (rc-lookahead above 0)\n");
 			return false;
