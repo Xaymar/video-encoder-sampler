@@ -204,6 +204,8 @@ class Amf : public Encoder {
 	std::atomic<bool> eof{false}, stop{false};
 	int b_delay = 0;
 	uint64_t adapter_luid = 0; // of the D3D11 adapter the encoder runs on
+	bool vulkan_only = false; // see open_vulkan_context()
+	int vidx = -1;
 #ifndef VES_NO_VULKAN
 	// Frames straight from VRAM (VES_ENC_GPU_INPUT, on by default): the converter's output (a buffer frame on FFmpeg's Vulkan device) is packed into
 	// NV12 / P010 by a compute shader (enc_pack, as repack() does in memory, padding included) and copied into a Vulkan surface that AMF allocated on
@@ -211,6 +213,9 @@ class Amf : public Encoder {
 	// D3D11 one as for frames from memory. On AMD this sharing is fine; it is NVIDIA's drivers that corrupt VRAM with shared NV12 images.
 	int gstate = 0; // 0: not tried yet, 1: frames from VRAM, -1: through memory
 	int gdevice = -1;
+	// VES_AMF_VULKAN=1: the context is a Vulkan-only one (no D3D11) on FFmpeg's device, from open() on. AMF's own conversion of a Vulkan surface to D3D11
+	// (surf->Convert(DX11)) crashes inside AMF on AMD (Invalid device / Invalid VkImage); the encoder takes Vulkan surfaces itself in a Vulkan context.
+	// Frames from memory then go in as host surfaces (Convert(VULKAN)), which is AMF's own upload.
 	std::unique_ptr<Vk> gvk;
 	Buf gstage, gpacked;
 	VkDeviceSize gstage_size = 0;
@@ -218,6 +223,59 @@ class Amf : public Encoder {
 	bool gpipe_made = false;
 	uint32_t gpitch = 0;
 	VkDeviceSize guv_off = 0;
+
+	// InitVulkan on FFmpeg's device (nat), on `c` as it is: "" when it worked, else why not. The compute queue AMF submits to is the last one of the family,
+	// which the converter and the scorer (the first) do not use.
+	std::string init_vulkan_on(amf::AMFContextPtr& c, const VkNative& nat) {
+		amf::AMFContext1Ptr c1(c);
+		if (!c1) return "the AMF runtime has no Vulkan support (AMFContext1)";
+		amf_size n = 0;
+		if (c1->GetVulkanDeviceExtensions(&n, nullptr) == AMF_OK && n) {
+			std::vector<const char*> need(n);
+			std::string missing;
+			if (c1->GetVulkanDeviceExtensions(&n, need.data()) == AMF_OK)
+				for (amf_size i = 0; i < n; i++)
+					if (need[i] && std::find(nat.extensions.begin(), nat.extensions.end(), std::string(need[i])) == nat.extensions.end())
+						missing += (missing.empty() ? "" : ", ") + std::string(need[i]);
+			if (!missing.empty()) return "FFmpeg's Vulkan device lacks " + missing + ", which AMF needs";
+		}
+		c->SetProperty(AMF_CONTEXT_VULKAN_COMPUTE_QUEUE, (amf_int64)(nat.compute_queues - 1));
+		amf::AMFVulkanDevice vd{};
+		vd.cbSizeof = sizeof vd;
+		vd.hInstance = nat.inst;
+		vd.hPhysicalDevice = nat.phys;
+		vd.hDevice = nat.dev;
+		AMF_RESULT ir;
+		{
+			TraceToLog trace(factory); // AMF says why in its trace only
+			ir = c1->InitVulkan(&vd);
+		}
+		if (ir != AMF_OK) return "InitVulkan failed (result " + std::to_string((int)ir) + ")";
+		return "";
+	}
+
+	// The Vulkan-only context of VES_AMF_VULKAN=1, made in open() on the Vulkan device of this encoder's adapter; false (nothing changed) when it cannot be.
+	bool open_vulkan_context() {
+		auto no = [&](const std::string& why) {
+			fprintf(stderr, "amf: no Vulkan-only context: %s\n", why.c_str());
+			ctx = nullptr;
+			return false;
+		};
+		std::string why;
+		const auto devs = Vk::devices(why);
+		int idx = -1;
+		for (size_t i = 0; i < devs.size(); i++) if (devs[i].luid_valid && devs[i].luid == adapter_luid) idx = (int)i;
+		if (idx < 0) return no("no Vulkan device on this adapter");
+		VkNative nat;
+		if (!vk_native(idx, nat)) return no("the adapter's Vulkan device is not FFmpeg's");
+		if (nat.compute_queues < 2) return no("FFmpeg's Vulkan device has only one compute queue");
+		if (factory->CreateContext(&ctx) != AMF_OK || !ctx) return no("CreateContext");
+		if (const std::string e = init_vulkan_on(ctx, nat); !e.empty()) return no(e);
+		vulkan_only = true;
+		vidx = idx;
+		fprintf(stderr, "amf: Vulkan-only context on Vulkan device %d (no D3D11)\n", idx);
+		return true;
+	}
 
 	bool gpu_open(const VkDecodedFrame& bf) {
 		gstate = -1;
@@ -236,30 +294,9 @@ class Amf : public Encoder {
 		if (!vk_native(bf.device, nat)) return no("the frames' Vulkan device is not FFmpeg's");
 		// AMF submits to a compute queue of its own: the last one of the family, which the converter and the scorer (the first) do not use
 		if (nat.compute_queues < 2) return no("FFmpeg's Vulkan device has only one compute queue");
-		amf::AMFContext1Ptr c1(ctx);
-		if (!c1) return no("the AMF runtime has no Vulkan support (AMFContext1)");
-		amf_size n = 0;
-		if (c1->GetVulkanDeviceExtensions(&n, nullptr) == AMF_OK && n) {
-			std::vector<const char*> need(n);
-			std::string missing;
-			if (c1->GetVulkanDeviceExtensions(&n, need.data()) == AMF_OK)
-				for (amf_size i = 0; i < n; i++)
-					if (need[i] && std::find(nat.extensions.begin(), nat.extensions.end(), std::string(need[i])) == nat.extensions.end())
-						missing += (missing.empty() ? "" : ", ") + std::string(need[i]);
-			if (!missing.empty()) return no("FFmpeg's Vulkan device lacks " + missing + ", which AMF needs");
-		}
-		ctx->SetProperty(AMF_CONTEXT_VULKAN_COMPUTE_QUEUE, (amf_int64)(nat.compute_queues - 1));
-		amf::AMFVulkanDevice vd{};
-		vd.cbSizeof = sizeof vd;
-		vd.hInstance = nat.inst;
-		vd.hPhysicalDevice = nat.phys;
-		vd.hDevice = nat.dev;
-		AMF_RESULT ir;
-		{
-			TraceToLog trace(factory); // AMF says why in its trace only
-			ir = c1->InitVulkan(&vd);
-		}
-		if (ir != AMF_OK) {
+		if (vulkan_only) {
+			if (bf.device != vidx) return no("the frames are on Vulkan device " + std::to_string(bf.device) + ", the encoder's context on " + std::to_string(vidx));
+		} else if (const std::string e = init_vulkan_on(ctx, nat); !e.empty()) {
 			// Which part AMF does not take: FFmpeg's device on a context that already has D3D11, FFmpeg's device on a context of its own, or a device AMF makes itself.
 			auto alone = [&](bool own_device) {
 				amf::AMFContextPtr c;
@@ -267,12 +304,16 @@ class Amf : public Encoder {
 				amf::AMFContext1Ptr x(c);
 				if (!x) return std::string("no AMFContext1");
 				TraceToLog trace(factory);
+				amf::AMFVulkanDevice vd{};
+				vd.cbSizeof = sizeof vd;
+				vd.hInstance = nat.inst;
+				vd.hPhysicalDevice = nat.phys;
+				vd.hDevice = nat.dev;
 				const AMF_RESULT r = x->InitVulkan(own_device ? nullptr : &vd);
 				x->Terminate();
 				return std::to_string((int)r);
 			};
-			const std::string a = alone(false), b = alone(true);
-			return no("InitVulkan failed (result " + std::to_string((int)ir) + "; on a context without D3D11: " + a + "; with a device AMF makes: " + b + ")");
+			return no(e + " (on a context without D3D11: " + alone(false) + "; with a device AMF makes: " + alone(true) + ")");
 		}
 		try {
 			gvk = std::make_unique<Vk>(bf.device, 1);
@@ -651,12 +692,18 @@ public:
 			if (d.VendorId == 0x1002 && seen++ == gpu) { memcpy(&adapter_luid, &d.AdapterLuid, sizeof adapter_luid); break; }
 		}
 		if (!adapter) { fprintf(stderr, "amf: no AMD adapter with index %d\n", gpu); return false; }
-		if (FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, nullptr))) {
-			fprintf(stderr, "amf: cannot create D3D11 device on the AMD adapter\n");
-			return false;
+		bool vk_context = false;
+#ifndef VES_NO_VULKAN
+		if (!probing) if (const char* e = getenv("VES_AMF_VULKAN"); e && atoi(e) > 0) vk_context = open_vulkan_context();
+#endif
+		if (!vk_context) {
+			if (FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, nullptr))) {
+				fprintf(stderr, "amf: cannot create D3D11 device on the AMD adapter\n");
+				return false;
+			}
+			if ((r = factory->CreateContext(&ctx)) != AMF_OK) return fail(r, "CreateContext");
+			if ((r = ctx->InitDX11(device.Get())) != AMF_OK) return fail(r, "InitDX11");
 		}
-		if ((r = factory->CreateContext(&ctx)) != AMF_OK) return fail(r, "CreateContext");
-		if ((r = ctx->InitDX11(device.Get())) != AMF_OK) return fail(r, "InitDX11");
 		if ((r = factory->CreateComponent(ctx, n->component, &enc)) != AMF_OK) return fail(r, "CreateComponent");
 
 		enc->SetProperty(n->usage, n->usage_transcoding);
@@ -755,7 +802,9 @@ public:
 			repack(fr, surf);
 		}
 		surf->SetPts(fr->pts);
-		if ((r = surf->Convert(amf::AMF_MEMORY_DX11)) != AMF_OK) return fail(r, "Convert");
+		if (vulkan_only) {
+			if (surf->GetMemoryType() != amf::AMF_MEMORY_VULKAN && (r = surf->Convert(amf::AMF_MEMORY_VULKAN)) != AMF_OK) return fail(r, "Convert (Vulkan)");
+		} else if ((r = surf->Convert(amf::AMF_MEMORY_DX11)) != AMF_OK) return fail(r, "Convert");
 
 		amf::AMFDataPtr data(surf);
 		if (filter_pp && !filter(surf, data)) return false;
