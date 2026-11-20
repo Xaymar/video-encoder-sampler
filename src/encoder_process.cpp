@@ -1271,6 +1271,7 @@ int encoder_process_main(int argc, char** argv) {
 		if (a == "--priority" && v == "low") set_low_priority();
 		else if (a == "--hw-decode") set_hw_decode(v);
 		else if (a == "--decode-threads") set_decode_threads(atoi(v.c_str()));
+		else if (a == "--frames-ahead") set_frames_ahead((size_t)std::max(2, atoi(v.c_str())));
 		else if (a == "--decode-gpu") decode_gpu_spec = v;
 		else if (a == "--scaling-gpu") scaling_gpu_spec = v;
 	}
