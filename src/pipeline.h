@@ -104,6 +104,7 @@ struct EncodeJob {
 	bool crashed = false; // the process it ran in ended under it (another run in that process may be what crashed it; see encoder_process.h)
 	std::string unsupported; // the encoder does not know an option of the run (see Encoder::unsupported): why; the run is ignored, not failed
 	bool no_session = false; // the encoder could not open: the GPU had no encode session left (see Encoder::no_session); the run is made again later
+	bool out_of_vram = false; // it failed while its process said the GPU ran out of video memory (see encoder_process.h); made again with fewer runs at once
 };
 
 // The frame map grows while the video is read, and scoring follows it.
