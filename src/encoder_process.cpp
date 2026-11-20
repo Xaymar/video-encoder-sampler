@@ -119,8 +119,8 @@ void get(Reader& r, Options& o) {
 }
 void put(Writer& w, const SourceInfo& s) { w.num(s.width).num(s.height); put(w, s.fmt); put(w, s.framerate); put(w, s.color); w.num(s.duration).str(s.decoder).num(s.frame_count); }
 void get(Reader& r, SourceInfo& s) { s.width = r.num<int>(); s.height = r.num<int>(); get(r, s.fmt); get(r, s.framerate); get(r, s.color); s.duration = r.num<double>(); s.decoder = r.str(); s.frame_count = r.num<long long>(); }
-void put(Writer& w, const Plan& p) { put(w, p.enc); put(w, p.score_fmt); w.num((uint8_t)p.convert_rate).num((uint8_t)p.rescale).num(p.range).num(p.trc); put(w, p.color); put(w, p.options); }
-void get(Reader& r, Plan& p) { get(r, p.enc); get(r, p.score_fmt); p.convert_rate = r.num<uint8_t>() != 0; p.rescale = r.num<uint8_t>() != 0; p.range = r.num<int>(); p.trc = r.num<int>(); get(r, p.color); get(r, p.options); }
+void put(Writer& w, const Plan& p) { put(w, p.enc); put(w, p.score_fmt); put(w, p.dist_fmt); w.num((uint8_t)p.convert_rate).num((uint8_t)p.rescale).num(p.range).num(p.trc); put(w, p.color); put(w, p.options); }
+void get(Reader& r, Plan& p) { get(r, p.enc); get(r, p.score_fmt); get(r, p.dist_fmt); p.convert_rate = r.num<uint8_t>() != 0; p.rescale = r.num<uint8_t>() != 0; p.range = r.num<int>(); p.trc = r.num<int>(); get(r, p.color); get(r, p.options); }
 void put(Writer& w, const ScaleOptions& s) { w.str(s.upscaler).str(s.downscaler).str(s.device).num(s.trc).num(s.bt709_curve); }
 void get(Reader& r, ScaleOptions& s) { s.upscaler = r.str(); s.downscaler = r.str(); s.device = r.str(); s.trc = r.num<int>(); s.bt709_curve = r.num<int>(); }
 void put(Writer& w, const VmafOptions& v) {
@@ -999,7 +999,7 @@ void run_wave_here(uint32_t id, const std::string& body) {
 	SourceInfo si;
 	if (!source_info(input, si)) si = planned;
 	const int source_range = si.fmt.rgb ? 1 : (si.color.range ? si.color.range : 1);
-	for (auto& pl : plans) pl.rescale = pl.enc.w != si.width || pl.enc.h != si.height || pl.enc.pix != si.fmt || (pl.range && pl.range != source_range);
+	for (auto& pl : plans) pl.rescale = pl.enc.w != si.width || pl.enc.h != si.height || pl.enc.pix != si.fmt || (pl.range && pl.range != source_range) || pl.trc;
 	// Scaling on the fastest GPU that gives the right pictures, or the one this machine's --scaling-gpu names (which beats the sweep's "scaling": {"gpu"}).
 	if (so.device.empty() || !scaling_gpu_spec.empty()) so.device = scaling_device();
 	std::vector<WaveRun*> ptrs;
