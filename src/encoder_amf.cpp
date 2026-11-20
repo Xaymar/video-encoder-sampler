@@ -23,6 +23,7 @@
 #include <dxgi.h>
 #include <wrl/client.h>
 #include <winternl.h>
+#include <tlhelp32.h>
 #include <d3dkmthk.h>
 
 #include <filesystem>
@@ -158,6 +159,23 @@ const Names AV1 = {AMFVideoEncoder_AV1, AMF_VIDEO_ENCODER_AV1_USAGE, AMF_VIDEO_E
 
 std::wstring wide(const std::string& s) { return std::wstring(s.begin(), s.end()); } // property names are ASCII
 
+// Every Vulkan loader (and AMF runtime) module of this process: AMF's "Invalid device" from the loader means a VkDevice handle from one loader copy was given to another.
+void log_vulkan_modules() {
+	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+	if (snap == INVALID_HANDLE_VALUE) return;
+	MODULEENTRY32W me{};
+	me.dwSize = sizeof me;
+	for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me)) {
+		std::wstring name = me.szModule;
+		for (auto& c : name) c = (wchar_t)towlower(c);
+		if (name.find(L"vulkan") == std::wstring::npos && name.find(L"amf") == std::wstring::npos && name.find(L"avutil") == std::wstring::npos) continue;
+		std::string path;
+		for (wchar_t c : std::wstring(me.szExePath)) path += c < 128 ? (char)c : '?';
+		fprintf(stderr, "amf: loaded module %p %s\n", (void*)me.modBaseAddr, path.c_str());
+	}
+	CloseHandle(snap);
+}
+
 // AMF's trace (warnings and errors, and its debug lines) into the log while one is alive: InitVulkan only returns AMF_FAIL and says why there.
 class TraceToLog : public amf::AMFTraceWriter {
 public:
@@ -227,6 +245,7 @@ class Amf : public Encoder {
 	// InitVulkan on FFmpeg's device (nat), on `c` as it is: "" when it worked, else why not. The compute queue AMF submits to is the last one of the family,
 	// which the converter and the scorer (the first) do not use.
 	std::string init_vulkan_on(amf::AMFContextPtr& c, const VkNative& nat) {
+		log_vulkan_modules();
 		amf::AMFContext1Ptr c1(c);
 		if (!c1) return "the AMF runtime has no Vulkan support (AMFContext1)";
 		amf_size n = 0;
