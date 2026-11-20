@@ -1,0 +1,17 @@
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 64) in;
+#include "speed_common.glsl"
+// test: dec[2i], dec[2i+1] = a, b -> tmpv[4i..]: fdiv(a,b), dsqrt_f(|a|), rsqrt_f(|b|), the same via the double way
+void main() {
+	const int i = int(gl_GlobalInvocationID.x);
+	if (i >= pc.DW) return;
+	const float a = dec[2 * i], b = dec[2 * i + 1];
+	tmpv[6 * i + 0] = fdiv(a, b);
+	tmpv[6 * i + 1] = dsqrt_f(abs(a));
+	tmpv[6 * i + 2] = rsqrt_f(abs(b));
+	tmpv[6 * i + 3] = rf(ddiv(double(a), double(b)));
+	tmpv[6 * i + 4] = rf(dsqrt(double(abs(a))));
+	tmpv[6 * i + 5] = rf(ddiv(1.0LF, dsqrt(double(abs(b)))));
+}

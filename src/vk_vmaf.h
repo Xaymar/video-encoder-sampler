@@ -17,8 +17,8 @@ struct GpuVmafFrame {
 
 class GpuVmaf {
 public:
-	// The Vulkan device to score on (an index into Vk::devices()), -1 (and `why`) if there is none. `spec` is vmaf.gpu: "" or "auto" for the fastest
-	// GPU that can score (vulkan_devices_fastest_first(); "own" for the GPU that encodes (GPU `encoder_gpu` of vendor
+	// The Vulkan device to score on (an index into Vk::devices()), -1 (and `why`) if there is none. `spec` is vmaf.gpu: "" or "auto" for the home GPU
+	// (home_vulkan_device()) if it can score, else the fastest one that can (vulkan_devices_fastest_first()); "own" for the GPU that encodes (GPU `encoder_gpu` of vendor
 	// `encoder_vendor`, see gpu.h), else the fastest; a number for that Vulkan device; anything else for the first device whose name contains it (any case).
 	static int pick_device(const std::string& spec, unsigned encoder_vendor, int encoder_gpu, std::string& why);
 	// Whether the GPU scorer can score these frames with these model files on Vulkan device `device`; `why` says what is in the way.
@@ -31,6 +31,15 @@ public:
 	// planes are only read when the model has a chroma feature. The planes are copied before it returns; the scoring goes on in the background, several
 	// frames at once, and add() waits only when all of them are still busy. False if the frame (or one before it) could not be scored.
 	bool add(const uint8_t* const ref[3], const size_t ref_stride[3], const uint8_t* const dis[3], const size_t dis_stride[3]);
+	// The same with a decoded frame that is still on the GPU (`dis`, opaque: a VkDecodedFrame of vk_compute.h), read where it is: false if it is on
+	// another device or in a form this cannot read (then download it and use add()). `refused` tells that apart from a failure of the scoring.
+	bool add_gpu(const uint8_t* const ref[3], const size_t ref_stride[3], const void* dis, bool& refused);
+	// The same with either frame, or both, on the GPU (`ref_gpu` / `dis_gpu`, opaque VkDecodedFrames, or null for the planes in memory): false
+	// and `refused` if one of them is where or in a form this cannot read (takes()); nothing was added then.
+	bool add_any(const uint8_t* const ref[3], const size_t ref_stride[3], const void* ref_gpu, const uint8_t* const dis[3], const size_t dis_stride[3],
+	             const void* dis_gpu, bool& refused);
+	bool takes(const void* gpu) const; // whether a frame on the GPU (an opaque VkDecodedFrame) can be read in place: this device, a layout it reads
+	int device() const; // the Vulkan device it scores on
 	// For each model (in the order given), the VMAF score of every pair added; and, if asked for, every frame's features as libvmaf names them.
 	bool finish(std::vector<std::vector<double>>& scores, std::vector<std::vector<std::map<std::string, double>>>* features = nullptr);
 	// Seconds spent so far, in add() and finish(): copying frames in and handing them to the GPU, and waiting for a frame in flight to be done; and in

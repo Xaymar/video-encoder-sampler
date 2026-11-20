@@ -30,6 +30,7 @@
 #endif
 
 #include "download.h"
+#include "fsutil.h"
 #include "encoder.h"
 #include "gpu.h"
 #include "hash.h"
@@ -42,7 +43,7 @@ namespace fs = std::filesystem;
 namespace {
 
 enum : uint8_t { M_HELLO = 1, M_JOB = 2, M_NEED = 3, M_FILE_DATA = 4, M_FILE_END = 5, M_RESULT = 6, M_DONE = 7, M_PROGRESS = 8, M_SOURCE = 9, M_LOG = 10, M_PING = 11, M_VIDEO = 12, M_VIDEO_END = 13 };
-constexpr int kVersion = 7; // 7: x264 and x265 encode CBR (VBV at the bitrate), their keys say so. 6: video jobs (the winners of their groups encoded again, their streams sent back). 5: dropped frames take the score of the frame on screen
+constexpr int kVersion = 8; // 8: our own Vulkan converter (linear light; frames differ from libplacebo's), the "trc" option, scaling.bt709_curve. 7: x264 and x265 encode CBR (VBV at the bitrate), their keys say so. 6: video jobs (the winners of their groups encoded again, their streams sent back). 5: dropped frames take the score of the frame on screen
 // Both sides say something at least every kPingEvery; one that has heard nothing for kSilence takes the other as gone (crashed, hung, or the machine is off) and ends
 // the connection: the host gives that worker's jobs to the others, the worker stops them and connects again.
 constexpr int kPingEvery = 10;      // seconds
@@ -227,7 +228,7 @@ struct RemoteHost::Impl {
 			if (!replace_key(content, r.key)) return false;
 			std::error_code ec;
 			fs::create_directories(fs::path(r.result_file).parent_path(), ec);
-			const fs::path tmp = r.result_file + ".tmp";
+			const fs::path tmp = unique_temp_path(r.result_file);
 			{
 				std::ofstream f(tmp, std::ios::binary);
 				f << content;
@@ -1040,7 +1041,7 @@ bool fetch_input(const std::function<bool(uint8_t, const std::string&)>& send, I
 	if (fs::exists(out, ec)) return true;
 	if (!send(M_NEED, id_bytes(job_id) + "{\"sha256\":" + jq(sha) + "}")) { err = "connection lost"; return false; }
 	fs::create_directories(dir, ec);
-	const fs::path tmp = out.string() + ".part" + std::to_string(job_id);
+	const fs::path tmp = unique_temp_path(out, "part");
 	std::ofstream f(tmp, std::ios::binary);
 	RunProgress rp; // shown while the file comes in
 	rp.begin(5, size);

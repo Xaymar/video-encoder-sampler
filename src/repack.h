@@ -41,3 +41,17 @@ inline void pack_uv(const Picture& fr, int w, int h, int depth, uint8_t* dst, si
 		}
 	}
 }
+
+// Fills the padding of a plane that is coded larger than the picture (cw x ch of which only w x h are the picture): each row's last sample
+// (`unit` bytes, two samples for interleaved chroma) is repeated to the right, then the last row downwards. Repeated edges cost the encoder
+// next to nothing and keep the edge blocks of the picture itself as they would be without padding; the container crops them off again.
+inline void pad_edges(uint8_t* dst, size_t pitch, int w, int h, int cw, int ch, int unit) {
+	if (w <= 0 || h <= 0) return;
+	for (int y = 0; y < h && cw > w; y++) {
+		uint8_t* d = dst + (size_t)y * pitch;
+		const uint8_t* last = d + (size_t)(w - 1) * unit;
+		for (int x = w; x < cw; x++) memcpy(d + (size_t)x * unit, last, (size_t)unit);
+	}
+	const uint8_t* last_row = dst + (size_t)(h - 1) * pitch;
+	for (int y = h; y < ch; y++) memcpy(dst + (size_t)y * pitch, last_row, (size_t)cw * unit);
+}

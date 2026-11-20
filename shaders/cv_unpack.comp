@@ -1,0 +1,19 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+// The converter's first step: one component of a frame, in whatever layout it is stored (planar, NV12/P010, packed RGB, ...), into a plane of floats,
+// one per sample, row after row: the value (`bytes` 1 or 2 wide, little- or big-endian, `shift` bits up, `depth` bits) times `mul` plus `add`, so
+// that what comes out is the nominal value (Y and RGB 0..1, Cb and Cr -0.5..0.5). Every layout gives the same floats for the same samples.
+layout(std430, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { float dst[]; };
+layout(push_constant) uniform PC { int w, h, base, stride, step, offset, bytes, shift, depth, big_endian; float mul, add; } pc;
+
+uint byte_at(int i) { return (src[i >> 2] >> uint((i & 3) * 8)) & 0xffu; }
+
+void main() {
+	const int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+	if (x >= pc.w || y >= pc.h) return;
+	const int b = pc.base + y * pc.stride + x * pc.step + pc.offset;
+	uint v = pc.bytes == 1 ? byte_at(b) : pc.big_endian != 0 ? (byte_at(b) << 8) | byte_at(b + 1) : byte_at(b) | (byte_at(b + 1) << 8);
+	v = (v >> uint(pc.shift)) & ((1u << uint(pc.depth)) - 1u);
+	dst[y * pc.w + x] = float(v) * pc.mul + pc.add;
+}

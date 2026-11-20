@@ -7,6 +7,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <map>
 #include <memory>
@@ -17,6 +18,8 @@
 #include "formats.h"
 #include "gpu.h"
 #include "mux.h"
+#include "convert.h"
+#include "decode.h"
 #include "source.h"
 
 bool source_info(const std::string& path, SourceInfo& out) {
@@ -40,7 +43,7 @@ bool source_info(const std::string& path, SourceInfo& out) {
 
 std::string Plan::feed_key() const {
 	char b[160];
-	snprintf(b, sizeof b, "%dx%d@%d/%d rate=%d fmt=%d/%d range=%d", enc.w, enc.h, enc.fps.num, enc.fps.den, convert_rate, enc.pix.chroma, enc.pix.depth, range);
+	snprintf(b, sizeof b, "%dx%d@%d/%d rate=%d fmt=%d/%d range=%d trc=%d", enc.w, enc.h, enc.fps.num, enc.fps.den, convert_rate, enc.pix.chroma, enc.pix.depth, range, trc);
 	return b;
 }
 
@@ -90,8 +93,19 @@ Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::str
 		else return ignore("range '" + v + "' is not source, limited (tv) or full (pc)");
 		o.erase(it);
 	}
+	// "trc": the transfer curve the encoder gets, by FFmpeg's names (bt709, iec61966-2-1 or srgb, smpte2084 or pq, arib-std-b67 or hlg, ...) or
+	// H.273 numbers; "source" or left out: the source's. The frames are converted to it in linear light (sRGB desktop captures to BT.709, say),
+	// and the decoded stream is converted back to the source's curve for scoring.
+	if (auto it = o.find("trc"); it != o.end()) {
+		const int t = trc_of(it->second);
+		if (t < 0) return ignore("trc '" + it->second + "' is not a transfer characteristic (FFmpeg's names, or H.273 numbers)");
+		const int src_trc = src.color.trc == 2 || src.color.trc == 0 ? 0 : src.color.trc;
+		pl.trc = t == src_trc ? 0 : t;
+		o.erase(it);
+	}
 	pl.color = src.color;
 	if (src.fmt.rgb) pl.color.space = 1; // the converter makes BT.709 from RGB
+	if (pl.trc) pl.color.trc = pl.trc;
 	const int source_range = src.fmt.rgb ? 1 : (src.color.range ? src.color.range : 1);
 	if (pl.range) pl.color.range = pl.range;
 	else if (src.fmt.rgb) pl.color.range = 1;
@@ -104,7 +118,7 @@ Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::str
 	pl.dist_fmt = planar_fmt(chroma == 422 ? 444 : chroma, std::max(depth, min_score_depth));
 	if (!valid(enc.pix) || !valid(pl.score_fmt) || !valid(pl.dist_fmt)) return ignore("unsupported chroma " + std::to_string(chroma) + " / bit depth " + std::to_string(depth));
 	pl.convert_rate = want.fps.num != 0 && !same_rate;
-	pl.rescale = enc.w != src.width || enc.h != src.height || enc.pix != src.fmt || (pl.range && pl.range != source_range); // scale, convert and/or change the range
+	pl.rescale = enc.w != src.width || enc.h != src.height || enc.pix != src.fmt || (pl.range && pl.range != source_range) || pl.trc; // scale, convert, change the range and/or the curve
 	pl.options = std::move(o);
 	return pl;
 }
@@ -269,7 +283,7 @@ void consume(EncodeJob& job, const SourceInfo& si, FrameQueue& q, Holding* holdi
 		if (job.tee) job.tee(d, n);
 		if (!job.file.empty() && !mp4.add(d, n, pts, key, dts)) write_failed = true;
 	})) { job.no_session = codec && codec->no_session; q.cancel(); ended(); return; }
-	if (!job.file.empty() && !mp4.open(job.file, job.id, pl.enc, job.color, codec->reorder_delay())) { fprintf(stderr, "cannot write %s\n", job.file.c_str()); q.cancel(); ended(); return; }
+	if (!job.file.empty() && !mp4.open(job.file, job.id, pl.enc, job.color, codec->reorder_delay(), codec->coded_w, codec->coded_h)) { fprintf(stderr, "cannot write %s\n", job.file.c_str()); q.cancel(); ended(); return; }
 	bool ok = true;
 	if (job.rp) job.rp->waits_excluded = false; // its work goes on while it waits (see RunProgress::waits_excluded)
 	for (Picture pic; q.pop(pic, job.rp);) {
@@ -424,12 +438,16 @@ void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& h
 }
 
 // Takes the decoded frames, drops frames to the target rate, scales and converts, and hands the result to the encoders and to the distorted scores (`enc`).
+// `gpu_out`: the encoders take frames from VRAM (NVENC and AMF, see encoder_nvenc.cpp, encoder_amf.cpp), so the converted frames stay on the GPU (buffer frames), and frames
+// decoded there that need no conversion go through the converter as they are (an exact copy), instead of being read back.
 // Frame rate conversion drops frames before scaling. Each source frame falls into a slot of the output timeline (its real presentation time times the rate,
 // rounded down) and only the first frame in each slot is kept. `shown[n]` records which encoded frame is on screen at source frame n, for scoring.
 void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Plan& pl, const ScaleOptions& so, Broadcast& bc, FrameHistory& enc, FeedResult& fr, bool& ok, RunProgress* rp,
-                   bool keep_for_scores = true) {
+                   bool keep_for_scores = true, bool gpu_out = false) {
 	const Shape& e = pl.enc;
 	auto scaler = make_converter();
+	scaler->set_output_on_gpu(gpu_out);
+	bool copy_through = false; // !pl.rescale, frames on the GPU: through the converter as they are
 	Picture frame, scaled;
 	int64_t last_slot = -1;
 	long long kept = 0;
@@ -452,9 +470,22 @@ void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Pl
 		if (keep) {
 			frame.pts = kept++; // encoded frames are numbered consecutively, whatever the gaps in the source timing
 			frame.duration = 1; // one tick of the 1/enc.fps time base
-			if (!pl.rescale) hand_on(frame);
+			if (frame.pts == 0 && !pl.rescale && gpu_out && frame.gpu) {
+				copy_through = true;
+				ScaleOptions to = so;
+				to.trc = 0;
+				ok = scaler->open(frame, e.fps.inverse(), e.w, e.h, e.pix, to, 0);
+			}
+			if (!pl.rescale && !copy_through) {
+				if (!picture_to_memory(frame)) { ok = false; break; } // decoded on the GPU, and the encoders take frames from memory
+				hand_on(frame);
+			}
 			else {
-				if (frame.pts == 0) ok = scaler->open(frame, e.fps.inverse(), e.w, e.h, e.pix, so, pl.range);
+				if (frame.pts == 0 && pl.rescale) {
+					ScaleOptions to = so;
+					to.trc = pl.trc;
+					ok = scaler->open(frame, e.fps.inverse(), e.w, e.h, e.pix, to, pl.range);
+				}
 				ok = ok && scaler->push(&frame);
 				queue_scaled();
 			}
@@ -462,7 +493,7 @@ void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Pl
 		fr.shown.push((uint32_t)(kept - 1));
 	}
 	raw.leave(reader);
-	if (ok && pl.rescale && kept) { ok = scaler->push(nullptr); queue_scaled(); }
+	if (ok && (pl.rescale || copy_through) && kept) { ok = scaler->push(nullptr); queue_scaled(); }
 	if (rp) rp->finish();
 	fr.shown.finish();
 	enc.close();
@@ -474,8 +505,11 @@ void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Pl
 // larger: scored at 10 bit or more). A scorer that waits for its encoder's packets does not hold it back: the busy scorers may need frames that encoder
 // has not been given yet (an encoder that holds more frames back than the others), and waiting for it would wait forever. `waiting` is set while it
 // waits for room.
-void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, Fmt fmt, const ScaleOptions& so, FrameHistory& out, std::atomic<bool>& waiting, RunProgress& rp) {
+// `on_gpu`: the frames are scored on the GPU, so frames decoded there stay there (converted or not) and are only read back by a scorer that cannot take them.
+void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, Fmt fmt, const ScaleOptions& so, FrameHistory& out, std::atomic<bool>& waiting, RunProgress& rp,
+                       bool on_gpu) {
 	auto conv = make_converter();
+	conv->set_output_on_gpu(on_gpu);
 	Picture t, o;
 	bool ok = true, first = true;
 	auto flush_converted = [&] {
@@ -497,7 +531,11 @@ void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, F
 		}
 		if (!out.read() || raw.next(reader, t, &rp) != 1) break; // the end, or every scorer of this format has ended
 		rp.step();
-		if (t.fmt == fmt) { out.push(t); continue; }
+		if (t.fmt == fmt) { // nothing to convert: the scorer takes the frame as it is (on the GPU when it can read it there)
+			if (!on_gpu && !picture_to_memory(t)) { ok = false; break; }
+			out.push(t);
+			continue;
+		}
 		t.duration = 1;
 		if (first) { ok = conv->open(t, si.framerate.inverse(), si.width, si.height, fmt, so); first = false; }
 		if (ok && !conv->push(&t)) ok = false;
@@ -660,7 +698,11 @@ bool run_wave(const std::string& input, const SourceInfo& planned, std::vector<W
 
 	bool decode_ok = false, feed_ok = false;
 	std::thread decoder([&] { decode_input(*src, raw, [&] { return raw.held() || enc_frames.held() || raw.too_far(IDLE_BEYOND) || enc_frames.too_far(IDLE_BEYOND); }, decode_ok, &decode_rp, limit); });
-	std::thread feeder([&] { feed_encoders(*src, raw, feed_reader, *runs[0]->enc.plan, so, bc, enc_frames, fr, feed_ok, feed_rp, !check); });
+	// NVENC and AMF take frames from VRAM (VES_ENC_GPU_INPUT=0: never): the feed's frames stay on the GPU when every encoder of the wave is one of them.
+	bool gpu_feed = converter_shares_ffmpeg_vulkan();
+	if (const char* e = getenv("VES_ENC_GPU_INPUT"); e && atoi(e) == 0) gpu_feed = false;
+	for (auto* r : runs) if (r->enc.encoder != "nvenc" && r->enc.encoder != "amf") gpu_feed = false;
+	std::thread feeder([&] { feed_encoders(*src, raw, feed_reader, *runs[0]->enc.plan, so, bc, enc_frames, fr, feed_ok, feed_rp, !check, gpu_feed); });
 	std::vector<std::thread> threads;
 	for (size_t i = 0; i < n; i++) threads.emplace_back([&, i] {
 		consume(runs[i]->enc, si, bc.at(i), holding[i].get(), [&, i] {
@@ -671,11 +713,11 @@ bool run_wave(const std::string& input, const SourceInfo& planned, std::vector<W
 
 	// Scoring runs at the same time, following the encoders' output as it is written.
 	RefInfo ref;
-	ref.width = si.width; ref.height = si.height; ref.framerate = si.framerate; ref.color = si.color; ref.frames = si.frame_count;
+	ref.width = si.width; ref.height = si.height; ref.framerate = si.framerate; ref.color = si.color; ref.frames = si.frame_count; ref.rgb = si.fmt.rgb;
 	ref.score_range = si.fmt.rgb ? 1 : (si.color.range ? si.color.range : 1); // the reference side is converted to YUV without changing the range (RGB: limited)
 	for (auto& gp : groups) {
 		Group& g = *gp;
-		threads.emplace_back([&, gptr = &g] { convert_reference(si, raw, gptr->raw_reader, gptr->fmt, so, gptr->frames, gptr->waiting, gptr->ref_rp); });
+		threads.emplace_back([&, gptr = &g] { convert_reference(si, raw, gptr->raw_reader, gptr->fmt, so, gptr->frames, gptr->waiting, gptr->ref_rp, vo.device != "cpu"); });
 		VmafOptions group_vo = vo;
 		if (group_vo.threads <= 0) group_vo.threads = std::max(2, (int)std::thread::hardware_concurrency() / (int)runs.size());
 		for (size_t m = 0; m < g.members.size(); m++) threads.emplace_back([&, gptr = &g, m, group_vo] {
@@ -686,7 +728,7 @@ bool run_wave(const std::string& input, const SourceInfo& planned, std::vector<W
 			const FrameFeed feed = [&g, reader, rp = run.score_rp](Picture& out) { return g.frames.next(reader, out, rp); };
 			const PacketFeed next_packet = [&pq, rp = run.score_rp](std::vector<uint8_t>& out) { return pq.pop(out, rp); };
 			const ShownFeed shown = [&fr](size_t k, uint32_t& v) { return fr.shown.get(k, v); };
-			VmafOptions run_vo = group_vo; // scoring follows the run's encoder to its GPU (vmaf.gpu "auto")
+			VmafOptions run_vo = group_vo; // scoring can follow the run's encoder to its GPU (vmaf.gpu "own")
 			run_vo.encoder_vendor = encoder_vendor(run.enc.encoder);
 			if (auto it = run.enc.plan->options.find("gpu"); it != run.enc.plan->options.end()) run_vo.encoder_gpu = atoi(it->second.c_str());
 			run.score_ok = vmaf_score(ref, feed, run.codec, next_packet, {}, run.enc.plan->enc, run.enc.plan->color, shown, g.fmt, run_vo, so, run.scores, run.score_rp, &run.detail);

@@ -1,0 +1,64 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// VMAF motion in one pass (motion_y then motion_x, the same integer steps, for up to 15 bits per sample): a workgroup makes the vertical
+// convolution of the difference of the two frames for the 20 columns its 16x16 tile reads in shared memory instead of in `ytmp`, then the
+// horizontal one, the absolute value and the sum of the workgroup.
+layout(local_size_x = 16, local_size_y = 16) in;
+layout(std430, binding = 0) readonly buffer Prev { uint prev[]; };
+layout(std430, binding = 1) readonly buffer Cur { uint cur[]; };
+layout(std430, binding = 3) writeonly buffer Part { uint part[]; };
+layout(push_constant) uniform PC { int W; int H; int bpc; } pc;
+
+const int F[5] = int[5](3571, 16004, 26386, 16004, 3571);
+const int T = 16, C = T + 4;
+shared int gY[T][C];
+shared uint sh[256];
+
+int mirror(int i, int n) {
+	if (i < 0) return -i;
+	if (i >= n) return 2 * n - i - 2;
+	return i;
+}
+
+int sample_at(bool a, int idx) {
+	if (pc.bpc > 8) {
+		uint w = a ? prev[idx >> 1] : cur[idx >> 1];
+		return int((w >> ((idx & 1) * 16)) & 65535u);
+	}
+	uint w = a ? prev[idx >> 2] : cur[idx >> 2];
+	return int((w >> ((idx & 3) * 8)) & 255u);
+}
+
+void main() {
+	const int x0 = int(gl_WorkGroupID.x) * T, y0 = int(gl_WorkGroupID.y) * T;
+	const uint lid = gl_LocalInvocationIndex;
+	for (int e = int(lid); e < T * C; e += 256) {
+		const int ly = e / C, c = e % C, y = y0 + ly;
+		const int x = clamp(mirror(x0 - 2 + c, pc.W), 0, pc.W - 1); // past the frame's last column only for unused outputs
+		int v = 0;
+		if (y < pc.H) {
+			int acc = 0;
+			for (int k = 0; k < 5; k++) {
+				const int row = mirror(y - 2 + k, pc.H);
+				acc += F[k] * (sample_at(true, row * pc.W + x) - sample_at(false, row * pc.W + x));
+			}
+			v = (acc + (1 << (pc.bpc - 1))) >> pc.bpc;
+		}
+		gY[ly][c] = v;
+	}
+	barrier();
+	const int lx = int(gl_LocalInvocationID.x), ly = int(gl_LocalInvocationID.y);
+	uint a = 0u;
+	if (x0 + lx < pc.W && y0 + ly < pc.H) {
+		int64_t acc = 0;
+		for (int k = 0; k < 5; k++) acc += int64_t(F[k]) * int64_t(gY[ly][lx + k]);
+		a = uint(abs(int((acc + 32768) >> 16)));
+	}
+	sh[lid] = a;
+	barrier();
+	for (uint s = 128u; s > 0u; s >>= 1) {
+		if (lid < s) sh[lid] += sh[lid + s];
+		barrier();
+	}
+	if (lid == 0u) part[gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x] = sh[0];
+}

@@ -11,6 +11,7 @@
 #include <sstream>
 
 #include "download.h"
+#include "fsutil.h"
 #include "gpu.h"
 #include "json.h"
 
@@ -96,7 +97,9 @@ std::string model_id(const std::string& model) {
 
 std::string key_settings(const ScaleOptions& scale, const VmafOptions& vmaf) {
 	std::ostringstream k;
-	k << "scaling=" << scale.upscaler << '/' << scale.downscaler << ' ' << scale.device << ' ' << scaler_library_version() << '\n';
+	k << "scaling=" << scale.upscaler << '/' << scale.downscaler << ' ' << scale.device << ' ' << scaler_library_version();
+	if (scale.bt709_curve != 1) k << " bt709=" << bt709_curve_name(scale.bt709_curve);
+	k << '\n';
 	k << "decoder=" << decoder_library_version() << '\n';
 	// the scorer: library version, model, and the model file's contents when it is a path
 	k << "vmaf=" << vmaf_library_version() << ' ' << model_key_text(vmaf.model);
@@ -191,8 +194,7 @@ bool result_load(const std::string& file, const std::string& key, CachedRun& out
 void result_store(const std::string& file, const std::string& key, const CachedRun& run, const std::string& details, const VmafOptions& vo) {
 	std::error_code ec;
 	fs::create_directories(fs::path(file).parent_path(), ec);
-	fs::path tmp = file;
-	tmp += ".tmp";
+	const fs::path tmp = unique_temp_path(file); // not shared with another process storing the same result
 	{
 		std::ofstream f(tmp, std::ios::binary);
 		char b[32];

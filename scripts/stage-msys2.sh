@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Copies the MSYS2 UCRT64 libraries VES builds against into third-party/<name>/ucrt64/{include,lib,bin}, the layout CMakeLists.txt expects.
 # Run it in an MSYS2 UCRT64 shell after installing the packages:
-#   pacman -S --needed mingw-w64-ucrt-x86_64-{libx264,x265,svt-av1,vmaf,libplacebo,libvpl,lcms2,libdovi,shaderc,spirv-cross,vulkan-headers,libgcc,libstdc++,libwinpthread}
+#   pacman -S --needed mingw-w64-ucrt-x86_64-{libx264,x265,svt-av1,vmaf,libvpl,vulkan-headers,libgcc,libstdc++,libwinpthread}
 # Usage: scripts/stage-msys2.sh [third-party directory]
 #
 # Only the named packages are copied, not their whole dependency tree: the libraries' DLLs have to sit next to ves.exe, nothing else does.
@@ -18,7 +18,7 @@ declare -A groups=(
 	[x265]="x265 libgcc libstdc++ libwinpthread"
 	[svt-av1]="svt-av1"
 	[vmaf]="vmaf"
-	[libplacebo]="libplacebo lcms2 libdovi shaderc spirv-cross vulkan-headers"
+	[vulkan-headers]="vulkan-headers"
 	[libvpl]="libvpl"
 )
 

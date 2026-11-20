@@ -88,21 +88,6 @@ modules:
         # 3.2.1 or later: 3.2.0 builds the VMAF v1 chroma feature (speed_chroma) only with -Denable_float=true
         tag: v3.2.1
 
-  # shortcut: shaderc is taken from the SDK; if it is missing there, add a shaderc (or glslang) module before this one
-  - name: libplacebo
-    buildsystem: meson
-    config-opts:
-      - --libdir=lib
-      - -Ddemos=false
-      - -Dtests=false
-      - -Ddovi=disabled
-      - -Dd3d11=disabled
-      - -Dopengl=disabled
-    sources:
-      - type: git
-        url: https://github.com/haasn/libplacebo.git
-        tag: v7.387.0
-
   - name: ffmpeg
     config-opts:
       - --enable-shared

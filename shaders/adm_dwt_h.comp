@@ -11,6 +11,7 @@ void main() {
 	int ind[4];
 	src_idx(j, pc.SW, ind);
 	const int T = pc.BH * pc.SW, N = pc.BW * pc.BH;
+	int outs[2][4];
 	for (int p = 0; p < 2; p++) {
 		int vl[4], vh[4];
 		for (int k = 0; k < 4; k++) {
@@ -38,11 +39,11 @@ void main() {
 			out_h = int((ah + add) >> sh);
 			out_d = int((bh + add) >> sh);
 		}
-		const int b0 = p == 0 ? RA : DA;
-		const int o = i * pc.BW + j;
-		cur[(b0 + 0) * N + o] = out_a;
-		cur[(b0 + 2) * N + o] = out_v;
-		cur[(b0 + 1) * N + o] = out_h;
-		cur[(b0 + 3) * N + o] = out_d;
+		outs[p][0] = out_a; outs[p][1] = out_h; outs[p][2] = out_v; outs[p][3] = out_d; // a, h, v, d: RA + 0..3
+	}
+	const int o = i * pc.BW + j;
+	for (int b = 0; b < 4; b++) {
+		if (pc.scale == 0) cur[b * N + o] = pack16(outs[0][b], outs[1][b]);
+		else { cur[(RA + b) * N + o] = outs[0][b]; cur[(DA + b) * N + o] = outs[1][b]; }
 	}
 }

@@ -14,6 +14,7 @@
 #ifdef _WIN32
 #define NOMINMAX
 #include <windows.h>
+#include <vulkan/vulkan_win32.h> // exportable_buffer(): VkMemoryGetWin32HandleInfoKHR
 #else
 #include <dlfcn.h>
 #endif
@@ -22,13 +23,14 @@
 
 #define VK_FUNCS(X) \
 	X(vkEnumeratePhysicalDevices) X(vkGetPhysicalDeviceProperties) X(vkGetPhysicalDeviceProperties2) X(vkGetPhysicalDeviceMemoryProperties) X(vkGetPhysicalDeviceQueueFamilyProperties) \
-	X(vkGetPhysicalDeviceFeatures) X(vkCreateDevice) X(vkGetDeviceQueue) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
+	X(vkGetPhysicalDeviceFeatures) X(vkCreateDevice) X(vkGetDeviceQueue) X(vkGetDeviceQueue2) X(vkCreateBuffer) X(vkDestroyBuffer) X(vkGetBufferMemoryRequirements) \
 	X(vkAllocateMemory) X(vkFreeMemory) X(vkBindBufferMemory) X(vkMapMemory) X(vkCreateShaderModule) X(vkCreateDescriptorSetLayout) \
-	X(vkCreatePipelineLayout) X(vkCreateComputePipelines) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) \
+	X(vkCreatePipelineLayout) X(vkCreateComputePipelines) X(vkCreateDescriptorPool) X(vkDestroyDescriptorPool) X(vkAllocateDescriptorSets) X(vkFreeDescriptorSets) \
 	X(vkUpdateDescriptorSets) X(vkCreateCommandPool) X(vkDestroyCommandPool) X(vkAllocateCommandBuffers) X(vkBeginCommandBuffer) \
 	X(vkEndCommandBuffer) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) X(vkCmdPushConstants) X(vkCmdDispatch) X(vkCmdPipelineBarrier) \
-	X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkResetFences) \
-	X(vkCmdCopyBuffer) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults)
+	X(vkQueueSubmit) X(vkResetCommandBuffer) X(vkCreateFence) X(vkDestroyFence) X(vkWaitForFences) X(vkGetFenceStatus) X(vkResetFences) \
+	X(vkCmdCopyBuffer) X(vkCmdCopyImageToBuffer) X(vkCmdCopyBufferToImage) X(vkCreateSemaphore) X(vkDestroySemaphore) X(vkCreateQueryPool) X(vkDestroyQueryPool) X(vkCmdResetQueryPool) X(vkCmdWriteTimestamp) X(vkGetQueryPoolResults) \
+	X(vkGetDeviceProcAddr) X(vkEnumerateDeviceExtensionProperties)
 
 #define X(n) static PFN_##n n;
 VK_FUNCS(X)
@@ -37,6 +39,14 @@ VK_FUNCS(X)
 namespace {
 
 constexpr int kBindings = 16;
+
+#ifdef _WIN32
+#define EXT_MEMORY_NAME VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
+constexpr VkExternalMemoryHandleTypeFlagBits kExportType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+#else
+#define EXT_MEMORY_NAME VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME
+constexpr VkExternalMemoryHandleTypeFlagBits kExportType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+#endif
 
 void chk(VkResult r, const char* what) {
 	if (r == VK_ERROR_DEVICE_LOST) gpu_lost(std::string("Vulkan device lost while scoring VMAF (") + what + ")");
@@ -75,7 +85,26 @@ struct Shared {
 	VkPipelineLayout layout{};
 	std::mutex queue_lock, xqueue_lock, cqueue2_lock, pipe_lock;
 	std::map<std::string, VkPipeline> pipelines;
+	VkExternal ext;        // where the device came from, if it is not ours
+	bool export_mem = false; // the external memory extension of the platform is on (exportable_buffer())
+#ifdef _WIN32
+	PFN_vkGetMemoryWin32HandleKHR get_handle = nullptr;
+#else
+	PFN_vkGetMemoryFdKHR get_fd = nullptr;
+#endif
+	bool external = false;
+	uint32_t queue_index = 0, xqueue_index = 0;
+	// Submits to one of the device's queues, under its lock (and its maker's, for a device that is not ours).
+	VkResult submit(VkQueue q, std::mutex& m, uint32_t fam, uint32_t idx, const VkSubmitInfo& si, VkFence f) {
+		std::lock_guard lock(m);
+		if (external && ext.lock) ext.lock(ext.ctx, fam, idx);
+		const VkResult r = vkQueueSubmit(q, 1, &si, f);
+		if (external && ext.unlock) ext.unlock(ext.ctx, fam, idx);
+		return r;
+	}
 };
+
+bool (*g_provider)(int, uint32_t, uint32_t, VkExternal&) = nullptr; // vk_set_external_provider()
 
 std::mutex init_lock;
 Instance instance;
@@ -133,6 +162,7 @@ bool instance_up(std::string& why) {
 			d.vendor_id = p2.properties.vendorID;
 			d.device_id = p2.properties.deviceID;
 			if (vkGetPhysicalDeviceProperties2 && idp.deviceLUIDValid) { memcpy(&d.luid, idp.deviceLUID, sizeof d.luid); d.luid_valid = true; }
+			if (vkGetPhysicalDeviceProperties2) { memcpy(d.uuid, idp.deviceUUID, sizeof d.uuid); d.uuid_valid = true; }
 			VkPhysicalDeviceMemoryProperties mp;
 			vkGetPhysicalDeviceMemoryProperties(in.phys[i], &mp);
 			for (uint32_t h = 0; h < mp.memoryHeapCount; h++)
@@ -161,13 +191,19 @@ Shared* bring_up(int index, std::string& why) {
 		if (!instance.info[index].usable) throw std::runtime_error("Vulkan device " + std::to_string(index) + " (" + instance.info[index].name + ") lacks 64 bit integer and float support");
 		s.phys = instance.phys[index];
 		s.name = instance.info[index].name;
+		if (const char* e = getenv("VES_SHARED_VULKAN"); g_provider && !(e && atoi(e) == 0) && g_provider(index, instance.info[index].vendor_id, instance.info[index].device_id, s.ext)) {
+			s.external = true;
+			s.phys = s.ext.phys;
+			s.dev = s.ext.dev;
+		}
 		vkGetPhysicalDeviceMemoryProperties(s.phys, &s.mem);
 		uint32_t qn = 0;
 		vkGetPhysicalDeviceQueueFamilyProperties(s.phys, &qn, nullptr);
 		std::vector<VkQueueFamilyProperties> qf(qn);
 		vkGetPhysicalDeviceQueueFamilyProperties(s.phys, &qn, qf.data());
 		bool found = false;
-		for (uint32_t i = 0; i < qn; i++) if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { s.family = i; found = true; break; }
+		if (s.external) { s.family = s.ext.compute_family; found = s.ext.compute_queues > 0; }
+		else for (uint32_t i = 0; i < qn; i++) if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) { s.family = i; found = true; break; }
 		if (!found) throw std::runtime_error("no compute queue");
 		{
 			VkPhysicalDeviceProperties props;
@@ -175,7 +211,14 @@ Shared* bring_up(int index, std::string& why) {
 			if (qf[s.family].timestampValidBits && props.limits.timestampPeriod > 0) s.timestamp_ns = props.limits.timestampPeriod;
 		}
 		const char* no_async = getenv("VES_VMAF_NO_ASYNC_UPLOAD");
-		if (!(no_async && atoi(no_async) > 0)) {
+		if (s.external) { // the maker's queues: the copies go to its transfer family, or the compute family's second queue
+			if (!(no_async && atoi(no_async) > 0)) {
+				if (s.ext.has_transfer) { s.xfamily = s.ext.transfer_family; s.has_x = true; s.xqueue_index = 0; }
+				else if (s.ext.compute_queues >= 2) { s.xfamily = s.family; s.has_x = true; s.xqueue_index = 1; }
+				// for testing the copies' own command buffers on a device with one queue: they go to the compute queue, submitted before its work
+				else if (const char* e = getenv("VES_VMAF_COPIES_ON_COMPUTE_QUEUE"); e && atoi(e) > 0) { s.xfamily = s.family; s.has_x = true; s.xqueue_index = 0; }
+			}
+		} else if (!(no_async && atoi(no_async) > 0)) {
 			for (uint32_t i = 0; i < qn && !s.has_x; i++)
 				if ((qf[i].queueFlags & VK_QUEUE_TRANSFER_BIT) && !(qf[i].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_GRAPHICS_BIT)) && qf[i].queueCount > 0) {
 					s.xfamily = i;
@@ -186,29 +229,65 @@ Shared* bring_up(int index, std::string& why) {
 		const char* c2 = getenv("VES_VMAF_SECOND_COMPUTE");
 		const uint32_t used = 1 + (s.has_x && s.xfamily == s.family ? 1 : 0);
 		if (c2 && atoi(c2) > 0 && qf[s.family].queueCount > used) s.has_c2 = true;
-		float prio[3] = {1.0f, 1.0f, 1.0f};
-		VkDeviceQueueCreateInfo qcis[2]{{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
-		uint32_t qcount = 1;
-		qcis[0].queueFamilyIndex = s.family;
-		qcis[0].queueCount = used + (s.has_c2 ? 1 : 0);
-		qcis[0].pQueuePriorities = prio;
-		if (s.has_x && s.xfamily != s.family) {
-			qcis[1].queueFamilyIndex = s.xfamily;
-			qcis[1].queueCount = 1;
-			qcis[1].pQueuePriorities = prio;
-			qcount = 2;
+		if (s.external) s.has_c2 = false;
+		if (!s.external) {
+			float prio[3] = {1.0f, 1.0f, 1.0f};
+			VkDeviceQueueCreateInfo qcis[2]{{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}, {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
+			uint32_t qcount = 1;
+			qcis[0].queueFamilyIndex = s.family;
+			qcis[0].queueCount = used + (s.has_c2 ? 1 : 0);
+			qcis[0].pQueuePriorities = prio;
+			if (s.has_x && s.xfamily != s.family) {
+				qcis[1].queueFamilyIndex = s.xfamily;
+				qcis[1].queueCount = 1;
+				qcis[1].pQueuePriorities = prio;
+				qcount = 2;
+			}
+			VkPhysicalDeviceFeatures feats{};
+			feats.shaderInt64 = VK_TRUE;
+			feats.shaderFloat64 = VK_TRUE;
+			VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+			dci.queueCreateInfoCount = qcount;
+			dci.pQueueCreateInfos = qcis;
+			dci.pEnabledFeatures = &feats;
+			// memory that CUDA can take in (exportable_buffer()), where the driver has it
+			const char* ext_mem = EXT_MEMORY_NAME;
+			{
+				uint32_t en = 0;
+				vkEnumerateDeviceExtensionProperties(s.phys, nullptr, &en, nullptr);
+				std::vector<VkExtensionProperties> ep(en);
+				if (en) vkEnumerateDeviceExtensionProperties(s.phys, nullptr, &en, ep.data());
+				for (auto& e : ep) if (!strcmp(e.extensionName, ext_mem)) s.export_mem = true;
+			}
+			if (s.export_mem) { dci.enabledExtensionCount = 1; dci.ppEnabledExtensionNames = &ext_mem; }
+			chk(vkCreateDevice(s.phys, &dci, nullptr, &s.dev), "vkCreateDevice");
+			s.xqueue_index = s.xfamily == s.family ? 1 : 0;
 		}
-		VkPhysicalDeviceFeatures feats{};
-		feats.shaderInt64 = VK_TRUE;
-		feats.shaderFloat64 = VK_TRUE;
-		VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-		dci.queueCreateInfoCount = qcount;
-		dci.pQueueCreateInfos = qcis;
-		dci.pEnabledFeatures = &feats;
-		chk(vkCreateDevice(s.phys, &dci, nullptr, &s.dev), "vkCreateDevice");
-		vkGetDeviceQueue(s.dev, s.family, 0, &s.queue);
-		if (s.has_x) vkGetDeviceQueue(s.dev, s.xfamily, s.xfamily == s.family ? 1 : 0, &s.xqueue);
-		if (s.has_c2) vkGetDeviceQueue(s.dev, s.family, used, &s.cqueue2);
+		if (s.external) s.export_mem = s.ext.export_memory;
+		if (s.export_mem) {
+#ifdef _WIN32
+			s.get_handle = (PFN_vkGetMemoryWin32HandleKHR)vkGetDeviceProcAddr(s.dev, "vkGetMemoryWin32HandleKHR");
+			if (!s.get_handle) s.export_mem = false;
+#else
+			s.get_fd = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(s.dev, "vkGetMemoryFdKHR");
+			if (!s.get_fd) s.export_mem = false;
+#endif
+		}
+		// Queues made with flags (FFmpeg's, with VK_KHR_internally_synchronized_queues) can only be had with the same flags.
+		auto get_queue = [&](uint32_t family, uint32_t index, VkQueue& q) {
+			q = VK_NULL_HANDLE;
+			if (s.external && s.ext.queue_flags) {
+				VkDeviceQueueInfo2 qi{VK_STRUCTURE_TYPE_DEVICE_QUEUE_INFO_2};
+				qi.flags = s.ext.queue_flags;
+				qi.queueFamilyIndex = family;
+				qi.queueIndex = index;
+				vkGetDeviceQueue2(s.dev, &qi, &q);
+			} else vkGetDeviceQueue(s.dev, family, index, &q);
+			if (!q) throw std::runtime_error("no queue " + std::to_string(index) + " of queue family " + std::to_string(family));
+		};
+		get_queue(s.family, s.queue_index, s.queue);
+		if (s.has_x) get_queue(s.xfamily, s.xqueue_index, s.xqueue);
+		if (s.has_c2) get_queue(s.family, used, s.cqueue2);
 		VkDescriptorSetLayoutBinding b[kBindings];
 		for (int i = 0; i < kBindings; i++) b[i] = {(uint32_t)i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
 		VkDescriptorSetLayoutCreateInfo dli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -233,6 +312,24 @@ Shared* bring_up(int index, std::string& why) {
 
 } // namespace
 
+void vk_set_external_provider(bool (*provider)(int index, uint32_t vendor_id, uint32_t device_id, VkExternal& out)) {
+	std::lock_guard lock(init_lock);
+	g_provider = provider;
+}
+
+bool vk_native(int index, VkNative& out) {
+	std::string why;
+	Shared* s = bring_up(index, why);
+	if (!s || !s->external) return false;
+	out.inst = s->ext.inst;
+	out.phys = s->phys;
+	out.dev = s->dev;
+	out.compute_family = s->family;
+	out.compute_queues = s->ext.compute_queues;
+	out.extensions = s->ext.extensions;
+	return out.inst != VK_NULL_HANDLE;
+}
+
 struct Vk::Impl {
 	Shared* s = nullptr;
 	VkCommandPool pool{};
@@ -240,6 +337,8 @@ struct Vk::Impl {
 		VkCommandBuffer cmd{};
 		VkFence fence{};
 		VkQueryPool stamps{}; // kStamps timestamps: 0 the work began, 1 it ended, the rest for parts of it
+		VkQueryPool pstamps{}; // VES_SCORE_TIMING=2: 0 the work began, then one after each dispatch, of the shader pnames[i - 1]
+		std::vector<const char*> pnames;
 		VkCommandBuffer xcmd{}; // copies on the second queue (upload_begin()), which the slot's next submit() waits for through xsem
 		VkSemaphore xsem{};
 		bool xpending = false;
@@ -247,14 +346,21 @@ struct Vk::Impl {
 		VkFence fence2{};
 		VkSemaphore xsem2{};    // the copies, for the second compute queue
 		bool xpending2 = false, pending2 = false;
+		std::vector<std::pair<VkSemaphore, uint64_t>> twait, tsignal; // wait_timeline(), signal_timeline(): for the next submit()
+		std::vector<std::pair<VkSemaphore, uint64_t>> xtwait, xtsignal; // ... upload_wait_timeline(), upload_signal_timeline(): for upload_submit()
 	};
 	VkCommandPool xpool{};
 	std::vector<Slot> slots;
 	VkCommandBuffer cmd{}; // the one being recorded (either compute queue)
+	std::vector<std::pair<VkBuffer, std::vector<VkBuffer>>> aliases; // alias(): a placeholder, and the buffer of each slot
+	int cur_slot = -1;     // ... its slot
+	const char* cur_name = ""; // the shader bound last
+	bool pass = false;     // VES_SCORE_TIMING=2
 	bool second = false;   // ... and it is the second one's
 	VkCommandBuffer xrec{}; // the one being recorded (second queue)
 	VkDescriptorPool dpool{};
 	std::vector<std::pair<VkBuffer, VkDeviceMemory>> owned;
+	std::vector<VkSemaphore> owned_sems; // timeline_semaphore()
 	uint64_t device_bytes = 0, host_bytes = 0;
 };
 
@@ -271,10 +377,12 @@ Vk::Vk(int device, int slots) : impl(new Impl) {
 	impl->s = bring_up(device, why);
 	if (!impl->s) { delete impl; impl = nullptr; throw std::runtime_error("Vulkan: " + why); }
 	Shared& s = *impl->s;
+	if (const char* e = getenv("VES_SCORE_TIMING"); e && atoi(e) >= 2) impl->pass = true;
 	try {
-		VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * 256};
+		VkDescriptorPoolSize ps{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16 * 1024};
 		VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-		dpi.maxSets = 256;
+		dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT; // release(): users that make pipelines again (the converter, on a new shape)
+		dpi.maxSets = 1024; // aliased pipelines take a set per slot
 		dpi.poolSizeCount = 1;
 		dpi.pPoolSizes = &ps;
 		chk(vkCreateDescriptorPool(s.dev, &dpi, nullptr, &impl->dpool), "descriptor pool");
@@ -323,6 +431,10 @@ Vk::Vk(int device, int slots) : impl(new Impl) {
 				qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
 				qi.queryCount = kStamps;
 				chk(vkCreateQueryPool(s.dev, &qi, nullptr, &sl.stamps), "query pool");
+				if (impl->pass) {
+					qi.queryCount = kPassStamps;
+					chk(vkCreateQueryPool(s.dev, &qi, nullptr, &sl.pstamps), "query pool (passes)");
+				}
 			}
 		}
 	} catch (...) {
@@ -339,6 +451,7 @@ void Vk::release() {
 	for (auto& sl : impl->slots) {
 		if (sl.fence) vkDestroyFence(s.dev, sl.fence, nullptr);
 		if (sl.stamps) vkDestroyQueryPool(s.dev, sl.stamps, nullptr);
+		if (sl.pstamps) vkDestroyQueryPool(s.dev, sl.pstamps, nullptr);
 		if (sl.xsem) vkDestroySemaphore(s.dev, sl.xsem, nullptr);
 		if (sl.xsem2) vkDestroySemaphore(s.dev, sl.xsem2, nullptr);
 		if (sl.fence2) vkDestroyFence(s.dev, sl.fence2, nullptr);
@@ -347,8 +460,78 @@ void Vk::release() {
 	if (impl->xpool) vkDestroyCommandPool(s.dev, impl->xpool, nullptr);
 	if (impl->dpool) vkDestroyDescriptorPool(s.dev, impl->dpool, nullptr);
 	for (auto& [b, m] : impl->owned) { vkDestroyBuffer(s.dev, b, nullptr); vkFreeMemory(s.dev, m, nullptr); }
+	for (VkSemaphore x : impl->owned_sems) vkDestroySemaphore(s.dev, x, nullptr);
 	delete impl;
 	impl = nullptr;
+}
+
+bool Vk::exportable_buffer(VkDeviceSize size, ExportedBuf& out, std::string& why) {
+	Shared& s = *impl->s;
+	out = ExportedBuf();
+	if (!s.export_mem) { why = std::string("the Vulkan device has no ") + EXT_MEMORY_NAME; return false; }
+	VkBuffer buf = VK_NULL_HANDLE;
+	VkDeviceMemory mem = VK_NULL_HANDLE;
+	try {
+		VkExternalMemoryBufferCreateInfo eb{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+		eb.handleTypes = kExportType;
+		VkBufferCreateInfo bi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+		bi.pNext = &eb;
+		bi.size = size;
+		bi.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		const uint32_t families[2] = {s.family, s.xfamily};
+		if (s.has_x && s.xfamily != s.family) {
+			bi.sharingMode = VK_SHARING_MODE_CONCURRENT;
+			bi.queueFamilyIndexCount = 2;
+			bi.pQueueFamilyIndices = families;
+		}
+		chk(vkCreateBuffer(s.dev, &bi, nullptr, &buf), "vkCreateBuffer (exportable)");
+		VkMemoryRequirements mr;
+		vkGetBufferMemoryRequirements(s.dev, buf, &mr);
+		int type = -1;
+		for (uint32_t i = 0; i < s.mem.memoryTypeCount && type < 0; i++)
+			if ((mr.memoryTypeBits & (1u << i)) && (s.mem.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) type = (int)i;
+		if (type < 0) throw std::runtime_error("Vulkan: no device-local memory for an exportable buffer");
+		VkMemoryDedicatedAllocateInfo ded{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+		ded.buffer = buf;
+		VkExportMemoryAllocateInfo ex{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+		ex.pNext = &ded;
+		ex.handleTypes = kExportType;
+		VkMemoryAllocateInfo mi{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+		mi.pNext = &ex;
+		mi.allocationSize = mr.size;
+		mi.memoryTypeIndex = (uint32_t)type;
+		chk(vkAllocateMemory(s.dev, &mi, nullptr, &mem), "vkAllocateMemory (exportable)");
+		chk(vkBindBufferMemory(s.dev, buf, mem, 0), "vkBindBufferMemory (exportable)");
+#ifdef _WIN32
+		VkMemoryGetWin32HandleInfoKHR hi{VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR};
+		hi.memory = mem;
+		hi.handleType = kExportType;
+		HANDLE h = nullptr;
+		chk(s.get_handle(s.dev, &hi, &h), "vkGetMemoryWin32HandleKHR");
+		out.win32 = h;
+#else
+		VkMemoryGetFdInfoKHR fi{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+		fi.memory = mem;
+		fi.handleType = kExportType;
+		int fd = -1;
+		chk(s.get_fd(s.dev, &fi, &fd), "vkGetMemoryFdKHR");
+		out.fd = fd;
+#endif
+	} catch (const std::exception& e) {
+		if (mem) vkFreeMemory(s.dev, mem, nullptr);
+		if (buf) vkDestroyBuffer(s.dev, buf, nullptr);
+		why = e.what();
+		return false;
+	}
+	VkMemoryRequirements mr;
+	vkGetBufferMemoryRequirements(s.dev, buf, &mr);
+	impl->owned.emplace_back(buf, mem);
+	impl->device_bytes += mr.size;
+	out.b.buf = buf;
+	out.b.mem = mem;
+	out.b.size = size;
+	out.alloc_size = mr.size;
+	return true;
 }
 
 Buf Vk::buffer(VkDeviceSize size, int kind) {
@@ -431,6 +614,7 @@ Pipe Vk::pipeline(const char* name, const std::vector<Buf*>& bindings) {
 			it = s.pipelines.emplace(name, pipe).first;
 		}
 		p.pipe = it->second;
+		p.name = it->first.c_str(); // the map's nodes stay put
 	}
 	VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
 	ai.descriptorPool = impl->dpool;
@@ -451,7 +635,38 @@ Pipe Vk::pipeline(const char* name, const std::vector<Buf*>& bindings) {
 		writes.push_back(w);
 	}
 	vkUpdateDescriptorSets(s.dev, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+	bool aliased = false;
+	for (auto& info : infos) for (auto& [from, to] : impl->aliases) if (info.buffer == from) aliased = true;
+	if (aliased) {
+		p.nslot = (int)impl->slots.size();
+		if (p.nslot > 8) throw std::runtime_error("Vulkan: too many slots for aliased buffers");
+		for (int k = 0; k < p.nslot; k++) {
+			chk(vkAllocateDescriptorSets(s.dev, &ai, &p.slot_sets[k]), "descriptor set");
+			std::vector<VkDescriptorBufferInfo> si = infos;
+			for (auto& info : si) for (auto& [from, to] : impl->aliases) if (info.buffer == from) info.buffer = to[k];
+			for (int i = 0; i < kBindings; i++) { writes[i].dstSet = p.slot_sets[k]; writes[i].pBufferInfo = &si[i]; }
+			vkUpdateDescriptorSets(s.dev, (uint32_t)writes.size(), writes.data(), 0, nullptr);
+		}
+	}
 	return p;
+}
+
+void Vk::release(Pipe& p) {
+	Shared& s = *impl->s;
+	std::vector<VkDescriptorSet> sets;
+	if (p.set) sets.push_back(p.set);
+	for (int k = 0; k < p.nslot; k++) if (p.slot_sets[k]) sets.push_back(p.slot_sets[k]);
+	if (!sets.empty()) vkFreeDescriptorSets(s.dev, impl->dpool, (uint32_t)sets.size(), sets.data());
+	p.set = VK_NULL_HANDLE;
+	for (auto& x : p.slot_sets) x = VK_NULL_HANDLE;
+	p.nslot = 0;
+}
+
+void Vk::alias(const Buf& placeholder, const std::vector<const Buf*>& per_slot) {
+	if (per_slot.size() != impl->slots.size()) throw std::runtime_error("Vulkan: alias needs a buffer per slot");
+	std::vector<VkBuffer> to;
+	for (const Buf* b : per_slot) to.push_back(b->buf);
+	impl->aliases.emplace_back(placeholder.buf, to);
 }
 
 void Vk::begin(int slot) {
@@ -463,6 +678,12 @@ void Vk::begin(int slot) {
 	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 	chk(vkBeginCommandBuffer(impl->cmd, &bi), "begin");
 	if (sl.stamps) vkCmdResetQueryPool(impl->cmd, sl.stamps, 0, kStamps);
+	impl->cur_slot = slot;
+	if (sl.pstamps) {
+		vkCmdResetQueryPool(impl->cmd, sl.pstamps, 0, kPassStamps);
+		vkCmdWriteTimestamp(impl->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.pstamps, 0);
+		sl.pnames.clear();
+	}
 }
 
 void Vk::stamp(int slot, int which) {
@@ -477,19 +698,95 @@ void Vk::copy(const Buf& src, const Buf& dst, VkDeviceSize size) {
 	vkCmdCopyBuffer(impl->cmd, src.buf, dst.buf, 1, &c);
 }
 
+namespace {
+void record_rows(VkCommandBuffer cmd, VkBuffer src, VkDeviceSize src_off, VkDeviceSize src_stride, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize row_bytes, uint32_t rows) {
+	if (src_stride == row_bytes || rows <= 1) {
+		VkBufferCopy c{src_off, dst_off, row_bytes * rows};
+		vkCmdCopyBuffer(cmd, src, dst, 1, &c);
+		return;
+	}
+	std::vector<VkBufferCopy> c(rows);
+	for (uint32_t r = 0; r < rows; r++) c[r] = {src_off + r * src_stride, dst_off + r * row_bytes, row_bytes};
+	vkCmdCopyBuffer(cmd, src, dst, rows, c.data());
+}
+} // namespace
+
+void Vk::copy_rows(VkBuffer src, VkDeviceSize src_off, VkDeviceSize src_stride, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize row_bytes, uint32_t rows) {
+	record_rows(impl->cmd, src, src_off, src_stride, dst, dst_off, row_bytes, rows);
+}
+void Vk::upload_copy_rows(VkBuffer src, VkDeviceSize src_off, VkDeviceSize src_stride, VkBuffer dst, VkDeviceSize dst_off, VkDeviceSize row_bytes, uint32_t rows) {
+	record_rows(impl->xrec, src, src_off, src_stride, dst, dst_off, row_bytes, rows);
+}
+
+VkSemaphore Vk::timeline_semaphore() {
+	VkSemaphoreTypeCreateInfo ti{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+	ti.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+	ti.initialValue = 0;
+	VkSemaphoreCreateInfo ci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+	ci.pNext = &ti;
+	VkSemaphore x = VK_NULL_HANDLE;
+	chk(vkCreateSemaphore(impl->s->dev, &ci, nullptr, &x), "timeline semaphore");
+	impl->owned_sems.push_back(x);
+	return x;
+}
+
 void Vk::copy_range(const Buf& src, VkDeviceSize src_off, const Buf& dst, VkDeviceSize dst_off, VkDeviceSize size) {
 	VkBufferCopy c{src_off, dst_off, size};
 	vkCmdCopyBuffer(impl->cmd, src.buf, dst.buf, 1, &c);
 }
 
 void Vk::bind(const Pipe& p) {
+	impl->cur_name = p.name;
 	vkCmdBindPipeline(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
-	vkCmdBindDescriptorSets(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, impl->s->layout, 0, 1, &p.set, 0, nullptr);
+	const VkDescriptorSet set = p.nslot > 0 && impl->cur_slot >= 0 && impl->cur_slot < p.nslot ? p.slot_sets[impl->cur_slot] : p.set;
+	vkCmdBindDescriptorSets(impl->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, impl->s->layout, 0, 1, &set, 0, nullptr);
 }
 
 void Vk::push(const void* data, uint32_t size) { vkCmdPushConstants(impl->cmd, impl->s->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, size, data); }
 
-void Vk::dispatch(uint32_t x, uint32_t y) { vkCmdDispatch(impl->cmd, x, y, 1); }
+// VES_DEBUG_SKIP=<name>[,<name>...]: leaves out every dispatch of those shaders. Only to measure what a shader costs on the critical path: the scores
+// are wrong with it.
+static bool debug_skip(const char* name) {
+	static const std::vector<std::string> skip = [] {
+		std::vector<std::string> v;
+		if (const char* e = getenv("VES_DEBUG_SKIP")) {
+			std::string s = e;
+			for (size_t a = 0; a <= s.size();) {
+				size_t b = s.find(',', a);
+				if (b == std::string::npos) b = s.size();
+				if (b > a) v.push_back(s.substr(a, b - a));
+				a = b + 1;
+			}
+		}
+		return v;
+	}();
+	if (skip.empty() || !name) return false;
+	for (const std::string& n : skip)
+		if (n == name) return true;
+	return false;
+}
+
+void Vk::dispatch(uint32_t x, uint32_t y) {
+	if (debug_skip(impl->cur_name)) return;
+	vkCmdDispatch(impl->cmd, x, y, 1);
+	if (!impl->pass || impl->second || impl->cur_slot < 0) return;
+	Impl::Slot& sl = impl->slots[impl->cur_slot];
+	if (!sl.pstamps || sl.pnames.size() + 1 >= (size_t)kPassStamps) return;
+	sl.pnames.push_back(impl->cur_name);
+	vkCmdWriteTimestamp(impl->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, sl.pstamps, (uint32_t)sl.pnames.size());
+}
+
+bool Vk::pass_timing() const { return impl->pass && impl->s->timestamp_ns > 0; }
+
+void Vk::pass_seconds(int slot, std::vector<std::pair<const char*, double>>& out) {
+	out.clear();
+	Impl::Slot& sl = impl->slots.at(slot);
+	if (!sl.pstamps || sl.pnames.empty()) return;
+	std::vector<uint64_t> t(sl.pnames.size() + 1);
+	if (vkGetQueryPoolResults(impl->s->dev, sl.pstamps, 0, (uint32_t)t.size(), t.size() * 8, t.data(), 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) return;
+	for (size_t i = 0; i < sl.pnames.size(); i++)
+		out.emplace_back(sl.pnames[i], t[i + 1] >= t[i] ? (double)(t[i + 1] - t[i]) * impl->s->timestamp_ns * 1e-9 : 0.0);
+}
 
 void Vk::barrier() {
 	VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
@@ -522,13 +819,30 @@ void Vk::upload_submit(int slot, bool for_second) {
 	VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
 	si.commandBufferCount = 1;
 	si.pCommandBuffers = &sl.xcmd;
-	const VkSemaphore sems[2] = {sl.xsem, sl.xsem2};
 	for_second = for_second && sl.xsem2;
-	si.signalSemaphoreCount = for_second ? 2 : 1;
-	si.pSignalSemaphores = sems;
+	// the binary semaphores the slot's next submit() (and submit2()) wait for, then the timeline semaphores of the images copied (wait for their
+	// maker, tell it when they were read)
+	std::vector<VkSemaphore> ssem{sl.xsem}, wsem;
+	std::vector<uint64_t> sval{0}, wval;
+	std::vector<VkPipelineStageFlags> wstage;
+	if (for_second) { ssem.push_back(sl.xsem2); sval.push_back(0); }
+	for (auto& [sem, v] : sl.xtsignal) { ssem.push_back(sem); sval.push_back(v); }
+	for (auto& [sem, v] : sl.xtwait) { wsem.push_back(sem); wval.push_back(v); wstage.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT); }
+	si.signalSemaphoreCount = (uint32_t)ssem.size();
+	si.pSignalSemaphores = ssem.data();
+	si.waitSemaphoreCount = (uint32_t)wsem.size();
+	si.pWaitSemaphores = wsem.data();
+	si.pWaitDstStageMask = wstage.data();
+	VkTimelineSemaphoreSubmitInfo ti{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+	ti.waitSemaphoreValueCount = (uint32_t)wval.size();
+	ti.pWaitSemaphoreValues = wval.data();
+	ti.signalSemaphoreValueCount = (uint32_t)sval.size();
+	ti.pSignalSemaphoreValues = sval.data();
+	if (!sl.xtwait.empty() || !sl.xtsignal.empty()) si.pNext = &ti;
+	sl.xtwait.clear();
+	sl.xtsignal.clear();
 	{
-		std::lock_guard lock(s.xqueue_lock);
-		chk(vkQueueSubmit(s.xqueue, 1, &si, VK_NULL_HANDLE), "submit (copies)");
+		chk(s.submit(s.xqueue, s.xqueue_lock, s.xfamily, s.xqueue_index, si, VK_NULL_HANDLE), "submit (copies)");
 	}
 	sl.xpending = true;
 	sl.xpending2 = for_second;
@@ -562,8 +876,7 @@ void Vk::submit2(int slot) {
 	}
 	vkResetFences(s.dev, 1, &sl.fence2);
 	{
-		std::lock_guard lock(s.cqueue2_lock);
-		chk(vkQueueSubmit(s.cqueue2, 1, &si, sl.fence2), "submit (second queue)");
+		chk(s.submit(s.cqueue2, s.cqueue2_lock, s.family, 2, si, sl.fence2), "submit (second queue)");
 	}
 	sl.pending2 = true;
 	impl->second = false;
@@ -584,10 +897,106 @@ void Vk::submit(int slot) {
 		si.pWaitDstStageMask = &wait_stage;
 		sl.xpending = false;
 	}
+	// timeline semaphores (a frame decoded on the device: wait for the decoder, tell it when the frame was read)
+	std::vector<VkSemaphore> wsem, ssem;
+	std::vector<uint64_t> wval, sval;
+	std::vector<VkPipelineStageFlags> wstage;
+	if (!sl.twait.empty() || !sl.tsignal.empty()) {
+		if (si.waitSemaphoreCount) { wsem.push_back(sl.xsem); wval.push_back(0); wstage.push_back(wait_stage); }
+		for (auto& [sem, v] : sl.twait) { wsem.push_back(sem); wval.push_back(v); wstage.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT); }
+		for (auto& [sem, v] : sl.tsignal) { ssem.push_back(sem); sval.push_back(v); }
+		si.waitSemaphoreCount = (uint32_t)wsem.size();
+		si.pWaitSemaphores = wsem.data();
+		si.pWaitDstStageMask = wstage.data();
+		si.signalSemaphoreCount = (uint32_t)ssem.size();
+		si.pSignalSemaphores = ssem.data();
+	}
+	VkTimelineSemaphoreSubmitInfo ti{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+	ti.waitSemaphoreValueCount = (uint32_t)wval.size();
+	ti.pWaitSemaphoreValues = wval.data();
+	ti.signalSemaphoreValueCount = (uint32_t)sval.size();
+	ti.pSignalSemaphoreValues = sval.data();
+	if (!wsem.empty() || !ssem.empty()) si.pNext = &ti;
+	sl.twait.clear();
+	sl.tsignal.clear();
 	vkResetFences(s.dev, 1, &sl.fence);
-	std::lock_guard lock(s.queue_lock);
-	chk(vkQueueSubmit(s.queue, 1, &si, sl.fence), "submit");
+	chk(s.submit(s.queue, s.queue_lock, s.family, s.queue_index, si, sl.fence), "submit");
 }
+
+void Vk::wait_timeline(int slot, VkSemaphore sem, uint64_t value) { impl->slots.at(slot).twait.emplace_back(sem, value); }
+void Vk::signal_timeline(int slot, VkSemaphore sem, uint64_t value) { impl->slots.at(slot).tsignal.emplace_back(sem, value); }
+bool Vk::external() const { return impl->s->external; }
+
+void Vk::image_to_transfer(VkImage img, VkImageLayout& layout, uint32_t& access) {
+	VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	b.srcAccessMask = (VkAccessFlags)access;
+	b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	b.oldLayout = layout;
+	b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	b.image = img;
+	b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	vkCmdPipelineBarrier(impl->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+	layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	access = VK_ACCESS_TRANSFER_READ_BIT;
+}
+
+void Vk::copy_image(const VkImagePlane& p, const Buf& dst, VkDeviceSize offset) {
+	VkBufferImageCopy r{};
+	r.bufferOffset = offset;
+	r.imageSubresource = {p.aspect, 0, 0, 1};
+	r.imageExtent = {p.w, p.h, 1};
+	vkCmdCopyImageToBuffer(impl->cmd, p.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.buf, 1, &r);
+}
+
+void Vk::image_to_transfer_dst(VkImage img, VkImageLayout& layout, uint32_t& access) {
+	VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	b.srcAccessMask = (VkAccessFlags)access;
+	b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+	b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED; // its old contents are all overwritten
+	b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	b.image = img;
+	b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	vkCmdPipelineBarrier(impl->cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+	layout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+	access = VK_ACCESS_TRANSFER_WRITE_BIT;
+}
+
+void Vk::copy_to_image(const Buf& src, VkDeviceSize offset, uint32_t row_texels, const VkImagePlane& p) {
+	VkBufferImageCopy r{};
+	r.bufferOffset = offset;
+	r.bufferRowLength = row_texels;
+	r.imageSubresource = {p.aspect, 0, 0, 1};
+	r.imageExtent = {p.w, p.h, 1};
+	vkCmdCopyBufferToImage(impl->cmd, src.buf, p.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+}
+
+void Vk::upload_image_to_transfer(VkImage img, VkImageLayout& layout, uint32_t& access) {
+	// No writes to make available here: the wait for the maker's timeline semaphore (upload_wait_timeline()) already covers every write before
+	// its signal, and naming the maker's access types (colour attachment, shader writes) is not allowed on a queue that only copies.
+	VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+	b.srcAccessMask = 0;
+	b.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+	b.oldLayout = layout;
+	b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	b.image = img;
+	b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+	vkCmdPipelineBarrier(impl->xrec, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
+	layout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+	access = VK_ACCESS_TRANSFER_READ_BIT;
+}
+
+void Vk::upload_copy_image(const VkImagePlane& p, const Buf& dst) {
+	VkBufferImageCopy r{};
+	r.imageSubresource = {p.aspect, 0, 0, 1};
+	r.imageExtent = {p.w, p.h, 1};
+	vkCmdCopyImageToBuffer(impl->xrec, p.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.buf, 1, &r);
+}
+
+void Vk::upload_wait_timeline(int slot, VkSemaphore sem, uint64_t value) { impl->slots.at(slot).xtwait.emplace_back(sem, value); }
+void Vk::upload_signal_timeline(int slot, VkSemaphore sem, uint64_t value) { impl->slots.at(slot).xtsignal.emplace_back(sem, value); }
 
 void Vk::memory(uint64_t& device_local, uint64_t& host) const { device_local = impl->device_bytes; host = impl->host_bytes; }
 
@@ -598,6 +1007,20 @@ void Vk::wait(int slot) {
 		chk(vkWaitForFences(impl->s->dev, 1, &sl.fence2, VK_TRUE, ~0ull), "wait (second queue)");
 		sl.pending2 = false;
 	}
+}
+
+bool Vk::done(int slot) {
+	Impl::Slot& sl = impl->slots.at(slot);
+	const VkResult r = vkGetFenceStatus(impl->s->dev, sl.fence);
+	if (r == VK_NOT_READY) return false;
+	chk(r, "fence status");
+	if (sl.pending2) {
+		const VkResult r2 = vkGetFenceStatus(impl->s->dev, sl.fence2);
+		if (r2 == VK_NOT_READY) return false;
+		chk(r2, "fence status (second queue)");
+		sl.pending2 = false;
+	}
+	return true;
 }
 
 double Vk::gpu_seconds(int slot, int from, int to) {

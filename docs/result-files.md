@@ -54,6 +54,9 @@ the encoder's own capability names to integers or booleans, and runs whose `enco
 * **AMF:** `ACCELERATION_TYPE` first, one of `HARDWARE` (the video block of the GPU), `GPU` (done with GPU compute) or `SOFTWARE`, then the SDK's own capability names and values
   (`MaxBitrate`, `MaxLevel`, `NumOfHwInstances`, `BFrames`, ...). Values that change with the load on the encoder (`RequestedThroughput`) are left out. Older files have `null`.
 
+The file keeps every cap as reported. A website that compares them leaves out the ones that describe the chip or its load rather than the encoder (ves.xaymar.com: NVENC
+`NUM_ENCODER_ENGINES`, `MB_PER_SEC_MAX`, `DYNAMIC_QUERY_ENCODER_CAPACITY`; AMF `MaxThroughput`, `NumOfHwInstances`, `EncoderCapNormalizedThroughput`), so GPUs whose encoders make identical streams share a generation.
+
 ### `key`
 
 A string of lines, each `name=value`, ending with a newline. A reader that wants one piece takes the first line that starts with the name. The lines:
@@ -65,7 +68,7 @@ encoder=<encoder>/<codec>
 environment=<the encoder's library for software encoders; the GPU, driver and PCI id for GPU encoders>
 options=<name>=<value>;<name>=<value>;...  sorted by name
 bitrate=<kbps> kf=<seconds> shape=<w>x<h>@<fps numerator>/<denominator>
-scaling=<up scaler>/<down scaler>  <libplacebo version>
+scaling=<up scaler>/<down scaler> <scaling gpu> <converter version>[ bt709=bt1886|srgb]
 decoder=<ffmpeg version>
 vmaf=<libvmaf version> <model> <model hash> [scorer=<device>-1]
 vmaf_extra=<model> <model hash>;<model> <model hash>;...   only when more models were scored with it

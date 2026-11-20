@@ -19,6 +19,8 @@
 #include "options.h"
 #include "gpu.h"
 #include "repack.h"
+#include "decode.h"
+#include "vk_compute.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -32,6 +34,7 @@ extern "C" {
 }
 
 #ifndef _WIN32
+#include <unistd.h>
 inline bool operator==(const GUID& a, const GUID& b) { return memcmp(&a, &b, sizeof a) == 0; } // the Linux header has no comparison
 #endif
 
@@ -234,10 +237,38 @@ Caps probe_caps(const std::string& codec) {
 }
 
 struct Slot {
-	NV_ENC_INPUT_PTR in = nullptr;
+	NV_ENC_INPUT_PTR in = nullptr; // made when the slot first takes a frame from memory
 	NV_ENC_OUTPUT_PTR out = nullptr;
 	void* ev = nullptr; // signaled when the encoder is done with this slot's picture
+	NV_ENC_INPUT_PTR mapped = nullptr; // a frame from VRAM: the slot's registered buffer, mapped while the encoder has its picture
 };
+
+#ifndef VES_NO_VULKAN
+constexpr unsigned CUDA_EXTERNAL_MEMORY_DEDICATED_FLAG = 1; // CUDA_EXTERNAL_MEMORY_DEDICATED, which the header lacks
+
+// Frames straight from VRAM: the converter's output (a buffer frame on the GPU, VkDecodedFrame::buffer) is packed into NVENC's layout by a
+// compute shader (enc_pack, the same as repack.h does in memory) into a Vulkan buffer whose memory CUDA imports as linear device memory and
+// NVENC has registered (one per slot). Only buffers cross from Vulkan to CUDA, never images: sharing Vulkan NV12 images with D3D11 or CUDA was
+// seen to corrupt VRAM. The CPU waits for the packing before the picture goes to the encoder.
+struct GpuInput {
+	struct Res {
+		ExportedBuf eb;
+		CUexternalMemory ext = nullptr;
+		CUdeviceptr ptr = 0;
+		void* reg = nullptr; // NVENC's registration
+		Pipe pipe;
+		bool has_pipe = false;
+	};
+	std::unique_ptr<Vk> vk;
+	int device = -1;
+	Buf stage; // the frame's planes copied out of the converter's buffer (pipelines bind fixed buffers)
+	VkDeviceSize stage_size = 0;
+	std::vector<Res> res; // per slot
+	uint32_t pitch = 0;
+	VkDeviceSize size = 0;
+	VkDeviceSize plane_off[3]{}; // where NVENC reads each plane (420: Y, UV)
+};
+#endif
 
 const GUID* const PRESETS[] = {
 	&NV_ENC_PRESET_P1_GUID, &NV_ENC_PRESET_P2_GUID, &NV_ENC_PRESET_P3_GUID, &NV_ENC_PRESET_P4_GUID,
@@ -278,6 +309,11 @@ class Nvenc : public Encoder {
 	int w = 0, h = 0;
 	size_t delay = 0;
 	int b_delay = 0;
+	CUdevice cudev = 0;
+#ifndef VES_NO_VULKAN
+	std::unique_ptr<GpuInput> gin;
+	int gin_state = 0; // 0: not tried yet, 1: frames from VRAM, -1: through memory
+#endif
 
 	bool fail(NVENCSTATUS s, const char* what) {
 		const char* msg = enc ? f.nvEncGetLastErrorString(enc) : "";
@@ -306,11 +342,18 @@ public:
 			unregister(eos_event);
 			for (auto& s : slots) unregister(s.ev);
 			for (auto& s : slots) {
+				if (s.mapped) f.nvEncUnmapInputResource(enc, s.mapped);
 				if (s.in) f.nvEncDestroyInputBuffer(enc, s.in);
 				if (s.out) f.nvEncDestroyBitstreamBuffer(enc, s.out);
 			}
+#ifndef VES_NO_VULKAN
+			if (gin) for (auto& r : gin->res) if (r.reg) f.nvEncUnregisterResource(enc, r.reg);
+#endif
 			f.nvEncDestroyEncoder(enc);
 		}
+#ifndef VES_NO_VULKAN
+		gin_free();
+#endif
 		if (ctx) cu->cuCtxDestroy(ctx);
 		nvenc_free_functions(&nv);
 		cuda_free_functions(&cu);
@@ -332,7 +375,7 @@ public:
 			return false;
 		}
 		int gpu = take("gpu", v) ? atoi(v.c_str()) : 0;
-		CUdevice dev;
+		CUdevice& dev = cudev;
 		if (cu->cuInit(0) || !cuda_device_for(cu, gpu, dev) || cu->cuCtxCreate(&ctx, 0, dev)) {
 			fprintf(stderr, "nvenc: CUDA init failed for gpu %d\n", gpu);
 			return false;
@@ -520,13 +563,7 @@ public:
 		delay = cfg.frameIntervalP + rc.lookaheadDepth + 3;
 		b_delay = (int)cfg.frameIntervalP > 1 ? (int)cfg.frameIntervalP - 1 : 0;
 		slots.resize(delay + 16);
-		for (auto& sl : slots) {
-			NV_ENC_CREATE_INPUT_BUFFER ci{};
-			ci.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
-			ci.width = w; ci.height = h;
-			ci.bufferFmt = buffer_fmt;
-			if ((st = f.nvEncCreateInputBuffer(enc, &ci))) return fail(st, "create input buffer");
-			sl.in = ci.inputBuffer;
+		for (auto& sl : slots) { // (input buffers are made when a slot first takes a frame from memory: frames from VRAM need none)
 			NV_ENC_CREATE_BITSTREAM_BUFFER cb{};
 			cb.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
 			if ((st = f.nvEncCreateBitstreamBuffer(enc, &cb))) return fail(st, "create bitstream buffer");
@@ -547,6 +584,152 @@ public:
 #endif
 		return true;
 	}
+
+#ifndef VES_NO_VULKAN
+	// Frees what gin_open() made in CUDA (after the encoder let go of the registrations) and then the Vulkan buffers.
+	void gin_free() {
+		if (!gin) return;
+		if (ctx && !cu->cuCtxPushCurrent(ctx)) {
+			for (auto& r : gin->res) {
+				if (r.ptr) cu->cuMemFree(r.ptr);
+				if (r.ext) cu->cuDestroyExternalMemory(r.ext);
+			}
+			CUcontext dummy;
+			cu->cuCtxPopCurrent(&dummy);
+		}
+		gin.reset();
+	}
+
+	// For the first frame on the GPU: whether frames can come straight from VRAM (the frame's Vulkan device is the encoder's GPU, Vulkan can export
+	// memory, CUDA can import it, NVENC takes it), and the buffers for it. False (and through memory from then on, said once) when not.
+	bool gin_open(const VkDecodedFrame& bf) {
+		gin_state = -1;
+		auto no = [&](const std::string& why) {
+			fprintf(stderr, "nvenc: frames come through memory: %s\n", why.c_str());
+			gin_free();
+			return false;
+		};
+		if (const char* e = getenv("VES_ENC_GPU_INPUT"); e && atoi(e) == 0) return no("VES_ENC_GPU_INPUT=0");
+		if (!cu->cuImportExternalMemory || !cu->cuExternalMemoryGetMappedBuffer || !cu->cuDestroyExternalMemory || !cu->cuDeviceGetUuid)
+			return no("the CUDA driver cannot import memory");
+		std::string why;
+		const auto devs = Vk::devices(why);
+		if (bf.device < 0 || bf.device >= (int)devs.size() || !devs[(size_t)bf.device].uuid_valid) return no("the frames' Vulkan device is unknown");
+		CUuuid u;
+		if (cu->cuDeviceGetUuid(&u, cudev)) return no("CUDA has no UUID for the GPU");
+		if (memcmp(&u, devs[(size_t)bf.device].uuid, 16)) return no("the frames are on another GPU (" + devs[(size_t)bf.device].name + ")");
+		auto g = std::make_unique<GpuInput>();
+		try {
+			g->vk = std::make_unique<Vk>(bf.device, 1);
+		} catch (const std::exception& e) { return no(e.what()); }
+		g->device = bf.device;
+		const int bps = depth > 8 ? 2 : 1;
+		g->pitch = (uint32_t)(((size_t)w * bps + 255) & ~(size_t)255);
+		g->plane_off[0] = 0;
+		g->plane_off[1] = (VkDeviceSize)g->pitch * h;
+		g->plane_off[2] = (VkDeviceSize)g->pitch * h * 2;
+		g->size = chroma == 444 ? (VkDeviceSize)g->pitch * h * 3 : (VkDeviceSize)g->pitch * h + (VkDeviceSize)g->pitch * ((h + 1) / 2);
+		gin = std::move(g);
+		gin->res.resize(slots.size());
+		if (cu->cuCtxPushCurrent(ctx)) return no("CUDA context");
+		bool ok = true;
+		for (auto& r : gin->res) {
+			if (!gin->vk->exportable_buffer(gin->size, r.eb, why)) { ok = false; break; }
+			CUDA_EXTERNAL_MEMORY_HANDLE_DESC md{};
+#ifdef _WIN32
+			md.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32;
+			md.handle.win32.handle = r.eb.win32;
+#else
+			md.type = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD;
+			md.handle.fd = r.eb.fd;
+#endif
+			md.size = r.eb.alloc_size;
+			md.flags = CUDA_EXTERNAL_MEMORY_DEDICATED_FLAG;
+			const CUresult cr = cu->cuImportExternalMemory(&r.ext, &md);
+#ifdef _WIN32
+			CloseHandle((HANDLE)r.eb.win32); // CUDA holds its own reference
+#else
+			if (cr) close(r.eb.fd); // a successful import owns the fd
+#endif
+			if (cr) { r.ext = nullptr; why = "cuImportExternalMemory failed (" + std::to_string((int)cr) + ")"; ok = false; break; }
+			CUDA_EXTERNAL_MEMORY_BUFFER_DESC bd{};
+			bd.offset = 0;
+			bd.size = gin->size;
+			if (const CUresult c2 = cu->cuExternalMemoryGetMappedBuffer(&r.ptr, r.ext, &bd)) { r.ptr = 0; why = "cuExternalMemoryGetMappedBuffer failed (" + std::to_string((int)c2) + ")"; ok = false; break; }
+			NV_ENC_REGISTER_RESOURCE rr{};
+			rr.version = NV_ENC_REGISTER_RESOURCE_VER;
+			rr.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_CUDADEVICEPTR;
+			rr.resourceToRegister = (void*)r.ptr;
+			rr.width = (uint32_t)w; rr.height = (uint32_t)h;
+			rr.pitch = gin->pitch;
+			rr.bufferFormat = buffer_fmt;
+			rr.bufferUsage = NV_ENC_INPUT_IMAGE;
+			if (const NVENCSTATUS st = f.nvEncRegisterResource(enc, &rr)) { why = "nvEncRegisterResource failed (status " + std::to_string((int)st) + ")"; ok = false; break; }
+			r.reg = rr.registeredResource;
+		}
+		CUcontext dummy;
+		cu->cuCtxPopCurrent(&dummy);
+		if (!ok) {
+			for (auto& r : gin->res) if (r.reg) { f.nvEncUnregisterResource(enc, r.reg); r.reg = nullptr; }
+			return no(why);
+		}
+		gin_state = 1;
+		fprintf(stderr, "nvenc: frames come straight from VRAM (Vulkan device %d, packed on the GPU, read by NVENC through CUDA)\n", bf.device);
+		return true;
+	}
+
+	// Packs a buffer frame into slot `k`'s registered buffer and waits until that is done. False (the run fails) when the GPU fails.
+	bool gin_pack(const VkDecodedFrame& bf, size_t k) {
+		GpuInput& g = *gin;
+		GpuInput::Res& r = g.res[k];
+		const int bytes = depth > 8 ? 2 : 1;
+		const int cw = chroma == 444 ? w : (w + 1) / 2, ch = chroma == 444 ? h : (h + 1) / 2;
+		if (bf.device != g.device || bf.nplanes != 3 || bf.bytes != bytes || (int)bf.planes[0].w != w || (int)bf.planes[0].h != h || (int)bf.planes[1].w != cw ||
+		    (int)bf.planes[1].h != ch || (int)bf.planes[2].w != cw || (int)bf.planes[2].h != ch) {
+			fprintf(stderr, "nvenc: a frame from VRAM is not the %dx%d %d-bit %d the encoder takes\n", w, h, depth, chroma);
+			return false;
+		}
+		VkDeviceSize need = 0;
+		for (int i = 0; i < 3; i++) need = std::max<VkDeviceSize>(need, bf.buf_offset[i] + (VkDeviceSize)bf.planes[i].w * bf.planes[i].h * bytes);
+		need = (need + 3) & ~(VkDeviceSize)3;
+		try {
+			if (g.stage_size < need) { // the first frame (or one laid out larger): the pipelines bind the staging buffer, so they are made again
+				for (auto& x : g.res) if (x.has_pipe) { g.vk->release(x.pipe); x.has_pipe = false; }
+				g.stage = g.vk->buffer(need, 1);
+				g.stage_size = need;
+			}
+			if (!r.has_pipe) { r.pipe = g.vk->pipeline("enc_pack", {&g.stage, &r.eb.b}); r.has_pipe = true; }
+			struct { int32_t w, h, bytes, shift, mode, src_a, src_b, dst_base, pitch_words, ow, oh; } pc{};
+			pc.bytes = bytes;
+			pc.shift = depth > 8 ? 16 - depth : 0;
+			pc.pitch_words = (int32_t)(g.pitch / 4);
+			auto run = [&](int mode, int pw, int ph, VkDeviceSize a, VkDeviceSize b, VkDeviceSize dst) {
+				pc.w = pc.ow = pw; pc.h = pc.oh = ph; pc.mode = mode;
+				pc.src_a = (int32_t)a; pc.src_b = (int32_t)b; pc.dst_base = (int32_t)(dst / 4);
+				const int row = mode == 1 ? pw * 2 : pw, per = 4 / bytes;
+				g.vk->bind(r.pipe);
+				g.vk->push(&pc, sizeof pc);
+				g.vk->dispatch((uint32_t)(((row + per - 1) / per + 15) / 16), (uint32_t)((ph + 15) / 16));
+			};
+			g.vk->begin(0);
+			g.vk->wait_timeline(0, bf.buf_sem, bf.buf_value);
+			g.vk->copy_rows(bf.buffer, 0, need, g.stage.buf, 0, need, 1);
+			g.vk->barrier();
+			run(0, w, h, bf.buf_offset[0], 0, g.plane_off[0]);
+			if (chroma == 444) {
+				run(0, cw, ch, bf.buf_offset[1], 0, g.plane_off[1]);
+				run(0, cw, ch, bf.buf_offset[2], 0, g.plane_off[2]);
+			} else run(1, cw, ch, bf.buf_offset[1], bf.buf_offset[2], g.plane_off[1]);
+			g.vk->barrier();
+			g.vk->submit(0);
+			g.vk->wait(0);
+		} catch (const std::exception& e) {
+			fprintf(stderr, "nvenc: packing a frame on the GPU: %s\n", e.what());
+			return false;
+		}
+		return true;
+	}
+#endif
 
 	// Copies the planar frame into the layout NVENC wants: NV12 / P010 (interleaved chroma) or planar 4:4:4.
 	// 10-bit samples go in the top bits of 16, as NVENC expects, so each one is shifted left by 6.
@@ -717,18 +900,53 @@ public:
 			s = free_.back(); free_.pop_back();
 		}
 
-		NV_ENC_LOCK_INPUT_BUFFER li{};
-		li.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
-		li.inputBuffer = s->in;
-		if ((st = f.nvEncLockInputBuffer(enc, &li))) return fail(st, "lock input");
-		repack(fr, (uint8_t*)li.bufferDataPtr, li.pitch);
-		f.nvEncUnlockInputBuffer(enc, s->in);
+		if (s->mapped) { f.nvEncUnmapInputResource(enc, s->mapped); s->mapped = nullptr; } // its last picture is done (its output was read)
+		NV_ENC_INPUT_PTR input = nullptr;
+		uint32_t pitch = 0;
+		Picture mem; // a frame on the GPU read back, when it cannot be taken from VRAM
+#ifndef VES_NO_VULKAN
+		if (fr->gpu && gin_state >= 0) {
+			const VkDecodedFrame* bf = (const VkDecodedFrame*)fr->gpu.get();
+			if (bf->buffer && (gin_state == 1 || gin_open(*bf))) {
+				if (!gin_pack(*bf, (size_t)(s - slots.data()))) return false;
+				NV_ENC_MAP_INPUT_RESOURCE mi{};
+				mi.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+				mi.registeredResource = gin->res[(size_t)(s - slots.data())].reg;
+				if ((st = f.nvEncMapInputResource(enc, &mi))) return fail(st, "map input resource");
+				s->mapped = input = mi.mappedResource;
+				pitch = gin->pitch;
+			}
+		}
+#endif
+		if (!input) { // from memory (a frame on the GPU is read back first)
+			if (fr->gpu) {
+				mem = *fr;
+				if (!picture_to_memory(mem)) return false;
+				fr = &mem;
+			}
+			if (!s->in) {
+				NV_ENC_CREATE_INPUT_BUFFER ci{};
+				ci.version = NV_ENC_CREATE_INPUT_BUFFER_VER;
+				ci.width = w; ci.height = h;
+				ci.bufferFmt = buffer_fmt;
+				if ((st = f.nvEncCreateInputBuffer(enc, &ci))) return fail(st, "create input buffer");
+				s->in = ci.inputBuffer;
+			}
+			NV_ENC_LOCK_INPUT_BUFFER li{};
+			li.version = NV_ENC_LOCK_INPUT_BUFFER_VER;
+			li.inputBuffer = s->in;
+			if ((st = f.nvEncLockInputBuffer(enc, &li))) return fail(st, "lock input");
+			repack(fr, (uint8_t*)li.bufferDataPtr, li.pitch);
+			f.nvEncUnlockInputBuffer(enc, s->in);
+			input = s->in;
+			pitch = li.pitch;
+		}
 
 		NV_ENC_PIC_PARAMS pp{};
 		pp.version = NV_ENC_PIC_PARAMS_VER;
-		pp.inputBuffer = s->in;
+		pp.inputBuffer = input;
 		pp.bufferFmt = buffer_fmt;
-		pp.inputWidth = w; pp.inputHeight = h; pp.inputPitch = li.pitch;
+		pp.inputWidth = w; pp.inputHeight = h; pp.inputPitch = pitch;
 		pp.outputBitstream = s->out;
 		if (ASYNC) pp.completionEvent = s->ev;
 		pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;

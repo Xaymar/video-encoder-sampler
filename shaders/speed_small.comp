@@ -1,8 +1,9 @@
 #version 450
 #extension GL_GOOGLE_include_directive : enable
-layout(local_size_x = 64) in;
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+layout(local_size_x = 256) in;
 #include "speed_common.glsl"
-// One workgroup per plane: what est_params() does with the 25x25 covariance matrix. Its eigenvalues (Householder tridiagonalisation, then implicit
+// Two workgroups per plane: what est_params() does with the 25x25 covariance matrix. Its eigenvalues (Householder tridiagonalisation, then implicit
 // QR steps: compute_eigenvalues()) and its QR decomposition (matrix_qr_decomposition(), for solve_linear_system()); the work on whole matrices is
 // spread over the invocations element by element (each element's sum still in order), the steps that go one after another are done by invocation 0.
 shared float C[N * N];  // the covariance matrix (A_immutable)
@@ -15,10 +16,22 @@ shared bool sh_div;
 
 const double EPS = 1e-6LF;
 
+// double(x) < EPS * double(s) for x, s >= 0, as the CPU tests it: in floats when the two sides are more than 2^-20 apart (the float product is
+// within 2^-22 of the double one), else in doubles (which consumer GPUs run slowly).
+bool lt_eps(float x, float s) {
+	if (s >= 1.0e-30 && s <= 1.0e30) {
+		precise float p = 1.0e-6 * s;
+		precise float lo = p * 0.99999904632568359375, hi = p * 1.00000095367431640625; // 1 -/+ 2^-20
+		if (x < lo) return true;
+		if (x > hi) return false;
+	}
+	return double(x) < EPS * double(s);
+}
+
 void chop(int a, int n) {
 	for (int i = 0; i < n - 1; i++) {
 		precise float s = abs(d[a + i]) + abs(d[a + i + 1]);
-		if (double(abs(sd[a + i])) < EPS * double(s)) sd[a + i] = 0.0;
+		if (lt_eps(abs(sd[a + i]), s)) sd[a + i] = 0.0;
 	}
 }
 
@@ -61,7 +74,7 @@ void givens(float a, float b, out float c, out float s) {
 void qr_step(int a, int n) {
 	float mu = trailing(a, n);
 	precise float lim = abs(d[a]) + abs(sd[a]);
-	if (EPS * double(abs(mu)) > double(lim)) mu = 0.0;
+	if (lt_eps(lim, abs(mu))) mu = 0.0;
 	precise float xx = d[a] - mu;
 	float z = sd[a];
 	float ak = 0.0, bk = 0.0, zk = 0.0;
@@ -108,42 +121,29 @@ float vnorm() { // vector_norm(v)
 	return dsqrt_f(s);
 }
 
-// dst = X * Y (matrix_mul: each element a sum over k in order, from 0), for the elements of this invocation; written after a barrier, so dst may be Y.
-void matmul_into_Z(uint t) { // Z = A * Z
-	float r[10];
+// Z = A * Z and Q = A * Q (matrix_mul: each element a sum over k in order, from 0), for the elements of this invocation; written after a barrier.
+void matmul_into_ZQ(uint t) {
+	float rz[3], rq[3];
 	int n = 0;
-	for (uint e = t; e < N * N; e += 64) {
+	for (uint e = t; e < N * N; e += 256) {
 		const int i = int(e) / N, j = int(e) % N;
-		precise float acc = 0.0;
-		for (int k = 0; k < N; k++) acc += A[i * N + k] * Z[k * N + j];
-		r[n++] = acc;
+		precise float az = 0.0, aq = 0.0;
+		for (int k = 0; k < N; k++) { az += A[i * N + k] * Z[k * N + j]; aq += A[i * N + k] * Q[k * N + j]; }
+		rz[n] = az; rq[n] = aq; n++;
 	}
 	barrier();
 	n = 0;
-	for (uint e = t; e < N * N; e += 64) Z[e] = r[n++];
-	barrier();
-}
-void matmul_into_Q(uint t) { // Q = A * Q
-	float r[10];
-	int n = 0;
-	for (uint e = t; e < N * N; e += 64) {
-		const int i = int(e) / N, j = int(e) % N;
-		precise float acc = 0.0;
-		for (int k = 0; k < N; k++) acc += A[i * N + k] * Q[k * N + j];
-		r[n++] = acc;
-	}
-	barrier();
-	n = 0;
-	for (uint e = t; e < N * N; e += 64) Q[e] = r[n++];
+	for (uint e = t; e < N * N; e += 256) { Z[e] = rz[n]; Q[e] = rq[n]; n++; }
 	barrier();
 }
 
 void main() {
 	const uint t = gl_LocalInvocationID.x;
 	const int p = int(gl_WorkGroupID.y), out0 = p * SMALL;
-	for (uint e = t; e < N * N; e += 64) { C[e] = covm[p * N * N + e]; A[e] = C[e]; }
+	const bool eigen = gl_WorkGroupID.x == 0u; // workgroup 0: the eigenvalues; 1: the QR decomposition (they don't depend on each other)
+	for (uint e = t; e < N * N; e += 256) { C[e] = covm[p * N * N + e]; A[e] = C[e]; }
 	barrier();
-
+	if (eigen) {
 	// convert_to_tridiagonal()
 	for (int i = 0; i < N - 2; i++) {
 		const int start = i + 1;
@@ -170,17 +170,17 @@ void main() {
 		barrier();
 		const float tau = sh_tau;
 		if (sh_div) {
-			for (int r = start + int(t); r < N; r += 64) A[r * N + i] = fdiv(A[r * N + i], sh_s);
+			for (int r = start + int(t); r < N; r += 256) A[r * N + i] = fdiv(A[r * N + i], sh_s);
 			barrier();
 			if (t == 0) A[start * N + i] = sh_beta;
 			barrier();
 		}
-		for (int j = start + int(t); j < N; j += 64) v[j] = A[j * N + i];
+		for (int j = start + int(t); j < N; j += 256) v[j] = A[j * N + i];
 		barrier();
 		if (tau != 0.0) {
 			if (t == 0) { A[(i + 1) * N + i] = v[i + 1]; v[i + 1] = 1.0; }
 			barrier();
-			for (int r = start + int(t); r < N; r += 64) { // tridiagonal_multiply()
+			for (int r = start + int(t); r < N; r += 256) { // tridiagonal_multiply()
 				precise float acc = 0.0;
 				for (int j = start; j < N; j++) acc += tau * A[r * N + j] * v[j];
 				x[r] = acc;
@@ -193,10 +193,10 @@ void main() {
 			}
 			barrier();
 			const float alpha = sh_alpha;
-			for (int r = start + int(t); r < N; r += 64) { precise float xr = x[r] + alpha * v[r]; x[r] = xr; }
+			for (int r = start + int(t); r < N; r += 256) { precise float xr = x[r] + alpha * v[r]; x[r] = xr; }
 			barrier();
 			const int m = N - start;
-			for (int e = int(t); e < m * m; e += 64) { // tridiagonal_syr2()
+			for (int e = int(t); e < m * m; e += 256) { // tridiagonal_syr2()
 				const int r = start + e / m, c = start + e % m;
 				precise float upd = A[r * N + c] - (x[r] * v[c] + v[r] * x[c]);
 				A[r * N + c] = upd;
@@ -225,12 +225,15 @@ void main() {
 		for (int i = 0; i < N; i++) eig[i] = d[i];
 	}
 	barrier();
+	if (t < N) small[out0 + 2 * N * N + int(t)] = eig[t];
+	return;
+	}
 
 	// matrix_qr_decomposition(C): Z = C, Q = I, then one Householder reflection per column
-	for (uint e = t; e < N * N; e += 64) { Z[e] = C[e]; Q[e] = (int(e) / N == int(e) % N) ? 1.0 : 0.0; }
+	for (uint e = t; e < N * N; e += 256) { Z[e] = C[e]; Q[e] = (int(e) / N == int(e) % N) ? 1.0 : 0.0; }
 	barrier();
 	for (int k = 0; k < N - 1; k++) {
-		for (uint e = t; e < N * N; e += 64) { // matrix_minor(Z, k)
+		for (uint e = t; e < N * N; e += 256) { // matrix_minor(Z, k)
 			const int i = int(e) / N, j = int(e) % N;
 			if (i < k || j < k) Z[e] = i == j ? 1.0 : 0.0;
 		}
@@ -245,32 +248,22 @@ void main() {
 		barrier();
 		if (t < N) v[t] = fdiv(v[t], sh_s); // each element on its own, as the CPU's loop does
 		barrier();
-		for (uint e = t; e < N * N; e += 64) { // matrix_identity_minus_v_vt()
+		for (uint e = t; e < N * N; e += 256) { // matrix_identity_minus_v_vt()
 			const int i = int(e) / N, j = int(e) % N;
 			precise float q = -2.0 * v[i] * v[j];
 			if (i == j) q = q + 1.0;
 			A[e] = q;
 		}
 		barrier();
-		matmul_into_Z(t);
-		matmul_into_Q(t);
+		matmul_into_ZQ(t);
 	}
-	// R = Q C; the system is then solved with Q (transposed twice); and whether it can be: all eigenvalues at least EPS (is_matrix_regular()), no
-	// diagonal element of R below EPS (solve_triangular_system())
-	for (uint e = t; e < N * N; e += 64) {
+	// R = Q C; the system is then solved with Q (transposed twice). Whether it can be (is_matrix_regular(), solve_triangular_system()) the
+	// shaders that read these work out (cannot_invert()).
+	for (uint e = t; e < N * N; e += 256) {
 		const int i = int(e) / N, j = int(e) % N;
 		precise float acc = 0.0;
 		for (int k = 0; k < N; k++) acc += Q[i * N + k] * C[k * N + j];
 		small[out0 + N * N + int(e)] = acc;
 		small[out0 + int(e)] = Q[e];
-	}
-	if (t < N) small[out0 + 2 * N * N + int(t)] = eig[t];
-	memoryBarrierBuffer();
-	barrier();
-	if (t == 0) {
-		bool bad = false;
-		for (int i = 0; i < N; i++) if (double(eig[i]) < EPS) bad = true;
-		if (!bad) for (int i = N - 1; i >= 0; i--) if (double(abs(small[out0 + N * N + i * N + i])) < EPS) { bad = true; break; }
-		small[out0 + 2 * N * N + N] = bad ? 1.0 : 0.0;
 	}
 }
