@@ -225,6 +225,9 @@ class Amf : public Encoder {
 	bool vulkan_only = false; // see open_vulkan_context()
 	int vidx = -1;
 #ifndef VES_NO_VULKAN
+	amf::AMFVulkanDevice vkdev{}; // what InitVulkan() was given (see init_vulkan_on)
+#endif
+#ifndef VES_NO_VULKAN
 	// Frames straight from VRAM (VES_ENC_GPU_INPUT, on by default): the converter's output (a buffer frame on FFmpeg's Vulkan device) is packed into
 	// NV12 / P010 by a compute shader (enc_pack, as repack() does in memory, padding included) and copied into a Vulkan surface that AMF allocated on
 	// that same device (the context is initialized for Vulkan as well as D3D11), which AMF then converts to D3D11 itself. The encoder is the same
@@ -259,15 +262,16 @@ class Amf : public Encoder {
 			if (!missing.empty()) return "FFmpeg's Vulkan device lacks " + missing + ", which AMF needs";
 		}
 		c->SetProperty(AMF_CONTEXT_VULKAN_COMPUTE_QUEUE, (amf_int64)(nat.compute_queues - 1));
-		amf::AMFVulkanDevice vd{};
-		vd.cbSizeof = sizeof vd;
-		vd.hInstance = nat.inst;
-		vd.hPhysicalDevice = nat.phys;
-		vd.hDevice = nat.dev;
+		// AMF may keep the pointer, not a copy of the struct (a stale one would give it a garbage VkDevice: "vkCreateImage: Invalid device"): it lives as long as the encoder
+		vkdev = amf::AMFVulkanDevice{};
+		vkdev.cbSizeof = sizeof vkdev;
+		vkdev.hInstance = nat.inst;
+		vkdev.hPhysicalDevice = nat.phys;
+		vkdev.hDevice = nat.dev;
 		AMF_RESULT ir;
 		{
 			TraceToLog trace(factory); // AMF says why in its trace only
-			ir = c1->InitVulkan(&vd);
+			ir = c1->InitVulkan(&vkdev);
 		}
 		if (ir != AMF_OK) return "InitVulkan failed (result " + std::to_string((int)ir) + ")";
 		return "";
