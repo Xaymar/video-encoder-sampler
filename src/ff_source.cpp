@@ -405,7 +405,20 @@ AVBufferRef* shared_hw_device(const std::string& type, const std::string& device
 	if (t == AV_HWDEVICE_TYPE_NONE) return nullptr;
 	std::lock_guard lock(devices_mutex);
 	AVBufferRef*& shared = devices[type + "|" + device];
-	if (!shared && av_hwdevice_ctx_create(&shared, t, device.empty() ? nullptr : device.c_str(), nullptr, 0) < 0) shared = nullptr;
+	AVDictionary* opts = nullptr;
+#ifdef _WIN32
+	// AMF takes frames from FFmpeg's Vulkan device (AMFContext1::InitVulkan) only when the device has every extension AMF asks for (GetVulkanDeviceExtensions()):
+	// VK_KHR_swapchain and VK_AMD_device_coherent_memory, which FFmpeg does not turn on, and by name the ones that are core since Vulkan 1.2/1.3 (FFmpeg turns
+	// on only their features). Extensions a driver lacks are left out by FFmpeg (with a warning).
+	// AMF loads vkGetPhysicalDeviceProperties2KHR & co. by their KHR names from the instance, which only works with those instance extensions enabled
+	// (RX 6600M: "Failed to aquire entrypoint vkGetPhysicalDeviceProperties2KHR", then InitVulkan fails).
+	if (t == AV_HWDEVICE_TYPE_VULKAN) {
+		av_dict_set(&opts, "instance_extensions", "VK_KHR_surface+VK_KHR_win32_surface+VK_KHR_get_physical_device_properties2+VK_KHR_external_memory_capabilities+VK_KHR_external_semaphore_capabilities", 0);
+		av_dict_set(&opts, "device_extensions", "VK_KHR_swapchain+VK_KHR_external_memory_win32+VK_KHR_external_semaphore_win32+VK_KHR_synchronization2+VK_KHR_timeline_semaphore+VK_AMD_device_coherent_memory", 0);
+	}
+#endif
+	if (!shared && av_hwdevice_ctx_create(&shared, t, device.empty() ? nullptr : device.c_str(), opts, 0) < 0) shared = nullptr;
+	av_dict_free(&opts);
 	return shared ? av_buffer_ref(shared) : nullptr;
 }
 
@@ -454,6 +467,17 @@ bool vulkan_provider(int index, uint32_t vendor_id, uint32_t device_id, VkExtern
 	out.phys = vk->phys_dev;
 	out.dev = vk->act_dev;
 	out.queue_flags = ffmpeg_queue_flags(*vk, 0);
+	// FFmpeg turns the platform's external memory extension on where the driver has it: then encoders can take frames from VRAM (Vk::exportable_buffer())
+#ifdef _WIN32
+	const char* ext_mem = "VK_KHR_external_memory_win32";
+#else
+	const char* ext_mem = "VK_KHR_external_memory_fd";
+#endif
+	for (int i = 0; i < vk->nb_enabled_dev_extensions; i++) {
+		out.extensions.push_back(vk->enabled_dev_extensions[i]);
+		if (!strcmp(vk->enabled_dev_extensions[i], ext_mem)) out.export_memory = true;
+	}
+	out.inst = vk->inst;
 	out.ctx = hw;
 	out.lock = [](void* c, uint32_t fam, uint32_t i) { auto* h = (AVHWDeviceContext*)c; ((AVVulkanDeviceContext*)h->hwctx)->lock_queue(h, fam, i); };
 	out.unlock = [](void* c, uint32_t fam, uint32_t i) { auto* h = (AVHWDeviceContext*)c; ((AVVulkanDeviceContext*)h->hwctx)->unlock_queue(h, fam, i); };
