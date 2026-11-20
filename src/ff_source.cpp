@@ -410,8 +410,10 @@ AVBufferRef* shared_hw_device(const std::string& type, const std::string& device
 	// AMF takes frames from FFmpeg's Vulkan device (AMFContext1::InitVulkan) only when the device has every extension AMF asks for (GetVulkanDeviceExtensions()):
 	// VK_KHR_swapchain and VK_AMD_device_coherent_memory, which FFmpeg does not turn on, and by name the ones that are core since Vulkan 1.2/1.3 (FFmpeg turns
 	// on only their features). Extensions a driver lacks are left out by FFmpeg (with a warning).
+	// AMF loads vkGetPhysicalDeviceProperties2KHR & co. by their KHR names from the instance, which only works with those instance extensions enabled
+	// (RX 6600M: "Failed to aquire entrypoint vkGetPhysicalDeviceProperties2KHR", then InitVulkan fails).
 	if (t == AV_HWDEVICE_TYPE_VULKAN) {
-		av_dict_set(&opts, "instance_extensions", "VK_KHR_surface+VK_KHR_win32_surface", 0);
+		av_dict_set(&opts, "instance_extensions", "VK_KHR_surface+VK_KHR_win32_surface+VK_KHR_get_physical_device_properties2+VK_KHR_external_memory_capabilities+VK_KHR_external_semaphore_capabilities", 0);
 		av_dict_set(&opts, "device_extensions", "VK_KHR_swapchain+VK_KHR_external_memory_win32+VK_KHR_external_semaphore_win32+VK_KHR_synchronization2+VK_KHR_timeline_semaphore+VK_AMD_device_coherent_memory", 0);
 	}
 #endif
