@@ -23,7 +23,6 @@
 #include <dxgi.h>
 #include <wrl/client.h>
 #include <winternl.h>
-#include <tlhelp32.h>
 #include <d3dkmthk.h>
 
 #include <filesystem>
@@ -159,23 +158,6 @@ const Names AV1 = {AMFVideoEncoder_AV1, AMF_VIDEO_ENCODER_AV1_USAGE, AMF_VIDEO_E
 
 std::wstring wide(const std::string& s) { return std::wstring(s.begin(), s.end()); } // property names are ASCII
 
-// Every Vulkan loader (and AMF runtime) module of this process: AMF's "Invalid device" from the loader means a VkDevice handle from one loader copy was given to another.
-void log_vulkan_modules() {
-	HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
-	if (snap == INVALID_HANDLE_VALUE) return;
-	MODULEENTRY32W me{};
-	me.dwSize = sizeof me;
-	for (BOOL ok = Module32FirstW(snap, &me); ok; ok = Module32NextW(snap, &me)) {
-		std::wstring name = me.szModule;
-		for (auto& c : name) c = (wchar_t)towlower(c);
-		if (name.find(L"vulkan") == std::wstring::npos && name.find(L"amf") == std::wstring::npos && name.find(L"avutil") == std::wstring::npos) continue;
-		std::string path;
-		for (wchar_t c : std::wstring(me.szExePath)) path += c < 128 ? (char)c : '?';
-		fprintf(stderr, "amf: loaded module %p %s\n", (void*)me.modBaseAddr, path.c_str());
-	}
-	CloseHandle(snap);
-}
-
 // AMF's trace (warnings and errors, and its debug lines) into the log while one is alive: InitVulkan only returns AMF_FAIL and says why there.
 class TraceToLog : public amf::AMFTraceWriter {
 public:
@@ -222,8 +204,6 @@ class Amf : public Encoder {
 	std::atomic<bool> eof{false}, stop{false};
 	int b_delay = 0;
 	uint64_t adapter_luid = 0; // of the D3D11 adapter the encoder runs on
-	bool vulkan_only = false; // see open_vulkan_context()
-	int vidx = -1;
 #ifndef VES_NO_VULKAN
 	amf::AMFVulkanDevice vkdev{}; // what InitVulkan() was given (see init_vulkan_on)
 #endif
@@ -234,9 +214,6 @@ class Amf : public Encoder {
 	// D3D11 one as for frames from memory. On AMD this sharing is fine; it is NVIDIA's drivers that corrupt VRAM with shared NV12 images.
 	int gstate = 0; // 0: not tried yet, 1: frames from VRAM, -1: through memory
 	int gdevice = -1;
-	// VES_AMF_VULKAN=1: the context is a Vulkan-only one (no D3D11) on FFmpeg's device, from open() on. AMF's own conversion of a Vulkan surface to D3D11
-	// (surf->Convert(DX11)) crashes inside AMF on AMD (Invalid device / Invalid VkImage); the encoder takes Vulkan surfaces itself in a Vulkan context.
-	// Frames from memory then go in as host surfaces (Convert(VULKAN)), which is AMF's own upload.
 	std::unique_ptr<Vk> gvk;
 	Buf gstage, gpacked;
 	VkDeviceSize gstage_size = 0;
@@ -248,7 +225,6 @@ class Amf : public Encoder {
 	// InitVulkan on FFmpeg's device (nat), on `c` as it is: "" when it worked, else why not. The compute queue AMF submits to is the last one of the family,
 	// which the converter and the scorer (the first) do not use.
 	std::string init_vulkan_on(amf::AMFContextPtr& c, const VkNative& nat) {
-		log_vulkan_modules();
 		amf::AMFContext1Ptr c1(c);
 		if (!c1) return "the AMF runtime has no Vulkan support (AMFContext1)";
 		amf_size n = 0;
@@ -277,29 +253,6 @@ class Amf : public Encoder {
 		return "";
 	}
 
-	// The Vulkan-only context of VES_AMF_VULKAN=1, made in open() on the Vulkan device of this encoder's adapter; false (nothing changed) when it cannot be.
-	bool open_vulkan_context() {
-		auto no = [&](const std::string& why) {
-			fprintf(stderr, "amf: no Vulkan-only context: %s\n", why.c_str());
-			ctx = nullptr;
-			return false;
-		};
-		std::string why;
-		const auto devs = Vk::devices(why);
-		int idx = -1;
-		for (size_t i = 0; i < devs.size(); i++) if (devs[i].luid_valid && devs[i].luid == adapter_luid) idx = (int)i;
-		if (idx < 0) return no("no Vulkan device on this adapter");
-		VkNative nat;
-		if (!vk_native(idx, nat)) return no("the adapter's Vulkan device is not FFmpeg's");
-		if (nat.compute_queues < 2) return no("FFmpeg's Vulkan device has only one compute queue");
-		if (factory->CreateContext(&ctx) != AMF_OK || !ctx) return no("CreateContext");
-		if (const std::string e = init_vulkan_on(ctx, nat); !e.empty()) return no(e);
-		vulkan_only = true;
-		vidx = idx;
-		fprintf(stderr, "amf: Vulkan-only context on Vulkan device %d (no D3D11)\n", idx);
-		return true;
-	}
-
 	bool gpu_open(const VkDecodedFrame& bf) {
 		gstate = -1;
 		auto no = [&](const std::string& why) {
@@ -317,9 +270,7 @@ class Amf : public Encoder {
 		if (!vk_native(bf.device, nat)) return no("the frames' Vulkan device is not FFmpeg's");
 		// AMF submits to a compute queue of its own: the last one of the family, which the converter and the scorer (the first) do not use
 		if (nat.compute_queues < 2) return no("FFmpeg's Vulkan device has only one compute queue");
-		if (vulkan_only) {
-			if (bf.device != vidx) return no("the frames are on Vulkan device " + std::to_string(bf.device) + ", the encoder's context on " + std::to_string(vidx));
-		} else if (const std::string e = init_vulkan_on(ctx, nat); !e.empty()) {
+		if (const std::string e = init_vulkan_on(ctx, nat); !e.empty()) {
 			// Which part AMF does not take: FFmpeg's device on a context that already has D3D11, FFmpeg's device on a context of its own, or a device AMF makes itself.
 			auto alone = [&](bool own_device) {
 				amf::AMFContextPtr c;
@@ -361,14 +312,7 @@ class Amf : public Encoder {
 			return nullptr;
 		}
 		amf::AMFSurfacePtr surf;
-		AMF_RESULT r;
-		{
-			static int traced = 0; // AMF's own trace of the first surfaces (a crash inside AllocSurface says nothing else), flushed before the call returns
-			std::unique_ptr<TraceToLog> trace;
-			if (traced++ < 2) { trace = std::make_unique<TraceToLog>(factory); fprintf(stderr, "amf: AllocSurface(Vulkan, %dx%d)\n", cw, ch); fflush(stderr); }
-			r = ctx->AllocSurface(amf::AMF_MEMORY_VULKAN, depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, cw, ch, &surf);
-			if (trace) fprintf(stderr, "amf: AllocSurface(Vulkan) returned %d\n", (int)r);
-		}
+		AMF_RESULT r = ctx->AllocSurface(amf::AMF_MEMORY_VULKAN, depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, cw, ch, &surf);
 		if (r != AMF_OK || !surf) { fail(r, "AllocSurface (Vulkan)"); return nullptr; }
 		// a plane's native object is a view of the surface's one image (both planes of NV12)
 		amf::AMFVulkanView* view = (amf::AMFVulkanView*)surf->GetPlaneAt(0)->GetNative();
@@ -715,18 +659,12 @@ public:
 			if (d.VendorId == 0x1002 && seen++ == gpu) { memcpy(&adapter_luid, &d.AdapterLuid, sizeof adapter_luid); break; }
 		}
 		if (!adapter) { fprintf(stderr, "amf: no AMD adapter with index %d\n", gpu); return false; }
-		bool vk_context = false;
-#ifndef VES_NO_VULKAN
-		if (!probing) if (const char* e = getenv("VES_AMF_VULKAN"); e && atoi(e) > 0) vk_context = open_vulkan_context();
-#endif
-		if (!vk_context) {
-			if (FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, nullptr))) {
-				fprintf(stderr, "amf: cannot create D3D11 device on the AMD adapter\n");
-				return false;
-			}
-			if ((r = factory->CreateContext(&ctx)) != AMF_OK) return fail(r, "CreateContext");
-			if ((r = ctx->InitDX11(device.Get())) != AMF_OK) return fail(r, "InitDX11");
+		if (FAILED(D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, nullptr))) {
+			fprintf(stderr, "amf: cannot create D3D11 device on the AMD adapter\n");
+			return false;
 		}
+		if ((r = factory->CreateContext(&ctx)) != AMF_OK) return fail(r, "CreateContext");
+		if ((r = ctx->InitDX11(device.Get())) != AMF_OK) return fail(r, "InitDX11");
 		if ((r = factory->CreateComponent(ctx, n->component, &enc)) != AMF_OK) return fail(r, "CreateComponent");
 
 		enc->SetProperty(n->usage, n->usage_transcoding);
@@ -825,9 +763,7 @@ public:
 			repack(fr, surf);
 		}
 		surf->SetPts(fr->pts);
-		if (vulkan_only) {
-			if (surf->GetMemoryType() != amf::AMF_MEMORY_VULKAN && (r = surf->Convert(amf::AMF_MEMORY_VULKAN)) != AMF_OK) return fail(r, "Convert (Vulkan)");
-		} else if ((r = surf->Convert(amf::AMF_MEMORY_DX11)) != AMF_OK) return fail(r, "Convert");
+		if ((r = surf->Convert(amf::AMF_MEMORY_DX11)) != AMF_OK) return fail(r, "Convert");
 
 		amf::AMFDataPtr data(surf);
 		if (filter_pp && !filter(surf, data)) return false;
