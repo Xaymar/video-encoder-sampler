@@ -1,6 +1,7 @@
 // Native NVENC backend: talks to nvEncodeAPI directly (loaded at runtime), no libavcodec.
 #include "encoder.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -275,6 +276,56 @@ const GUID* const PRESETS[] = {
 	&NV_ENC_PRESET_P5_GUID, &NV_ENC_PRESET_P6_GUID, &NV_ENC_PRESET_P7_GUID,
 };
 
+// The max_num_ref_frames of an H.264 SPS (from NVENC's header: start codes, NAL units with emulation prevention bytes); -1 if it cannot be read.
+static int h264_sps_max_refs(const uint8_t* p, size_t n) {
+	for (size_t i = 0; i + 4 < n; i++) {
+		if (!(p[i] == 0 && p[i + 1] == 0 && p[i + 2] == 1) || (p[i + 3] & 0x1f) != 7) continue;
+		std::vector<uint8_t> rb; // the SPS's payload without emulation prevention bytes
+		for (size_t j = i + 4, zeros = 0; j < n; j++) {
+			if (zeros >= 2 && p[j] == 1) break; // the next start code
+			if (zeros >= 2 && p[j] == 3) { zeros = 0; continue; }
+			zeros = p[j] == 0 ? zeros + 1 : 0;
+			rb.push_back(p[j]);
+		}
+		size_t bit = 0;
+		bool bad = false;
+		auto u = [&](int k) {
+			uint32_t v = 0;
+			for (int x = 0; x < k; x++, bit++) {
+				if (bit / 8 >= rb.size()) { bad = true; return 0u; }
+				v = (v << 1) | ((rb[bit / 8] >> (7 - bit % 8)) & 1);
+			}
+			return v;
+		};
+		auto ue = [&] {
+			int lz = 0;
+			while (!bad && u(1) == 0) if (++lz > 31) { bad = true; return 0u; }
+			return lz ? (1u << lz) - 1 + u(lz) : 0u;
+		};
+		const uint32_t profile = u(8);
+		u(16); // constraint flags, level
+		ue(); // seq_parameter_set_id
+		if (profile == 100 || profile == 110 || profile == 122 || profile == 244 || profile == 44 || profile == 83 || profile == 86 || profile == 118 || profile == 128 ||
+		    profile == 138 || profile == 139 || profile == 134 || profile == 135) {
+			if (ue() == 3) u(1); // chroma_format_idc, separate_colour_plane_flag
+			ue(); ue(); u(1); // bit depths, qpprime_y_zero_transform_bypass_flag
+			if (u(1)) return -1; // scaling matrices: not read
+		}
+		ue(); // log2_max_frame_num_minus4
+		const uint32_t poc = ue();
+		if (poc == 0) ue();
+		else if (poc == 1) {
+			u(1); ue(); ue(); // (se() has the length of ue())
+			const uint32_t cycle = ue();
+			if (cycle > 255) return -1;
+			for (uint32_t c = 0; c < cycle; c++) ue();
+		}
+		const uint32_t refs = ue();
+		return bad ? -1 : (int)refs;
+	}
+	return -1;
+}
+
 class Nvenc : public Encoder {
 	CudaFunctions* cu = nullptr;
 	NvencFunctions* nv = nullptr;
@@ -540,20 +591,6 @@ public:
 			}
 			it->second.set(n);
 		}
-		if (codec == NV_ENC_CODEC_H264_GUID) {
-			// NVENC takes a reference count below what the GOP needs without a word and writes an SPS whose max_num_ref_frames is too small for the
-			// stream: software decoders drop a reference ("number of reference frames (1+1) exceeds max (1)"), GPU decoders refuse the stream. Such a run
-			// cannot give a valid stream, so it is ignored, not failed. Needed: one short-term reference, two once there are B-frames, plus the long-term ones.
-			const auto& c = cfg.encodeCodecConfig.h264Config;
-			const uint32_t need = (cfg.frameIntervalP > 1 ? 2u : 1u) + (c.enableLTR ? c.ltrNumFrames : 0u);
-			if (c.maxNumRefFrames > 0 && c.maxNumRefFrames < need) {
-				unsupported = "max_ref_frames " + std::to_string(c.maxNumRefFrames) + " is below the " + std::to_string(need) + " references this GOP needs (" +
-				              (cfg.frameIntervalP > 1 ? "B-frames" : "P-frames") + (c.enableLTR ? " and " + std::to_string(c.ltrNumFrames) + " long-term" : "") +
-				              "); NVENC would write an H.264 stream that does not decode";
-				fprintf(stderr, "nvenc: %s\n", unsupported.c_str());
-				return false;
-			}
-		}
 		if (rc.lookaheadLevel != 0 && !rc.enableLookahead) { // NVIDIA's user-mode library aborts the process on this (fast-fail) instead of returning an error
 			fprintf(stderr, "nvenc: lookaheadLevel needs lookahead (rc-lookahead above 0)\n");
 			return false;
@@ -572,6 +609,7 @@ public:
 		ip.encodeConfig = &cfg;
 		used_cfg = cfg; used_ip = ip; used_ip.encodeConfig = nullptr; used_codec = codec; used_preset = preset; used_tune = tune;
 		if ((st = f.nvEncInitializeEncoder(enc, &ip))) return fail(st, "initialize");
+		if (codec == NV_ENC_CODEC_H264_GUID && !h264_refs_fit(cfg)) return false;
 
 		// Enough buffers to cover the reorder and lookahead delay.
 		delay = cfg.frameIntervalP + rc.lookaheadDepth + 3;
@@ -597,6 +635,30 @@ public:
 		rx = std::thread([this] { receive(); });
 #endif
 		return true;
+	}
+
+	// NVENC takes reference settings the stream then breaks without a word: with long-term references on (num_ltr_frames, max_ref_frames 16) it wrote an
+	// SPS with max_num_ref_frames 1 and still used a short-term and a long-term reference at once. Software decoders drop one ("number of reference
+	// frames (1+1) exceeds max (1)"), NVIDIA's Vulkan decoder refuses the stream. Such a run cannot give a valid stream: ignored, not failed.
+	// Needed at least: one short-term reference, one more with B-frames, one more with long-term references.
+	bool h264_refs_fit(const NV_ENC_CONFIG& cfg) {
+		std::vector<uint8_t> hdr(1024);
+		uint32_t got = 0;
+		NV_ENC_SEQUENCE_PARAM_PAYLOAD sp{};
+		sp.version = NV_ENC_SEQUENCE_PARAM_PAYLOAD_VER;
+		sp.inBufferSize = (uint32_t)hdr.size();
+		sp.spsppsBuffer = hdr.data();
+		sp.outSPSPPSPayloadSize = &got;
+		if (f.nvEncGetSequenceParams(enc, &sp) != NV_ENC_SUCCESS) return true; // nothing to check against
+		const int refs = h264_sps_max_refs(hdr.data(), std::min<size_t>(got, hdr.size()));
+		const auto& c = cfg.encodeCodecConfig.h264Config;
+		const int need = 1 + (cfg.frameIntervalP > 1 ? 1 : 0) + (c.enableLTR ? 1 : 0);
+		if (refs < 0 || refs >= need) return true;
+		unsupported = "NVENC wrote an H.264 SPS with max_num_ref_frames " + std::to_string(refs) + " for a stream that needs " + std::to_string(need) + " (" +
+		              (c.enableLTR ? "long-term references" : "") + (c.enableLTR && cfg.frameIntervalP > 1 ? " and " : "") + (cfg.frameIntervalP > 1 ? "B-frames" : "") +
+		              (need == 1 ? "P-frames" : "") + "): its stream would not decode";
+		fprintf(stderr, "nvenc: %s\n", unsupported.c_str());
+		return false;
 	}
 
 #ifndef VES_NO_VULKAN
