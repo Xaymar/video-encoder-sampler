@@ -490,6 +490,14 @@ static void load_config(const std::string& path, Config& cfg) {
 	catch (const std::runtime_error& e) { throw std::runtime_error(path + ": " + e.what()); }
 }
 
+// A GPU encoder entry that does not name a "gpu" runs on every GPU of its vendor (gpu=all): a machine's first GPU is often a small integrated one, and the
+// GPUs that cannot encode the codec are skipped one by one (their caps say so), so nothing is lost on the way.
+static void default_to_all_gpus(Job& j) {
+	if (!is_gpu_encoder(j.encoder)) return;
+	for (auto& ax : j.axes) if (ax.key == "gpu") return;
+	j.axes.push_back(Axis{"gpu", {"all"}, {}, {}});
+}
+
 static void load_config_json(const Json& root, Config& cfg) {
 
 	auto list = [&](const char* k, auto fn) {
@@ -652,6 +660,7 @@ static void load_config_json(const Json& root, Config& cfg) {
 				                     r->where().c_str(), j.encoder.c_str(), name.c_str());
 			}
 		}
+		default_to_all_gpus(j);
 		cfg.jobs.push_back(std::move(j));
 	});
 }
@@ -808,6 +817,7 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 	sc.shapes = make_shapes(res, fps);
 	for (auto& sh : sc.shapes) sh.upscale = upscale;
 	cfg.scenarios.push_back(std::move(sc));
+	default_to_all_gpus(j);
 	cfg.jobs.push_back(std::move(j));
 	return true;
 }
@@ -913,6 +923,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		sc.shapes = make_shapes(res, fps);
 		for (auto& sh : sc.shapes) sh.upscale = upscale;
 		cfg.scenarios.push_back(std::move(sc));
+		default_to_all_gpus(job);
 		cfg.jobs.push_back(std::move(job));
 	} else {
 		load_config(config_path, cfg);
