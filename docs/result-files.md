@@ -55,7 +55,7 @@ the encoder's own capability names to integers or booleans, and runs whose `enco
   (`MaxBitrate`, `MaxLevel`, `NumOfHwInstances`, `BFrames`, ...). Values that change with the load on the encoder (`RequestedThroughput`) are left out. Older files have `null`.
 
 The file keeps every cap as reported. A website that compares them leaves out the ones that describe the chip or its load rather than the encoder (ves.xaymar.com: NVENC
-`NUM_ENCODER_ENGINES`, `MB_PER_SEC_MAX`, `DYNAMIC_QUERY_ENCODER_CAPACITY`; AMF `MaxThroughput`), so GPUs whose encoders make identical streams share a generation.
+`NUM_ENCODER_ENGINES`, `MB_PER_SEC_MAX`, `DYNAMIC_QUERY_ENCODER_CAPACITY`; AMF `MaxThroughput`, `NumOfHwInstances`, `EncoderCapNormalizedThroughput`), so GPUs whose encoders make identical streams share a generation.
 
 ### `key`
 
