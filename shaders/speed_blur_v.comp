@@ -1,5 +1,6 @@
 #version 450
 #extension GL_GOOGLE_include_directive : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 layout(local_size_x = 64) in;
 #include "speed_common.glsl"
 // speed.c's 3x3 blur (vif_filter1d_s), the vertical pass: tmp = sum over fi of f[fi] * plane[mirror(i - fw / 2 + fi)][j], in the order of fi.

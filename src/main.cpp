@@ -86,7 +86,7 @@ struct Scenario {
 	std::vector<int64_t> bitrates;   // kbps
 	std::vector<double> kfs{2.0};    // key frame intervals, seconds
 	std::vector<Shape> shapes{Shape{}}; // resolution / frame rate to encode at; zero fields mean "as the source"
-	std::vector<std::string> chroma, bitdepth, range; // pixel format to encode in (420, 444; 8, 10; source, limited, full); empty: the source's
+	std::vector<std::string> chroma, bitdepth, range, trc; // pixel format to encode in (420, 444; 8, 10; source, limited, full; transfer curve); empty: the source's
 };
 
 struct Config {
@@ -106,7 +106,7 @@ struct Config {
 	UploadOptions upload; // where the results go after a sweep; no address: nowhere
 	bool plain = false; // no live display, just lines
 	std::string log_file; // --log: the lines also go to this file, with the date and time
-	std::string hw_decode = "auto"; // "" software only, "auto", or a device type or decoder name: see set_hw_decode()
+	std::string hw_decode = "on"; // "" software only, anything else on (Vulkan Video): see set_hw_decode()
 	int decode_threads = 0;  // 0: as many as the cores allow within a memory budget
 	// Where the encoder processes decode and scale (vmaf.gpu says where they score): "" or "auto" the fastest GPU, "own" the GPU that encodes, a Vulkan index or a
 	// name. This machine's choice, so not part of a run's key; scaling_gpu beats the sweep's "scaling": {"gpu"} in the processes.
@@ -140,6 +140,7 @@ struct Run {
 	const Options* options = nullptr; // the run's encoder options: the variant's, shared by every run of it
 	std::string video;      // the saved stream, relative to the output directory; empty if none was saved
 	std::string video_file; // where run_one() writes it
+	std::string held_video; // "videos": "best": the stream this run was scored on, kept in the scratch folder while the run is among the best of its group
 	std::string video_sha256; // SHA-256 of the encoded stream
 	std::string result;     // its result file (options, bitrates, per-frame VMAF), relative to the output directory; empty if none
 	std::string tag;        // "[run 12/240]", for the progress lines
@@ -489,6 +490,14 @@ static void load_config(const std::string& path, Config& cfg) {
 	catch (const std::runtime_error& e) { throw std::runtime_error(path + ": " + e.what()); }
 }
 
+// A GPU encoder entry that does not name a "gpu" runs on every GPU of its vendor (gpu=all): a machine's first GPU is often a small integrated one, and the
+// GPUs that cannot encode the codec are skipped one by one (their caps say so), so nothing is lost on the way.
+static void default_to_all_gpus(Job& j) {
+	if (!is_gpu_encoder(j.encoder)) return;
+	for (auto& ax : j.axes) if (ax.key == "gpu") return;
+	j.axes.push_back(Axis{"gpu", {"all"}, {}, {}});
+}
+
 static void load_config_json(const Json& root, Config& cfg) {
 
 	auto list = [&](const char* k, auto fn) {
@@ -519,6 +528,7 @@ static void load_config_json(const Json& root, Config& cfg) {
 		strs("chroma", [&](const std::string& t) { sc.chroma.push_back(t); });
 		strs("bitdepth", [&](const std::string& t) { sc.bitdepth.push_back(t); });
 		strs("range", [&](const std::string& t) { sc.range.push_back(t); });
+		strs("trc", [&](const std::string& t) { sc.trc.push_back(t); });
 		if (auto* u = o.find("upscale"); u && (u->text() == "1" || u->text() == "true")) for (auto& sh : sc.shapes) sh.upscale = true;
 		if (sc.bitrates.empty()) throw std::runtime_error(o.where() + "a scenario needs bitrates");
 		cfg.scenarios.push_back(std::move(sc));
@@ -528,6 +538,10 @@ static void load_config_json(const Json& root, Config& cfg) {
 		if (auto* u = v->find("upscaler")) cfg.scale.upscaler = u->text();
 		if (auto* d = v->find("downscaler")) cfg.scale.downscaler = d->text();
 		if (auto* g = v->find("gpu")) cfg.scale.device = g->text();
+		if (auto* c = v->find("bt709_curve")) {
+			cfg.scale.bt709_curve = bt709_curve_of(c->text());
+			if (!cfg.scale.bt709_curve) throw std::runtime_error(c->where() + "'bt709_curve' must be \"oetf\", \"bt1886\" or \"srgb\"");
+		}
 	}
 	// These live in "settings"; older files have them at the top level, which still works.
 	auto setting = [&](const char* k) -> const Json* {
@@ -537,7 +551,7 @@ static void load_config_json(const Json& root, Config& cfg) {
 	if (auto* v = setting("log")) cfg.log_file = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "ves.log" : "") : v->text();
 	if (auto* v = setting("cache")) cfg.cache_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "cache" : "") : v->text();
 	if (auto* v = root.find("output")) cfg.output_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "output" : "") : v->text();
-	if (auto* v = setting("hw_decode")) cfg.hw_decode = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "auto" : "") : v->text();
+	if (auto* v = setting("hw_decode")) cfg.hw_decode = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "on" : "") : v->text();
 	if (auto* v = setting("decode_threads")) cfg.decode_threads = atoi(v->text().c_str());
 	if (auto* v = setting("decode_gpu")) cfg.decode_gpu = v->text();
 	if (auto* v = setting("scaling_gpu")) cfg.scaling_gpu = v->text();
@@ -640,12 +654,13 @@ static void load_config_json(const Json& root, Config& cfg) {
 			j.rules.parse(*r);
 			// A misspelt name reads as an unset option: say so for names the entry does not list.
 			for (auto& name : j.rules.names()) {
-				bool listed = is_default_key(name) || name == "range";
+				bool listed = is_default_key(name) || name == "range" || name == "trc";
 				for (auto& ax : j.axes) listed |= ax.key == name;
 				if (!listed) fprintf(stderr, "config: %s%s rules read '%s', which the entry does not list: it reads as the encoder's default where that is known\n",
 				                     r->where().c_str(), j.encoder.c_str(), name.c_str());
 			}
 		}
+		default_to_all_gpus(j);
 		cfg.jobs.push_back(std::move(j));
 	});
 }
@@ -683,11 +698,19 @@ Paths
         --upload-key <key>  the API key from the website's account page; better in the config ("upload": {"key": ...}) or the VES_API_KEY environment variable
         --no-upload-videos  upload the results but not the encoded videos
         --no-skip-known     run everything, also runs the site already has (by default those are skipped and their results downloaded)
-        --hw-decode <auto|off|name>  decode the sources on the GPU when their first frames match a software decode exactly (default: auto);
-                            a name is a device type (cuda, d3d11va, d3d12va, dxva2, qsv, amf, vaapi, vulkan) or a hardware decoder (hevc_cuvid, h264_qsv, ...)
-        --decode-gpu <auto|own|n|name>  the GPU the sources are decoded on (default: auto, the fastest GPU: discrete first, then the most VRAM); own: the GPU
-                            that encodes the run; n: Vulkan device n; name: the first device whose name contains it (--vmaf-gpu list shows them)
-        --scaling-gpu <auto|own|n|name>  the GPU frames are scaled and converted on, the same way (default: auto). Beats "scaling": {"gpu"} of the
+        --hw-decode <on|off>  decode the sources on the GPU with Vulkan Video when their first frames match a software decode exactly (default: on;
+                            "auto", "true" or a device type name from older configs mean on, "false" off).
+                            The encoded streams that are scored too: until a stream of a kind (codec, size, bit depth, chroma) decoded
+                            exactly like software all the way through, the GPU and software run side by side; after that the GPU decodes that kind alone.
+                            The verdicts are kept per GPU, driver and FFmpeg version (VES_HW_DECODE_VERDICTS=<file|off>; VES_HW_DECODE_VERIFY=<frames|all> checks again)
+                            Its frames stay on the GPU, where the converter and the scorer use them on FFmpeg's own device
+                            (VES_SHARED_VULKAN=0: they make their own devices; VES_HW_DECODE_TO_MEMORY=1: frames are read back as they are decoded).
+                            Vulkan decodes only H.264, HEVC, AV1 and VP9 (the video engine), not FFmpeg's compute shader decoders (FFV1, ...).
+        --decode-gpu <auto|own|n|name>  the home GPU, which decodes the sources and the scored streams (default: auto, the fastest GPU: discrete first,
+                            then the most VRAM); own: the GPU that encodes the run; n: Vulkan device n; name: the first device whose name contains it
+                            (--vmaf-gpu list shows them). Converting and scoring follow it. A kind of stream it decodes wrongly goes to the next GPU
+                            that decodes it right, and to software last
+        --scaling-gpu <auto|own|n|name>  the GPU frames are scaled and converted on, the same way (default: auto, the home GPU). Beats "scaling": {"gpu"} of the
                             config; unlike that one it is this machine's choice and does not change which runs count as done
         --priority <low|normal>  low (default): idle CPU priority and the lowest disk priority, so ves never gets in the way of other programs; normal: the system default
         --decode-threads <n> threads per decoder (default: all cores; 4 with --low-memory)
@@ -706,7 +729,7 @@ Scoring
         --vmaf-threads <n>
         --vmaf-device <cpu|gpu|auto>  where VMAF is computed (default: cpu). gpu: on the GPU with Vulkan compute (8 and 10 bit input; v0 and v1 models; scores within 1e-9 of libvmaf's);
                             auto: the GPU where it can be used (8 or 10 bit YUV, a model file, a Vulkan GPU), else the CPU. These scores are kept apart from libvmaf's in the cache
-        --vmaf-gpu <auto|n|name>  the Vulkan device that scores (default: auto, the fastest GPU: discrete first, then the most VRAM); own: the GPU that encodes the run; n: Vulkan device n;
+        --vmaf-gpu <auto|n|name>  the Vulkan device that scores (default: auto, the home GPU, else the fastest: discrete first, then the most VRAM); own: the GPU that encodes the run; n: Vulkan device n;
                             name: the first device whose name contains it. --vmaf-gpu list shows the Vulkan devices
         --over-penalty <p>  VMAF points deducted per percent for a run just over the target bitrate (default: 0.025); it grows exponentially, like the website's
 
@@ -794,6 +817,7 @@ static bool parse_cli(int argc, char** argv, Config& cfg) {
 	sc.shapes = make_shapes(res, fps);
 	for (auto& sh : sc.shapes) sh.upscale = upscale;
 	cfg.scenarios.push_back(std::move(sc));
+	default_to_all_gpus(j);
 	cfg.jobs.push_back(std::move(j));
 	return true;
 }
@@ -806,6 +830,10 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	std::optional<double> check;
 	std::optional<double> penalty;
 	std::optional<std::string> vmaf_device, vmaf_gpu;
+	// Flags for what the config's "settings" also has: kept until the config is read, so that the flag wins (a worker passes its own on as flags).
+	std::optional<std::string> hw_decode, decode_gpu, scaling_gpu, priority;
+	std::optional<int> decode_threads;
+	bool low_memory = false, in_process = false;
 	bool videos = true, all_videos = false, upload_videos = true, skip_known = true, quick = false, upscale = false;
 	std::set<std::string> only_lines; // --only-runs
 	bool short_names = false;
@@ -839,8 +867,8 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		}
 		else if (a == "--plain") cfg.plain = true;
 		else if (a == "--log") log_path = value();
-		else if (a == "--low-memory") cfg.low_memory = true;
-		else if (a == "--in-process") cfg.in_process = true;
+		else if (a == "--low-memory") low_memory = true;
+		else if (a == "--in-process") in_process = true;
 		else if (a == "--host") cfg.host_port = atoi(value().c_str());
 		else if (a == "--progress") ui::set_progress_stdout(true);
 		else if (a == "--trust-downloads") set_trust_downloads(true);
@@ -848,11 +876,11 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--only-runs") { std::ifstream f(value()); for (std::string l; std::getline(f, l);) { if (!l.empty() && l.back() == '\r') l.pop_back(); only_lines.insert(l); } only_set = true; }
 		else if (a == "--token") cfg.token = value();
 		else if (a == "--min-workers") cfg.min_workers = std::max(1, atoi(value().c_str()));
-		else if (a == "--decode-threads") cfg.decode_threads = atoi(value().c_str());
-		else if (a == "--hw-decode") cfg.hw_decode = value();
-		else if (a == "--decode-gpu") cfg.decode_gpu = value();
-		else if (a == "--scaling-gpu") cfg.scaling_gpu = value();
-		else if (a == "--priority") cfg.priority = value();
+		else if (a == "--decode-threads") decode_threads = atoi(value().c_str());
+		else if (a == "--hw-decode") hw_decode = value();
+		else if (a == "--decode-gpu") decode_gpu = value();
+		else if (a == "--scaling-gpu") scaling_gpu = value();
+		else if (a == "--priority") priority = value();
 		else if (a == "-c" || a == "--cache") cache = value();
 		else if (a == "--vmaf-model") model = value();
 		else if (a == "--vmaf-threads") threads = atoi(value().c_str());
@@ -895,6 +923,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		sc.shapes = make_shapes(res, fps);
 		for (auto& sh : sc.shapes) sh.upscale = upscale;
 		cfg.scenarios.push_back(std::move(sc));
+		default_to_all_gpus(job);
 		cfg.jobs.push_back(std::move(job));
 	} else {
 		load_config(config_path, cfg);
@@ -904,6 +933,13 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 			if (!job.pool.empty()) j.pool = job.pool;
 		}
 	}
+	if (hw_decode) cfg.hw_decode = *hw_decode;
+	if (decode_gpu) cfg.decode_gpu = *decode_gpu;
+	if (scaling_gpu) cfg.scaling_gpu = *scaling_gpu;
+	if (priority) cfg.priority = *priority;
+	if (decode_threads) cfg.decode_threads = *decode_threads;
+	if (low_memory) cfg.low_memory = true;
+	if (in_process) cfg.in_process = true;
 	if (!inputs.empty()) { cfg.inputs.clear(); for (auto& i : inputs) add_inputs(cfg, i); }
 	if (output) cfg.output_dir = *output == "off" ? "" : *output;
 	cfg.save_videos = cfg.save_videos && videos;
@@ -990,9 +1026,11 @@ static std::string sub_config(const Config& cfg, const Job& job, const Scenario&
 	if (!sc.chroma.empty()) o << ",\"chroma\":" << list(sc.chroma);
 	if (!sc.bitdepth.empty()) o << ",\"bitdepth\":" << list(sc.bitdepth);
 	if (!sc.range.empty()) o << ",\"range\":" << list(sc.range);
+	if (!sc.trc.empty()) o << ",\"trc\":" << list(sc.trc);
 	if (shape.upscale) o << ",\"upscale\":true";
 	o << "}],\"scaling\":{\"upscaler\":" << jq(cfg.scale.upscaler) << ",\"downscaler\":" << jq(cfg.scale.downscaler);
 	if (!cfg.scale.device.empty()) o << ",\"gpu\":" << jq(cfg.scale.device);
+	if (cfg.scale.bt709_curve != 1) o << ",\"bt709_curve\":" << jq(bt709_curve_name(cfg.scale.bt709_curve));
 	o << "},\"vmaf\":{\"model\":[";
 	for (size_t i = 0, n = vmaf_models(cfg.vo).size(); i < n; i++) o << (i ? "," : "") << jq(vmaf_models(cfg.vo)[i]);
 	o << "],\"device\":" << jq(cfg.vo.device) << "},\"encoders\":[{\"encoder\":" << jq(job.encoder) << ",\"codec\":" << jq(job.codec);
@@ -1299,7 +1337,7 @@ static int run(int argc, char** argv) {
 	};
 
 	for (auto& job : cfg.jobs) for (auto& ax : job.axes) for (auto& sc : cfg.scenarios) {
-		const bool in_scenario = (ax.key == "chroma" && !sc.chroma.empty()) || (ax.key == "bitdepth" && !sc.bitdepth.empty()) || (ax.key == "range" && !sc.range.empty());
+		const bool in_scenario = (ax.key == "chroma" && !sc.chroma.empty()) || (ax.key == "bitdepth" && !sc.bitdepth.empty()) || (ax.key == "range" && !sc.range.empty()) || (ax.key == "trc" && !sc.trc.empty());
 		if (in_scenario && takes_part(job, sc)) {
 			fprintf(stderr, "config: '%s' is listed by encoder '%s' and by scenario '%s'; list it in one of them\n", ax.key.c_str(), job.encoder.c_str(), sc.name.c_str());
 			return 1;
@@ -1322,8 +1360,8 @@ static int run(int argc, char** argv) {
 	};
 	// What an entry's options are made of in a scenario: the scenario only adds its chroma, bit depth and range, so scenarios that list the same ones share the
 	// entry's variants and option table (the sizes and bit rates are put around them later).
-	using ShareKey = std::tuple<const Job*, std::vector<std::string>, std::vector<std::string>, std::vector<std::string>>;
-	auto share_key = [](const Job& job, const Scenario& sc) { return ShareKey{&job, sc.chroma, sc.bitdepth, sc.range}; };
+	using ShareKey = std::tuple<const Job*, std::vector<std::string>, std::vector<std::string>, std::vector<std::string>, std::vector<std::string>>;
+	auto share_key = [](const Job& job, const Scenario& sc) { return ShareKey{&job, sc.chroma, sc.bitdepth, sc.range, sc.trc}; };
 	std::map<ShareKey, std::vector<Variant>> variants;
 	// The options of an entry whose list has "" (not set): for those, a value that is what the encoder has anyway (the default of the run's preset and tune, see
 	// encoder_defaults) is the same run as "", so it is not made. Conditions read an unset option as that default too (unset_value_for), so both make the same runs.
@@ -1333,7 +1371,7 @@ static int run(int argc, char** argv) {
 		if (it != unset_too.end()) return it->second;
 		std::set<std::string> keys;
 		for (auto& ax : job.axes) if (std::find(ax.values.begin(), ax.values.end(), std::string()) != ax.values.end()) keys.insert(ax.key);
-		for (const char* k : {"preset", "tune", "profile", "gpu", "chroma", "bitdepth", "range"}) keys.erase(k);
+		for (const char* k : {"preset", "tune", "profile", "gpu", "chroma", "bitdepth", "range", "trc"}) keys.erase(k);
 		return unset_too[&job] = keys;
 	};
 	// What a condition reads for an option that is not set: the encoder's default with the run's preset, tune, profile, chroma, bit depth and GPU. Not known on a worker
@@ -1346,6 +1384,7 @@ static int run(int argc, char** argv) {
 			int gpu = 0;
 			if (auto it = b.find("gpu"); it != b.end()) { gpu = atoi(it->second.c_str()); b.erase(it); }
 			b.erase("range");
+			b.erase("trc");
 			std::string v;
 			default_of(jp->encoder, jp->codec, key, encoder_defaults(jp->encoder, jp->codec, gpu, b), v);
 			return v;
@@ -1460,8 +1499,9 @@ static int run(int argc, char** argv) {
 			if (models.empty()) ui::log("no worker has a GPU that can encode " + job.encoder + "/" + job.codec + ": those runs are skipped");
 		}
 		for (const Options& base : expand(job.encoder, remote_gpu ? axes_no_gpu : job.axes, {}, unset_value_for(job)))
-			for (auto& chroma : axis(sc.chroma)) for (auto& bitdepth : axis(sc.bitdepth)) for (auto& range : axis(sc.range)) {
+			for (auto& chroma : axis(sc.chroma)) for (auto& bitdepth : axis(sc.bitdepth)) for (auto& range : axis(sc.range)) for (auto& trc : axis(sc.trc)) {
 				Options opts = base;
+				if (!trc.empty()) opts["trc"] = trc;
 				if (!chroma.empty()) opts["chroma"] = chroma;
 				if (!bitdepth.empty()) opts["bitdepth"] = bitdepth;
 				if (!range.empty()) opts["range"] = range;
@@ -1540,6 +1580,7 @@ static int run(int argc, char** argv) {
 			if (!sc.chroma.empty()) free_axes.push_back(Axis{"chroma", sc.chroma, {}, {}});
 			if (!sc.bitdepth.empty()) free_axes.push_back(Axis{"bitdepth", sc.bitdepth, {}, {}});
 			if (!sc.range.empty()) free_axes.push_back(Axis{"range", sc.range, {}, {}});
+			if (!sc.trc.empty()) free_axes.push_back(Axis{"trc", sc.trc, {}, {}});
 			std::vector<Axis> axes;
 			for (auto& ax : job.axes) if (!(remote && is_gpu_encoder(job.encoder) && ax.key == "gpu")) axes.push_back(ax);
 			slot = std::make_unique<LazyTable>(job.encoder, axes, free_axes, job.fixed, job.prune, unset_value_for(job), job.rules);
@@ -1719,8 +1760,8 @@ static int run(int argc, char** argv) {
 			for (size_t k = 0; k < sc.kfs.size(); k++) put("%s%g", k ? "," : "", sc.kfs[k]);
 			put(" s");
 			for (auto& sh : sc.shapes) if (sh.w || sh.fps.num || sh.fps_rule()) put(", %dx%d@%s", sh.w, sh.h, sh.fps.num || sh.fps_rule() ? rate_text(sh).c_str() : "0");
-			for (auto* list : {&sc.chroma, &sc.bitdepth, &sc.range}) if (!list->empty()) {
-				put(", %s ", list == &sc.chroma ? "chroma" : list == &sc.bitdepth ? "bitdepth" : "range");
+			for (auto* list : {&sc.chroma, &sc.bitdepth, &sc.range, &sc.trc}) if (!list->empty()) {
+				put(", %s ", list == &sc.chroma ? "chroma" : list == &sc.bitdepth ? "bitdepth" : list == &sc.range ? "range" : "trc");
 				for (size_t k = 0; k < list->size(); k++) put("%s%s", k ? "," : "", (*list)[k].c_str());
 			}
 			put("\n");
@@ -1807,6 +1848,35 @@ static int run(int argc, char** argv) {
 	// What picks a group's winner: the score the website ranks by by default, the Distorted Score (the encode against the frames its encoder got), less the
 	// overshoot penalty; the True Score (Run::rwm) when a run of the group has no distorted score.
 	auto winner_score = [](const Run& r, bool distorted) { return distorted ? r.distorted.rwm - r.penalty : r.rwm; };
+	// "videos": "best": which of a group's scored runs keep their streams. cfg.best_count, or cfg.best_percent of the group, whichever is more, in the
+	// order winner_score() ranks them; a run whose stream is identical to a better one's adds nothing and does not count.
+	auto best_of_group = [&](const std::vector<Task*>& runs_ok) {
+		bool distorted = true;
+		for (Task* x : runs_ok) distorted &= x->r.has_distorted;
+		std::vector<Task*> ranked = runs_ok;
+		std::stable_sort(ranked.begin(), ranked.end(), [&](Task* a, Task* b) { return winner_score(a->r, distorted) > winner_score(b->r, distorted); });
+		const size_t want = std::max<size_t>((size_t)cfg.best_count, (size_t)std::ceil(ranked.size() * cfg.best_percent / 100.0));
+		std::vector<Task*> keep;
+		std::set<std::string> streams;
+		for (Task* x : ranked) {
+			if (keep.size() >= want) break;
+			if (!x->r.video_sha256.empty() && !streams.insert(x->r.video_sha256).second) continue;
+			keep.push_back(x);
+		}
+		return keep;
+	};
+	// The scored streams of a group's runs that are not among its best so far are deleted. x264 and x265 with a VBV (the CBR ves runs them at) and more
+	// than one thread do not make the same stream twice (their rate control reads the sizes of frames other threads are still encoding), so the stream
+	// that was scored is kept from the start instead of being encoded again when the group is complete.
+	auto trim_held = [&](const std::vector<Task*>& runs_ok) {
+		const std::vector<Task*> keep = best_of_group(runs_ok);
+		for (Task* x : runs_ok) {
+			if (x->r.held_video.empty() || std::find(keep.begin(), keep.end(), x) != keep.end()) continue;
+			std::error_code ec;
+			fs::remove(x->r.held_video, ec);
+			x->r.held_video.clear();
+		}
+	};
 	// The stream of a run goes to the site with its result, which went out without it (UploadItem::late).
 	auto upload_video = [&](const Task& t) {
 		if (!uploader || t.r.result.empty() || t.r.video.empty()) return;
@@ -1854,8 +1924,12 @@ static int run(int argc, char** argv) {
 			if (!cfg.best_videos && !r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) it.video_file = (fs::path(cfg.output_dir) / r.video).string();
 			uploader->add(std::move(it));
 		}
-		// Only the stream of the group's winner stays, decided when the group is complete (see `finish`).
-		if (cfg.best_videos) group_ok[r.group].push_back(&t);
+		// Only the streams of the group's best runs stay, decided when the group is complete (see `finish`); until then the scored streams of the
+		// group's best runs so far are held, and the others go.
+		if (cfg.best_videos) {
+			group_ok[r.group].push_back(&t);
+			trim_held(group_ok[r.group]);
+		}
 		snprintf(line, sizeof line, "%s finished  %s: %.0f kbps, vmaf rwm %.3f mean %.3f min %.3f p5 %.3f%s%s%s%s  [wave %.1fs: encoder busy %.1f, starved %.1f; decoder backed up %.1f; scorer starved %.1f]", r.tag.c_str(), r.label.c_str(), r.kbps,
 		         fs_.rwm, fs_.mean, fs_.min, fs_.p5, rel, r.from_site ? " (from the site)" : r.cached ? " (cached)" : "",
 		         r.gpu.empty() ? "" : " on ", r.gpu.c_str(), r.encode_s, r.enc_busy_s, r.enc_starved_s, r.decode_blocked_s, r.score_starved_s);
@@ -1945,6 +2019,10 @@ static int run(int argc, char** argv) {
 			CachedRun hit;
 			if (!result_load(file, t.key(), hit)) { ui::log("remote: the worker's result for " + t.r.label + " cannot be used (" + file + "): unreadable, or without the distorted score (a worker older than this host?); it is not used"); return; }
 			t.r.kbps = hit.kbps; t.r.scores = std::move(hit.scores); t.r.detail = std::move(hit.detail);
+			// The host never opens the input for a run that names no size or rate, so the geometry the worker encoded at is taken from its result (otherwise the
+			// rewritten result has fps 0 and the site refuses it).
+			if (!t.r.shape.w && hit.width > 0 && hit.height > 0) { t.r.shape.w = hit.width; t.r.shape.h = hit.height; }
+			if (!t.r.shape.fps.num && hit.fps > 0) t.r.shape.fps = Rational{(int)std::lround(hit.fps * 1000), 1000};
 			store_result(t, file, cached_of(t.r), run_details(t));
 			t.r.imported = false; // already rewritten
 			if (uploader && !t.r.result.empty()) {
@@ -2007,6 +2085,29 @@ static int run(int argc, char** argv) {
 		}
 	};
 
+	// A run whose encoder does not know one of its options (AMF: a property the GPU and codec lack) cannot work there, and always will not: it is ignored, and
+	// the file next to where its result would be says so, so that later sweeps ignore it without opening an encoder. The key has the GPU and driver in it.
+	auto ignored_marker = [](const Task& t) { return t.result_file + ".ignored"; };
+	auto remember_ignored = [&](const Task& t) {
+		if (t.result_file.empty()) return;
+		std::error_code ec;
+		fs::create_directories(fs::path(t.result_file).parent_path(), ec);
+		std::ofstream f(ignored_marker(t), std::ios::binary);
+		f << "{\"key\":" << jq(t.key()) << ",\"ignored\":" << jq(t.r.reason) << "}\n";
+	};
+	auto recall_ignored = [&](Task& t) { // the reason it was ignored before, if it was
+		if (t.result_file.empty() || !result_listed(ignored_marker(t))) return false;
+		std::ifstream f(ignored_marker(t));
+		std::stringstream ss; ss << f.rdbuf();
+		try {
+			Json j = Json::parse(ss.str());
+			const Json* k = j.find("key");
+			const Json* why = j.find("ignored");
+			if (!k || !why || k->text() != t.key()) return false;
+			t.r.reason = why->text();
+			return true;
+		} catch (const std::exception&) { return false; }
+	};
 	// Runs the site has already (anyone ran them, here or on another machine, with the very same key: input, encoder and options, GPU and driver, library
 	// versions, scoring models) are not run again: before runs are settled, the site is asked for their keys, a batch at a time, and the result files of
 	// those it has are downloaded into the output folder, where settle() finds them like the results of an earlier sweep (and the next sweep finds them there
@@ -2074,7 +2175,8 @@ static int run(int argc, char** argv) {
 				if (!r.shape.w && hit.width > 0 && hit.height > 0 && hit.fps > 0) { // the geometry the run was encoded at, for the summary: from its result file
 					r.shape.w = hit.width; r.shape.h = hit.height;
 					r.shape.fps = Rational{(int)std::lround(hit.fps * 1000), 1000};
-				} else if (!r.shape.w) if (const SourceInfo* src = source_of(r.input)) { // an older result file: ask the source (which has to be had for that)
+				} else if (r.shape.w && !r.shape.fps.num && hit.fps > 0) r.shape.fps = Rational{(int)std::lround(hit.fps * 1000), 1000}; // a size was asked for, the rate was not
+				else if (!r.shape.w) if (const SourceInfo* src = source_of(r.input)) { // an older result file: ask the source (which has to be had for that)
 					t.plan = make_plan(*src, t.job->encoder, t.job->codec, *t.opts, r.shape);
 					fit_shape(t);
 				}
@@ -2089,6 +2191,7 @@ static int run(int argc, char** argv) {
 				return true;
 			}
 		}
+		if (recall_ignored(t)) { r.ignored = true; finish(t); return true; }
 		return false;
 	};
 	{
@@ -2122,7 +2225,7 @@ static int run(int argc, char** argv) {
 				sm = samples.emplace(&job, decltype(sm->second){}).first;
 				for (size_t a = 0; a < job.axes.size(); a++) {
 					const Axis& ax = job.axes[a];
-					if (job.fixed.count(ax.key) || ax.key == "gpu" || ax.key == "chroma" || ax.key == "bitdepth" || ax.key == "range") continue;
+					if (job.fixed.count(ax.key) || ax.key == "gpu" || ax.key == "chroma" || ax.key == "bitdepth" || ax.key == "range" || ax.key == "trc") continue;
 					std::vector<std::string> vals;
 					bool numeric = true;
 					for (auto& v : ax.values) {
@@ -2383,6 +2486,13 @@ static int run(int argc, char** argv) {
 				}
 				if (!t.ok) r.reason = wr[i].enc.error;
 				std::error_code ec;
+				if (!t.ok && !wr[i].enc.unsupported.empty()) { // the encoder lacks an option of the run: ignored, not failed, and not tried again
+					fs::remove(wr[i].enc.file, ec);
+					r.ignored = true;
+					remember_ignored(t);
+					finish(t);
+					continue;
+				}
 				if (!t.ok && wr[i].enc.no_session) { // not the run's fault: it is made again once the GPU has a session for it
 					fs::remove(wr[i].enc.file, ec);
 					r.reason.clear();
@@ -2412,7 +2522,8 @@ static int run(int argc, char** argv) {
 					continue;
 				}
 				if (t.ok && !check) r.video_sha256 = sha256_file(wr[i].enc.file);
-				if (r.video_file.empty() || cfg.best_videos) fs::remove(wr[i].enc.file, ec); // a temporary file; with "best" the winner is encoded again when its input is done
+				if (t.ok && !check && cfg.best_videos) r.held_video = wr[i].enc.file; // in the scratch folder; finish() deletes it unless the run is among the best so far
+				else if (r.video_file.empty() || cfg.best_videos) fs::remove(wr[i].enc.file, ec); // a temporary file
 				if (cfg.best_videos) r.video.clear();
 				finish(t);
 			}
@@ -2466,23 +2577,12 @@ static int run(int argc, char** argv) {
 		for (auto it = group_ok.begin(); it != group_ok.end();) {
 			auto& runs_ok = it->second;
 			if (runs_ok.empty() || runs_ok.front()->r.input != input_name) { ++it; continue; }
-			bool distorted = true;
-			for (Task* x : runs_ok) distorted &= x->r.has_distorted;
-			// The best runs keep their streams: cfg.best_count, or cfg.best_percent of the group, whichever is more. Runs whose stream is identical to a better one's
-			// add nothing and do not count.
-			std::vector<Task*> ranked = runs_ok;
-			std::stable_sort(ranked.begin(), ranked.end(), [&](Task* a, Task* b) { return winner_score(a->r, distorted) > winner_score(b->r, distorted); });
-			const size_t want = std::max<size_t>((size_t)cfg.best_count, (size_t)std::ceil(ranked.size() * cfg.best_percent / 100.0));
-			std::set<Task*> keep;
-			std::set<std::string> streams;
-			for (Task* x : ranked) {
-				if (keep.size() >= want) break;
-				if (!x->r.video_sha256.empty() && !streams.insert(x->r.video_sha256).second) continue;
-				keep.insert(x);
-			}
+			const std::vector<Task*> winners = best_of_group(runs_ok); // the best runs keep their streams
+			const std::set<Task*> keep(winners.begin(), winners.end());
 			for (Task* x : runs_ok) {
-				if (keep.count(x) || x->r.video.empty()) continue;
 				std::error_code ec;
+				if (!keep.count(x) && !x->r.held_video.empty()) { fs::remove(x->r.held_video, ec); x->r.held_video.clear(); }
+				if (keep.count(x) || x->r.video.empty()) continue;
 				fs::remove(fs::path(cfg.output_dir) / x->r.video, ec);
 				x->r.video.clear();
 				if (uploader && x->r.cached && !x->r.result.empty()) { // an earlier sweep may have sent it to the site as its best
@@ -2493,10 +2593,32 @@ static int run(int argc, char** argv) {
 					uploader->add(std::move(drop));
 				}
 			}
-			for (Task* x : ranked) {
-				if (!keep.count(x)) continue;
+			for (Task* x : winners) {
 				Task* best = x; // one of the best
 				Run& r = best->r;
+				// The stream this sweep scored, held since: it moves next to the result.
+				if (!r.held_video.empty()) {
+					const fs::path to = fs::path(cfg.output_dir) / video_name_of(r);
+					std::error_code ec;
+					fs::remove(to, ec);
+					fs::rename(r.held_video, to, ec);
+					if (ec) { // another drive: copied instead
+						ec.clear();
+						fs::copy_file(r.held_video, to, fs::copy_options::overwrite_existing, ec);
+						std::error_code ec2;
+						fs::remove(r.held_video, ec2);
+					}
+					r.held_video.clear();
+					if (!ec) {
+						r.video = video_name_of(r);
+						ui::log("One of the best of its group  " + r.label + ": stream kept (" + r.video + ")");
+						if (!best->result_file.empty()) store_result(*best, best->result_file, cached_of(r), run_details(*best)); // the result names its stream now
+						upload_video(*best);
+						continue;
+					}
+					ui::log("One of the best of its group  " + r.label + ": its stream could not be moved to " + to.string() + " (" + ec.message() + "); no video");
+					continue;
+				}
 				// A stream an earlier sweep kept is used if it is the one that was scored; anything else there is encoded again.
 				bool kept = false;
 				if (!r.video.empty() && fs::exists(fs::path(cfg.output_dir) / r.video)) {
@@ -2507,6 +2629,7 @@ static int run(int argc, char** argv) {
 				if (kept) {}
 				else if (r.result.empty()) {}
 				else if (r.video_sha256.empty()) ui::log("One of the best of its group  " + r.label + ": its result has no video_sha256, so a new encode cannot be checked against it; no video");
+				else if (r.encoder == "x264" || r.encoder == "x265") ui::log("One of the best of its group  " + r.label + ": scored in an earlier sweep or elsewhere, and " + r.encoder + " with a VBV does not make the same stream twice, so there is no video");
 				else if (!best->model.empty()) remote_winners.push_back(best); // a worker's GPU: a worker with it encodes it again
 				else {
 					r.video_file = (fs::path(cfg.output_dir) / video_name_of(r)).string();

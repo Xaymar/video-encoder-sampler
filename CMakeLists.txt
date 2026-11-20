@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ves LANGUAGES CXX)
+project(ves LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -43,9 +43,8 @@ find_library(X265_LIB x265.dll PATHS "${X265_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
 set(SVTAV1_DIR "${CMAKE_SOURCE_DIR}/third-party/svt-av1/ucrt64" CACHE PATH "SVT-AV1 package root")
 find_library(SVTAV1_LIB SvtAv1Enc.dll PATHS "${SVTAV1_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
 
-# libplacebo (MSYS2 ucrt64 packages: libplacebo with lcms2, libdovi, shaderc and spirv-cross).
-set(PLACEBO_DIR "${CMAKE_SOURCE_DIR}/third-party/libplacebo/ucrt64" CACHE PATH "libplacebo package root")
-find_library(PLACEBO_LIB placebo.dll PATHS "${PLACEBO_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
+# The Vulkan headers (MSYS2 ucrt64 package vulkan-headers) for the converter and the GPU VMAF scorer; the loader is opened at run time.
+set(VULKAN_HEADERS_DIR "${CMAKE_SOURCE_DIR}/third-party/vulkan-headers/ucrt64" CACHE PATH "Vulkan headers package root")
 
 # libvmaf (MSYS2 ucrt64 package).
 set(VMAF_DIR "${CMAKE_SOURCE_DIR}/third-party/vmaf/ucrt64" CACHE PATH "libvmaf package root")
@@ -53,7 +52,7 @@ find_library(VMAF_LIB vmaf.dll PATHS "${VMAF_DIR}/lib" NO_DEFAULT_PATH REQUIRED)
 else()
 	# Linux: the libraries come from the system (or the Flatpak runtime/modules) through pkg-config.
 	find_package(PkgConfig REQUIRED)
-	pkg_check_modules(LIBS REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil x264 SvtAv1Enc libplacebo libvmaf)
+	pkg_check_modules(LIBS REQUIRED IMPORTED_TARGET libavformat libavcodec libavutil x264 SvtAv1Enc libvmaf)
 	find_library(X265_LIB x265 REQUIRED)
 	find_package(Threads REQUIRED)
 	pkg_check_modules(VPL IMPORTED_TARGET vpl) # QuickSync headers; the library itself is loaded at run time
@@ -113,20 +112,20 @@ string(APPEND SPV_TEXT "const unsigned char* spv_find(const char* name, size_t& 
 file(WRITE "${CMAKE_BINARY_DIR}/shaders_spv.cpp.new" "${SPV_TEXT}")
 execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_BINARY_DIR}/shaders_spv.cpp.new" "${CMAKE_BINARY_DIR}/shaders_spv.cpp")
 
-add_executable(ves src/main.cpp src/combos.cpp src/rules.cpp src/source.cpp src/ff.cpp src/ff_source.cpp src/pl_convert.cpp src/ff_decode.cpp src/formats.cpp src/cache.cpp src/gpu.cpp src/versions.cpp src/ui.cpp src/pipeline.cpp src/mux.cpp src/download.cpp src/hash.cpp src/options.cpp src/list_options.cpp src/upload.cpp src/priority.cpp src/vmaf.cpp src/net.cpp src/remote.cpp src/encoder_process.cpp src/vk_compute.cpp src/vk_vmaf.cpp "${CMAKE_BINARY_DIR}/shaders_spv.cpp" src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_qsv.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
+add_executable(ves src/main.cpp src/combos.cpp src/rules.cpp src/source.cpp src/ff.cpp src/ff_source.cpp src/vk_convert.cpp src/ff_decode.cpp src/formats.cpp src/cache.cpp src/gpu.cpp src/versions.cpp src/ui.cpp src/pipeline.cpp src/mux.cpp src/download.cpp src/fsutil.cpp src/hash.cpp src/options.cpp src/list_options.cpp src/upload.cpp src/priority.cpp src/vmaf.cpp src/net.cpp src/remote.cpp src/encoder_process.cpp src/vk_compute.cpp src/vk_vmaf.cpp "${CMAKE_BINARY_DIR}/shaders_spv.cpp" src/encoder_nvenc.cpp src/encoder_amf.cpp src/encoder_qsv.cpp src/encoder_x264.cpp src/encoder_x265.cpp src/encoder_svtav1.cpp)
 target_include_directories(ves PRIVATE "${CMAKE_SOURCE_DIR}/src")
 target_compile_definitions(ves PRIVATE "VES_VERSION=\"${VES_VERSION}\"")
 if(WIN32)
-	target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include" "${CMAKE_SOURCE_DIR}/third-party/amf-include" "${CMAKE_SOURCE_DIR}/third-party/libvpl/ucrt64/include" "${X264_DIR}/include" "${X265_DIR}/include" "${SVTAV1_DIR}/include" "${VMAF_DIR}/include" "${PLACEBO_DIR}/include")
+	target_include_directories(ves PRIVATE "${FFMPEG_DIR}/include" "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include" "${CMAKE_SOURCE_DIR}/third-party/amf-include" "${CMAKE_SOURCE_DIR}/third-party/libvpl/ucrt64/include" "${X264_DIR}/include" "${X265_DIR}/include" "${SVTAV1_DIR}/include" "${VMAF_DIR}/include" "${VULKAN_HEADERS_DIR}/include")
 	target_compile_definitions(ves PRIVATE _CRT_SECURE_NO_WARNINGS)
-	target_link_libraries(ves PRIVATE ${FF_LINK} ${X264_LIB} ${X265_LIB} ${SVTAV1_LIB} ${VMAF_LIB} ${PLACEBO_LIB} d3d11 dxgi CURL::libcurl ws2_32 winmm)
+	target_link_libraries(ves PRIVATE ${FF_LINK} ${X264_LIB} ${X265_LIB} ${SVTAV1_LIB} ${VMAF_LIB} d3d11 dxgi CURL::libcurl ws2_32 winmm)
 	# The manifest makes paths over 260 characters work (needs Windows' LongPathsEnabled setting); results of long names and deep folders would fail without it.
 	target_link_options(ves PRIVATE "SHELL:-Xlinker /MANIFEST:EMBED" "SHELL:-Xlinker /MANIFESTINPUT:${CMAKE_SOURCE_DIR}/src/ves.manifest")
 
 	# Runtime DLLs next to the executable (only the DLLs: the packages' bin folders also hold command line tools).
 	file(GLOB RUNTIME_DLLS CONFIGURE_DEPENDS
 		"${FFMPEG_DIR}/bin/*.dll" "${X264_DIR}/bin/*.dll" "${X265_DIR}/bin/*.dll" "${SVTAV1_DIR}/bin/*.dll"
-		"${CMAKE_SOURCE_DIR}/third-party/libvpl/ucrt64/bin/libvpl-2.dll" "${VMAF_DIR}/bin/libvmaf.dll" "${PLACEBO_DIR}/bin/*.dll")
+		"${CMAKE_SOURCE_DIR}/third-party/libvpl/ucrt64/bin/libvpl-2.dll" "${VMAF_DIR}/bin/libvmaf.dll")
 	add_custom_command(TARGET ves POST_BUILD
 		COMMAND ${CMAKE_COMMAND} -E copy_if_different ${RUNTIME_DLLS} "$<TARGET_FILE_DIR:ves>")
 
@@ -139,7 +138,7 @@ if(WIN32)
 	install(FILES config.jsonc README.md DESTINATION .)
 else()
 	target_include_directories(ves PRIVATE "${CMAKE_SOURCE_DIR}/third-party/nv-codec-headers/include")
-	# The GPU VMAF scorer needs the Vulkan headers (the loader is opened at run time); without them it is left out.
+	# The converter and the GPU VMAF scorer need the Vulkan headers (the loader is opened at run time); without them they are left out.
 	find_path(VULKAN_INCLUDE_DIR vulkan/vulkan.h)
 	if(VULKAN_INCLUDE_DIR)
 		target_include_directories(ves PRIVATE "${VULKAN_INCLUDE_DIR}")
@@ -160,7 +159,7 @@ endif()
 add_executable(ves-vmaf-bench EXCLUDE_FROM_ALL src/vmaf_bench.cpp src/vk_vmaf.cpp src/vk_compute.cpp src/gpu.cpp "${CMAKE_BINARY_DIR}/shaders_spv.cpp")
 target_include_directories(ves-vmaf-bench PRIVATE "${CMAKE_SOURCE_DIR}/src")
 if(WIN32)
-	target_include_directories(ves-vmaf-bench PRIVATE "${PLACEBO_DIR}/include")
+	target_include_directories(ves-vmaf-bench PRIVATE "${VULKAN_HEADERS_DIR}/include")
 	target_compile_definitions(ves-vmaf-bench PRIVATE _CRT_SECURE_NO_WARNINGS)
 	target_link_libraries(ves-vmaf-bench PRIVATE dxgi)
 else()
@@ -168,4 +167,17 @@ else()
 		target_include_directories(ves-vmaf-bench PRIVATE "${VULKAN_INCLUDE_DIR}")
 	endif()
 	target_link_libraries(ves-vmaf-bench PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+endif()
+
+# ves-convert-test: the converter alone on raw frames (tools/convert_test), for checking it against a reference. Not installed.
+if(NOT WIN32)
+	get_target_property(VES_SOURCES ves SOURCES)
+	list(REMOVE_ITEM VES_SOURCES src/main.cpp)
+	add_executable(ves-convert-test EXCLUDE_FROM_ALL tools/convert_test/main.cpp ${VES_SOURCES})
+	get_target_property(VES_INCLUDES ves INCLUDE_DIRECTORIES)
+	get_target_property(VES_DEFS ves COMPILE_DEFINITIONS)
+	get_target_property(VES_LINKS ves LINK_LIBRARIES)
+	target_include_directories(ves-convert-test PRIVATE ${VES_INCLUDES})
+	target_compile_definitions(ves-convert-test PRIVATE ${VES_DEFS})
+	target_link_libraries(ves-convert-test PRIVATE ${VES_LINKS})
 endif()

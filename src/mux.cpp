@@ -21,6 +21,7 @@
 
 extern "C" {
 #include <libavformat/avformat.h>
+#include <libavutil/intreadwrite.h>
 #include <libavutil/mem.h>
 }
 
@@ -339,8 +340,9 @@ Mp4Writer::~Mp4Writer() {
 	delete impl;
 }
 
-bool Mp4Writer::open(const std::string& path, Codec codec, const Shape& enc, const Color& color, int delay_hint) {
+bool Mp4Writer::open(const std::string& path, Codec codec, const Shape& enc, const Color& color, int delay_hint, int coded_w, int coded_h) {
 	path_ = path; codec_ = codec; enc_ = enc; color_ = color; hint_ = delay_hint;
+	coded_w_ = std::max(coded_w, enc.w); coded_h_ = std::max(coded_h, enc.h);
 	if (codec != Codec::H264 && codec != Codec::HEVC && codec != Codec::AV1) return false;
 	th = std::thread([this] { run(); });
 	return true;
@@ -355,7 +357,15 @@ bool Mp4Writer::start(const uint8_t* first, size_t size) {
 	AVCodecParameters* cp = st->codecpar;
 	cp->codec_type = AVMEDIA_TYPE_VIDEO;
 	cp->codec_id = id;
-	cp->width = enc_.w; cp->height = enc_.h;
+	cp->width = coded_w_; cp->height = coded_h_;
+	if (coded_w_ != enc_.w || coded_h_ != enc_.h) {
+		// The padding the encoder added at the right and bottom, as FFmpeg's frame cropping (top, bottom, left, right; little endian), which the MP4 muxer
+		// writes as a 'clap' box and demuxers read back. AV1 has no cropping in the stream itself.
+		AVPacketSideData* sd = av_packet_side_data_new(&cp->coded_side_data, &cp->nb_coded_side_data, AV_PKT_DATA_FRAME_CROPPING, 4 * sizeof(uint32_t), 0);
+		if (!sd) return false;
+		const uint32_t crop[4] = {0, (uint32_t)(coded_h_ - enc_.h), 0, (uint32_t)(coded_w_ - enc_.w)};
+		for (int i = 0; i < 4; i++) AV_WL32(sd->data + 4 * i, crop[i]);
+	}
 	cp->format = av_planar_format(enc_.pix.chroma, enc_.pix.depth);
 	cp->color_range = (AVColorRange)color_.range;
 	cp->color_space = (AVColorSpace)color_.space;

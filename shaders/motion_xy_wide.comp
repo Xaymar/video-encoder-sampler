@@ -1,0 +1,69 @@
+#version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+// motion_xy with wider tiles (64 x 16 outputs per workgroup): the difference of the two frames is read once per sample into shared memory
+// (motion_xy read each of the 5 rows of the vertical convolution again for every output, 12.5 reads per output), then the vertical
+// convolution of the 20 rows, the horizontal one, the absolute value and the sum of the workgroup: the same integer steps as motion_xy and
+// motion_y + motion_x, so the same sums (up to 15 bits per sample).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Prev { uint prev[]; };
+layout(std430, binding = 1) readonly buffer Cur { uint cur[]; };
+layout(std430, binding = 3) writeonly buffer Part { uint part[]; };
+layout(push_constant) uniform PC { int W; int H; int bpc; } pc;
+
+const int F[5] = int[5](3571, 16004, 26386, 16004, 3571);
+const int TW = 64, TH = 16, CW = TW + 4, RH = TH + 4;
+shared int dif[RH][CW];
+shared int gY[TH][CW];
+shared uint total;
+
+int mirror(int i, int n) {
+	if (i < 0) return -i;
+	if (i >= n) return 2 * n - i - 2;
+	return i;
+}
+
+int sample_at(bool a, int idx) {
+	if (pc.bpc > 8) {
+		uint w = a ? prev[idx >> 1] : cur[idx >> 1];
+		return int((w >> ((idx & 1) * 16)) & 65535u);
+	}
+	uint w = a ? prev[idx >> 2] : cur[idx >> 2];
+	return int((w >> ((idx & 3) * 8)) & 255u);
+}
+
+void main() {
+	const int x0 = int(gl_WorkGroupID.x) * TW, y0 = int(gl_WorkGroupID.y) * TH;
+	const int lid = int(gl_LocalInvocationIndex);
+	if (lid == 0) total = 0u;
+	// rows y0 - 2 .. y0 + TH + 1 (mirrored at the edges; past them only for outputs that are not used), columns x0 - 2 .. x0 + TW + 1
+	for (int e = lid; e < RH * CW; e += 256) {
+		const int r = e / CW, c = e % CW;
+		const int x = clamp(mirror(x0 - 2 + c, pc.W), 0, pc.W - 1);
+		const int row = clamp(mirror(y0 - 2 + r, pc.H), 0, pc.H - 1);
+		dif[r][c] = sample_at(true, row * pc.W + x) - sample_at(false, row * pc.W + x);
+	}
+	barrier();
+	for (int e = lid; e < TH * CW; e += 256) {
+		const int ly = e / CW, c = e % CW;
+		int v = 0;
+		if (y0 + ly < pc.H) {
+			int acc = 0;
+			for (int k = 0; k < 5; k++) acc += F[k] * dif[ly + k][c];
+			v = (acc + (1 << (pc.bpc - 1))) >> pc.bpc;
+		}
+		gY[ly][c] = v;
+	}
+	barrier();
+	uint a = 0u;
+	for (int e = lid; e < TH * TW; e += 256) {
+		const int ly = e / TW, lx = e % TW;
+		if (x0 + lx < pc.W && y0 + ly < pc.H) {
+			int64_t acc = 0;
+			for (int k = 0; k < 5; k++) acc += int64_t(F[k]) * int64_t(gY[ly][lx + k]);
+			a += uint(abs(int((acc + 32768) >> 16)));
+		}
+	}
+	atomicAdd(total, a);
+	barrier();
+	if (lid == 0) part[gl_WorkGroupID.y * gl_NumWorkGroups.x + gl_WorkGroupID.x] = total;
+}

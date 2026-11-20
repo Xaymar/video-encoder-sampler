@@ -1,0 +1,22 @@
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+// The converter's last step: a plane of floats (nominal values) into samples of `bytes` (1 or 2, little-endian, the value in the low bits): value
+// times `mul` plus `add`, rounded to the nearest whole number (no dithering) and clamped to 0 .. maxv. Rows are `stride_words` words apart from word
+// `base_words` on; each invocation writes one word.
+layout(std430, binding = 0) readonly buffer Src { float src[]; };
+layout(std430, binding = 1) buffer Dst { uint dst[]; };
+layout(push_constant) uniform PC { int w, h, base_words, stride_words, bytes; float mul, add, maxv; } pc;
+
+uint code(int x, int y) { return uint(clamp(floor(src[y * pc.w + x] * pc.mul + pc.add + 0.5), 0.0, pc.maxv)); }
+
+void main() {
+	const int kx = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+	const int per = 4 / pc.bytes;
+	if (kx * per >= pc.w || y >= pc.h) return;
+	uint word = 0u;
+	for (int s = 0; s < per; s++) {
+		const int x = kx * per + s;
+		if (x < pc.w) word |= code(x, y) << uint(s * 8 * pc.bytes);
+	}
+	dst[pc.base_words + y * pc.stride_words + kx] = word;
+}

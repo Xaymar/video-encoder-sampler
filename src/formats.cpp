@@ -58,7 +58,7 @@ Settings open_and_read(const std::string& encoder, const std::string& codec, int
 	for (auto& [k, v] : base) {
 		if (k == "chroma") chroma = atoi(v.c_str());
 		else if (k == "bitdepth") depth = atoi(v.c_str());
-		else if (k != "range") p.options[k] = v;
+		else if (k != "range" && k != "trc") p.options[k] = v;
 	}
 	p.pix = planar_fmt(chroma, depth);
 	if (is_gpu_encoder(encoder)) p.options["gpu"] = std::to_string(gpu);

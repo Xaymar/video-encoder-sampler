@@ -1,0 +1,119 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "cv_common.glsl"
+layout(local_size_x = 16, local_size_y = 8) in;
+// The linear-light scaling step in one pass, for a polar (EWA) kernel: cv_to_linear's work as the input samples are read into shared memory,
+// cv_resample_ewa's on all three channels at once (each tap's weight found once for the three), and cv_from_linear's on the result. The
+// arithmetic and its order are those of the three separate passes, so both give the same values. Takes full-resolution Y, Cb, Cr (or R, G, B)
+// and writes Y, Cb, Cr. vk_convert.cpp uses it only where a 16 x 8 tile's input fits (TILE samples per channel; it checks with the same bounds).
+const int TILE = 3072, LUT_MAX = 1025;
+layout(std430, binding = 0) readonly buffer S0 { float s0[]; };
+layout(std430, binding = 1) readonly buffer S1 { float s1[]; };
+layout(std430, binding = 2) readonly buffer S2 { float s2[]; };
+layout(std430, binding = 3) writeonly buffer D0 { float d0[]; };
+layout(std430, binding = 4) writeonly buffer D1 { float d1[]; };
+layout(std430, binding = 5) writeonly buffer D2 { float d2[]; };
+layout(std430, binding = 6) readonly buffer Lut { float lut[]; };
+layout(push_constant) uniform PC {
+	int in_w, in_h, out_w, out_h, lut_n;
+	float ax, bx, ay, by, fx, fy, radius;
+	int rgb, trc_in, sig, trc_out, pre;
+	float kr_in, kb_in, kr_out, kb_out;
+	int px, py; // > 0: the outputs' sample positions repeat every px columns and py rows exactly (in float), so the weights are found once per phase
+} pc;
+
+shared float t0[TILE], t1[TILE], t2[TILE];
+shared float slut[LUT_MAX];
+const int WMAX = 1024; // weights of every phase (vk_convert.cpp checks they fit)
+shared float wt[WMAX];
+
+float kernel(float d) {
+	if (d >= pc.radius) return 0.0;
+	const float p = d / pc.radius * float(pc.lut_n - 1);
+	const int i = min(int(p), pc.lut_n - 2);
+	return mix(slut[i], slut[i + 1], p - float(i));
+}
+
+void main() {
+	const int j0 = int(gl_WorkGroupID.x) * 16, k0 = int(gl_WorkGroupID.y) * 8;
+	const float sx = pc.radius * pc.fx, sy = pc.radius * pc.fy;
+	const int x0 = int(ceil(pc.ax * float(j0) + pc.bx - sx)), x1 = int(floor(pc.ax * float(j0 + 15) + pc.bx + sx));
+	const int y0 = int(ceil(pc.ay * float(k0) + pc.by - sy)), y1 = int(floor(pc.ay * float(k0 + 7) + pc.by + sy));
+	const int tw = x1 - x0 + 1, th = y1 - y0 + 1;
+	const int lid = int(gl_LocalInvocationIndex);
+	for (int i = lid; i < tw * th; i += 128) {
+		const int ty = i / tw, tx = i - ty * tw;
+		const int at = clamp(y0 + ty, 0, pc.in_h - 1) * pc.in_w + clamp(x0 + tx, 0, pc.in_w - 1);
+		float r, g, b;
+		if (pc.rgb != 0) { r = s0[at]; g = s1[at]; b = s2[at]; }
+		else {
+			const float y = s0[at], cb = s1[at], cr = s2[at], kg = 1.0 - pc.kr_in - pc.kb_in;
+			r = y + 2.0 * (1.0 - pc.kr_in) * cr;
+			b = y + 2.0 * (1.0 - pc.kb_in) * cb;
+			g = (y - pc.kr_in * r - pc.kb_in * b) / kg;
+		}
+		if (pc.trc_in > 0) { r = to_linear(pc.trc_in, r); g = to_linear(pc.trc_in, g); b = to_linear(pc.trc_in, b); }
+		if (pc.sig != 0) { r = sigmoidize(r); g = sigmoidize(g); b = sigmoidize(b); }
+		t0[i] = r; t1[i] = g; t2[i] = b;
+	}
+	for (int i = lid; i < pc.lut_n; i += 128) slut[i] = lut[i];
+	barrier();
+	// per phase (output column j % px, row k % py; the outputs j = 0..px-1, k = 0..py-1 stand for them): the tap weights in the order the loop
+	// below takes them, the same values it would compute itself (x - u is exact, and the same, for every output of a phase)
+	const int nx = int(floor(2.0 * sx)) + 2, ny = int(floor(2.0 * sy)) + 2; // at most this many taps per axis (slots past the last stay unused)
+	if (pc.px > 0) {
+		for (int i = lid; i < pc.px * pc.py * nx * ny; i += 128) {
+			const int ph = i / (nx * ny), t = i - ph * nx * ny, ty = t / nx, tx = t - ty * nx;
+			const int pj = ph % pc.px, pk = ph / pc.px;
+			const float u = pc.ax * float(pj) + pc.bx, v = pc.ay * float(pk) + pc.by;
+			const int x = int(ceil(u - sx)) + tx, y = int(ceil(v - sy)) + ty;
+			if (float(x) <= u + sx && float(y) <= v + sy) {
+				const float dx = (float(x) - u) / pc.fx, dy = (float(y) - v) / pc.fy;
+				wt[i] = kernel(sqrt(dx * dx + dy * dy));
+			}
+		}
+		barrier();
+	}
+	const int j = j0 + int(gl_LocalInvocationID.x), k = k0 + int(gl_LocalInvocationID.y);
+	if (j >= pc.out_w || k >= pc.out_h) return;
+	const float u = pc.ax * float(j) + pc.bx, v = pc.ay * float(k) + pc.by;
+	float a0 = 0.0, a1 = 0.0, a2 = 0.0, wsum = 0.0;
+	if (pc.px > 0) {
+		const int wb = ((k % pc.py) * pc.px + j % pc.px) * nx * ny;
+		const int xs = int(ceil(u - sx)), ys = int(ceil(v - sy));
+		int cx = 0, cy = 0;
+		while (float(xs + cx) <= u + sx) cx++;
+		while (float(ys + cy) <= v + sy) cy++;
+		for (int ty = 0; ty < cy; ty++) {
+			const int row = (ys + ty - y0) * tw - x0 + xs, wr = wb + ty * nx;
+			for (int tx = 0; tx < cx; tx++) {
+				const float w = wt[wr + tx];
+				a0 += w * t0[row + tx];
+				a1 += w * t1[row + tx];
+				a2 += w * t2[row + tx];
+				wsum += w;
+			}
+		}
+	} else
+	for (int y = int(ceil(v - sy)); float(y) <= v + sy; y++) {
+		const float dy = (float(y) - v) / pc.fy;
+		const int row = (y - y0) * tw - x0;
+		for (int x = int(ceil(u - sx)); float(x) <= u + sx; x++) {
+			const float dx = (float(x) - u) / pc.fx;
+			const float w = kernel(sqrt(dx * dx + dy * dy));
+			a0 += w * t0[row + x];
+			a1 += w * t1[row + x];
+			a2 += w * t2[row + x];
+			wsum += w;
+		}
+	}
+	float r = wsum != 0.0 ? a0 / wsum : 0.0, g = wsum != 0.0 ? a1 / wsum : 0.0, b = wsum != 0.0 ? a2 / wsum : 0.0;
+	if (pc.sig != 0) { r = unsigmoidize(r); g = unsigmoidize(g); b = unsigmoidize(b); }
+	if (pc.pre > 0) { r = to_linear(pc.pre, r); g = to_linear(pc.pre, g); b = to_linear(pc.pre, b); }
+	if (pc.trc_out > 0) { r = from_linear(pc.trc_out, r); g = from_linear(pc.trc_out, g); b = from_linear(pc.trc_out, b); }
+	const float yy = pc.kr_out * r + (1.0 - pc.kr_out - pc.kb_out) * g + pc.kb_out * b;
+	const int o = k * pc.out_w + j;
+	d0[o] = yy;
+	d1[o] = (b - yy) / (2.0 * (1.0 - pc.kb_out));
+	d2[o] = (r - yy) / (2.0 * (1.0 - pc.kr_out));
+}

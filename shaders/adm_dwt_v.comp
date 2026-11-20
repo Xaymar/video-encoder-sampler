@@ -23,7 +23,7 @@ void main() {
 	for (int p = 0; p < 2; p++) {
 		int s[4];
 		for (int k = 0; k < 4; k++)
-			s[k] = pc.scale == 0 ? sample_at(p == 0, ind[k] * pc.SW + x) : prev[(p == 0 ? RA : DA) * pc.prevN + ind[k] * pc.SW + x];
+			s[k] = pc.scale == 0 ? sample_at(p == 0, ind[k] * pc.SW + x) : prev_band(p == 0 ? RA : DA, ind[k] * pc.SW + x);
 		int tl, th;
 		if (pc.scale == 0) {
 			int lo = 0, hi = 0;

@@ -227,7 +227,9 @@ public:
 		return true;
 	}
 
-	bool add(const Picture& ref, const Picture& dis) override {
+	bool add(const Picture& ref_in, const Picture& dis_in) override {
+		Picture ref = ref_in, dis = dis_in;
+		if (!picture_to_memory(ref) || !picture_to_memory(dis)) return false;
 		VmafPicture rp{}, dp{};
 		if (!to_picture(ref, rp)) return false;
 		if (!to_picture(dis, dp)) { vmaf_picture_unref(&rp); return false; }
@@ -267,15 +269,43 @@ class GpuScorer : public Scorer {
 	int w, h;
 
 public:
+	long long in_place = 0, ref_in_place = 0; // frames scored where they are on the GPU (encoded, original)
+	bool told_refused = false, told_ref_refused = false;
 	GpuScorer(std::unique_ptr<GpuVmaf> g, int w, int h) : gpu(std::move(g)), w(w), h(h) {}
-	bool add(const Picture& ref, const Picture& dis) override {
-		if (ref.width != w || ref.height != h || dis.width != w || dis.height != h) { fprintf(stderr, "vmaf: the frames are not %dx%d\n", w, h); return false; }
-		if (ref.fmt != dis.fmt || !ref.fmt.planar || ref.fmt.rgb) { fprintf(stderr, "vmaf: the frames are not in the same planar YUV format\n"); return false; }
+	bool add(const Picture& ref_in, const Picture& dis_in) override {
+		if (ref_in.width != w || ref_in.height != h || dis_in.width != w || dis_in.height != h) { fprintf(stderr, "vmaf: the frames are not %dx%d\n", w, h); return false; }
+		if (ref_in.fmt != dis_in.fmt || !ref_in.fmt.planar || ref_in.fmt.rgb) { fprintf(stderr, "vmaf: the frames are not in the same planar YUV format\n"); return false; }
+		// Either frame may still be on the GPU (decoded or converted there): it is scored where it is when this device can read it, else read back first.
+		Picture ref = ref_in, dis = dis_in;
+		if (ref.gpu && !gpu->takes(ref.gpu.get())) {
+			if (!told_ref_refused) { told_ref_refused = true; fprintf(stderr, "vmaf: original frames on the GPU are read back to memory to be scored (another device, or a layout the scorer cannot read)\n"); }
+			if (!picture_to_memory(ref)) return false;
+		}
+		if (dis.gpu && !gpu->takes(dis.gpu.get())) {
+			if (!told_refused) { told_refused = true; fprintf(stderr, "vmaf: frames decoded on the GPU are read back to memory to be scored (another device, or a layout the scorer cannot read)\n"); }
+			if (!picture_to_memory(dis)) return false;
+		}
 		const uint8_t* rd[3] = {ref.data[0], ref.data[1], ref.data[2]};
-		const uint8_t* dd[3] = {dis.data[0], dis.data[1], dis.data[2]};
 		const size_t rs[3] = {(size_t)ref.stride[0], (size_t)ref.stride[1], (size_t)ref.stride[2]};
+		const uint8_t* dd[3] = {dis.data[0], dis.data[1], dis.data[2]};
 		const size_t ds[3] = {(size_t)dis.stride[0], (size_t)dis.stride[1], (size_t)dis.stride[2]};
-		return gpu->add(rd, rs, dd, ds);
+		bool refused = false;
+		if (gpu->add_any(rd, rs, ref.gpu.get(), dd, ds, dis.gpu.get(), refused)) {
+			if (dis.gpu) in_place++;
+			if (ref.gpu) ref_in_place++;
+			static std::atomic<bool> told_dis{false}, told_ref{false};
+			if (dis.gpu && !told_dis.exchange(true)) fprintf(stderr, "vmaf: encoded frames on the GPU are scored there, without reading them back\n");
+			if (ref.gpu && !told_ref.exchange(true)) fprintf(stderr, "vmaf: original frames on the GPU are scored there, without reading them back\n");
+			return true;
+		}
+		if (!refused) return false;
+		// takes() said yes but add_any() refused after all: read both back.
+		if (!picture_to_memory(ref) || !picture_to_memory(dis)) return false;
+		const uint8_t* rd2[3] = {ref.data[0], ref.data[1], ref.data[2]};
+		const size_t rs2[3] = {(size_t)ref.stride[0], (size_t)ref.stride[1], (size_t)ref.stride[2]};
+		const uint8_t* dd2[3] = {dis.data[0], dis.data[1], dis.data[2]};
+		const size_t ds2[3] = {(size_t)dis.stride[0], (size_t)dis.stride[1], (size_t)dis.stride[2]};
+		return gpu->add(rd2, rs2, dd2, ds2);
 	}
 	bool timing(double& copy, double& wait, double& g, double& results) const override { gpu->timing(copy, wait, g, results); return true; }
 	void gpu_parts(std::vector<std::pair<std::string, double>>& parts) const override { gpu->gpu_parts(parts); }
@@ -307,7 +337,7 @@ bool vmaf_score(const RefInfo& ref, const FrameFeed& next_ref, Codec codec, cons
 	score_clock = ScoreClock();
 	score_clock.began = std::chrono::steady_clock::now();
 	auto decoder = make_decoder();
-	if (!decoder->open(codec, extradata)) return false;
+	if (!decoder->open(codec, extradata, &enc)) return false;
 	long long m = 0;
 	bool flushed = false;
 	const FrameFeed next_dis = [&](Picture& d) -> int {
@@ -333,7 +363,13 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
                        Fmt score_fmt, const VmafOptions& opt, const ScaleOptions& scale, std::vector<double>& scores, RunProgress* rp, VmafDetail* detail) {
 	if (rp) rp->begin(2, std::max<long long>(1, ref.frames));
 
-	const bool convert_dis = enc.w != ref.width || enc.h != ref.height || enc.pix != score_fmt || (decoded_color.range ? decoded_color.range : 1) != ref.score_range; // scale back, change format, change range back
+	// The encode's transfer curve differs from the reference's (the "trc" option): converted back to the reference's in linear light.
+	const int ref_trc = ref.color.trc != 2 && ref.color.trc != 0 ? ref.color.trc : ref.rgb ? 13 : 1;
+	const bool trc_back = decoded_color.trc != 2 && decoded_color.trc != 0 && decoded_color.trc != ref_trc;
+	const bool convert_dis = enc.w != ref.width || enc.h != ref.height || enc.pix != score_fmt || (decoded_color.range ? decoded_color.range : 1) != ref.score_range ||
+	                         trc_back; // scale back, change format, change range or curve back
+	ScaleOptions back = scale;
+	back.trc = trc_back ? ref_trc : 0;
 
 	// "gpu" needs the GPU scorer; "auto" falls back to libvmaf when it cannot be used.
 	std::unique_ptr<Scorer> scorer;
@@ -373,6 +409,7 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 		scorer = std::move(cpu);
 	}
 	auto up = make_converter();
+	up->set_output_on_gpu(dynamic_cast<GpuScorer*>(scorer.get()) != nullptr); // the GPU scorer takes the frames scaled back where they are
 	Picture d, u, r;
 	long long m = 0, mo = 0, k = 0; // decoded frames in, converted frames out, original frame index
 
@@ -397,7 +434,7 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 			if (rp) rp->step();
 		}
 	};
-	// libplacebo holds frames back until it has seen the next one, so converted frames are collected as they appear.
+	// The converter holds frames back while they are in flight on the GPU, so converted frames are collected as they appear.
 	auto collect_converted = [&] {
 		int got;
 		while (ok && (got = up->pop(u)) == 1) show(u, mo++);
@@ -406,8 +443,8 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 	};
 	for (int got; ok && (got = next_dis(d)) != 0;) {
 		if (got < 0) { ok = false; break; }
-		// AMF's AV1 on RDNA 3 codes 1080 lines as 1082 (Av1AlignmentMode 64X16_1080P_CODED_1082); a few padding lines or columns at the bottom and
-		// right are cut off, as the frame's render size says.
+		// An encoder that pads the picture (Encoder::coded_w/coded_h: AMF's AV1 codes 64x16 blocks, 1920x1080 as 1920x1088) decodes that large, since AV1
+		// cannot crop; the MP4 crops it, the raw stream scored here does not. The padding at the right and bottom is cut off, so the score is of the picture.
 		if (d.fmt == enc.pix && d.width >= enc.w && d.height >= enc.h && d.width - enc.w < 64 && d.height - enc.h < 16) { d.width = enc.w; d.height = enc.h; }
 		if (d.width != enc.w || d.height != enc.h || d.fmt != enc.pix) {
 			fprintf(stderr, "decoded stream is %dx%d %d-bit %d, expected %dx%d %d-bit %d\n", d.width, d.height, d.fmt.depth, d.fmt.chroma, enc.w, enc.h, enc.pix.depth, enc.pix.chroma);
@@ -417,9 +454,9 @@ bool vmaf_score_frames(const RefInfo& ref, const FrameFeed& next_ref, const Fram
 		d.color = decoded_color;
 		if (!convert_dis) show(d, m);
 		else {
-			d.pts = m;
-			d.duration = 1; // libplacebo needs it to know when the last frame ends; the packets carry none
-			if (m == 0 && !up->open(d, enc.fps.inverse(), ref.width, ref.height, score_fmt, scale, ref.score_range)) { fprintf(stderr, "vmaf: cannot scale the encoded frames back to %dx%d\n", ref.width, ref.height); ok = false; break; }
+			d.pts = m; // a frame on the GPU is converted where it is (or read back by the converter when it is on another device)
+			d.duration = 1; // the packets carry none
+			if (m == 0 && !up->open(d, enc.fps.inverse(), ref.width, ref.height, score_fmt, back, ref.score_range)) { fprintf(stderr, "vmaf: cannot scale the encoded frames back to %dx%d\n", ref.width, ref.height); ok = false; break; }
 			bool pushed;
 			{ Timed t{score_clock.convert}; pushed = up->push(&d); }
 			if (!pushed) { fprintf(stderr, "scaling the decoded frame back failed\n"); ok = false; break; }

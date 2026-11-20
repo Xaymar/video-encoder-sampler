@@ -14,7 +14,7 @@ void main() {
 	int64_t acc[3] = int64_t[3](0l, 0l, 0l);
 	for (int j = pc.cl + int(lid); j < pc.cr; j += 256) {
 		for (int band = 0; band < 3; band++) {
-			const int src = cur[(RH + band) * N + row * pc.BW + j];
+			const int src = cur_band(RH + band, row * pc.BW + j, N);
 			uint64_t val;
 			if (pc.scale == 0) {
 				const uint64_t a = uint64_t(uint(abs(src)) & 65535u);

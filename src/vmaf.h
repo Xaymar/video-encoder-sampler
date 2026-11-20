@@ -54,6 +54,7 @@ struct RefInfo {
 	long long frames = 0; // expected number of original frames, for the progress display only
 	Rational framerate;
 	Color color;
+	bool rgb = false;    // the source is RGB (an untagged transfer curve is then taken as sRGB, else as BT.709, as the converter does)
 	int score_range = 1; // the range of the reference frames (1 limited, 2 full); the decoded stream is converted to it
 };
 using FrameFeed = std::function<int(Picture&)>; // 1: a frame, 0: no more, <0: error

@@ -7,7 +7,14 @@ def load(path):
     b = open(path, 'rb').read()
     bw, bh, nblk, ncm = struct.unpack_from('<4i', b, 0)
     n = bw * bh
-    cur = struct.unpack_from('<%di' % (nblk * n), b, 16)
+    cur = list(struct.unpack_from('<%di' % (nblk * n), b, 16))
+    # scale 0's bands are packed: block k (0..3) holds the reference's band k in its low 16 bits and the distorted frame's in its high ones
+    for k in range(4):
+        for i in range(n):
+            w = cur[k * n + i]
+            lo = w & 0xffff
+            cur[k * n + i] = lo - 0x10000 if lo >= 0x8000 else lo
+            cur[(k + 4) * n + i] = w >> 16
     off = 16 + 4 * nblk * n
     cm = struct.unpack_from('<%dq' % (ncm // 8), b, off)
     off += ncm

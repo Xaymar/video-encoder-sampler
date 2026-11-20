@@ -10,6 +10,7 @@
 
 #include <curl/curl.h>
 
+#include "fsutil.h"
 #include "ui.h"
 
 namespace fs = std::filesystem;
@@ -39,8 +40,13 @@ Meta read_meta(const fs::path& p) {
 }
 
 void write_meta(const fs::path& p, const Meta& m) {
-	std::ofstream f(p, std::ios::trunc);
+	const fs::path tmp = unique_temp_path(p); // whole or not at all: a reader never sees half a meta file
+	std::ofstream f(tmp, std::ios::trunc);
 	f << "url=" << m.url << "\netag=" << m.etag << "\nlast_modified=" << m.last_modified << "\nsize=" << m.size << "\n";
+	f.close();
+	std::error_code ec;
+	if (f) fs::rename(tmp, p, ec);
+	if (!f || ec) fs::remove(tmp, ec);
 }
 
 std::string file_name_of(const std::string& url) {
@@ -172,6 +178,10 @@ std::string fetch_url(const std::string& url, const std::string& dir, RunProgres
 	fs::create_directories(fs::path(dir) / folder, ec);
 	const fs::path file = fs::path(dir) / folder / file_name_of(url);
 	const fs::path part = file.string() + ".part", meta_file = file.string() + ".meta";
+	// One process at a time per file: the others wait here, and then find the finished download (or continue where a crashed one stopped).
+	// Without this, two processes appended to the same .part and the damage was never noticed. The OS drops the lock when a process dies.
+	FileLock lock(file.string() + ".lock");
+	if (!lock.locked()) throw std::runtime_error("cannot lock " + file.string() + ".lock");
 	// A copy whose size is not the one written down is damaged (two writers at once, an interrupted move): start over.
 	auto intact = [&] {
 		if (!fs::exists(file) || !fs::exists(meta_file)) return false;
@@ -251,8 +261,8 @@ std::string fetch_url(const std::string& url, const std::string& dir, RunProgres
 		}
 		if (t.total && t.done != t.total) throw std::runtime_error("the download is incomplete (" + size_text(t.done) + " of " + size_text(t.total) + "); run again to continue");
 
-		fs::remove(file, ec);
-		fs::rename(part, file, ec);
+		if (fs::file_size(part, ec) != t.done || ec) throw std::runtime_error("the download of " + url + " is not the size that arrived; run again");
+		fs::rename(part, file, ec); // replaces an earlier copy in one step
 		if (ec) throw std::runtime_error("cannot move the download into place: " + ec.message());
 		Meta m;
 		m.url = url; m.etag = t.etag; m.last_modified = t.modified; m.size = t.done;

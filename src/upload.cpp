@@ -1,4 +1,5 @@
 #include "upload.h"
+#include "fsutil.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -413,8 +414,7 @@ bool Uploader::fetch_result(const std::string& uuid, const std::string& file, st
 	if (r.status != 200 || r.body.empty()) { why = Site::why(r); return false; }
 	std::error_code ec;
 	fs::create_directories(fs::path(file).parent_path(), ec);
-	fs::path tmp = file;
-	tmp += ".site";
+	const fs::path tmp = unique_temp_path(file, "site");
 	{
 		std::ofstream f(tmp, std::ios::binary);
 		f.write(r.body.data(), (std::streamsize)r.body.size());

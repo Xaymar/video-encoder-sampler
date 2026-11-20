@@ -1,0 +1,26 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "cv_common.glsl"
+layout(local_size_x = 256) in;
+// Three planes of the same size, in place: Y'CbCr (nominal values) to R'G'B' with the matrix of Kr, Kb (`rgb` 1: they already are R'G'B'), then,
+// with `trc` > 0, to linear light through that curve, and with `sig` 1 on to sigmoidal light (for upscaling, see cv_common.glsl).
+layout(std430, binding = 0) buffer P0 { float p0[]; };
+layout(std430, binding = 1) buffer P1 { float p1[]; };
+layout(std430, binding = 2) buffer P2 { float p2[]; };
+layout(push_constant) uniform PC { int n, rgb, trc, sig; float kr, kb; } pc;
+
+void main() {
+	const int i = int(gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 256u + gl_GlobalInvocationID.x);
+	if (i >= pc.n) return;
+	float r, g, b;
+	if (pc.rgb != 0) { r = p0[i]; g = p1[i]; b = p2[i]; }
+	else {
+		const float y = p0[i], cb = p1[i], cr = p2[i], kg = 1.0 - pc.kr - pc.kb;
+		r = y + 2.0 * (1.0 - pc.kr) * cr;
+		b = y + 2.0 * (1.0 - pc.kb) * cb;
+		g = (y - pc.kr * r - pc.kb * b) / kg;
+	}
+	if (pc.trc > 0) { r = to_linear(pc.trc, r); g = to_linear(pc.trc, g); b = to_linear(pc.trc, b); }
+	if (pc.sig != 0) { r = sigmoidize(r); g = sigmoidize(g); b = sigmoidize(b); }
+	p0[i] = r; p1[i] = g; p2[i] = b;
+}

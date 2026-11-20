@@ -1,0 +1,41 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16) in;
+#include "cambi_common.glsl"
+// cambi_decimate and both passes of cambi_mode in one: the next scale (every second sample of the image and of the mask of the scale before,
+// pc.W x pc.H, into pc.OW x pc.OH), and the 3x3 mode filter of its image, from a tile with a border of one sample in shared memory. The
+// same values as the three passes: the mode (else the minimum) of three along the rows, then along the columns; the first and last rows keep
+// their samples, the first and last columns their row-filtered ones.
+layout(std430, binding = 0) readonly buffer Img { uint img[]; };
+layout(std430, binding = 1) readonly buffer Mask { uint mask[]; };
+layout(std430, binding = 2) writeonly buffer OImg { uint oimg[]; };
+layout(std430, binding = 3) writeonly buffer OMask { uint omask[]; };
+
+uint cmin3(uint a, uint b, uint c) { return (a <= b && a <= c) ? a : (b <= c ? b : c); }
+uint cmode3(uint a, uint b, uint c) { return (a == b || a == c) ? a : (b == c ? b : cmin3(a, b, c)); }
+
+const int T = 16, B = T + 2;
+shared uint sv[B][B]; // the decimated samples, rows i0 - 1 .. i0 + T, columns j0 - 1 .. j0 + T
+shared uint sr[B][T]; // ... filtered along the rows
+
+void main() {
+	const int w = pc.OW, h = pc.OH;
+	const int j0 = int(gl_WorkGroupID.x) * T, i0 = int(gl_WorkGroupID.y) * T;
+	const int lid = int(gl_LocalInvocationIndex);
+	for (int e = lid; e < B * B; e += 256) {
+		const int r = e / B, c = e % B, i = i0 - 1 + r, j = j0 - 1 + c;
+		sv[r][c] = (i >= 0 && i < h && j >= 0 && j < w) ? img[(2 * i) * pc.W + 2 * j] : 0u;
+	}
+	barrier();
+	for (int e = lid; e < B * T; e += 256) {
+		const int r = e / T, c = e % T, j = j0 + c;
+		sr[r][c] = (j == 0 || j == w - 1) ? sv[r][c + 1] : cmode3(sv[r][c], sv[r][c + 1], sv[r][c + 2]);
+	}
+	barrier();
+	const int lx = int(gl_LocalInvocationID.x), ly = int(gl_LocalInvocationID.y);
+	const int j = j0 + lx, i = i0 + ly;
+	if (j >= w || i >= h) return;
+	const int o = i * w + j;
+	oimg[o] = (i == 0 || i == h - 1) ? sv[ly + 1][lx + 1] : cmode3(sr[ly][lx], sr[ly + 1][lx], sr[ly + 2][lx]);
+	omask[o] = mask[(2 * i) * pc.W + 2 * j];
+}
