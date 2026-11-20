@@ -637,10 +637,11 @@ public:
 		return true;
 	}
 
-	// NVENC takes reference settings the stream then breaks without a word: with long-term references on (num_ltr_frames, max_ref_frames 16) it wrote an
-	// SPS with max_num_ref_frames 1 and still used a short-term and a long-term reference at once. Software decoders drop one ("number of reference
-	// frames (1+1) exceeds max (1)"), NVIDIA's Vulkan decoder refuses the stream. Such a run cannot give a valid stream: ignored, not failed.
-	// Needed at least: one short-term reference, one more with B-frames, one more with long-term references.
+	// NVENC takes reference settings the stream then breaks without a word: with hierarchical P-frames on it writes an SPS with max_num_ref_frames 1,
+	// whatever maxNumRefFrames says, and still uses two references at once (two short-term, or a short-term and a long-term one with num_ltr_frames).
+	// Software decoders drop one ("number of reference frames (2+0) / (1+1) exceeds max (1)") [T 2026-11-20, RTX 4070 Laptop GPU, driver 621.24: every
+	// one of 2448 combinations with hierarchical P-frames, none without]. Such a run cannot give a valid stream: ignored, not failed.
+	// Needed at least: one short-term reference, one more with B-frames, with long-term references and with hierarchical P-frames each.
 	bool h264_refs_fit(const NV_ENC_CONFIG& cfg) {
 		std::vector<uint8_t> hdr(1024);
 		uint32_t got = 0;
@@ -652,11 +653,13 @@ public:
 		if (f.nvEncGetSequenceParams(enc, &sp) != NV_ENC_SUCCESS) return true; // nothing to check against
 		const int refs = h264_sps_max_refs(hdr.data(), std::min<size_t>(got, hdr.size()));
 		const auto& c = cfg.encodeCodecConfig.h264Config;
-		const int need = 1 + (cfg.frameIntervalP > 1 ? 1 : 0) + (c.enableLTR ? 1 : 0);
+		const int need = 1 + (cfg.frameIntervalP > 1 ? 1 : 0) + (c.enableLTR ? 1 : 0) + (c.hierarchicalPFrames ? 1 : 0);
 		if (refs < 0 || refs >= need) return true;
-		unsupported = "NVENC wrote an H.264 SPS with max_num_ref_frames " + std::to_string(refs) + " for a stream that needs " + std::to_string(need) + " (" +
-		              (c.enableLTR ? "long-term references" : "") + (c.enableLTR && cfg.frameIntervalP > 1 ? " and " : "") + (cfg.frameIntervalP > 1 ? "B-frames" : "") +
-		              (need == 1 ? "P-frames" : "") + "): its stream would not decode";
+		std::string why;
+		for (const char* x : {c.hierarchicalPFrames ? "hierarchical P-frames" : "", c.enableLTR ? "long-term references" : "", cfg.frameIntervalP > 1 ? "B-frames" : ""})
+			if (*x) why += (why.empty() ? "" : ", ") + std::string(x);
+		unsupported = "NVENC wrote an H.264 SPS with max_num_ref_frames " + std::to_string(refs) + " for a stream that needs " + std::to_string(need) + " (" + why +
+		              "): its stream would not decode right";
 		fprintf(stderr, "nvenc: %s\n", unsupported.c_str());
 		return false;
 	}
