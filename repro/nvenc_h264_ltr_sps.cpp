@@ -1,20 +1,24 @@
-// Reproduces an H.264 stream from NVENC whose SPS allows fewer reference frames than its slices use, which NVIDIA's own Vulkan
-// H.264 decoder then refuses:
-// with long-term references on (NV_ENC_CONFIG_H264::enableLTR = 1, ltrNumFrames = 4, ltrTrustMode = 1) and maxNumRefFrames = 16,
-// no B-frames, preset P4, tuning high quality, CBR, nvEncInitializeEncoder succeeds, but the SPS NVENC writes (nvEncGetSequenceParams and the
-// stream itself) has max_num_ref_frames = 1, while the slices keep a short-term and a long-term reference at once.
+// Reproduces an H.264 stream from NVENC whose SPS allows fewer reference frames than its slices use:
+// with hierarchical P-frames on (NV_ENC_CONFIG_H264::hierarchicalPFrames = 1), NVENC writes max_num_ref_frames = 1 in the SPS
+// (nvEncGetSequenceParams and the stream) whatever maxNumRefFrames is. With long-term references on as well (enableLTR = 1,
+// ltrTrustMode = 1, ltrNumFrames = 4), the slices keep a short-term and a long-term reference at once, and FFmpeg's software decoder says
+// "number of reference frames (1+1) exceeds max (1; probably corrupt input)". Without hierarchicalPFrames, the SPS has maxNumRefFrames.
+// Measured on Irkela (RTX 4070 Laptop GPU, driver 621.24): 2448 of 2448 init-only combinations with hierarchicalPFrames = 1 gave 1, none without it.
+// Results (gop 60, 30 fps): --ves --hierp on a real clip: SPS 1, 297 of 300 frames "exceeds max"; --ves: SPS 16, clean;
+// --ves --hierp --ltr 0 --trust 0: SPS 1.
 //
 // Uses only the public NVENC API through FFmpeg's ffnvcodec headers (nv-codec-headers), which load nvcuda.dll and nvEncodeAPI64.dll at run time.
 //
-// Build (Windows, clang; nv-codec-headers' include folder is the only dependency):
-//   clang++ -std=c++17 -O2 -I <nv-codec-headers>/include nvenc_h264_ltr_sps.cpp -o nvenc_h264_ltr_sps.exe
+// Build (Windows, clang; nv-codec-headers' include folder is the only dependency; NOMINMAX because dynlink_loader.h includes windows.h):
+//   clang++ -std=c++17 -O2 -DNOMINMAX -I <nv-codec-headers>/include nvenc_h264_ltr_sps.cpp -o nvenc_h264_ltr_sps.exe
 // Run:
-//   nvenc_h264_ltr_sps.exe --help-less: see the options above main()
-// Prints the SPS's max_num_ref_frames, then writes the stream. Check it with FFmpeg:
-//   ffmpeg -i ltr.h264 -f null -                     software decoder: "number of reference frames (1+1) exceeds max (1; probably corrupt input)"
-//   ffmpeg -hwaccel vulkan -i ltr.h264 -f null -     NVIDIA Vulkan decode: "Unable to finish command buffer", "hardware accelerator failed to decode picture"
-//   ffmpeg -i ltr.h264 -c copy -bsf:v trace_headers -f null - 2>&1 | findstr "max_num_ref_frames long_term_reference_flag"
-// Expected: max_num_ref_frames covers the references the stream uses (at least short-term + long-term), or nvEncInitializeEncoder refuses the settings.
+//   nvenc_h264_ltr_sps.exe --hierp [--ves] [--ltr 4] [--trust 1] [--refs 16] [--gop 60] [--fps 30] [--frames 300] [--input in.nv12] [--out ltr.h264] [-p n [--other-hierp]]
+//   (in.nv12: raw 1280x720 NV12 frames, e.g. ffmpeg -i clip.mp4 -vf scale=1280:720 -pix_fmt nv12 -frames:v 300 -f rawvideo in.nv12)
+// Prints max_num_ref_frames from nvEncGetSequenceParams and from the stream. Check the stream with FFmpeg:
+//   ffmpeg -i ltr.h264 -f null -
+//   ffmpeg -i ltr.h264 -c copy -bsf:v trace_headers -f null - 2>&1 | findstr "max_num_ref_frames long_term_reference_flag memory_management"
+// Expected: max_num_ref_frames covers the references the stream uses (maxNumRefFrames, or at least short-term + long-term), or
+// nvEncInitializeEncoder refuses the settings.
 #define NOMINMAX
 #include <cstdint>
 #include <cstdio>
@@ -86,6 +90,7 @@ static int h264_sps_max_refs(const uint8_t* p, size_t n) {
 struct Opt {
 	int ltr = 4, trust = 1, refs = 16, frames = 300, gop = 300, fps = 60;
 	std::string out = "ltr.h264", input; // input: raw NV12 1280x720 frames (ffmpeg -i clip.mp4 -vf scale=1280:720 -pix_fmt nv12 -f rawvideo in.nv12)
+	bool hierp = false; // NV_ENC_CONFIG_H264::hierarchicalPFrames = 1: the trigger
 	bool ves = false; // what ves sets besides: chroma/bit depth fields, VUI (limited range, BT.709 primaries and matrix, sRGB curve), the rest at 0
 };
 
@@ -158,7 +163,8 @@ static int run_one(const Opt& op) {
 		c.hierarchicalPFrames = 0;
 		c.tfLevel = NV_ENC_TEMPORAL_FILTER_LEVEL_0;
 	}
-	STEP("gop %d (idrPeriod too), %d fps, %s input%s", op.gop, op.fps, in ? op.input.c_str() : "synthetic", op.ves ? ", ves extras (chroma/depth fields, VUI, explicit zeros)" : "");
+	if (op.hierp) c.hierarchicalPFrames = 1;
+	STEP("gop %d (idrPeriod too), %d fps, %s input%s%s", op.gop, op.fps, in ? op.input.c_str() : "synthetic", op.ves ? ", ves extras (chroma/depth fields, VUI, explicit zeros)" : "", op.hierp ? ", hierarchicalPFrames 1" : "");
 	STEP("h264 %dx%d, P4 hq, CBR 3500 kbps, no B-frames: enableLTR %u, ltrNumFrames %u, ltrTrustMode %u, maxNumRefFrames %u", w, h, (unsigned)c.enableLTR,
 	     (unsigned)c.ltrNumFrames, (unsigned)c.ltrTrustMode, (unsigned)c.maxNumRefFrames);
 
@@ -274,6 +280,7 @@ static int run_one(const Opt& op) {
 int main(int argc, char** argv) {
 	Opt op;
 	int parallel = 0;
+	bool other_hierp = false;
 	for (int i = 1; i < argc; i++) {
 		const std::string a = argv[i];
 		auto next = [&] { return i + 1 < argc ? std::string(argv[++i]) : std::string(); };
@@ -287,16 +294,18 @@ int main(int argc, char** argv) {
 		else if (a == "--input") op.input = next();
 		else if (a == "--out") op.out = next();
 		else if (a == "--ves") op.ves = true;
+		else if (a == "--hierp") op.hierp = true;
+		else if (a == "--other-hierp") other_hierp = true; // the other -p sessions: hierarchical P without LTR
 		else { printf("unknown option %s\n", a.c_str()); return 1; }
 	}
 	if (parallel > 0) {
 		std::vector<std::thread> t;
 		for (int i = 0; i < parallel; i++)
-			t.emplace_back([i, op] {
+			t.emplace_back([i, op, other_hierp] {
 				g_tag = "[session " + std::to_string(i) + "] ";
 				Opt o = op;
 				o.out = "P" + std::to_string(i) + ".h264";
-				if (i > 0) { o.ltr = 0; o.trust = 0; o.refs = 1; }
+				if (i > 0) { o.ltr = 0; o.trust = 0; o.refs = other_hierp ? 16 : 1; o.hierp = other_hierp; }
 				run_one(o);
 			});
 		for (auto& x : t) x.join();
