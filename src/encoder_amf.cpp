@@ -164,6 +164,7 @@ public:
 	explicit TraceToLog(amf::AMFFactory* f) {
 		if (!f || f->GetTrace(&trace) != AMF_OK || !trace) { trace = nullptr; return; }
 		trace->RegisterWriter(kId, this, true);
+		trace->TraceEnableAsync(false); // lines arrive before a crash
 		trace->SetWriterLevel(kId, AMF_TRACE_DEBUG);
 		level = trace->SetGlobalLevel(AMF_TRACE_DEBUG);
 	}
@@ -179,6 +180,7 @@ public:
 		line += ": ";
 		for (const wchar_t* p = message; p && *p; p++) if (*p != L'\r' && *p != L'\n') line += *p < 128 ? (char)*p : '?';
 		fprintf(stderr, "%s\n", line.c_str());
+		fflush(stderr);
 	}
 	void AMF_CDECL_CALL Flush() override { fflush(stderr); }
 private:
@@ -295,7 +297,14 @@ class Amf : public Encoder {
 			return nullptr;
 		}
 		amf::AMFSurfacePtr surf;
-		AMF_RESULT r = ctx->AllocSurface(amf::AMF_MEMORY_VULKAN, depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, cw, ch, &surf);
+		AMF_RESULT r;
+		{
+			static int traced = 0; // AMF's own trace of the first surfaces (a crash inside AllocSurface says nothing else), flushed before the call returns
+			std::unique_ptr<TraceToLog> trace;
+			if (traced++ < 2) { trace = std::make_unique<TraceToLog>(factory); fprintf(stderr, "amf: AllocSurface(Vulkan, %dx%d)\n", cw, ch); fflush(stderr); }
+			r = ctx->AllocSurface(amf::AMF_MEMORY_VULKAN, depth > 8 ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12, cw, ch, &surf);
+			if (trace) fprintf(stderr, "amf: AllocSurface(Vulkan) returned %d\n", (int)r);
+		}
 		if (r != AMF_OK || !surf) { fail(r, "AllocSurface (Vulkan)"); return nullptr; }
 		// a plane's native object is a view of the surface's one image (both planes of NV12)
 		amf::AMFVulkanView* view = (amf::AMFVulkanView*)surf->GetPlaneAt(0)->GetNative();
