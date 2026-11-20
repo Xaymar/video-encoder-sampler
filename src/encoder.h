@@ -49,6 +49,9 @@ public:
 	// open() failed because the GPU had no encode session left (NVENC's per-GPU limit, which sessions of other processes count against, also ones stuck
 	// in the driver): not the run's fault, so it is run again later instead of counting as failed.
 	bool no_session = false;
+	// open() failed because this GPU's encoder does not know an option the run asks for (AMF: a property the GPU/codec pair lacks): the run cannot work
+	// here, which is not a failure. It says which; empty otherwise. The run is ignored, and remembered as such (see main.cpp, ignored_marker).
+	std::string unsupported;
 };
 
 // The native backends, selected by the names "nvenc", "amf", "qsv", "x264", "x265" and "svtav1".

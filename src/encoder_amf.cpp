@@ -195,6 +195,7 @@ class Amf : public Encoder {
 	ComPtr<ID3D11Device> device;
 	amf::AMFContextPtr ctx;
 	amf::AMFComponentPtr enc;
+	std::string codec_name; // "h264", "hevc" or "av1", once open() was called
 	int depth = 8;
 	Sink sink;
 	int w = 0, h = 0;   // the picture
@@ -377,7 +378,7 @@ class Amf : public Encoder {
 	bool set(const std::string& key, const std::string& val) {
 		std::wstring k = wide(key);
 		const amf::AMFPropertyInfo* info = nullptr;
-		if (enc->GetPropertyInfo(k.c_str(), &info) != AMF_OK || !info) { fprintf(stderr, "amf: unknown property '%s'\n", key.c_str()); return false; }
+		if (enc->GetPropertyInfo(k.c_str(), &info) != AMF_OK || !info) { fprintf(stderr, "amf: unknown property '%s'\n", key.c_str()); unsupported = "this GPU's " + codec_name + " encoder does not know the property '" + key + "'"; return false; }
 		amf::AMFVariant v;
 		switch (info->type) {
 		case amf::AMF_VARIANT_BOOL: v = (val == "1" || val == "true"); break;
@@ -632,6 +633,7 @@ public:
 		depth = fmt.depth;
 		if (fmt.chroma != 420 || depth > 10) { fprintf(stderr, "amf: cannot encode %d-bit %d\n", depth, fmt.chroma); return false; }
 		const Names* n = p.codec == "h264" ? &H264 : p.codec == "hevc" ? &HEVC : p.codec == "av1" ? &AV1 : nullptr;
+		codec_name = p.codec;
 		if (!n) { fprintf(stderr, "amf: unknown codec '%s'\n", p.codec.c_str()); return false; }
 		Options o = p.options;
 		int gpu = 0;
@@ -708,6 +710,7 @@ public:
 				std::string known;
 				for (auto& [n, native] : names) known += (known.empty() ? "" : ", ") + n;
 				fprintf(stderr, "amf: unknown property '%s'; this encoder has: %s\n", k.c_str(), known.c_str());
+				unsupported = "this GPU's " + codec_name + " encoder does not know the property '" + k + "'";
 				return false;
 			}
 			return set(it->second, v);

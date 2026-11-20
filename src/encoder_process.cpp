@@ -1034,10 +1034,11 @@ void run_wave_here(uint32_t id, const std::string& body) {
 	w.num((uint8_t)fr.ok).num(fr.frames).num((int64_t)feed_rp.blocked_ms).str(si.decoder);
 	for (auto& run : runs) {
 		const EncodeJob& ej = run.enc;
-		w.num((uint8_t)(ej.ok ? 1 : ej.no_session ? 2 : 0)).num(ej.kbps).num(ej.output.count).num(ej.output.bytes).num(ej.output.hash).num(ej.output.pictures);
+		w.num((uint8_t)(ej.ok ? 1 : ej.no_session ? 2 : !ej.unsupported.empty() ? 3 : 0)).num(ej.kbps).num(ej.output.count).num(ej.output.bytes).num(ej.output.hash).num(ej.output.pictures);
 		w.num((int64_t)ej.rp->busy_ms).num((int64_t)ej.rp->starved_ms).num((uint8_t)run.score_ok).num((int64_t)run.score_rp->starved_ms);
 		put_list(w, run.scores);
 		put(w, run.detail);
+		w.str(ej.unsupported);
 	}
 	reply('w', id, w.s);
 }
@@ -1150,7 +1151,7 @@ bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vect
 		const std::string decoder = r.str();
 		for (WaveRun* run : part) {
 			EncodeJob& ej = run->enc;
-			const uint8_t enc_state = r.num<uint8_t>(); // 1 ok, 2 no encode session left, 0 failed
+			const uint8_t enc_state = r.num<uint8_t>(); // 1 ok, 2 no encode session left, 3 the encoder lacks an option of the run, 0 failed
 			ej.ok = enc_state == 1;
 			ej.no_session = enc_state == 2;
 			ej.kbps = r.num<double>();
@@ -1165,7 +1166,9 @@ bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vect
 			run->scores.clear();
 			for (uint32_t i = 0; i < count && r.ok; i++) run->scores.push_back(r.num<double>());
 			get(r, run->detail);
+			ej.unsupported = r.str();
 			if (!ej.ok || !run->score_ok) ej.error = why(!ej.ok ? "the encoder failed and said nothing" : "scoring failed and said nothing");
+			if (!ej.unsupported.empty()) ej.error = ej.unsupported;
 			if (ej.rp) { ej.rp->busy_ms = busy; ej.rp->starved_ms = starved; ej.rp->failed = !ej.ok; ej.rp->finish(); }
 			if (run->score_rp) { run->score_rp->starved_ms = score_starved; run->score_rp->failed = !run->score_ok; run->score_rp->finish(); }
 		}

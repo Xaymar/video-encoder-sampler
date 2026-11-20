@@ -102,6 +102,7 @@ struct EncodeJob {
 	bool ok = false;
 	std::string error;    // why it failed, when it ran in an encoder process: what that process printed while it ran (see encoder_process.h)
 	bool crashed = false; // the process it ran in ended under it (another run in that process may be what crashed it; see encoder_process.h)
+	std::string unsupported; // the encoder does not know an option of the run (see Encoder::unsupported): why; the run is ignored, not failed
 	bool no_session = false; // the encoder could not open: the GPU had no encode session left (see Encoder::no_session); the run is made again later
 };
 
