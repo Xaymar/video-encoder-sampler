@@ -2463,7 +2463,11 @@ static int run(int argc, char** argv) {
 			if (feed_handle >= 0) ui::detach(feed_handle);
 			for (int h : handles) ui::detach(h);
 			const size_t crashed_runs = (size_t)std::count_if(wr.begin(), wr.end(), [](const WaveRun& w) { return w.enc.crashed; });
+			std::map<std::string, int> wave_of_pool; // how many runs of each pool the wave had
+			for (Task* t : wave) wave_of_pool[t->pool]++;
+			auto pool_wave_runs = [&](const std::string& pool) { return wave_of_pool[pool]; };
 			std::vector<Task*> no_session_again;
+			std::vector<Task*> vram_again;
 			for (size_t i = 0; i < wave.size(); i++) {
 				Task& t = *wave[i];
 				Run& r = t.r;
@@ -2497,6 +2501,14 @@ static int run(int argc, char** argv) {
 					fs::remove(wr[i].enc.file, ec);
 					r.reason.clear();
 					no_session_again.push_back(&t);
+					continue;
+				}
+				// The GPU ran out of video memory with this many runs at once: not the run's fault while fewer at once can still be tried (see below).
+				if (!t.ok && wr[i].enc.out_of_vram && pool_wave_runs(t.pool) > 1) {
+					fs::remove(wr[i].enc.file, ec);
+					ui::log(t.r.tag + " " + t.r.label + ": the GPU ran out of video memory (" + r.reason + "); it is made again with fewer runs at once");
+					r.reason.clear();
+					vram_again.push_back(&t);
 					continue;
 				}
 				if (!t.ok && wr[i].enc.crashed && !t.retried && crashed_runs > 1) { // others were in the process with it
@@ -2533,6 +2545,17 @@ static int run(int argc, char** argv) {
 			for (Task* t : wave) pool_wave[t->pool].first++;
 			for (Task* t : no_session_again) pool_wave[t->pool].second++;
 			for (auto it = no_session_again.rbegin(); it != no_session_again.rend(); ++it) by_pool[(*it)->pool].push_front(*it);
+			// A pool whose GPU ran out of video memory runs half as many at once from now on (at least 1), and its runs that failed for it go back to its front.
+			std::map<std::string, int> vram_lost;
+			for (Task* t : vram_again) vram_lost[t->pool]++;
+			for (auto it = vram_again.rbegin(); it != vram_again.rend(); ++it) by_pool[(*it)->pool].push_front(*it);
+			for (auto& [pool, lost] : vram_lost) {
+				Pool& p = pools[pool];
+				const int ran = pool_wave_runs(pool);
+				p.parallel = std::max(1, std::min(p.parallel, ran / 2));
+				ui::log("Pool " + pool + ": the GPU ran out of video memory with " + std::to_string(ran) + " runs at once; it runs " + std::to_string(p.parallel) +
+				        " at once from now on, and the " + std::to_string(lost) + (lost == 1 ? " run" : " runs") + " that failed for it are made again");
+			}
 			for (auto& [pool, counts] : pool_wave) {
 				Pool& p = pools[pool];
 				const auto [ran, lost] = counts;

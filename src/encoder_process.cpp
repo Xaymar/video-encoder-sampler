@@ -374,6 +374,14 @@ struct Waiter {
 	virtual size_t count() const { return 0; }    // how many
 };
 
+// A line in which a library (FFmpeg's Vulkan or CUDA code, the scorer's Vulkan code via chk()) says the GPU ran out of video memory. Many runs at once on a
+// small GPU do that: FFmpeg's Vulkan source decoder then gets no frame buffers ("get_buffer() failed"), and every frame after a missing one fails ("Could not
+// find ref with POC n", "Error constructing the frame RPS") [T 2026-11-20, RTX 4070 Laptop GPU 8 GB, driver 621.24, nvenc parallel 12].
+// NVENC's NV_ENC_ERR_OUT_OF_MEMORY at open is not one: it means no encode session (Encoder::no_session).
+static bool out_of_vram_line(const std::string& l) {
+	return l.find("VK_ERROR_OUT_OF_DEVICE_MEMORY") != std::string::npos || l.find("CUDA_ERROR_OUT_OF_MEMORY") != std::string::npos;
+}
+
 // One encoder process, and what waits for it.
 struct Device {
 	std::string encoder, name; // name: for messages ("nvenc GPU 0", "x264")
@@ -394,6 +402,7 @@ struct Device {
 	std::mutex lines_m;
 	std::deque<std::string> lines;
 	uint64_t line_count = 0;
+	std::atomic<uint64_t> vram_lines{0}; // lines that said the GPU ran out of video memory (see out_of_vram_line)
 	uint64_t lines_so_far() {
 		std::lock_guard lock(lines_m);
 		return line_count;
@@ -485,6 +494,7 @@ struct Device {
 	}
 	void keep(const std::string& line) {
 		ui::log("[" + name + "] " + line);
+		if (out_of_vram_line(line)) vram_lines++;
 		std::lock_guard lock(lines_m);
 		lines.push_back(line);
 		if (lines.size() > 64) lines.pop_front();
@@ -1112,6 +1122,16 @@ bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vect
 		}
 		if (!dev) { fail_all(false); return; }
 		first_line = dev->lines_so_far();
+		// Runs of the part that failed while the process said the GPU ran out of video memory: so marked whichever way the part ends (see EncodeJob::out_of_vram).
+		struct VramCheck {
+			Device& dev;
+			const std::vector<WaveRun*>& part;
+			const uint64_t before;
+			~VramCheck() {
+				if (dev.vram_lines.load() == before) return;
+				for (WaveRun* run : part) if (!run->enc.ok || !run->score_ok) run->enc.out_of_vram = true;
+			}
+		} vram_check{*dev, part, dev->vram_lines.load()};
 		Writer w;
 		w.str(input);
 		put(w, si);

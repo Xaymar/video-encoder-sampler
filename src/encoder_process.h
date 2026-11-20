@@ -18,6 +18,7 @@ void set_encoder_process_args(const std::vector<std::string>& args);
 
 // run_wave() in the processes: the runs of each GPU (and those of the CPU encoders) in the process of that GPU, all parts at the same time. The rows of the live
 // display come from the processes; `feed_rp` only gets the time the decodes were held up. `decoders` says what decoded the input in each process.
+// Runs that failed while their process said its GPU ran out of video memory get EncodeJob::out_of_vram.
 bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vector<WaveRun*>& runs, const ScaleOptions& so, const VmafOptions& vo, RunProgress* feed_rp, FeedResult& fr,
                        std::string& decoders);
 
