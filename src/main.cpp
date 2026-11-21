@@ -2345,9 +2345,14 @@ static int run(int argc, char** argv) {
 		}
 	}
 	// reencode: the runs are group winners that were scored before; they are encoded again for their streams (see the end of the input below) and not finished again.
-	auto run_round = [&](const std::vector<size_t>& todo, bool reencode) {
+	auto run_round = [&](const std::vector<size_t>& todo_in, bool reencode) {
 	// Plan the runs of this input: opening the source is where a URL is downloaded. Runs that cannot work are finished right away; the rest is
-	// sorted by the frames it needs, and runs with the same resolution, frame rate and pixel format share one decode.
+	// grouped by the frames it needs, and runs with the same resolution, frame rate and pixel format share one decode.
+	// The runs go in the order the config lists things (tasks are made in that order: encoder entry, scenario, bitrate, key frame interval, size): the feeds
+	// come in the order their first run was made, and the groups in a feed too. A feed is one scenario's, so a size two scenarios list runs with each of them;
+	// each size of a scenario runs all its bitrates before the next size, as they share the decode.
+	std::vector<size_t> todo = todo_in;
+	std::sort(todo.begin(), todo.end());
 	std::map<std::string, std::vector<Task*>> by_feed;
 	std::vector<std::string> feed_order;
 	for (size_t i : todo) {
@@ -2359,7 +2364,7 @@ static int run(int argc, char** argv) {
 			t.plan = make_plan(*src, t.job->encoder, t.job->codec, *t.opts, r.shape);
 			if (t.plan.ignored) continue;
 			fit_shape(t);
-			const std::string fk = r.input + "|" + t.plan.feed_key();
+			const std::string fk = r.input + "|" + std::to_string(t.sc - cfg.scenarios.data()) + "|" + t.plan.feed_key();
 			if (!by_feed.count(fk)) feed_order.push_back(fk);
 			by_feed[fk].push_back(&t);
 			continue;
@@ -2371,16 +2376,10 @@ static int run(int argc, char** argv) {
 		if (t.plan.ignored) { r.ignored = true; r.expected = t.plan.expected; r.reason = t.plan.reason; finish(t); continue; }
 		if (std::string why = caps_refusal(t.job->encoder, t.job->codec, *t.opts, r.caps_json); !why.empty()) { r.ignored = true; r.reason = why; finish(t); continue; }
 		fit_shape(t);
-		const std::string fk = r.input + "|" + t.plan.feed_key();
+		const std::string fk = r.input + "|" + std::to_string(t.sc - cfg.scenarios.data()) + "|" + t.plan.feed_key();
 		if (!by_feed.count(fk)) feed_order.push_back(fk);
 		by_feed[fk].push_back(&t);
 	}
-	// The smallest uncompressed data rate of the encoded format (resolution, frame rate, chroma, bit depth) goes first: the cheap ones finish early.
-	auto raw_rate = [&](const std::string& fk) {
-		const Shape& s = by_feed[fk][0]->plan.enc;
-		return (double)s.w * s.h * s.fps.value() * (s.pix.chroma == 444 ? 3.0 : 1.5) * s.pix.depth;
-	};
-	std::stable_sort(feed_order.begin(), feed_order.end(), [&](const std::string& a, const std::string& b) { return raw_rate(a) < raw_rate(b); });
 	for (auto& fk : feed_order) {
 		// The runs of a pool in order, each group's probes before the rest of it.
 		std::map<std::string, std::list<Task*>> by_pool;
