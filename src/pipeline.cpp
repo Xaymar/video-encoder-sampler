@@ -123,6 +123,10 @@ Plan make_plan(const SourceInfo& src, const std::string& encoder, const std::str
 	return pl;
 }
 
+static std::atomic<size_t> g_frames_ahead{30};
+size_t frames_ahead() { return g_frames_ahead.load(); }
+void set_frames_ahead(size_t n) { g_frames_ahead = std::max<size_t>(2, n); }
+
 namespace {
 
 // Hands frames from one thread to another; push() waits while the queue is full, pop() while it is empty.
@@ -241,7 +245,7 @@ class Broadcast {
 	std::vector<std::unique_ptr<FrameQueue>> qs;
 
 public:
-	explicit Broadcast(size_t n) { for (size_t i = 0; i < n; i++) qs.push_back(std::make_unique<FrameQueue>(DECODE_AHEAD)); }
+	explicit Broadcast(size_t n) { for (size_t i = 0; i < n; i++) qs.push_back(std::make_unique<FrameQueue>(frames_ahead())); }
 	FrameQueue& at(size_t i) { return *qs[i]; }
 	bool push(const Picture& p, RunProgress* rp = nullptr) { // false once every consumer has given up
 		bool any = false;
@@ -396,15 +400,15 @@ public:
 // waits for its encoder's packets never holds the decode back, since the encoder may need more frames before it gives the scorer anything to do. The
 // frames the encoder holds (Holding) do not count: measured from the decode, x264's scorer is always that far behind, so the decode stopped whenever it
 // scored, which fed x264 one frame per scored frame and left its threads with nothing to do.
-constexpr long long SCORE_BEHIND = 30;
+static long long score_behind() { return (long long)frames_ahead(); }
 
 // How much further than that any reader, even one that waits for its encoder's packets, may fall behind before everything waits for it
 // (FrameHistory::too_far). A scorer that waits is never more than its encoder's queue and what the encoder holds behind (both in its slack); this is the
 // margin on top, so that only a reader that will not come back stops the wave, which the device process's watchdog then ends.
-constexpr long long IDLE_BEYOND = 2 * (long long)DECODE_AHEAD + 16;
+static long long idle_beyond() { return 2 * (long long)frames_ahead() + 16; }
 
-// Decodes the input once for the whole wave, while nothing that reads the frames holds it back (FrameHistory::held(): the encoders' feed DECODE_AHEAD frames
-// behind, a busy scorer SCORE_BEHIND frames behind).
+// Decodes the input once for the whole wave, while nothing that reads the frames holds it back (FrameHistory::held(): the encoders' feed frames_ahead() frames
+// behind, a busy scorer score_behind() frames behind).
 void decode_input(Source& src, FrameHistory& raw, const std::function<bool()>& held, bool& ok, RunProgress* rp, long long limit = 0) {
 	Picture frame;
 	long long n = 0;
@@ -501,7 +505,7 @@ void feed_encoders(const Source& src, FrameHistory& raw, size_t reader, const Pl
 }
 
 // Takes the decoded frames and converts them to `fmt` for scoring (the true score's reference), for every scorer of that format, staying at most
-// DECODE_AHEAD frames ahead of the slowest busy one: the decoded frames are what is kept for a scorer that is behind, not the converted ones (which are
+// frames_ahead() frames ahead of the slowest busy one: the decoded frames are what is kept for a scorer that is behind, not the converted ones (which are
 // larger: scored at 10 bit or more). A scorer that waits for its encoder's packets does not hold it back: the busy scorers may need frames that encoder
 // has not been given yet (an encoder that holds more frames back than the others), and waiting for it would wait forever. `waiting` is set while it
 // waits for room.
@@ -518,12 +522,12 @@ void convert_reference(const SourceInfo& si, FrameHistory& raw, size_t reader, F
 		if (got < 0) ok = false;
 	};
 	for (;;) {
-		if (out.behind(true) >= (long long)DECODE_AHEAD || out.too_far(IDLE_BEYOND)) {
+		if (out.behind(true) >= (long long)frames_ahead() || out.too_far(idle_beyond())) {
 			const auto t = std::chrono::steady_clock::now();
 			rp.wait(2);
 			waiting = true;
 			changed.notify();
-			changed.wait_until([&] { return (out.behind(true) < (long long)DECODE_AHEAD && !out.too_far(IDLE_BEYOND)) || !out.read(); });
+			changed.wait_until([&] { return (out.behind(true) < (long long)frames_ahead() && !out.too_far(idle_beyond())) || !out.read(); });
 			waiting = false;
 			changed.notify();
 			rp.state = 0;
@@ -663,8 +667,8 @@ bool run_wave(const std::string& input, const SourceInfo& planned, std::vector<W
 			const Plan& pl = *runs[i]->enc.plan;
 			const double per = pl.convert_rate && pl.enc.fps.value() > 0 ? std::max(1.0, si.framerate.value() / pl.enc.fps.value()) : 1.0;
 			// slack (only too_far() reads it here): its encoder's queue and what the encoder holds, in decoded frames
-			g->readers.push_back(g->frames.add_reader(DECODE_AHEAD, [pq] { return pq->waiting.load(); },
-				[hd = holding[i].get(), per] { return (long long)std::ceil((hd->frames() + (long long)DECODE_AHEAD) * per); }));
+			g->readers.push_back(g->frames.add_reader(frames_ahead(), [pq] { return pq->waiting.load(); },
+				[hd = holding[i].get(), per] { return (long long)std::ceil((hd->frames() + (long long)frames_ahead()) * per); }));
 		}
 		// The converter holds the decode back like a busy scorer when it waits for one; when its scorers all wait for packets, it does not. Its slack is
 		// what the members' encoders hold, in decoded frames (more of them than encoded ones when the frame rate is lowered).
@@ -673,7 +677,7 @@ bool run_wave(const std::string& input, const SourceInfo& planned, std::vector<W
 			const Plan& pl = *runs[i]->enc.plan;
 			held_by.push_back({holding[i].get(), pl.convert_rate && pl.enc.fps.value() > 0 ? std::max(1.0, si.framerate.value() / pl.enc.fps.value()) : 1.0});
 		}
-		g->raw_reader = raw.add_reader(SCORE_BEHIND, [gp = g.get()] { return gp->waiting.load() && !gp->frames.busy(); }, [held_by] {
+		g->raw_reader = raw.add_reader(score_behind(), [gp = g.get()] { return gp->waiting.load() && !gp->frames.busy(); }, [held_by] {
 			long long most = 0;
 			for (auto& [h, per] : held_by) most = std::max(most, (long long)std::ceil(h->frames() * per));
 			return most;
@@ -682,12 +686,12 @@ bool run_wave(const std::string& input, const SourceInfo& planned, std::vector<W
 		g->handle = ui::attach(&g->ref_rp, "reference to " + std::to_string(f.depth) + "-bit " + (f.rgb ? std::string("RGB") : f.chroma == 420 ? std::string("4:2:0") : f.chroma == 422 ? std::string("4:2:2") : std::string("4:4:4")), "convert");
 		groups.push_back(std::move(g));
 	}
-	const size_t feed_reader = raw.add_reader(DECODE_AHEAD);
+	const size_t feed_reader = raw.add_reader(frames_ahead());
 	std::vector<size_t> dist_readers;
 	if (!check) for (size_t i = 0; i < n; i++) {
 		PacketQueue* dq = dist_packets[i].get();
 		Holding* hd = holding[i].get();
-		dist_readers.push_back(enc_frames.add_reader(SCORE_BEHIND, [dq] { return dq->waiting.load(); }, [hd] { return hd->frames(); }));
+		dist_readers.push_back(enc_frames.add_reader(score_behind(), [dq] { return dq->waiting.load(); }, [hd] { return hd->frames(); }));
 	}
 	if (feed_rp) feed_rp->begin(6, std::max<long long>(1, si.frame_count)); // it steps once per decoded frame, kept or dropped
 	// The one decode of the wave has a row of its own; the feed and the references are conversions of what it decoded.
@@ -697,7 +701,7 @@ bool run_wave(const std::string& input, const SourceInfo& planned, std::vector<W
 	const int decode_handle = ui::attach(&decode_rp, input.substr(slash == std::string::npos ? 0 : slash + 1), "decode");
 
 	bool decode_ok = false, feed_ok = false;
-	std::thread decoder([&] { decode_input(*src, raw, [&] { return raw.held() || enc_frames.held() || raw.too_far(IDLE_BEYOND) || enc_frames.too_far(IDLE_BEYOND); }, decode_ok, &decode_rp, limit); });
+	std::thread decoder([&] { decode_input(*src, raw, [&] { return raw.held() || enc_frames.held() || raw.too_far(idle_beyond()) || enc_frames.too_far(idle_beyond()); }, decode_ok, &decode_rp, limit); });
 	// NVENC and AMF take frames from VRAM (VES_ENC_GPU_INPUT=0: never): the feed's frames stay on the GPU when every encoder of the wave is one of them.
 	bool gpu_feed = converter_shares_ffmpeg_vulkan();
 	if (const char* e = getenv("VES_ENC_GPU_INPUT"); e && atoi(e) == 0) gpu_feed = false;

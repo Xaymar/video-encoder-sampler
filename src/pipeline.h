@@ -2,7 +2,7 @@
 // Decoding, converting, encoding and scoring, arranged so that the expensive software decode of an input is done once for
 // all the encoders that can share it. Runs that need the very same frames (same input, resolution, frame rate, pixel format)
 // are encoded together as a "wave": one thread decodes, one converts for the encoders, every encoder has a thread that takes the frames
-// from a queue of its own, and the decoder stays at most DECODE_AHEAD frames ahead of the slowest encoder. The same decode serves the
+// from a queue of its own, and the decoder stays at most frames_ahead() frames ahead of the slowest encoder. The same decode serves the
 // scoring: the original frames in each scoring format (the true score) and the frames the encoders got (the distorted score) are kept
 // until every scorer has used them, and the decode waits for a scorer that falls far behind (see run_wave).
 #include <condition_variable>
@@ -52,8 +52,10 @@ private:
 	}
 };
 
-// How many converted frames may wait in front of an encoder (or scorer).
-constexpr size_t DECODE_AHEAD = 30;
+// How many converted frames may wait in front of an encoder (or scorer), and how far a busy scorer may fall behind the decode: the frames in flight of a
+// wave. 30 unless --frames-ahead or the setting "frames_ahead" says otherwise; fewer take less memory, and less video memory where the frames stay on the GPU.
+size_t frames_ahead();
+void set_frames_ahead(size_t n); // at least 2
 
 // What is needed to know about an input before decoding any of it.
 struct SourceInfo {

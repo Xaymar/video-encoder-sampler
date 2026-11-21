@@ -125,6 +125,7 @@
 		// ("hevc_cuvid"). The encoded streams that are scored are always decoded in software.
 		"hw_decode": "auto",
 		"decode_threads": 0,   // threads per decoder; 0 uses every core
+		"frames_ahead": 30,    // frames that may wait in front of each encoder and scorer (at least 2); fewer take less (video) memory
 		"priority": "low",     // "low": idle CPU priority and the lowest disk priority, so ves never slows down other programs; "normal": the system default
 		"low_memory": false,   // true: fewer VMAF and decoder threads, much less memory, a bit slower
 		// An option that shows no effect is not swept further: within a group, for every combination of the other options, the lowest and the highest
