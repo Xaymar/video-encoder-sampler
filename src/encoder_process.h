@@ -35,6 +35,6 @@ size_t abandoned_encoder_processes();
 // Ends the processes (at the end of a sweep); they also end by themselves when this process does.
 void stop_encoder_processes();
 
-// `ves --encoder-process <encoder|cpu> <gpu> [--priority low] [--hw-decode <type>] [--decode-threads <n>]`: the process itself. Talks to the process that started it
+// `ves --encoder-process <encoder|cpu> <gpu> [--priority low] [--hw-decode <type>] [--decode-threads <n>] [--frames-ahead <n>]`: the process itself. Talks to the process that started it
 // on stdin and stdout until stdin closes.
 int encoder_process_main(int argc, char** argv);

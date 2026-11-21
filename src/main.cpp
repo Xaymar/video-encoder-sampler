@@ -108,6 +108,7 @@ struct Config {
 	std::string log_file; // --log: the lines also go to this file, with the date and time
 	std::string hw_decode = "on"; // "" software only, anything else on (Vulkan Video): see set_hw_decode()
 	int decode_threads = 0;  // 0: as many as the cores allow within a memory budget
+	int frames_ahead = 0;    // frames in flight of a wave (see frames_ahead() in pipeline.h); 0: the default, 30
 	// Where the encoder processes decode and scale (vmaf.gpu says where they score): "" or "auto" the fastest GPU, "own" the GPU that encodes, a Vulkan index or a
 	// name. This machine's choice, so not part of a run's key; scaling_gpu beats the sweep's "scaling": {"gpu"} in the processes.
 	std::string decode_gpu, scaling_gpu;
@@ -553,6 +554,7 @@ static void load_config_json(const Json& root, Config& cfg) {
 	if (auto* v = root.find("output")) cfg.output_dir = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "output" : "") : v->text();
 	if (auto* v = setting("hw_decode")) cfg.hw_decode = v->type == Json::Bool || v->type == Json::Null ? (v->s == "1" ? "on" : "") : v->text();
 	if (auto* v = setting("decode_threads")) cfg.decode_threads = atoi(v->text().c_str());
+	if (auto* v = setting("frames_ahead")) cfg.frames_ahead = atoi(v->text().c_str());
 	if (auto* v = setting("decode_gpu")) cfg.decode_gpu = v->text();
 	if (auto* v = setting("scaling_gpu")) cfg.scaling_gpu = v->text();
 	if (auto* v = setting("priority")) cfg.priority = v->text();
@@ -714,6 +716,7 @@ Paths
                             config; unlike that one it is this machine's choice and does not change which runs count as done
         --priority <low|normal>  low (default): idle CPU priority and the lowest disk priority, so ves never gets in the way of other programs; normal: the system default
         --decode-threads <n> threads per decoder (default: all cores; 4 with --low-memory)
+        --frames-ahead <n>  frames that may wait in front of each encoder and scorer (default 30, at least 2); fewer take less (video) memory
         --low-memory        score each wave before the next is encoded and use fewer VMAF threads: slower, takes much less memory
         --plain             plain lines instead of the live display (also used when stdout is not a terminal)
         --log <file>        every line also goes to this file, with the date and time (appended to; "log" in the config's settings; a worker takes it
@@ -832,7 +835,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	std::optional<std::string> vmaf_device, vmaf_gpu;
 	// Flags for what the config's "settings" also has: kept until the config is read, so that the flag wins (a worker passes its own on as flags).
 	std::optional<std::string> hw_decode, decode_gpu, scaling_gpu, priority;
-	std::optional<int> decode_threads;
+	std::optional<int> decode_threads, frames_ahead;
 	bool low_memory = false, in_process = false;
 	bool videos = true, all_videos = false, upload_videos = true, skip_known = true, quick = false, upscale = false;
 	std::set<std::string> only_lines; // --only-runs
@@ -877,6 +880,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 		else if (a == "--token") cfg.token = value();
 		else if (a == "--min-workers") cfg.min_workers = std::max(1, atoi(value().c_str()));
 		else if (a == "--decode-threads") decode_threads = atoi(value().c_str());
+		else if (a == "--frames-ahead") frames_ahead = atoi(value().c_str());
 		else if (a == "--hw-decode") hw_decode = value();
 		else if (a == "--decode-gpu") decode_gpu = value();
 		else if (a == "--scaling-gpu") scaling_gpu = value();
@@ -938,6 +942,7 @@ static void parse_flags(int argc, char** argv, Config& cfg, bool& quit) {
 	if (scaling_gpu) cfg.scaling_gpu = *scaling_gpu;
 	if (priority) cfg.priority = *priority;
 	if (decode_threads) cfg.decode_threads = *decode_threads;
+	if (frames_ahead) cfg.frames_ahead = *frames_ahead;
 	if (low_memory) cfg.low_memory = true;
 	if (in_process) cfg.in_process = true;
 	if (!inputs.empty()) { cfg.inputs.clear(); for (auto& i : inputs) add_inputs(cfg, i); }
@@ -1107,7 +1112,7 @@ static SourceInfo source_from_json(const std::string& text) {
 static int run_worker(int argc, char** argv) {
 	// Settings of the runs from the worker config, as the flags they stand for; a flag on the command line is passed on as it is and wins.
 	static const std::pair<const char*, const char*> run_settings[] = {
-		{"vmaf_gpu", "--vmaf-gpu"}, {"vmaf_device", "--vmaf-device"}, {"hw_decode", "--hw-decode"}, {"decode_gpu", "--decode-gpu"}, {"scaling_gpu", "--scaling-gpu"}, {"decode_threads", "--decode-threads"}, {"priority", "--priority"}};
+		{"vmaf_gpu", "--vmaf-gpu"}, {"vmaf_device", "--vmaf-device"}, {"hw_decode", "--hw-decode"}, {"decode_gpu", "--decode-gpu"}, {"scaling_gpu", "--scaling-gpu"}, {"decode_threads", "--decode-threads"}, {"frames_ahead", "--frames-ahead"}, {"priority", "--priority"}};
 	std::vector<std::pair<std::string, std::string>> from_file; // flag, value
 	int only_gpu = -1, default_parallel = 0;
 	std::string target, dir, log_path, token = getenv("VES_TOKEN") ? getenv("VES_TOKEN") : "";
@@ -1264,10 +1269,12 @@ static int run(int argc, char** argv) {
 		if (cfg.priority == "low") { args.push_back("--priority"); args.push_back("low"); }
 		if (!cfg.decode_gpu.empty()) { args.push_back("--decode-gpu"); args.push_back(cfg.decode_gpu); }
 		if (!cfg.scaling_gpu.empty()) { args.push_back("--scaling-gpu"); args.push_back(cfg.scaling_gpu); }
+		if (cfg.frames_ahead > 0) { args.push_back("--frames-ahead"); args.push_back(std::to_string(cfg.frames_ahead)); }
 		set_encoder_process_args(args);
 	}
 	set_hw_decode(cfg.in_process ? cfg.hw_decode : "");
 	set_decode_threads(cfg.decode_threads > 0 ? cfg.decode_threads : cfg.low_memory ? 4 : 0);
+	if (cfg.frames_ahead > 0) set_frames_ahead((size_t)cfg.frames_ahead);
 	if (!cfg.log_file.empty()) {
 		std::string why;
 		if (!ui::open_log(cfg.log_file, std::string("ves ") + VERSION + " started", why)) { fprintf(stderr, "error: %s\n", why.c_str()); return 1; }
