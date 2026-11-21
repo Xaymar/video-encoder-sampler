@@ -3,6 +3,7 @@
 
 #ifndef VES_NO_VULKAN
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
