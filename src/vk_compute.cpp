@@ -327,6 +327,7 @@ bool vk_native(int index, VkNative& out) {
 	out.dev = s->dev;
 	out.compute_family = s->family;
 	out.compute_queues = s->ext.compute_queues;
+	out.first_unused_queue = 1 + (s->has_x && s->xfamily == s->family && s->xqueue_index == 1 ? 1 : 0);
 	out.extensions = s->ext.extensions;
 	return out.inst != VK_NULL_HANDLE;
 }

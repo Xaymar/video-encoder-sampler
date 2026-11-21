@@ -60,12 +60,13 @@ void vk_set_external_provider(bool (*provider)(int index, uint32_t vendor_id, ui
 
 // The native handles of Vulkan device `index` as Vk brought it up (bringing it up if needed), for a library that works on the same VkDevice (AMF,
 // which takes frames there as Vulkan surfaces). False when it cannot be had or did not come from a VkExternal provider (FFmpeg's device): only that
-// one is guaranteed to hold the frames. `compute_queues` is how many queues the compute family has (the scorer and the converter use the first).
+// one is guaranteed to hold the frames. `compute_queues` is how many queues the compute family has (the scorer and the converter use the first);
+// `first_unused_queue` is the first of them that Vk does not submit to itself (the second one holds the copies when the device has no transfer family).
 struct VkNative {
 	VkInstance inst = VK_NULL_HANDLE;
 	VkPhysicalDevice phys = VK_NULL_HANDLE;
 	VkDevice dev = VK_NULL_HANDLE;
-	uint32_t compute_family = 0, compute_queues = 0;
+	uint32_t compute_family = 0, compute_queues = 0, first_unused_queue = 1;
 	std::vector<std::string> extensions;
 };
 bool vk_native(int index, VkNative& out);
