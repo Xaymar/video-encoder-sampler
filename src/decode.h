@@ -21,3 +21,6 @@ std::unique_ptr<Decoder> make_decoder(); // libavcodec
 
 // A picture that is still on the GPU (Picture::gpu) read back into memory, as decoding to memory would have given it; true if it is in memory now.
 bool picture_to_memory(Picture& p);
+
+// Decoders of encoded streams alive in this process, those on a GPU, and failed GPU decoders still being freed (VES_VRAM_TRACE).
+void decoders_live(int64_t& all, int64_t& hw, int64_t& discarding);

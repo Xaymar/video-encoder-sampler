@@ -364,7 +364,12 @@ struct Vk::Impl {
 	std::vector<std::pair<VkBuffer, VkDeviceMemory>> owned;
 	std::vector<VkSemaphore> owned_sems; // timeline_semaphore()
 	uint64_t device_bytes = 0, host_bytes = 0;
+	bool counted = false; // in g_live_vk
 };
+
+// Every Vk alive in the process and the device-local memory they hold (vk_live(), for VES_VRAM_TRACE).
+static std::atomic<int64_t> g_live_vk{0}, g_live_device_bytes{0};
+void vk_live(int64_t& count, int64_t& device_bytes) { count = g_live_vk.load(); device_bytes = g_live_device_bytes.load(); }
 
 std::vector<VkDeviceInfo> Vk::devices(std::string& why) {
 	std::lock_guard lock(init_lock);
@@ -443,6 +448,8 @@ Vk::Vk(int device, int slots) : impl(new Impl) {
 		release();
 		throw;
 	}
+	impl->counted = true;
+	g_live_vk++;
 }
 
 Vk::~Vk() { release(); }
@@ -462,6 +469,8 @@ void Vk::release() {
 	if (impl->xpool) vkDestroyCommandPool(s.dev, impl->xpool, nullptr);
 	if (impl->dpool) vkDestroyDescriptorPool(s.dev, impl->dpool, nullptr);
 	for (auto& [b, m] : impl->owned) { vkDestroyBuffer(s.dev, b, nullptr); vkFreeMemory(s.dev, m, nullptr); }
+	g_live_device_bytes -= (int64_t)impl->device_bytes;
+	if (impl->counted) g_live_vk--;
 	for (VkSemaphore x : impl->owned_sems) vkDestroySemaphore(s.dev, x, nullptr);
 	delete impl;
 	impl = nullptr;
@@ -529,6 +538,7 @@ bool Vk::exportable_buffer(VkDeviceSize size, ExportedBuf& out, std::string& why
 	vkGetBufferMemoryRequirements(s.dev, buf, &mr);
 	impl->owned.emplace_back(buf, mem);
 	impl->device_bytes += mr.size;
+	g_live_device_bytes += (int64_t)mr.size;
 	out.b.buf = buf;
 	out.b.mem = mem;
 	out.b.size = size;
@@ -584,6 +594,7 @@ Buf Vk::buffer(VkDeviceSize size, int kind) {
 	}
 	impl->owned.emplace_back(b.buf, b.mem);
 	(s.mem.memoryTypes[found].propertyFlags & dl ? impl->device_bytes : impl->host_bytes) += mr.size;
+	if (s.mem.memoryTypes[found].propertyFlags & dl) g_live_device_bytes += (int64_t)mr.size;
 	chk(vkBindBufferMemory(s.dev, b.buf, b.mem, 0), "vkBindBufferMemory");
 	// Host visible memory is taken coherent here; the memory types picked above are on every desktop GPU.
 	if (s.mem.memoryTypes[found].propertyFlags & hv) {

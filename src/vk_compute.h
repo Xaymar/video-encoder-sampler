@@ -121,6 +121,9 @@ struct Buf {
 // in an allocation of its own (`alloc_size` bytes: what the importer is told). `win32` (an NT handle, Windows) or `fd` (elsewhere) is the
 // memory's handle, which the caller owns: CloseHandle() it after the import (a successful CUDA import of an fd takes the fd over).
 // Only buffers cross to the other API, never images: sharing Vulkan NV12 images with D3D11 or CUDA was seen to corrupt VRAM.
+// How many Vk are alive in this process and the device-local memory they hold (VES_VRAM_TRACE).
+void vk_live(int64_t& count, int64_t& device_bytes);
+
 struct ExportedBuf {
 	Buf b;
 	VkDeviceSize alloc_size = 0;
