@@ -725,7 +725,7 @@ std::shared_ptr<Device> device_for(const std::string& encoder, int gpu, std::str
 	bool finished = true;
 	if (d) {
 		std::lock_guard dl(d->m);
-		if (d->alive) return d;
+		if (d->alive && !d->stopping) return d; // (one that is being ended, see run_wave_isolated's retire, is replaced)
 		finished = d->ended;
 	}
 	if (d && finished) d->reap();
@@ -1063,6 +1063,12 @@ void run_wave_here(uint32_t id, const std::string& body) {
 		put(w, run.detail);
 		w.str(ej.unsupported);
 	}
+	// A failed GPU decoder whose freeing never came back (see discard_failed() in ff_decode.cpp) keeps its video memory for as long as this process lives:
+	// about 100-200 MB each on an RTX 4070 Laptop GPU, so a sweep filled its 8 GB in minutes [T 2026-11-21, driver 621.24, NVENC H.264 streams with long-term
+	// references that NVIDIA's Vulkan decoder refuses]. Then this process asks to be replaced once the wave is done; ending the process frees it all.
+	int64_t decs = 0, hw_decs = 0, discarding = 0;
+	decoders_live(decs, hw_decs, discarding);
+	w.num((uint8_t)(discarding > 0));
 	reply('w', id, w.s);
 }
 
@@ -1205,7 +1211,13 @@ bool run_wave_isolated(const std::string& input, const SourceInfo& si, std::vect
 			if (ej.rp) { ej.rp->busy_ms = busy; ej.rp->starved_ms = starved; ej.rp->failed = !ej.ok; ej.rp->finish(); }
 			if (run->score_rp) { run->score_rp->starved_ms = score_starved; run->score_rp->failed = !run->score_ok; run->score_rp->finish(); }
 		}
+		const bool retire = r.num<uint8_t>() != 0; // it holds memory it cannot free (see run_wave_here): a new process takes the next wave
 		if (!r.ok) { fail_all(false); return; }
+		if (retire) {
+			ui::log("The encoder process for " + dev->name + " (pid " + std::to_string(dev->proc.pid) + ") holds failed GPU decoders that never finish freeing their video memory: "
+			        "it is ended, and the next wave starts a new one");
+			dev->stop();
+		}
 		std::lock_guard lock(m);
 		all_ok = all_ok && feed_ok;
 		frames = std::max(frames, part_frames);
