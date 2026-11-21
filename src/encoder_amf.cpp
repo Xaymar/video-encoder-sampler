@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <set>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -189,6 +190,27 @@ private:
 	amf_int32 level = AMF_TRACE_INFO;
 };
 
+#ifndef VES_NO_VULKAN
+// The compute queues that this process's AMF sessions submit to, per Vulkan device. AMF does not lock a queue before it submits (FFmpeg's lock_queue is
+// unknown to it), and Vulkan lets only one thread at a time submit to a queue: two sessions in one process on the same queue lost the device on an
+// RX 6600M within seconds, every time (once as a full TDR). So each session takes a queue of its own, from the last one down; with none left, its frames
+// come through memory.
+std::mutex amf_queues_lock;
+std::map<int, std::set<uint32_t>> amf_queues_taken;
+int claim_amf_queue(int device, uint32_t first, uint32_t count) {
+	std::lock_guard lock(amf_queues_lock);
+	auto& taken = amf_queues_taken[device];
+	for (uint32_t q = count; q-- > first;)
+		if (!taken.count(q)) { taken.insert(q); return (int)q; }
+	return -1;
+}
+void release_amf_queue(int device, int q) {
+	if (q < 0) return;
+	std::lock_guard lock(amf_queues_lock);
+	amf_queues_taken[device].erase((uint32_t)q);
+}
+#endif
+
 class Amf : public Encoder {
 	HMODULE dll = nullptr;
 	amf::AMFFactory* factory = nullptr;
@@ -215,6 +237,7 @@ class Amf : public Encoder {
 	// D3D11 one as for frames from memory. On AMD this sharing is fine; it is NVIDIA's drivers that corrupt VRAM with shared NV12 images.
 	int gstate = 0; // 0: not tried yet, 1: frames from VRAM, -1: through memory
 	int gdevice = -1;
+	int gqueue = -1; // the compute queue AMF submits to, this session's alone (claim_amf_queue)
 	std::unique_ptr<Vk> gvk;
 	Buf gstage, gpacked;
 	VkDeviceSize gstage_size = 0;
@@ -223,9 +246,9 @@ class Amf : public Encoder {
 	uint32_t gpitch = 0;
 	VkDeviceSize guv_off = 0;
 
-	// InitVulkan on FFmpeg's device (nat), on `c` as it is: "" when it worked, else why not. The compute queue AMF submits to is the last one of the family,
-	// which the converter and the scorer (the first) do not use.
-	std::string init_vulkan_on(amf::AMFContextPtr& c, const VkNative& nat) {
+	// InitVulkan on FFmpeg's device (nat), on `c` as it is: "" when it worked, else why not. AMF submits to compute queue `queue` of the family, which
+	// nothing else in this process uses (see claim_amf_queue).
+	std::string init_vulkan_on(amf::AMFContextPtr& c, const VkNative& nat, int queue) {
 		amf::AMFContext1Ptr c1(c);
 		if (!c1) return "the AMF runtime has no Vulkan support (AMFContext1)";
 		amf_size n = 0;
@@ -238,7 +261,7 @@ class Amf : public Encoder {
 						missing += (missing.empty() ? "" : ", ") + std::string(need[i]);
 			if (!missing.empty()) return "FFmpeg's Vulkan device lacks " + missing + ", which AMF needs";
 		}
-		c->SetProperty(AMF_CONTEXT_VULKAN_COMPUTE_QUEUE, (amf_int64)(nat.compute_queues - 1));
+		c->SetProperty(AMF_CONTEXT_VULKAN_COMPUTE_QUEUE, (amf_int64)queue);
 		// AMF may keep the pointer, not a copy of the struct (a stale one would give it a garbage VkDevice: "vkCreateImage: Invalid device"): it lives as long as the encoder
 		vkdev = amf::AMFVulkanDevice{};
 		vkdev.cbSizeof = sizeof vkdev;
@@ -259,6 +282,8 @@ class Amf : public Encoder {
 		auto no = [&](const std::string& why) {
 			fprintf(stderr, "amf: frames come through memory: %s\n", why.c_str());
 			gvk.reset();
+			release_amf_queue(bf.device, gqueue);
+			gqueue = -1;
 			return false;
 		};
 		if (const char* e = getenv("VES_ENC_GPU_INPUT"); e && atoi(e) == 0) return no("VES_ENC_GPU_INPUT=0");
@@ -269,9 +294,12 @@ class Amf : public Encoder {
 		if (!di.luid_valid || di.luid != adapter_luid) return no("the frames are on another GPU (" + di.name + ")");
 		VkNative nat;
 		if (!vk_native(bf.device, nat)) return no("the frames' Vulkan device is not FFmpeg's");
-		// AMF submits to a compute queue of its own: the last one of the family, which the converter and the scorer (the first) do not use
-		if (nat.compute_queues < 2) return no("FFmpeg's Vulkan device has only one compute queue");
-		if (const std::string e = init_vulkan_on(ctx, nat); !e.empty()) {
+		// AMF submits to a compute queue of its own, one that the converter, the scorer and the copies do not use, nor another AMF session of this process
+		if (nat.compute_queues <= nat.first_unused_queue) return no("FFmpeg's Vulkan device has no compute queue that ves does not use already");
+		gqueue = claim_amf_queue(bf.device, nat.first_unused_queue, nat.compute_queues);
+		if (gqueue < 0)
+			return no("each of the " + std::to_string(nat.compute_queues - nat.first_unused_queue) + " compute queue(s) left on FFmpeg's Vulkan device is in use by another AMF session");
+		if (const std::string e = init_vulkan_on(ctx, nat, gqueue); !e.empty()) {
 			// Which part AMF does not take: FFmpeg's device on a context that already has D3D11, FFmpeg's device on a context of its own, or a device AMF makes itself.
 			auto alone = [&](bool own_device) {
 				amf::AMFContextPtr c;
@@ -299,7 +327,7 @@ class Amf : public Encoder {
 		} catch (const std::exception& e) { return no(e.what()); }
 		gdevice = bf.device;
 		gstate = 1;
-		fprintf(stderr, "amf: frames come straight from VRAM (Vulkan device %d, packed on the GPU into a Vulkan surface of AMF's)\n", bf.device);
+		fprintf(stderr, "amf: frames come straight from VRAM (Vulkan device %d, packed on the GPU into a Vulkan surface of AMF's; AMF submits to compute queue %d of %u)\n", bf.device, gqueue, nat.compute_queues);
 		return true;
 	}
 
@@ -587,6 +615,9 @@ public:
 		enc = nullptr;
 		if (ctx) ctx->Terminate();
 		ctx = nullptr;
+#ifndef VES_NO_VULKAN
+		release_amf_queue(gdevice, gqueue); // after Terminate: AMF no longer submits
+#endif
 		device.Reset();
 		// shortcut: amfrt64.dll stays loaded; unloading it while AMF's worker threads wind down has been unreliable
 	}
