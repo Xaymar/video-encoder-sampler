@@ -14,6 +14,7 @@
 #include "decode.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -107,6 +108,9 @@ void tell_once(const std::string& key, const std::string& msg) {
 	fprintf(stderr, "%s\n", msg.c_str());
 }
 
+// Decoders of scored streams alive in this process, those on a GPU among them, and failed GPU decoders whose freeing has not come back (VES_VRAM_TRACE).
+static std::atomic<int64_t> g_live_decoders{0}, g_live_hw_decoders{0}, g_discarding{0};
+
 // One libavcodec decoder and the frames it has given that were not handed out yet.
 struct Dec {
 	AVCodecContext* ctx = nullptr;
@@ -121,7 +125,10 @@ struct Dec {
 	int vk_device = -1;
 	long long got = 0; // frames received
 
+	Dec() { g_live_decoders++; }
 	~Dec() {
+		g_live_decoders--;
+		if (ctx && ctx->hw_device_ctx) g_live_hw_decoders--;
 		av_frame_free(&frame);
 		av_frame_free(&down);
 		av_frame_free(&planar);
@@ -164,6 +171,7 @@ struct Dec {
 			}
 			if (!(dev = shared_hw_device(type, device))) return false;
 			ctx->hw_device_ctx = av_buffer_ref(dev);
+			g_live_hw_decoders++;
 			ctx->opaque = (void*)(intptr_t)hw_fmt;
 			ctx->get_format = &Dec::pick_format;
 			ctx->thread_count = 1; // the GPU does the work
@@ -253,7 +261,9 @@ struct Dec {
 // never signaled, and ff_vk_exec_pool_free() (avcodec_free_context) waits for it with no timeout once that context had a submission before. Freed on
 // the scorer's thread, that held the run, and its whole wave, for good (seen on an RTX 4070 Laptop GPU with NVIDIA's Vulkan H.264 decoder).
 static void discard_failed(std::unique_ptr<Dec> d) {
-	if (d) std::thread([p = d.release()] { delete p; }).detach();
+	if (!d) return;
+	g_discarding++;
+	std::thread([p = d.release()] { delete p; g_discarding--; }).detach();
 }
 
 class FfDecoder : public Decoder {
@@ -462,6 +472,8 @@ public:
 };
 
 } // namespace
+
+void decoders_live(int64_t& all, int64_t& hw, int64_t& discarding) { all = g_live_decoders.load(); hw = g_live_hw_decoders.load(); discarding = g_discarding.load(); }
 
 bool picture_to_memory(Picture& p) {
 	if (!p.gpu) return true;

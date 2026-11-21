@@ -70,6 +70,8 @@ bool vulkan_frame(const AVFrame* f, int device, VkDecodedFrame& out);
 // twin of the frame's own) and color, no samples. for_scorer: false unless the scorer can read it in place (vulkan_frame()); otherwise it can still be
 // converted in place (pl_convert.cpp) or read back (picture_to_memory()).
 bool vulkan_picture(const AVFrame* f, int device, bool for_scorer, Picture& out);
+// FFmpeg GPU frames held by pictures in this process (VES_VRAM_TRACE).
+int64_t held_gpu_frames();
 // The FFmpeg frame behind a picture that is on the GPU, nullptr for one in memory.
 const AVFrame* gpu_avframe(const Picture& p);
 // FFmpeg's Vulkan device `index` (as Vk::devices() numbers them) if it is the GPU with these PCI ids, else nullptr; the caller gets a reference of its own.

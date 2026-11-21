@@ -17,6 +17,8 @@
 #include <vector>
 
 #include "convert.h"
+#include "decode.h"
+#include "ff.h"
 #include "formats.h"
 #include "gpu.h"
 #include "pipeline.h"
@@ -1037,6 +1039,17 @@ void run_wave_here(uint32_t id, const std::string& body) {
 	});
 	FeedResult fr;
 	run_wave(input, si, ptrs, so, vo, &feed_rp, fr);
+	if (const char* e = getenv("VES_VRAM_TRACE"); e && atoi(e)) { // what is still alive once the wave is done: it should all be gone
+		int64_t vks = 0, vk_bytes = 0, decs = 0, hw_decs = 0, discarding = 0;
+		int64_t held = 0;
+#ifndef VES_NO_VULKAN
+		vk_live(vks, vk_bytes);
+		held = held_gpu_frames();
+#endif
+		decoders_live(decs, hw_decs, discarding);
+		fprintf(stderr, "vram trace after wave: %lld Vk alive holding %lld MB device memory; %lld stream decoders alive (%lld on a GPU), %lld failed GPU decoders still being freed; %lld FFmpeg GPU frames held\n",
+		        (long long)vks, (long long)(vk_bytes >> 20), (long long)decs, (long long)hw_decs, (long long)discarding, (long long)held);
+	}
 	finished = true;
 	rows.join();
 	for (int h : handles) ui::detach(h);

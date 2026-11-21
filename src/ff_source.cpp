@@ -4,6 +4,7 @@
 #include "source.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -423,6 +424,10 @@ AVBufferRef* shared_hw_device(const std::string& type, const std::string& device
 }
 
 #ifndef VES_NO_VULKAN
+// FFmpeg's GPU frames held by pictures (VES_VRAM_TRACE): each keeps its frames pool, and so its decoder's memory, alive.
+static std::atomic<int64_t> g_held_gpu_frames{0};
+int64_t held_gpu_frames() { return g_held_gpu_frames.load(); }
+
 // FFmpeg's Vulkan device of a GPU is also the scorer's (vk_compute.h, VkExternal), so that what its decoder makes is read on the GPU where it is.
 std::mutex g_vk_mutex;
 std::map<int, uint32_t> g_vk_compute_family; // per Vulkan device given out: the family the scorer submits to
@@ -587,7 +592,8 @@ bool vulkan_frame(const AVFrame* f, int device, VkDecodedFrame& out) {
 	struct Lock { AVHWFramesContext* fc; AVVulkanFramesContext* vfc; AVVkFrame* vf; };
 	auto* l = new Lock{fc, vfc, vf};
 	AVFrame* keep = av_frame_clone(f);
-	out.keep = std::shared_ptr<void>(keep, [l](void* p) { AVFrame* a = (AVFrame*)p; av_frame_free(&a); delete l; });
+	g_held_gpu_frames++;
+	out.keep = std::shared_ptr<void>(keep, [l](void* p) { AVFrame* a = (AVFrame*)p; av_frame_free(&a); delete l; g_held_gpu_frames--; });
 	out.ctx = l;
 	out.lock_domain = fc; // FFmpeg's frame lock is the frames context's
 	out.lock = [](void* c) { auto* k = (Lock*)c; if (k->vfc->lock_frame) k->vfc->lock_frame(k->fc, k->vf); };
@@ -609,7 +615,8 @@ bool vulkan_picture(const AVFrame* hwf, int device, bool for_scorer, Picture& ou
 		*vf = VkDecodedFrame(); // the scorer cannot read it in place; it is still on the GPU for the converter
 		AVFrame* keep = av_frame_clone(hwf);
 		if (!keep) return false;
-		vf->keep = std::shared_ptr<void>(keep, [](void* a) { AVFrame* f = (AVFrame*)a; av_frame_free(&f); });
+		g_held_gpu_frames++;
+		vf->keep = std::shared_ptr<void>(keep, [](void* a) { AVFrame* f = (AVFrame*)a; av_frame_free(&f); g_held_gpu_frames--; });
 		vf->device = device;
 	}
 	Picture p;
