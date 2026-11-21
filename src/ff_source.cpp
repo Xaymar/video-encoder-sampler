@@ -5,12 +5,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdarg>
+#include <chrono>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <thread>
+#include <vector>
 
 #include "encoder.h"
 #include "ff.h"
@@ -23,6 +27,7 @@ extern "C" {
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext.h>
 #include <libavutil/intreadwrite.h>
+#include <libavutil/log.h>
 #ifndef VES_NO_VULKAN
 #include <libavutil/hwcontext_vulkan.h>
 #endif
@@ -396,7 +401,224 @@ std::vector<HwChoice> hw_choices(AVCodecID id, const std::string& want) {
 	return out;
 }
 
+#ifndef VES_NO_VULKAN
+// FFmpeg's Vulkan code resets an execution's fence before it records, and when vkEndCommandBuffer or the submit then fails (NVIDIA's Vulkan H.264
+// decoder: "Unable to finish command buffer: Unknown error" for some NVENC streams) that fence is never submitted; freeing the decoder later waits for
+// it with no timeout (ff_vk_exec_pool_free), so the decoder and its frames (about 100-200 MB of video memory each) were never freed, and in one process
+// (--in-process) a sweep filled an 8 GB GPU [T 2026-11-21, RTX 4070 Laptop GPU, driver 621.24, FFmpeg 8].
+// The device FFmpeg's decoders load their functions from is given these instead: they note which fences were reset and not submitted since, and a
+// wait for such a fence does not wait forever (after a grace period for a submit from another thread, it is taken as signaled: nothing can signal it).
+namespace fence_guard {
+PFN_vkGetInstanceProcAddr real_gipa = nullptr;
+std::mutex m;
+struct DevFns {
+	PFN_vkWaitForFences wait = nullptr;
+	PFN_vkResetFences reset = nullptr;
+	PFN_vkDestroyFence destroy = nullptr;
+	PFN_vkGetFenceStatus status = nullptr;
+	PFN_vkQueueSubmit submit = nullptr;
+	PFN_vkQueueSubmit2 submit2 = nullptr, submit2_khr = nullptr;
+	PFN_vkGetDeviceQueue queue = nullptr;
+	PFN_vkGetDeviceQueue2 queue2 = nullptr;
+};
+std::map<VkDevice, DevFns>* devs = new std::map<VkDevice, DevFns>; // never freed: decoders on other threads may still call in at exit
+std::map<VkQueue, VkDevice>* queues = new std::map<VkQueue, VkDevice>;
+std::map<VkFence, int64_t>* unsubmitted = new std::map<VkFence, int64_t>; // reset and not submitted since: when it was reset (clock)
+std::atomic<int64_t> given_up{0};
+
+int64_t now_ms() { return (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+DevFns fns(VkDevice d) {
+	std::lock_guard l(m);
+	auto it = devs->find(d);
+	return it == devs->end() ? DevFns{} : it->second;
+}
+DevFns fns_q(VkQueue q) {
+	std::lock_guard l(m);
+	auto it = queues->find(q);
+	if (it == queues->end()) return {};
+	auto d = devs->find(it->second);
+	return d == devs->end() ? DevFns{} : d->second;
+}
+void submitted(VkFence f) {
+	if (f == VK_NULL_HANDLE) return;
+	std::lock_guard l(m);
+	unsubmitted->erase(f);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL reset_fences(VkDevice d, uint32_t n, const VkFence* f) {
+	const VkResult r = fns(d).reset(d, n, f);
+	if (r == VK_SUCCESS) {
+		std::lock_guard l(m);
+		const int64_t t = now_ms();
+		for (uint32_t i = 0; i < n; i++) (*unsubmitted)[f[i]] = t;
+	}
+	return r;
+}
+VKAPI_ATTR void VKAPI_CALL destroy_fence(VkDevice d, VkFence f, const VkAllocationCallbacks* a) {
+	{
+		std::lock_guard l(m);
+		unsubmitted->erase(f);
+	}
+	fns(d).destroy(d, f, a);
+}
+VKAPI_ATTR VkResult VKAPI_CALL queue_submit(VkQueue q, uint32_t n, const VkSubmitInfo* s, VkFence f) {
+	const VkResult r = fns_q(q).submit(q, n, s, f);
+	if (r == VK_SUCCESS) submitted(f);
+	return r;
+}
+VKAPI_ATTR VkResult VKAPI_CALL queue_submit2(VkQueue q, uint32_t n, const VkSubmitInfo2* s, VkFence f) {
+	const DevFns d = fns_q(q);
+	const VkResult r = (d.submit2 ? d.submit2 : d.submit2_khr)(q, n, s, f);
+	if (r == VK_SUCCESS) submitted(f);
+	return r;
+}
+VKAPI_ATTR VkResult VKAPI_CALL queue_submit2_khr(VkQueue q, uint32_t n, const VkSubmitInfo2* s, VkFence f) {
+	const DevFns d = fns_q(q);
+	const VkResult r = (d.submit2_khr ? d.submit2_khr : d.submit2)(q, n, s, f);
+	if (r == VK_SUCCESS) submitted(f);
+	return r;
+}
+VKAPI_ATTR void VKAPI_CALL get_queue(VkDevice d, uint32_t fam, uint32_t i, VkQueue* q) {
+	fns(d).queue(d, fam, i, q);
+	if (*q) { std::lock_guard l(m); (*queues)[*q] = d; }
+}
+VKAPI_ATTR void VKAPI_CALL get_queue2(VkDevice d, const VkDeviceQueueInfo2* info, VkQueue* q) {
+	fns(d).queue2(d, info, q);
+	if (*q) { std::lock_guard l(m); (*queues)[*q] = d; }
+}
+
+// The fences of `f` that were reset and not submitted for longer than the grace period, which nothing will signal any more.
+constexpr int64_t kGraceMs = 2000;
+std::vector<VkFence> waitable(uint32_t n, const VkFence* f, bool& any_pending) {
+	std::vector<VkFence> out;
+	any_pending = false;
+	std::lock_guard l(m);
+	for (uint32_t i = 0; i < n; i++) {
+		auto it = unsubmitted->find(f[i]);
+		if (it == unsubmitted->end()) out.push_back(f[i]);
+		else any_pending = true;
+	}
+	return out;
+}
+bool all_dead(uint32_t n, const VkFence* f) { // every unsubmitted one of them is past its grace period
+	std::lock_guard l(m);
+	const int64_t t = now_ms();
+	for (uint32_t i = 0; i < n; i++) {
+		auto it = unsubmitted->find(f[i]);
+		if (it != unsubmitted->end() && t - it->second < kGraceMs) return false;
+	}
+	return true;
+}
+void note_given_up() {
+	if (given_up++ == 0)
+		fprintf(stderr, "vulkan: a wait for a fence that was reset and never submitted (FFmpeg after a failed GPU submit) is taken as done, so the decoder can be freed\n");
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL wait_fences(VkDevice d, uint32_t n, const VkFence* f, VkBool32 all, uint64_t timeout) {
+	const DevFns fn = fns(d);
+	const int64_t start = now_ms();
+	for (;;) {
+		bool pending;
+		std::vector<VkFence> real = waitable(n, f, pending);
+		if (!pending) return fn.wait(d, n, f, all, timeout);
+		// Some were never submitted. Wait in slices for the others (and for a submit of those from another thread).
+		const uint64_t slice = 20'000'000; // 20 ms
+		if (!real.empty()) {
+			const VkResult r = fn.wait(d, (uint32_t)real.size(), real.data(), all, std::min(timeout, slice));
+			if (r != VK_TIMEOUT && r != VK_SUCCESS) return r;
+			if (r == VK_SUCCESS && !all) return VK_SUCCESS;
+			if (r == VK_SUCCESS) {
+				if (all_dead(n, f)) { note_given_up(); return VK_SUCCESS; }
+				std::this_thread::sleep_for(std::chrono::milliseconds(20));
+			}
+		} else {
+			if (all_dead(n, f)) { note_given_up(); return VK_SUCCESS; }
+			std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		}
+		const uint64_t spent = (uint64_t)(now_ms() - start) * 1'000'000;
+		if (timeout != UINT64_MAX && spent >= timeout) return VK_TIMEOUT;
+	}
+}
+VKAPI_ATTR VkResult VKAPI_CALL fence_status(VkDevice d, VkFence f) {
+	const VkResult r = fns(d).status(d, f);
+	if (r == VK_NOT_READY && all_dead(1, &f)) {
+		bool pending;
+		waitable(1, &f, pending);
+		if (pending) { note_given_up(); return VK_SUCCESS; }
+	}
+	return r;
+}
+
+PFN_vkGetDeviceProcAddr real_gdpa = nullptr;
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL gdpa(VkDevice d, const char* name) {
+	const PFN_vkVoidFunction real = real_gdpa(d, name);
+	if (!real || !name) return real;
+	std::lock_guard l(m);
+	DevFns& fn = (*devs)[d];
+#define W(str, field, type, ours) if (!strcmp(name, str)) { fn.field = (type)real; return (PFN_vkVoidFunction)&ours; }
+	W("vkWaitForFences", wait, PFN_vkWaitForFences, wait_fences)
+	W("vkResetFences", reset, PFN_vkResetFences, reset_fences)
+	W("vkDestroyFence", destroy, PFN_vkDestroyFence, destroy_fence)
+	W("vkGetFenceStatus", status, PFN_vkGetFenceStatus, fence_status)
+	W("vkQueueSubmit", submit, PFN_vkQueueSubmit, queue_submit)
+	W("vkQueueSubmit2", submit2, PFN_vkQueueSubmit2, queue_submit2)
+	W("vkQueueSubmit2KHR", submit2_khr, PFN_vkQueueSubmit2, queue_submit2_khr)
+	W("vkGetDeviceQueue", queue, PFN_vkGetDeviceQueue, get_queue)
+	W("vkGetDeviceQueue2", queue2, PFN_vkGetDeviceQueue2, get_queue2)
+#undef W
+	return real;
+}
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL gipa(VkInstance inst, const char* name) {
+	if (name && !strcmp(name, "vkGetDeviceProcAddr")) {
+		const PFN_vkVoidFunction real = real_gipa(inst, name);
+		if (!real) return real;
+		{
+			std::lock_guard l(m);
+			real_gdpa = (PFN_vkGetDeviceProcAddr)real; // the loader's: the same for every device
+		}
+		return (PFN_vkVoidFunction)&gdpa;
+	}
+	return real_gipa(inst, name);
+}
+
+// Installed on FFmpeg's device once it is made, before any decoder loads its functions from it (VES_FENCE_GUARD=0 leaves it out).
+void install(AVBufferRef* dev) {
+	if (const char* e = getenv("VES_FENCE_GUARD"); e && atoi(e) == 0) return;
+	AVVulkanDeviceContext* hw = (AVVulkanDeviceContext*)((AVHWDeviceContext*)dev->data)->hwctx;
+	if (!hw->get_proc_addr || hw->get_proc_addr == &gipa) return;
+	{
+		std::lock_guard l(m);
+		if (real_gipa && real_gipa != hw->get_proc_addr) return; // another loader: left alone
+		real_gipa = hw->get_proc_addr;
+	}
+	hw->get_proc_addr = &gipa;
+}
+} // namespace fence_guard
+#endif
+
 } // namespace
+
+// FFmpeg's messages go on as before; those that say the GPU ran out of video memory are counted (note_out_of_vram), for runs in this process.
+static void count_vram_log(void* avcl, int level, const char* fmt, va_list vl) {
+	if (level <= av_log_get_level()) {
+		va_list c;
+		va_copy(c, vl);
+		char line[1024];
+		int prefix = 1;
+		av_log_format_line2(avcl, level, fmt, c, line, sizeof line, &prefix);
+		va_end(c);
+		if (strstr(line, "VK_ERROR_OUT_OF_DEVICE_MEMORY") || strstr(line, "CUDA_ERROR_OUT_OF_MEMORY")) note_out_of_vram();
+	}
+	av_log_default_callback(avcl, level, fmt, vl);
+}
+
+int64_t fence_waits_given_up() {
+#ifndef VES_NO_VULKAN
+	return fence_guard::given_up.load();
+#else
+	return 0;
+#endif
+}
 
 AVBufferRef* shared_hw_device(const std::string& type, const std::string& device) {
 	// one device per type for the whole run: creating it is slow, and decoders can share it
@@ -404,6 +626,8 @@ AVBufferRef* shared_hw_device(const std::string& type, const std::string& device
 	static std::map<std::string, AVBufferRef*> devices;
 	const AVHWDeviceType t = av_hwdevice_find_type_by_name(type.c_str());
 	if (t == AV_HWDEVICE_TYPE_NONE) return nullptr;
+	static std::once_flag log_once;
+	std::call_once(log_once, [] { av_log_set_callback(&count_vram_log); });
 	std::lock_guard lock(devices_mutex);
 	AVBufferRef*& shared = devices[type + "|" + device];
 	AVDictionary* opts = nullptr;
@@ -419,6 +643,9 @@ AVBufferRef* shared_hw_device(const std::string& type, const std::string& device
 	}
 #endif
 	if (!shared && av_hwdevice_ctx_create(&shared, t, device.empty() ? nullptr : device.c_str(), opts, 0) < 0) shared = nullptr;
+#ifndef VES_NO_VULKAN
+	else if (shared && t == AV_HWDEVICE_TYPE_VULKAN) fence_guard::install(shared);
+#endif
 	av_dict_free(&opts);
 	return shared ? av_buffer_ref(shared) : nullptr;
 }

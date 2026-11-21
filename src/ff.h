@@ -60,6 +60,8 @@ std::vector<HwChoice> hw_decode_choices(AVCodecID id);
 std::string hw_decode_gpu_identity();
 // The hardware device of a type, made once per run and shared by every decoder; nullptr if it cannot be made. The caller gets a reference of its own.
 AVBufferRef* shared_hw_device(const std::string& type, const std::string& device);
+// Waits for a fence of FFmpeg's Vulkan device that was reset and never submitted, taken as done so that a failed decoder can be freed (ff_source.cpp).
+int64_t fence_waits_given_up();
 
 #ifndef VES_NO_VULKAN
 #include "vk_compute.h"

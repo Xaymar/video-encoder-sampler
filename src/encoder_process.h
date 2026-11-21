@@ -38,3 +38,6 @@ void stop_encoder_processes();
 // `ves --encoder-process <encoder|cpu> <gpu> [--priority low] [--hw-decode <type>] [--decode-threads <n>] [--frames-ahead <n>]`: the process itself. Talks to the process that started it
 // on stdin and stdout until stdin closes.
 int encoder_process_main(int argc, char** argv);
+
+// VES_VRAM_TRACE=1: after each wave, what of the GPU is still alive in this process (Vk objects, decoders, failed decoders still being freed, held frames).
+void vram_trace();

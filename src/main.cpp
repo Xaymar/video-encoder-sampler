@@ -2456,8 +2456,14 @@ static int run(int argc, char** argv) {
 			const int feed_handle = cfg.in_process ? ui::attach(&feed_rp, "for the encoders to " + std::to_string(wave[0]->plan.enc.w) + "x" + std::to_string(wave[0]->plan.enc.h), "convert") : -1;
 			FeedResult fr;
 			const auto t_wave = std::chrono::steady_clock::now();
-			if (cfg.in_process) run_wave(local_path(input), si, ptrs, cfg.scale, cfg.vo, &feed_rp, fr);
-			else {
+			if (cfg.in_process) {
+				// Runs that failed while the GPU said it ran out of video memory are made again with fewer at once (below), as encoder processes do it.
+				const uint64_t vram_before = out_of_vram_count();
+				run_wave(local_path(input), si, ptrs, cfg.scale, cfg.vo, &feed_rp, fr);
+				vram_trace();
+				if (out_of_vram_count() != vram_before)
+					for (WaveRun* run : ptrs) if (!run->enc.ok || !run->score_ok) run->enc.out_of_vram = true;
+			} else {
 				std::string decoders;
 				run_wave_isolated(local_path(input), si, ptrs, cfg.scale, cfg.vo, &feed_rp, fr, decoders);
 				if (!decoders.empty() && infos.at(input).decoder != decoders) { // what the result file says decoded the input
