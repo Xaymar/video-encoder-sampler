@@ -51,6 +51,7 @@ constexpr VkExternalMemoryHandleTypeFlagBits kExportType = VK_EXTERNAL_MEMORY_HA
 
 void chk(VkResult r, const char* what) {
 	if (r == VK_ERROR_DEVICE_LOST) gpu_lost(std::string("Vulkan device lost while scoring VMAF (") + what + ")");
+	if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY) note_out_of_vram();
 	if (r == VK_ERROR_OUT_OF_DEVICE_MEMORY) throw std::runtime_error(std::string("Vulkan: ") + what + " failed (VK_ERROR_OUT_OF_DEVICE_MEMORY)"); // read by encoder_process.cpp
 	if (r != VK_SUCCESS) throw std::runtime_error(std::string("Vulkan: ") + what + " failed (" + std::to_string((int)r) + ")");
 }

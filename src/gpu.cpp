@@ -166,6 +166,10 @@ std::atomic<bool> lost_told{false};
 
 void set_gpu_lost_handler(void (*handler)(const std::string& what)) { lost_handler = handler; }
 
+static std::atomic<uint64_t> g_out_of_vram{0};
+void note_out_of_vram() { g_out_of_vram++; }
+uint64_t out_of_vram_count() { return g_out_of_vram.load(); }
+
 void gpu_lost(const std::string& what) {
 	if (auto h = lost_handler.load()) { h(what); return; }
 	if (!lost_told.exchange(true)) fprintf(stderr, "the GPU was lost (%s); what still runs on it fails\n", what.c_str());

@@ -38,3 +38,8 @@ std::string render_node(unsigned vendor, int index);
 // ends (see encoder_process.cpp), so that its runs are tried again in a new process on devices that work. Without a handler it is said once.
 void gpu_lost(const std::string& what);
 void set_gpu_lost_handler(void (*handler)(const std::string& what));
+
+// How often this process was told the GPU ran out of video memory (FFmpeg's Vulkan and CUDA messages, the scorer's chk()): runs that fail while it grows
+// are made again with fewer at once. Encoder processes are judged by their lines instead (encoder_process.cpp); this is for --in-process.
+void note_out_of_vram();
+uint64_t out_of_vram_count();
