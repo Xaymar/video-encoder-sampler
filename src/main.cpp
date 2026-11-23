@@ -58,10 +58,11 @@ namespace fs = std::filesystem;
 
 
 // Running under a CBR target is the encoder's own loss, so only overshoot is penalized.
-// Default slope: the 3000 -> 6000 kbps sweep gains roughly 2.5 VMAF over +100%, i.e. ~0.025 per percent.
-static double over_penalty = 0.025; // VMAF points per percent over target, for a hair over; it steepens from there
-// The same curve as the website's over_penalty(): slope * width * (e^(x / width) - 1) with x the percent over target (2% over loses 0.06, 10% 0.64, 12% 0.96, 20% 4.1, 30% 22), at most 100.
-// The width was 3 (12% over cost about 4 points) until x264's ABR, which overshoots at scene cuts, ranked below clearly worse encodes that hit the target.
+// Default slope: on the current reference, each extra 1% of bits buys about 0.13 to 0.24 VMAF (3500 -> 6000 kbps, same encoder), so 0.25 per percent
+// keeps overshooting from paying off at any size. It was 0.025 (from an old sweep that gained ~2.5 VMAF over +100%), which let encodes 5-7% over rank on top.
+static double over_penalty = 0.25; // VMAF points per percent over target, for a hair over; it steepens from there
+// The same curve as the website's over_penalty(): slope * width * (e^(x / width) - 1) with x the percent over target (1% over loses 0.27, 2% 0.59, 5% 1.95,
+// 10% 6.4, 20% 41), at most 100.
 static double over_penalty_points(double kbps, double target) {
 	const double width = 6.0;
 	if (target <= 0 || kbps <= target) return 0;
@@ -734,7 +735,7 @@ Scoring
                             auto: the GPU where it can be used (8 or 10 bit YUV, a model file, a Vulkan GPU), else the CPU. These scores are kept apart from libvmaf's in the cache
         --vmaf-gpu <auto|n|name>  the Vulkan device that scores (default: auto, the home GPU, else the fastest: discrete first, then the most VRAM); own: the GPU that encodes the run; n: Vulkan device n;
                             name: the first device whose name contains it. --vmaf-gpu list shows the Vulkan devices
-        --over-penalty <p>  VMAF points deducted per percent for a run just over the target bitrate (default: 0.025); it grows exponentially, like the website's
+        --over-penalty <p>  VMAF points deducted per percent for a run just over the target bitrate (default: 0.25); it grows exponentially, like the website's
 
 Distributed (see docs/distributed.md)
         --host <port>       decide what is run, and hand the runs that are not done to the workers that connect to this port. The host runs nothing
