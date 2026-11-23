@@ -75,7 +75,7 @@
 	"vmaf": {
 		// Running over the target bitrate costs this many VMAF points per percent for a run just over; the cost grows exponentially, as on the website
 		// (2% over loses 0.07, 10% 1.9, 20% 59). The default is about what 3000 -> 6000 kbit/s gains.
-		"over_penalty": 0.025,
+		"over_penalty": 0.25,
 		// Model files, relative to the working directory ("path=..."), or built-in ones ("version=..."), which the libvmaf we ship has none of. One model,
 		// or a list scored in one pass (what the models compute alike is computed once, so four v1 models cost far less than four runs): the first one
 		// ranks and prunes, every one's scores (and, for v1, the chroma values per frame) go into the result files and to the website.
